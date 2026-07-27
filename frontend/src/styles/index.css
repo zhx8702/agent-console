@@ -1,0 +1,19 @@
+/*
+ * Single, deterministic cascade entrypoint. Keep imports in layer order.
+ * Responsive policy: wide 1280px, desktop 1120px, compact 820px, mobile 680px.
+ * CSS custom properties are intentionally not used inside media conditions.
+ */
+@import "./palette.css";
+@import "./tokens.css";
+@import "../styles.css";
+@import "../pages/connections/connections.css";
+@import "./pages/plugins.css";
+@import "./pages/plugin-marketplace.css";
+@import "./pages/relationship-graph.css";
+@import "./pages/auth.css";
+@import "./components/authenticated-image.css";
+@import "./navigation.css";
+@import "./pages/capabilities.css";
+@import "./interaction.css";
+@import "./components/badge.css";
+@import "./utilities.css";

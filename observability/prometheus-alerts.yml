@@ -1,0 +1,71 @@
+groups:
+  - name: agent-console-reliability
+    rules:
+      - alert: AgentConsoleLateRepliesSuppressed
+        expr: sum(increase(cs_wxbot_reply_suppressed_total{reason="superseded_or_cooldown"}[10m])) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WeChat late/cooldown reply suppression is elevated"
+          description: "More than 20 stale or cooldown replies were suppressed in 10 minutes."
+
+      - alert: AgentConsoleSessionLockLost
+        expr: sum(increase(cs_session_lock_events_total{event="lost"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A distributed session lock was lost"
+          description: "At least one in-flight task was interrupted because its Redis lease was lost."
+
+      - alert: AgentConsoleRAGNoContextRateHigh
+        expr: |
+          sum(rate(cs_rag_retrieval_results_total{result="empty"}[15m]))
+          /
+          clamp_min(sum(rate(cs_rag_retrieval_results_total[15m])), 0.001) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG no-context rate exceeds 25%"
+          description: "Review retrieval thresholds, index health and the WeChat evaluation set."
+
+      - alert: AgentConsoleCitationValidationFailing
+        expr: sum(rate(cs_rag_citation_validation_total{result!="valid"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG citation validation failures are elevated"
+          description: "Answers are being rejected because citations are missing, unknown or unsupported."
+
+      - alert: AgentConsoleKnowledgeIndexRollback
+        expr: sum(increase(cs_kb_index_operations_total{result=~"rollback_failed|stale_cleanup_failed"}[10m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Knowledge index compensation needs attention"
+          description: "A Qdrant compensation/cleanup failed. Retrieval remains DB-authoritative, but cleanup should be retried."
+
+      - alert: AgentConsoleMemoryRejectionRateHigh
+        expr: |
+          sum(rate(cs_memory_acceptance_decisions_total{status="rejected"}[30m]))
+          /
+          clamp_min(sum(rate(cs_memory_acceptance_decisions_total[30m])), 0.001) > 0.35
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Automatic memory rejection rate exceeds 35%"
+          description: "Check extraction prompts, confidence calibration and recent noisy group traffic."
+
+      - alert: AgentConsoleMemoryGovernanceFailed
+        expr: sum(increase(cs_memory_governance_events_total{result!~"success|dry_run"}[1h])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory governance cleanup failed"
+          description: "The scheduled memory expiry/purge pass reported a failure."

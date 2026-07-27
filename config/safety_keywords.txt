@@ -1,0 +1,9 @@
+# One keyword per line. Empty lines and lines starting with # are ignored.
+# Seed list is conservative. Replace with a production taxonomy.
+bomb
+terrorist
+child porn
+suicide method
+jailbreak you
+ignore previous instructions
+disregard the above

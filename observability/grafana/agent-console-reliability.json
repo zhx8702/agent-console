@@ -1,0 +1,51 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Late / cooldown replies suppressed",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(cs_wxbot_reply_suppressed_total[5m])) by (reason)", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Session lock lost",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "targets": [{"expr": "sum(increase(cs_session_lock_events_total{event=\"lost\"}[5m]))", "legendFormat": "lost"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "RAG outcomes",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "targets": [{"expr": "sum(rate(cs_rag_retrieval_results_total[5m])) by (result, scope)", "legendFormat": "{{result}} / {{scope}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Citation validation",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "targets": [{"expr": "sum(rate(cs_rag_citation_validation_total[5m])) by (result)", "legendFormat": "{{result}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Knowledge index operations",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "targets": [{"expr": "sum(rate(cs_kb_index_operations_total[5m])) by (operation, result)", "legendFormat": "{{operation}} / {{result}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory acceptance decisions",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "targets": [{"expr": "sum(rate(cs_memory_acceptance_decisions_total[5m])) by (status, source)", "legendFormat": "{{status}} / {{source}}"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["agent-console", "reliability", "rag", "wxbot"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Agent Console Reliability",
+  "uid": "agent-console-reliability",
+  "version": 1
+}

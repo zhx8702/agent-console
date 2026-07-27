@@ -1,0 +1,34 @@
+{
+  "_comment_auth": "远程授权服务 (Ed25519 签名验证)",
+  "auth_base_url": "",
+  "activation_code": "",
+  "_comment_device_binding_consent": "设为 true 表示同意向授权服务发送随机生成的持久化设备 ID、通用设备标签和运行时完整性摘要；不会采集或发送主机名、MachineGuid、BIOS/CPU/磁盘序列号",
+  "device_binding_consent": false,
+  "device_name": "wxbot-device",
+  "heartbeat_interval_sec": 60,
+  "heartbeat_timeout_sec": 8,
+  "auth_grace_sec": 180,
+
+  "_comment_api": "SDK HTTP API 服务",
+  "api_host": "127.0.0.1",
+  "api_port": 5080,
+  "_comment_api_token": "必填：使用 python -c \"import secrets; print(secrets.token_urlsafe(32))\" 生成，回环地址也必须鉴权",
+  "api_token": "REPLACE_WITH_A_RANDOM_TOKEN",
+
+  "_comment_wechat": "微信数据",
+  "wechat_data_dir": "auto",
+  "self_wxid": "auto",
+  "decrypted_dir": "./data/decrypted",
+
+  "my_names": ["bot", "机器人"],
+  "group_require_at_me": false,
+  "ingest_interval_sec": 10,
+  "send_interval_sec": 5,
+  "image_decrypt_thumbnail_fallback": true,
+  "session_name_overrides": {},
+
+  "_comment_sealed": "编译保护 (生产环境设 true)",
+  "require_compiled_ingest": false,
+  "require_compiled_sender": false,
+  "compiled_hash_manifest_path": "./build/protected/module_hashes.json"
+}

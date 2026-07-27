@@ -1,0 +1,43 @@
+# Single-host server overlay for the companion wx-bot deployment.
+#
+# The API, workers, and scheduler all call WXBOT_SDK_URL. Keep every process
+# that can execute wxbot work attached to the SDK network; otherwise scheduled
+# reports can be created successfully but fail while collecting messages.
+services:
+  postgres:
+    restart: unless-stopped
+    ports: !override ["127.0.0.1:5432:5432"]
+  redis:
+    restart: unless-stopped
+    ports: !override ["127.0.0.1:6379:6379"]
+  otel-collector:
+    restart: unless-stopped
+    ports: !override ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
+  api:
+    restart: unless-stopped
+    ports: !override ["127.0.0.1:8000:8000"]
+    networks: [default, wxbot-sdk]
+  inbound-worker:
+    restart: unless-stopped
+    networks: [default, wxbot-sdk]
+  outbound-worker:
+    restart: unless-stopped
+    networks: [default, wxbot-sdk]
+  scheduler:
+    restart: unless-stopped
+    networks: [default, wxbot-sdk]
+  wxbot-bridge-worker:
+    restart: unless-stopped
+    networks: [default, wxbot-sdk]
+  frontend:
+    restart: unless-stopped
+    ports: !override ["0.0.0.0:4173:8080"]
+  qdrant:
+    image: qdrant/qdrant:v1.16.3
+    restart: unless-stopped
+    ports: !override ["127.0.0.1:6333:6333", "127.0.0.1:6334:6334"]
+
+networks:
+  wxbot-sdk:
+    external: true
+    name: ${COMPOSE_WXBOT_DOCKER_NETWORK:-wx-bot-linux-xfce_default}

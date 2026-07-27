@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: agent-console-api
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["api:8000"]
+              labels:
+                process_role: api
+        - job_name: agent-console-workers
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["inbound-worker:9100"]
+              labels:
+                process_role: inbound
+            - targets: ["outbound-worker:9100"]
+              labels:
+                process_role: outbound
+            - targets: ["scheduler:9100"]
+              labels:
+                process_role: scheduler
+            - targets: ["wxbot-bridge-worker:9100"]
+              labels:
+                process_role: wxbot_bridge
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch]
+      exporters: [debug]

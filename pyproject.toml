@@ -1,0 +1,107 @@
+[project]
+name = "agent-console"
+version = "0.1.0"
+description = "Plugin-based multi-channel conversation operations console"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "httpx>=0.27,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<3",
+    "asyncpg>=0.29,<1",
+    "alembic>=1.13,<2",
+    "redis[hiredis]>=5.2,<9",
+    "anthropic>=0.39,<1",
+    "openai>=2.0,<3",
+    "qdrant-client>=1.12,<2",
+    "structlog>=24.4,<27",
+    "orjson>=3.10,<4",
+    "tenacity>=9.0,<10",
+    "rank-bm25>=0.2.2,<1",
+    "numpy>=1.26,<3",
+    "tiktoken>=0.8,<1",
+    "PyYAML>=6.0,<7",
+    "packaging>=24.0,<27",
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp>=1.27,<2",
+    "opentelemetry-instrumentation-fastapi>=0.48b0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0,<1",
+    "opentelemetry-instrumentation-redis>=0.48b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.48b0,<1",
+    "prometheus-client>=0.21,<1",
+    "qrcode[pil]>=7.4,<9",
+]
+
+[project.urls]
+Repository = "https://github.com/zhx8702/agent-console"
+Issues = "https://github.com/zhx8702/agent-console/issues"
+
+[project.optional-dependencies]
+dev = [
+    "aiosqlite>=0.20,<1",
+    "fakeredis>=2.26,<3",
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.24,<2",
+    "pytest-cov>=6.0,<8",
+    "httpx>=0.27,<1",
+    "ruff>=0.7,<1",
+    "mypy>=1.13,<3",
+    "types-PyYAML>=6,<7",
+    "faker>=30.0,<41",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "plugins*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
+markers = [
+    "integration: requires docker-compose infra",
+    "e2e: end-to-end tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+# Chinese product copy and tokenization regexes intentionally contain full-width
+# punctuation. Converting those characters would alter user-visible language or
+# matching behavior. The existing ``str, Enum`` classes also preserve their
+# established serialization/string semantics instead of adopting StrEnum.
+ignore = ["E501", "RUF001", "RUF002", "UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+files = [
+    "app/admin/authorization.py",
+    "app/common/canned.py",
+    "app/common/clock.py",
+    "app/common/config.py",
+    "app/common/context.py",
+    "app/common/exceptions.py",
+    "app/common/hashing.py",
+    "app/common/ids.py",
+    "app/common/safe_url.py",
+    "app/common/utils.py",
+    "app/orchestrator/outcome.py",
+    "app/orchestrator/flow.py",
+    "app/social/contracts.py",
+    "app/social/participation.py",
+    "app/social/rollout.py",
+]

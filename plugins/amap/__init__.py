@@ -1,0 +1,2 @@
+"""AMap personal map plugin."""
+

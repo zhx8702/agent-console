@@ -1,0 +1,93 @@
+:root {
+  color-scheme: light;
+
+  /* Semantic color tokens */
+  --bg: var(--color-custom-f5f7fa);
+  --bg-surface: var(--color-white);
+  --sidebar-bg: var(--color-slate-900);
+  --sidebar-text: var(--color-slate-300);
+  --sidebar-text-bright: var(--color-slate-100);
+  --sidebar-hover: rgba(255, 255, 255, 0.06);
+  --sidebar-active: rgba(99, 102, 241, 0.15);
+  --sidebar-active-text: var(--color-indigo-400);
+  --sidebar-border: rgba(255, 255, 255, 0.06);
+  --panel: var(--color-white);
+  --panel-alt: var(--color-slate-50);
+  --line: var(--color-slate-200);
+  --line-light: var(--color-slate-100);
+  --text: var(--color-slate-900);
+  --text-secondary: var(--color-slate-600);
+  --text-muted: var(--color-slate-500);
+  --muted: var(--color-slate-500);
+  --accent: var(--color-custom-5b5bd6);
+  --accent-hover: var(--color-indigo-600);
+  --accent-light: rgba(91, 91, 214, 0.08);
+  --success: var(--color-emerald-700);
+  --warning: var(--color-amber-700);
+  --danger: var(--color-red-700);
+  --focus-ring: var(--color-sky-600);
+  --focus-ring-shadow: rgba(2, 132, 199, 0.2);
+
+  /* Reusable status tones */
+  --tone-info-bg: var(--color-blue-50);
+  --tone-info-text: var(--color-blue-700);
+  --tone-info-border: var(--color-blue-200);
+  --tone-success-bg: var(--color-emerald-50);
+  --tone-success-text: var(--color-emerald-700);
+  --tone-success-border: var(--color-emerald-200);
+  --tone-warning-bg: var(--color-amber-50);
+  --tone-warning-text: var(--color-amber-800);
+  --tone-warning-border: var(--color-amber-200);
+  --tone-danger-bg: var(--color-red-50);
+  --tone-danger-text: var(--color-red-700);
+  --tone-danger-border: var(--color-red-200);
+  --tone-muted-bg: var(--color-slate-100);
+  --tone-muted-text: var(--color-slate-600);
+  --tone-muted-border: var(--color-slate-200);
+  --tone-accent-bg: var(--color-purple-50);
+  --tone-accent-text: var(--color-purple-800);
+  --tone-accent-border: var(--color-purple-200);
+  --tone-inverse-bg: rgba(15, 23, 42, 0.78);
+  --tone-inverse-text: var(--color-slate-100);
+  --tone-inverse-border: rgba(148, 163, 184, 0.2);
+
+  /* Spacing scale */
+  --space-0: 0;
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-3-5: 14px;
+  --space-4: 16px;
+  --space-4-5: 18px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Type scale */
+  --font-size-3xs: 0.625rem;
+  --font-size-2xs: 0.6875rem;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.8125rem;
+  --font-size-base: 0.875rem;
+  --font-size-md: 0.9375rem;
+  --font-size-lg: 1rem;
+  --font-size-xl: 1.125rem;
+  --font-size-2xl: 1.25rem;
+  --font-size-3xl: 1.5rem;
+  --font-size-4xl: 1.75rem;
+
+  /* Shape, elevation, and interaction */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  --touch-target: 44px;
+}

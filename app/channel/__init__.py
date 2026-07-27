@@ -1,0 +1,76 @@
+from app.channel.adapters import (
+    WECHAT_SDK_ADAPTER_ID,
+    WECHAT_SDK_DESCRIPTOR,
+    ChannelAdapterCatalog,
+    ChannelAdapterDescriptor,
+    ChannelAdapterRegistration,
+    ChannelProbeResult,
+    SecretFieldDescriptor,
+    build_default_channel_adapter_catalog,
+)
+from app.channel.connections import (
+    ChannelConnectionCheckResult,
+    ChannelConnectionCreateRequest,
+    ChannelConnectionDeleteResult,
+    ChannelConnectionDocument,
+    ChannelConnectionStore,
+    ChannelConnectionUpdateRequest,
+    legacy_wxbot_connection_from_settings,
+    normalize_secret_ref,
+)
+from app.channel.identity import (
+    LEGACY_WXBOT_CONNECTION_ID,
+    canonical_conversation_id,
+    canonical_external_id,
+    canonical_message_id,
+    canonical_participant_id,
+    canonical_session_namespace,
+)
+from app.channel.models import (
+    ChannelMedia,
+    ChannelSendOptions,
+    ChannelSendResult,
+    ChannelTarget,
+    apply_event_scope_to_session,
+)
+from app.channel.registry import ChannelOutbound, ChannelRegistry
+from app.channel.reply_policy import (
+    REPLY_POLICY_OVERRIDE_KEY,
+    get_reply_policy_override,
+    set_reply_policy_override,
+)
+
+__all__ = [
+    "LEGACY_WXBOT_CONNECTION_ID",
+    "REPLY_POLICY_OVERRIDE_KEY",
+    "WECHAT_SDK_ADAPTER_ID",
+    "WECHAT_SDK_DESCRIPTOR",
+    "ChannelAdapterCatalog",
+    "ChannelAdapterDescriptor",
+    "ChannelAdapterRegistration",
+    "ChannelConnectionCheckResult",
+    "ChannelConnectionCreateRequest",
+    "ChannelConnectionDeleteResult",
+    "ChannelConnectionDocument",
+    "ChannelConnectionStore",
+    "ChannelConnectionUpdateRequest",
+    "ChannelMedia",
+    "ChannelOutbound",
+    "ChannelProbeResult",
+    "ChannelRegistry",
+    "ChannelSendOptions",
+    "ChannelSendResult",
+    "ChannelTarget",
+    "SecretFieldDescriptor",
+    "apply_event_scope_to_session",
+    "build_default_channel_adapter_catalog",
+    "canonical_conversation_id",
+    "canonical_external_id",
+    "canonical_message_id",
+    "canonical_participant_id",
+    "canonical_session_namespace",
+    "get_reply_policy_override",
+    "legacy_wxbot_connection_from_settings",
+    "normalize_secret_ref",
+    "set_reply_policy_override",
+]

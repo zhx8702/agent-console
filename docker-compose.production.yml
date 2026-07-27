@@ -1,0 +1,162 @@
+# Production hardening overlay.
+#
+# Compose expands the required variables before creating containers, so a
+# production deployment fails closed when a secret or trust boundary is not
+# configured. APP_ENV=prod also activates the application's rejection of known
+# development credentials such as compose_dev_*.
+name: ${COMPOSE_PROJECT_NAME:-agent-console-prod}
+
+x-production-required-env: &production-required-env
+  APP_ENV: prod
+  DB_DSN: ${COMPOSE_DB_DSN:?set COMPOSE_DB_DSN in the production env file}
+  REDIS_URL: ${COMPOSE_REDIS_URL:?set COMPOSE_REDIS_URL in the production env file}
+  OUTBOUND_WEBHOOK_URL: ${COMPOSE_OUTBOUND_WEBHOOK_URL:?set COMPOSE_OUTBOUND_WEBHOOK_URL in the production env file}
+  OUTBOUND_HMAC_SECRET: ${COMPOSE_OUTBOUND_HMAC_SECRET:?set a unique COMPOSE_OUTBOUND_HMAC_SECRET}
+  ADMIN_BEARER_TOKEN: ${COMPOSE_ADMIN_BEARER_TOKEN:?set a unique COMPOSE_ADMIN_BEARER_TOKEN}
+  ADMIN_SESSION_SIGNING_SECRET: ${COMPOSE_ADMIN_SESSION_SIGNING_SECRET:?set an independent COMPOSE_ADMIN_SESSION_SIGNING_SECRET of at least 32 characters}
+  MEDIA_ID_SIGNING_SECRET: ${COMPOSE_MEDIA_ID_SIGNING_SECRET:?set an independent COMPOSE_MEDIA_ID_SIGNING_SECRET of at least 32 characters}
+  ADMIN_SESSION_COOKIE_SECURE: ${COMPOSE_ADMIN_SESSION_COOKIE_SECURE:?set COMPOSE_ADMIN_SESSION_COOKIE_SECURE=true}
+  ADMIN_ALLOW_BEARER_FALLBACK: ${COMPOSE_ADMIN_ALLOW_BEARER_FALLBACK:-false}
+  TENANT_DEMO_SECRET: ${COMPOSE_TENANT_DEMO_SECRET:?set a unique COMPOSE_TENANT_DEMO_SECRET}
+  MODERATION_WEBHOOK_ALLOWED_HOSTS: ${COMPOSE_MODERATION_WEBHOOK_ALLOWED_HOSTS:?set the exact moderation webhook host allowlist}
+  FRONTEND_CORS_ORIGINS: ${COMPOSE_FRONTEND_CORS_ORIGINS:?set the deployed frontend origin}
+  READINESS_REQUIRED_WORKER_ROLES: inbound,outbound,scheduler
+  # Production traffic uses only target Flow profiles. Unmodelled message
+  # shapes fail closed instead of silently returning to the legacy hook track.
+  ORCHESTRATOR_FLOW_RUNTIME_ENABLED: "true"
+  ORCHESTRATOR_FLOW_RUNTIME_NAME: auto
+  ORCHESTRATOR_FLOW_RUNTIME_ALLOWED_NAMES: auto
+  ORCHESTRATOR_FLOW_RUNTIME_ALLOW_TARGET_FLOWS: "true"
+  ORCHESTRATOR_FLOW_RUNTIME_ALLOW_COMPATIBLE_FALLBACK: "false"
+  ORCHESTRATOR_FLOW_EFFECT_COMMIT_BACKEND: redis
+  ORCHESTRATOR_FLOW_EFFECT_HANDLERS_ENABLED: "true"
+  ORCHESTRATOR_FLOW_EFFECT_LOG_BACKEND: postgres
+  ORCHESTRATOR_FLOW_EFFECT_LOG_FAILURE_POLICY: fail_closed
+
+x-production-wxbot-env: &production-wxbot-env
+  APP_ENV: prod
+  DB_DSN: ${COMPOSE_DB_DSN:?set COMPOSE_DB_DSN in the production env file}
+  REDIS_URL: ${COMPOSE_REDIS_URL:?set COMPOSE_REDIS_URL in the production env file}
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${COMPOSE_POSTGRES_PASSWORD:?set a unique COMPOSE_POSTGRES_PASSWORD}
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+  otel-collector:
+    restart: unless-stopped
+
+  migrate:
+    environment: *production-required-env
+
+  api:
+    environment: *production-required-env
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
+
+  inbound-worker:
+    environment: *production-required-env
+    expose: ["9100"]
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "--role", "inbound"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
+
+  outbound-worker:
+    environment: *production-required-env
+    expose: ["9100"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "--role", "outbound"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
+
+  scheduler:
+    environment: *production-required-env
+    expose: ["9100"]
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck", "--role", "scheduler"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
+
+  wxbot-bridge-worker:
+    # Keep the connector in a separate least-privilege secret domain. Compose
+    # merges this overlay with the base adapter-only environment, so core
+    # webhook, admin, tenant, LLM, and media signing secrets never enter it.
+    environment: *production-wxbot-env
+    expose: ["9100"]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - app.workers.healthcheck
+        - --role
+        - wxbot_bridge
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 90s
+
+  qdrant:
+    profiles: ["app", "knowledge"]
+    restart: unless-stopped
+
+  frontend:
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+volumes:
+  pgdata:
+    name: ${COMPOSE_PROD_PGDATA_VOLUME:-agent-console-prod-pgdata}
+  redisdata:
+    name: ${COMPOSE_PROD_REDISDATA_VOLUME:-agent-console-prod-redisdata}
+  qdrantdata:
+    name: ${COMPOSE_PROD_QDRANTDATA_VOLUME:-agent-console-prod-qdrantdata}
+  configdata:
+    name: ${COMPOSE_PROD_CONFIGDATA_VOLUME:-agent-console-prod-configdata}
+  drawdata:
+    name: ${COMPOSE_PROD_DRAWDATA_VOLUME:-agent-console-prod-drawdata}
+  amapdata:
+    name: ${COMPOSE_PROD_AMAPDATA_VOLUME:-agent-console-prod-amapdata}

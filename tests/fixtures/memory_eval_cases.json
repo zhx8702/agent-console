@@ -1,0 +1,85 @@
+{
+  "extraction_cases": [
+    {
+      "id": "explicit_remember_brand",
+      "text": "记住我喜欢 Adidas",
+      "expected": {
+        "ops": ["add"],
+        "active_contents": ["用户喜欢 Adidas"],
+        "memory_type": "preference"
+      }
+    },
+    {
+      "id": "explicit_change_brand",
+      "text": "我现在不喜欢 Adidas 了，换成 Puma",
+      "expected": {
+        "ops": ["invalidate", "add"],
+        "invalidates_values": ["Adidas"],
+        "active_contents": ["用户喜欢 Puma"]
+      }
+    },
+    {
+      "id": "temporary_refund",
+      "text": "我想要退款",
+      "expected": {
+        "ops": ["ignore"],
+        "active_contents": []
+      }
+    },
+    {
+      "id": "temporary_lookup",
+      "text": "帮我查一下",
+      "expected": {
+        "ops": ["ignore"],
+        "active_contents": []
+      }
+    },
+    {
+      "id": "temporary_order",
+      "text": "我需要下单",
+      "expected": {
+        "ops": ["ignore"],
+        "active_contents": []
+      }
+    },
+    {
+      "id": "pii_phone",
+      "text": "记住我的手机号是13800138000",
+      "expected": {
+        "ops": ["add"],
+        "status": "pending",
+        "sensitivity": "pii"
+      }
+    },
+    {
+      "id": "pii_address",
+      "text": "记住我的收货地址是上海市浦东新区测试路1号",
+      "expected": {
+        "ops": ["add"],
+        "status": "pending",
+        "sensitivity": "pii"
+      }
+    },
+    {
+      "id": "sensitive_token",
+      "text": "记住我的 api key 是 sk-test-token",
+      "expected": {
+        "ops": ["add"],
+        "status": "pending",
+        "sensitivity": "sensitive"
+      }
+    }
+  ],
+  "prompt_order": [
+    "当前会话摘要：",
+    "当前未完成事项：",
+    "当前会话已确认决定：",
+    "近期会话轮次摘要：",
+    "短期记忆：",
+    "人工/置顶核心记忆：",
+    "与当前消息相关的记忆",
+    "相关图谱事实",
+    "相关图谱事件",
+    "当前会话备注："
+  ]
+}

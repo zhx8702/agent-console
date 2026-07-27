@@ -1,0 +1,455 @@
+items:
+  - name: amap
+    display_name: 高德地图
+    version: 0.1.0
+    description: AMap personal map, POI search, and route planning agent tools
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/amap
+    capability_digest: sha256:d1613dac4d3149cad9adeb776455272f823c0445ac020a55f6504905954a56b9
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: network:amap
+        level: external
+        description: 访问高德地图 API
+      - id: storage:plugin
+        level: local
+        description: 写入地图缓存和生成文件
+      - id: agent_tools
+        level: runtime
+        description: 注册地图相关 Agent 工具
+      - id: admin_api
+        level: local
+        description: 暴露插件管理接口
+    capabilities:
+      routes: ["/plugins/amap"]
+      hooks: []
+      agent_tools:
+        - amap_around_search
+        - amap_bus_info
+        - amap_coordinate_convert
+        - amap_create_personal_map
+        - amap_distance
+        - amap_district
+        - amap_geo
+        - amap_input_tips
+        - amap_place_detail
+        - amap_regeo
+        - amap_route_plan
+        - amap_static_map
+        - amap_text_search
+        - amap_traffic_status
+        - amap_weather
+      commands: []
+    restart_policy: required_after_install
+
+  - name: commands
+    display_name: 命令中心
+    version: 0.1.0
+    description: Tenant-wide command center for intercepted slash commands
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/commands
+    capability_digest: sha256:8c0cd7dd79873e593447e74a0dae7eb2778694a648a6ed3eec83f7acda1e3d30
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: commands
+        level: runtime
+        description: 注册和拦截命令
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入消息管线 hook
+      - id: admin_api
+        level: local
+        description: 暴露命令管理接口
+    capabilities:
+      routes: ["/plugins/commands"]
+      hooks: ["before_route"]
+      agent_tools: []
+      commands: []
+    restart_policy: always_required
+
+  - name: credits
+    display_name: 积分插件
+    version: 0.1.0
+    description: Credit balance, check-in rewards, and per-chat cost deduction
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/credits
+    capability_digest: sha256:27669f5053836a75f634b3ade5250d47a95427a96ea15ac679775e1c76b2995d
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: commands
+        version: ">=0.1.0"
+        required: false
+    permissions:
+      - id: storage:shared
+        level: local
+        description: 写入积分账户和流水
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入扣费和结算 hook
+      - id: commands
+        level: runtime
+        description: 注册积分命令
+      - id: admin_api
+        level: local
+        description: 暴露积分管理接口
+    capabilities:
+      routes: ["/plugins/credits"]
+      hooks: ["after_capability", "before_capability", "before_route"]
+      agent_tools: []
+      commands:
+        - /balance
+        - /checkin
+        - /grant
+        - /rank
+        - /sign-in
+        - /signin
+        - /top
+        - /transfer
+        - /余额
+        - /榜单
+        - /积分排名
+        - /签到
+        - /签到模式
+        - /赠送
+        - /转账
+    restart_policy: required_after_install
+
+  - name: draw
+    display_name: 画图插件
+    version: 0.1.0
+    description: Slash-command image generation for wxbot chats
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/draw
+    capability_digest: sha256:189cde457cac43b070146fa11642d5a3bec1ec5767d171e44a0979654461e8a7
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: commands
+        version: ">=0.1.0"
+        required: false
+    permissions:
+      - id: network:*
+        level: external
+        description: 访问配置的画图服务
+      - id: storage:plugin
+        level: local
+        description: 写入生成图片和引用素材
+      - id: agent_tools
+        level: runtime
+        description: 注册画图 Agent 工具
+      - id: commands
+        level: runtime
+        description: 注册画图命令
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入画图结果后处理 hook
+      - id: admin_api
+        level: local
+        description: 暴露画图管理接口
+    capabilities:
+      routes: ["/plugins/draw"]
+      hooks: ["before_postprocess"]
+      agent_tools: ["generate_group_image"]
+      commands: [/draw, /redraw, /画图, /重绘]
+    restart_policy: required_after_install
+
+  - name: memory
+    display_name: 用户记忆
+    version: 0.1.0
+    description: Per-user short-term and long-term memory keyed by channel/source/wxid
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/memory
+    capability_digest: sha256:dde3aeb2284d3f06f79d943fc9734a9976e61c625f6da3359a2f1851cc04df1b
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: network:wxbot
+        level: external
+        description: 通过受限历史能力读取微信 SDK 数据
+      - id: storage:shared
+        level: local
+        description: 写入用户记忆资料
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入记忆检索与保存 hook
+      - id: admin_api
+        level: local
+        description: 暴露记忆管理接口
+    capabilities:
+      routes: ["/plugins/memory"]
+      hooks: ["after_postprocess", "before_capability", "before_route"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: moderation
+    display_name: 审核插件
+    version: 0.1.0
+    description: Per-session keyword moderation, audit logging, and webhook alerts
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/moderation
+    capability_digest: sha256:c589b613c851ac5e87524e8909446c92fbe36042b69360cab9c9314b2ff069f1
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: network:webhook
+        level: external
+        description: 向 allowlist 内的审核 webhook 发送告警
+      - id: storage:shared
+        level: local
+        description: 写入审核配置和事件
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入消息审核 hook
+      - id: admin_api
+        level: local
+        description: 暴露审核管理接口
+    capabilities:
+      routes: ["/plugins/moderation"]
+      hooks: ["after_capability", "after_preprocess", "before_capability"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: persona_extract
+    display_name: 回复风格
+    version: 0.2.0
+    description: Extract and synthesize reply-style profiles from user message history
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/persona_extract
+    capability_digest: sha256:5ed52cfe00cd1d63670c626ad5ad5874b8f4c22b277ed636753fa81024c34c24
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: wxbot
+        version: ">=0.2.0"
+        required: false
+    permissions:
+      - id: network:wxbot
+        level: external
+        description: 仅在显式 legacy 连接作用域内读取微信 SDK 历史
+      - id: storage:shared
+        level: local
+        description: 写入风格档案和提取任务
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入风格提示词 hook
+      - id: admin_api
+        level: local
+        description: 暴露风格管理接口
+    capabilities:
+      routes: ["/plugins/persona_extract"]
+      hooks: ["before_capability"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: repeater
+    display_name: 复读机
+    version: 0.1.0
+    description: Per-session repeater with cooldown dedupe for group chats
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/repeater
+    capability_digest: sha256:576bce17a4053fb09747795f53651e85f31cf30529cb04f98493faab43e0ef35
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: storage:shared
+        level: local
+        description: 写入复读机配置
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入复读行为 hook
+      - id: admin_api
+        level: local
+        description: 暴露复读机管理接口
+    capabilities:
+      routes: ["/plugins/repeater"]
+      hooks: ["before_route"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: group_activity
+    display_name: 群聊主动参与
+    version: 0.1.0
+    description: Group idle activity starter using group Agent skill and wxbot outbound queue
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/group_activity
+    capability_digest: sha256:0f9d84a6ef7e590dcd14537c04c754ce6f25e465bdba061bc1dac02452a614a5
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: wxbot
+        version: ">=0.2.0"
+        required: true
+    permissions:
+      - id: network:wxbot
+        level: external
+        description: 仅在显式 legacy 连接作用域内读取微信 SDK 历史
+      - id: storage:shared
+        level: local
+        description: 读取群消息并写入主动参与任务
+      - id: hooks:pipeline
+        level: runtime
+        description: 观察群消息并维护暖场状态
+      - id: admin_api
+        level: local
+        description: 暴露群活跃策略与预览接口
+    capabilities:
+      routes: ["/plugins/group_activity"]
+      hooks: ["after_preprocess"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: tibo_reset
+    display_name: Codex Tibo 重置提醒
+    version: 0.2.3
+    description: Persist confirmed Codex reset history, answer group queries, and forward new posts
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/tibo_reset
+    capability_digest: sha256:a30ca50345c8515fbf9f96760c746049871ef1ae6f9b2b4ef65519e5b7c57e44
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: wxbot
+        version: ">=0.2.0"
+        required: true
+    permissions:
+      - id: network:tibo-reset
+        level: external
+        description: 访问运维方显式配置的可选重置记录 feed
+      - id: storage:plugin
+        level: local
+        description: 持久保存推文历史、统计数据和每群投递去重状态
+      - id: hooks:pipeline
+        level: local
+        description: 识别已启用群中的重置相关问题并生成回复
+      - id: admin_api
+        level: local
+        description: 暴露轮询状态、统计和投递审计接口
+    capabilities:
+      routes: ["/plugins/tibo_reset"]
+      hooks: ["before_route"]
+      agent_tools: []
+      commands: []
+    config_schema:
+      type: object
+      properties:
+        session_name:
+          type: string
+          maxLength: 128
+          description: Display name for the target WeChat group
+      additionalProperties: false
+    restart_policy: required_after_install
+
+  - name: wxbot
+    display_name: 微信机器人
+    version: 0.2.0
+    description: WeChat bot SDK bridge — polls inbound messages, dispatches replies
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/wxbot
+    capability_digest: sha256:1583e4eaf0684207905a59cefc2ccdaa3d12f1bdbb74fff4263f24dd4cdb8b89
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    permissions:
+      - id: network:wxbot
+        level: external
+        description: 访问微信机器人 SDK
+      - id: storage:shared
+        level: local
+        description: 写入群、成员和消息索引
+      - id: agent_tools
+        level: runtime
+        description: 注册微信群工具
+      - id: commands
+        level: runtime
+        description: 注册微信机器人命令
+      - id: hooks:pipeline
+        level: runtime
+        description: 注入微信上下文与参与决策 hook
+      - id: admin_api
+        level: local
+        description: 暴露微信机器人管理接口
+    capabilities:
+      routes: ["/plugins/wxbot"]
+      hooks: ["after_postprocess", "before_capability", "before_preprocess", "before_route"]
+      agent_tools:
+        - get_group_info
+        - list_group_members
+        - get_group_member_avatar
+        - search_group_messages
+        - research_group_messages
+        - build_group_member_profile_report
+        - get_group_public_facts
+        - get_group_reply_policy
+        - get_group_credits_status
+        - get_group_credits_member
+        - get_group_moderation_status
+        - get_group_repeater_status
+        - get_group_welcome_status
+        - get_group_report_status
+        - get_group_credits_leaderboard
+        - get_group_recent_moderation_events
+        - get_group_activity_ranking
+      commands:
+        - /ban
+        - /banlist
+        - /research
+        - /unban
+        - /搜聊天
+        - /搜记录
+        - /查聊天
+        - /查记录
+        - /禁言
+        - /禁言列表
+        - /解禁
+    restart_policy: always_required

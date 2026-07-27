@@ -1,0 +1,302 @@
+name: Quality CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_USER: cs
+          POSTGRES_PASSWORD: cs
+          POSTGRES_DB: cs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cs -d cs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      APP_ENV: test
+      DB_DSN: postgresql+asyncpg://cs:cs@localhost:5432/cs
+      REDIS_URL: redis://localhost:6379/14
+      LLM_PROVIDER: fake
+      LLM_EMBED_PROVIDER: fake
+      OUTBOUND_HMAC_SECRET: ci_outbound_secret
+      ADMIN_BEARER_TOKEN: ci_admin_token
+      TENANT_DEMO_SECRET: ci_tenant_secret
+      COMPOSE_PROJECT_NAME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      COMPOSE_PROD_PGDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-pgdata
+      COMPOSE_PROD_REDISDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-redisdata
+      COMPOSE_PROD_QDRANTDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-qdrantdata
+      COMPOSE_PROD_CONFIGDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-configdata
+      COMPOSE_PROD_DRAWDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-drawdata
+      COMPOSE_PROD_AMAPDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-amapdata
+      COMPOSE_POSTGRES_PASSWORD: ci_prod_postgres_password
+      COMPOSE_DB_DSN: postgresql+asyncpg://cs:ci_prod_postgres_password@postgres:5432/cs
+      COMPOSE_REDIS_URL: redis://redis:6379/0
+      COMPOSE_OUTBOUND_WEBHOOK_URL: https://outbound.example.test/deliver
+      COMPOSE_OUTBOUND_HMAC_SECRET: ci_prod_outbound_secret
+      COMPOSE_ADMIN_BEARER_TOKEN: ci_prod_admin_token
+      COMPOSE_ADMIN_SESSION_SIGNING_SECRET: ci_prod_admin_session_signing_secret_32_chars
+      COMPOSE_MEDIA_ID_SIGNING_SECRET: ci_prod_media_id_signing_secret_32_chars_long
+      COMPOSE_ADMIN_SESSION_COOKIE_SECURE: "true"
+      COMPOSE_ADMIN_ALLOW_BEARER_FALLBACK: "false"
+      COMPOSE_TENANT_DEMO_SECRET: ci_prod_tenant_secret
+      COMPOSE_WXBOT_API_TOKEN: ci_prod_wxbot_token
+      COMPOSE_MODERATION_WEBHOOK_ALLOWED_HOSTS: hooks.example.test
+      COMPOSE_FRONTEND_CORS_ORIGINS: https://console.example.test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Verify lock file
+        run: uv lock --check
+
+      - name: Install locked development environment
+        run: uv sync --all-extras --frozen
+
+      - name: Build Python package smoke with bundled plugins
+        run: |
+          uv build --wheel --out-dir dist
+          uv run --all-extras --frozen python -c '
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          required = {
+              "app/main.py",
+              "plugins/__init__.py",
+              "plugins/wxbot/plugin.py",
+              "plugins/memory/plugin.py",
+          }
+          missing = sorted(required - names)
+          assert not missing, f"wheel is missing runtime packages: {missing}"
+          '
+
+      - name: Ruff
+        run: >-
+          uv run --all-extras --frozen ruff check
+          app plugins tests migrations wxbot_client
+
+      - name: Mypy typed-core baseline
+        run: uv run --all-extras --frozen mypy
+
+      - name: Mypy runtime-role boundaries
+        run: >-
+          uv run --all-extras --frozen mypy --follow-imports=skip
+          app/container.py
+          app/workers/readiness.py
+          app/workers/healthcheck.py
+          app/workers/scheduler_worker.py
+          app/workers/runtime.py
+          app/workers/outbound_worker.py
+          app/workers/wxbot_bridge_worker.py
+
+      - name: Apply test database migrations
+        run: uv run --all-extras --frozen alembic upgrade head
+
+      - name: Verify plugin descriptor and manifest consistency
+        run: uv run --all-extras --frozen python scripts/check_plugin_manifest.py
+
+      - name: Validate humanization replay scenario contract
+        run: >-
+          uv run --all-extras --frozen python scripts/evaluate_social_replay.py
+          --validate-scenarios-only
+          tests/fixtures/social_replay_scenario_contract.jsonl
+
+      - name: Verify full migration rollback and re-apply
+        run: |
+          uv run --all-extras --frozen alembic downgrade base
+          uv run --all-extras --frozen alembic upgrade head
+
+      - name: Pytest
+        run: uv run --all-extras --frozen pytest -m "not e2e"
+
+      - name: Backend end-to-end scenarios
+        run: uv run --all-extras --frozen pytest -m e2e tests/e2e
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Test and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          uv run --project .. --all-extras --frozen python ../scripts/check_dependency_licenses.py
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Install browser test runtime
+        working-directory: frontend
+        run: npm run test:e2e:install
+
+      - name: Frontend browser and axe gates
+        working-directory: frontend
+        run: npm run test:e2e
+
+      - name: Validate development Compose configuration
+        run: docker compose --profile app config --quiet
+
+      - name: Validate production Compose configuration
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.production.yml
+          --profile app config --quiet
+
+      - name: Enforce basic Compose security invariants
+        run: |
+          uv run --all-extras --frozen python -c '
+          import json
+          import subprocess
+
+          config = json.loads(
+              subprocess.check_output(
+                  [
+                      "docker",
+                      "compose",
+                      "-f",
+                      "docker-compose.yml",
+                      "-f",
+                      "docker-compose.production.yml",
+                      "--profile",
+                      "app",
+                      "config",
+                      "--format",
+                      "json",
+                  ],
+                  text=True,
+              )
+          )
+          for name, service in config["services"].items():
+              assert not service.get("privileged", False), f"{name}: privileged containers are forbidden"
+              assert service.get("network_mode") != "host", f"{name}: host networking is forbidden"
+              assert service.get("pid") != "host", f"{name}: host PID namespace is forbidden"
+              for mount in service.get("volumes", []):
+                  source = mount.get("source", "") if isinstance(mount, dict) else str(mount)
+                  assert source not in {
+                      "/var/run/docker.sock",
+                      "/run/docker.sock",
+                  }, f"{name}: Docker socket mounts are forbidden"
+
+          edge_services = {"api", "frontend"}
+          for name, service in config["services"].items():
+              published_ports = service.get("ports", [])
+              if name not in edge_services:
+                  assert not published_ports, f"{name}: internal service must not publish host ports"
+                  continue
+              for port in published_ports:
+                  host_ip = port.get("host_ip") if isinstance(port, dict) else None
+                  assert host_ip in {"127.0.0.1", "::1"}, f"{name}: published ports must bind loopback"
+
+          required_healthy = {
+              "api",
+              "inbound-worker",
+              "outbound-worker",
+              "scheduler",
+              "wxbot-bridge-worker",
+              "frontend",
+          }
+          for name in required_healthy:
+              service = config["services"][name]
+              assert service.get("restart") == "unless-stopped", f"{name}: restart policy missing"
+              assert service.get("healthcheck"), f"{name}: healthcheck missing"
+
+          api_health = " ".join(config["services"]["api"]["healthcheck"]["test"])
+          assert "/readyz" in api_health, "api healthcheck must enforce readiness, not liveness"
+          role_healthchecks = {
+              "inbound-worker": "inbound",
+              "outbound-worker": "outbound",
+              "scheduler": "scheduler",
+              "wxbot-bridge-worker": "wxbot_bridge",
+          }
+          for name, role in role_healthchecks.items():
+              test = " ".join(config["services"][name]["healthcheck"]["test"])
+              assert "app.workers.healthcheck" in test, f"{name}: semantic worker healthcheck missing"
+              assert role in test, f"{name}: healthcheck does not select role {role}"
+              env_role = config["services"][name].get("environment", {}).get("APP_PROCESS_ROLE")
+              assert env_role == role, f"{name}: APP_PROCESS_ROLE must be {role}, got {env_role!r}"
+
+          api_env = config["services"]["api"].get("environment", {})
+          expected_flow_cutover = {
+              "ORCHESTRATOR_FLOW_RUNTIME_ENABLED": "true",
+              "ORCHESTRATOR_FLOW_RUNTIME_NAME": "auto",
+              "ORCHESTRATOR_FLOW_RUNTIME_ALLOWED_NAMES": "auto",
+              "ORCHESTRATOR_FLOW_RUNTIME_ALLOW_TARGET_FLOWS": "true",
+              "ORCHESTRATOR_FLOW_RUNTIME_ALLOW_COMPATIBLE_FALLBACK": "false",
+              "ORCHESTRATOR_FLOW_EFFECT_COMMIT_BACKEND": "redis",
+              "ORCHESTRATOR_FLOW_EFFECT_HANDLERS_ENABLED": "true",
+              "ORCHESTRATOR_FLOW_EFFECT_LOG_BACKEND": "postgres",
+              "ORCHESTRATOR_FLOW_EFFECT_LOG_FAILURE_POLICY": "fail_closed",
+          }
+          for key, expected in expected_flow_cutover.items():
+              actual = str(api_env.get(key, "")).lower()
+              assert actual == expected, f"api: {key} must be {expected}, got {actual!r}"
+
+          for name, volume in config["volumes"].items():
+              assert "-prod-ci-" in volume["name"], f"{name}: production volume is not CI-isolated"
+          '
+
+      - name: Build production images
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.production.yml
+          --profile app build api frontend
+
+      - name: Validate unprivileged Nginx configuration
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.production.yml
+          --profile app run --rm --no-deps frontend sh -ec
+          'test "$(id -u)" -ne 0; nginx -t'
+
+      - name: Verify application volume write permissions
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.production.yml
+          --profile app run --rm --no-deps api python -c
+          "import os; from pathlib import Path; assert os.geteuid()!=0; paths=[Path('/data/config/.write-probe'),Path('/data/draw/.write-probe'),Path('/data/amap/.write-probe')]; [p.write_text('ok',encoding='utf-8') for p in paths]; [p.unlink() for p in paths]"
+
+      - name: Clean production validation resources
+        if: always()
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.production.yml
+          --profile app down -v --remove-orphans

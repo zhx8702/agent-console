@@ -1,0 +1,135 @@
+/*
+ * Canonical badge primitive.
+ * Legacy class names remain in the selector bridge so pages can migrate to
+ * .ui-badge incrementally without carrying their own box-model definitions.
+ */
+.ui-badge,
+.pill,
+.plugin-badge,
+.marketplace-badge,
+.agent-tool-badge,
+.connection-state-badge,
+.memory-graph-quality-badge,
+.launch-state-badge,
+.relationship-graph-filter-pill,
+.relationship-privacy-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--badge-gap, var(--space-1));
+  padding: var(--badge-padding-block, var(--space-0-5)) var(--badge-padding-inline, var(--space-2));
+  border: var(--badge-border, 0);
+  border-radius: var(--badge-radius, var(--radius-pill));
+  background: var(--badge-bg, var(--tone-muted-bg));
+  color: var(--badge-text, var(--tone-muted-text));
+  font-size: var(--badge-font-size, var(--font-size-2xs));
+  font-weight: var(--badge-font-weight, 600);
+  line-height: var(--badge-line-height, 1.25);
+}
+
+.ui-badge--success,
+.pill-ok,
+.plugin-badge {
+  --badge-bg: var(--tone-success-bg);
+  --badge-text: var(--tone-success-text);
+}
+
+.ui-badge--danger,
+.pill-danger,
+.plugin-badge.is-danger,
+.memory-graph-quality-badge.is-inactive_status,
+.connection-state-badge.is-danger {
+  --badge-bg: var(--tone-danger-bg);
+  --badge-text: var(--tone-danger-text);
+  --badge-border: 1px solid var(--tone-danger-border);
+}
+
+.ui-badge--warning,
+.plugin-badge.is-warning,
+.memory-graph-quality-badge,
+.connection-state-badge.is-warning {
+  --badge-bg: var(--tone-warning-bg);
+  --badge-text: var(--tone-warning-text);
+  --badge-border: 1px solid var(--tone-warning-border);
+}
+
+.ui-badge--info,
+.pill-feature,
+.marketplace-badge,
+.agent-tool-badge {
+  --badge-bg: var(--tone-info-bg);
+  --badge-text: var(--tone-info-text);
+}
+
+.ui-badge--muted,
+.pill-muted,
+.plugin-badge.is-muted,
+.agent-tool-badge-muted,
+.connection-state-badge.is-muted {
+  --badge-bg: var(--tone-muted-bg);
+  --badge-text: var(--tone-muted-text);
+}
+
+.plugin-badge {
+  --badge-padding-block: var(--space-1);
+  --badge-font-size: var(--font-size-xs);
+}
+
+.plugins-page .plugin-badge {
+  --badge-border: 1px solid color-mix(in srgb, var(--tone-success-text) 14%, transparent);
+}
+
+.plugins-page .plugin-badge.is-muted {
+  --badge-border: 1px solid var(--tone-muted-border);
+}
+
+.marketplace-badge.installed,
+.connection-state-badge.is-ok,
+.relationship-privacy-pill {
+  --badge-bg: var(--tone-success-bg);
+  --badge-text: var(--tone-success-text);
+  --badge-border: 1px solid var(--tone-success-border);
+}
+
+.agent-tool-badge {
+  --badge-font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.memory-graph-quality-badge {
+  --badge-padding-inline: var(--space-1-5);
+  --badge-font-weight: 700;
+  max-width: 100%;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.connection-state-badge {
+  --badge-border: 1px solid var(--tone-muted-border);
+  --badge-font-weight: 700;
+  min-height: 24px;
+  white-space: nowrap;
+}
+
+.launch-state-badge {
+  --badge-padding-inline: var(--space-1-5);
+  --badge-border: 1px solid var(--tone-inverse-border);
+  --badge-bg: transparent;
+  --badge-text: var(--tone-inverse-text);
+  --badge-font-size: var(--font-size-3xs);
+  --badge-font-weight: 700;
+}
+
+.relationship-graph-filter-pill,
+.relationship-privacy-pill {
+  --badge-padding-block: var(--space-1-5);
+  --badge-radius: var(--radius);
+  --badge-font-size: var(--font-size-xs);
+  --badge-font-weight: 700;
+}
+
+.relationship-graph-filter-pill {
+  --badge-bg: var(--tone-accent-bg);
+  --badge-text: var(--tone-accent-text);
+  --badge-border: 1px solid var(--tone-accent-border);
+}

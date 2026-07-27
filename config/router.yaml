@@ -1,0 +1,58 @@
+# Router rule config. Evaluated top-to-bottom; first matching rule wins.
+# Conditions are evaluated against a PreprocessedMessage + session snapshot.
+# See app/router/rules.py for the schema.
+rules:
+  - name: safety_blocked
+    when:
+      sensitive: true
+    route: canned
+    reason: "safety block"
+
+  - name: user_requested_handoff
+    when:
+      intent_coarse: handoff_request
+    route: handoff
+    reason: "user asked for a human"
+
+  - name: strong_negative_emotion
+    when:
+      emotion: negative
+      consecutive_fallbacks_gte: 2
+    route: handoff
+    reason: "persistent negative emotion after fallbacks"
+
+  - name: faq_hit
+    when:
+      faq_similarity_gte: 0.88
+    route: faq
+    reason: "high FAQ similarity"
+
+  - name: business_with_tools
+    when:
+      intent_coarse: business
+      tools_available: true
+    route: agent
+    reason: "business intent with tools"
+
+  - name: group_tools_query
+    when:
+      tools_available: true
+    route: agent
+    reason: "group query with tools"
+
+  - name: business_knowledge
+    when:
+      intent_coarse: business
+    route: rag
+    reason: "business knowledge question"
+
+  - name: faq_intent
+    when:
+      intent_coarse: faq
+    route: rag
+    reason: "FAQ-style question, use RAG over knowledge base"
+
+  - name: default
+    when: {}
+    route: llm
+    reason: "default conversation"

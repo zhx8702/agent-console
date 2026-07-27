@@ -1,0 +1,367 @@
+/* ── Authenticated entry ── */
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(340px, 0.9fr) minmax(500px, 1.1fr);
+  background: var(--color-custom-eef2f5);
+  color: var(--color-gray-900);
+}
+
+.login-signal-panel {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: clamp(var(--space-8), 6vw, 80px);
+  background: var(--color-custom-0b1422);
+  color: var(--color-custom-e5edf5);
+}
+
+.login-brand-mark {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  place-items: center;
+  border: 1px solid rgba(125, 211, 252, 0.55);
+  color: var(--color-sky-300);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-base);
+  font-weight: 800;
+  letter-spacing: 0.13em;
+}
+
+.login-signal-copy {
+  position: relative;
+  z-index: 1;
+  max-width: 520px;
+}
+
+.login-eyebrow {
+  margin: 0 0 var(--space-2-5);
+  color: var(--color-custom-36c9a5);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-xs);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+}
+
+.login-signal-copy h1 {
+  margin: 0;
+  color: var(--color-slate-50);
+  font-size: clamp(2.5rem, 6vw, 5.4rem);
+  line-height: 0.92;
+  letter-spacing: -0.065em;
+}
+
+.login-signal-copy > p:last-child {
+  max-width: 430px;
+  margin: var(--space-6) 0 0;
+  color: var(--color-custom-9fb0c3);
+  font-size: var(--font-size-lg);
+  line-height: 1.75;
+}
+
+.login-system-list {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 0;
+  max-width: 480px;
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+}
+
+.login-system-list > div {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: var(--space-4-5);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.login-system-list span {
+  color: var(--color-custom-6f8297);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+}
+
+.login-system-list strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-custom-dbe7f3);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-grid-decoration {
+  position: absolute;
+  top: 12%;
+  right: -15%;
+  z-index: -1;
+  width: 58%;
+  aspect-ratio: 1;
+  border: 1px solid rgba(56, 189, 248, 0.12);
+  transform: rotate(16deg);
+}
+
+.login-grid-decoration::before,
+.login-grid-decoration::after {
+  position: absolute;
+  content: "";
+  border: 1px solid rgba(56, 189, 248, 0.09);
+}
+
+.login-grid-decoration::before {
+  inset: 17%;
+}
+
+.login-grid-decoration::after {
+  inset: 35%;
+}
+
+.login-form-panel {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: clamp(var(--space-6), 7vw, 96px);
+  background: var(--color-custom-eef2f5);
+}
+
+.login-card {
+  width: min(100%, 480px);
+}
+
+.login-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3-5);
+  padding-bottom: var(--space-6);
+  border-bottom: 1px solid var(--color-custom-cfd8e3);
+}
+
+.login-status-dot {
+  width: 10px;
+  height: 10px;
+  margin-top: var(--space-1-5);
+  border: 2px solid var(--color-custom-eef2f5);
+  outline: 2px solid var(--color-custom-13a87f);
+  background: var(--color-custom-13a87f);
+}
+
+.login-card-header h2 {
+  margin: 0;
+  font-size: clamp(1.7rem, 3vw, 2.3rem);
+  line-height: 1.1;
+  letter-spacing: -0.035em;
+}
+
+.login-card-copy {
+  margin: var(--space-6) 0 var(--space-6);
+  color: var(--color-custom-5b6878);
+  line-height: 1.75;
+}
+
+.login-token-field {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.login-token-field > span {
+  color: var(--color-slate-700);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-xs);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.login-token-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  border: 1px solid var(--color-custom-b9c6d4);
+  background: var(--color-slate-50);
+  transition: border-color 140ms, box-shadow 140ms;
+}
+
+.login-token-input:focus-within {
+  border-color: var(--color-teal-700);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+}
+
+.login-token-input input {
+  min-width: 0;
+  padding: var(--space-3-5) var(--space-4);
+  border: 0;
+  background: transparent;
+  color: var(--color-slate-900);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.login-token-input button {
+  padding: 0 var(--space-4);
+  border: 0;
+  border-left: 1px solid var(--color-custom-d7dee7);
+  background: transparent;
+  color: var(--color-teal-700);
+  font-size: var(--font-size-xs);
+  font-weight: 800;
+}
+
+.login-alert {
+  display: grid;
+  gap: var(--space-0-5);
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-3-5);
+  border-left: 3px solid var(--color-red-600);
+  background: var(--color-custom-fff7f7);
+  color: var(--color-red-900);
+}
+
+.login-alert strong {
+  font-size: var(--font-size-xs);
+}
+
+.login-alert span {
+  font-size: var(--font-size-sm);
+}
+
+.login-submit {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: var(--space-5);
+  padding: var(--space-3-5) var(--space-4-5);
+  border: 1px solid var(--color-custom-0b1422);
+  background: var(--color-custom-0b1422);
+  color: var(--color-slate-50);
+  font-weight: 800;
+  transition: background 140ms, border-color 140ms, transform 140ms;
+}
+
+.login-submit:hover:not(:disabled) {
+  border-color: var(--color-teal-700);
+  background: var(--color-teal-700);
+  transform: translateY(-1px);
+}
+
+.login-submit:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.login-footnote {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  color: var(--color-custom-7a8796);
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+}
+
+.login-lock-icon {
+  color: var(--color-custom-13a87f);
+  font-size: var(--font-size-3xs);
+  line-height: 1.8;
+}
+
+.login-page-checking {
+  grid-template-columns: 1fr;
+  place-items: center;
+  background: var(--color-custom-0b1422);
+  color: var(--color-custom-e5edf5);
+}
+
+.login-checking-card {
+  display: grid;
+  max-width: 420px;
+  justify-items: center;
+  padding: var(--space-10);
+  text-align: center;
+}
+
+.login-checking-card h1 {
+  margin: var(--space-1) 0 var(--space-2-5);
+  color: var(--color-slate-50);
+  font-size: var(--font-size-3xl);
+}
+
+.login-checking-card > p:last-child {
+  margin: 0;
+  color: var(--color-custom-93a4b8);
+}
+
+.login-checking-spinner {
+  width: 28px;
+  height: 28px;
+  margin-bottom: var(--space-6);
+  border: 2px solid rgba(125, 211, 252, 0.2);
+  border-top-color: var(--color-custom-36c9a5);
+  border-radius: 50%;
+  animation: login-spin 800ms linear infinite;
+}
+
+@keyframes login-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sidebar-connection {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2-5);
+  border: 1px solid rgba(52, 211, 153, 0.18);
+  border-radius: 6px;
+  background: rgba(16, 185, 129, 0.07);
+}
+
+.sidebar-connection-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  margin-top: var(--space-1);
+  border-radius: 50%;
+  background: var(--color-emerald-400);
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.12);
+}
+
+.sidebar-connection div {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-0-5);
+}
+
+.sidebar-connection strong {
+  color: var(--color-emerald-100);
+  font-size: var(--font-size-xs);
+}
+
+.sidebar-connection div span {
+  overflow: hidden;
+  color: var(--color-custom-7f94aa);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--font-size-3xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-config-body .sidebar-logout-button {
+  border-color: rgba(248, 113, 113, 0.22);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--color-red-300);
+}
+
+.sidebar-config-body .sidebar-logout-button:hover {
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(239, 68, 68, 0.16);
+}

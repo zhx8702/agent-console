@@ -1,0 +1,57 @@
+cases:
+  - id: safety_sensitive_blocks
+    message:
+      cleaned_text: "blocked content"
+      sensitive: true
+      intent_coarse: handoff_request
+      emotion: neutral
+    signals:
+      faq_similarity: 0.99
+      tools_available: true
+      consecutive_fallbacks: 5
+    expect:
+      route: canned
+      rule: safety_blocked
+
+  - id: explicit_handoff_wins_over_negative_emotion
+    message:
+      cleaned_text: "I need a person now"
+      intent_coarse: handoff_request
+      emotion: negative
+    signals:
+      faq_similarity: 0.99
+      consecutive_fallbacks: 5
+    expect:
+      route: handoff
+      rule: user_requested_handoff
+
+  - id: business_with_tools_routes_to_agent
+    message:
+      cleaned_text: "check my order"
+      intent_coarse: business
+      emotion: neutral
+    signals:
+      tools_available: true
+    expect:
+      route: agent
+      rule: business_with_tools
+
+  - id: business_without_tools_routes_to_rag
+    message:
+      cleaned_text: "what is your refund policy"
+      intent_coarse: business
+      emotion: neutral
+    signals:
+      tools_available: false
+    expect:
+      route: rag
+      rule: business_knowledge
+
+  - id: chitchat_defaults_to_llm
+    message:
+      cleaned_text: "hello"
+      intent_coarse: chitchat
+      emotion: neutral
+    expect:
+      route: llm
+      rule: default

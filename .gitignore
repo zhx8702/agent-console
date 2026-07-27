@@ -1,0 +1,46 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+frontend/test-results/
+.tmp/
+artifacts/ui-audit-*/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+node_modules/
+*.tsbuildinfo
+*.log
+.DS_Store
+.codex
+.run/
+.runlogs/
+.run-*.log
+wxbot_client/config.json
+wxbot_client/data/
+
+# Local runtime state can contain message bodies, session credentials, keys,
+# and decrypted media. Keep it out of source control even if a tool writes it
+# outside the standard wxbot_client/data directory.
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+**/decrypted/
+**/decrypted-*
+**/decrypted_*
+
+# Deployment scratch archives and screenshots are local operator artifacts.
+/.tmp-*
