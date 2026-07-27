@@ -270,6 +270,45 @@ describe("PersonaWorkspace asynchronous jobs", () => {
     ))).toHaveLength(1);
   });
 
+  it("restores the saved persona after the workspace is reloaded", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "小海",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接、会接梗。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接、会接梗。" },
+      },
+    };
+    apiRequestMock.mockImplementation(async (_config, path) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [xiaohaiProfile] };
+      return {};
+    });
+
+    renderWorkspace();
+
+    expect(await screen.findByLabelText("当前风格技能")).toHaveValue("12");
+    expect(screen.getByLabelText("配置名称")).toHaveValue("小海");
+    expect(screen.getByLabelText("技能标识")).toHaveValue("xiaohai");
+    expect(screen.getByLabelText("技能提示词正文（运行时注入）")).toHaveValue("# 小海\n\n说话直接、会接梗。");
+  });
+
   it("saves an existing persona even when its source member is no longer in the group roster", async () => {
     const xiaohaiProfile = {
       id: 12,

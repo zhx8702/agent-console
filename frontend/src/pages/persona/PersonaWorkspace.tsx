@@ -414,7 +414,7 @@ export function PersonaWorkspace() {
     if (selectedSessionIsVerified) {
       void loadMembers();
       void listJobs();
-      void listProfiles({ hydrateFirst: false });
+      void listProfiles();
     }
   }, [listJobs, listProfiles, loadMembers, selectedSessionIsVerified]);
 
