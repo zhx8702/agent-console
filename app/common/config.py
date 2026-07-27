@@ -278,6 +278,27 @@ class Settings(BaseSettings):
         ge=5_000,
         le=200_000,
     )
+    persona_extract_online_max_messages: int = Field(
+        default=10_000,
+        ge=100,
+        le=50_000,
+    )
+    persona_extract_offline_export_dir: str = "/data/config/persona-exports"
+    persona_extract_offline_export_timeout_seconds: float = Field(
+        default=600.0,
+        ge=30.0,
+        le=3_600.0,
+    )
+    persona_extract_offline_export_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=1024 * 1024 * 1024,
+    )
+    persona_extract_offline_retention_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        ge=3_600,
+        le=30 * 24 * 60 * 60,
+    )
     wxbot_report_stage_timeout_seconds: float = 240.0
     wxbot_report_max_chars_per_chunk: int = Field(default=12_000, ge=1000)
     wxbot_report_transient_backoff_seconds: float = Field(default=900.0, gt=0)

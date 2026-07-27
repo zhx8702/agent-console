@@ -5,7 +5,7 @@ import { OutputPanel } from "../../components/OutputPanel";
 import { PageHeader } from "../../components/PageHeader";
 import { SearchableSelect } from "../../components/SearchableSelect";
 import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
-import { apiRequest, formatJson, parseJsonInput } from "../../lib/api";
+import { apiBlobRequest, apiRequest, formatJson, parseJsonInput } from "../../lib/api";
 import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { requireSelectedGroup, useConsoleConfig } from "../../state/console-config";
 
@@ -48,6 +48,7 @@ type PersonaJobMutationResponse = {
   accepted?: boolean;
   status_url?: string;
   cancel_requested?: boolean;
+  download_url?: string;
   job?: PersonaJob;
 };
 
@@ -97,9 +98,11 @@ export function PersonaWorkspace() {
   const [profileBaselineRequest, setProfileBaselineRequest] = useState(0);
   const [profileBaselineCaptured, setProfileBaselineCaptured] = useState(0);
   const [jobNotice, setJobNotice] = useState("");
+  const [offlineArtifactFile, setOfflineArtifactFile] = useState<File | null>(null);
   const profileDirtyRef = useRef(false);
   const artifactEditorDirtyRef = useRef(false);
   const jobRequestRef = useRef<AbortController | null>(null);
+  const offlineArtifactInputRef = useRef<HTMLInputElement | null>(null);
 
   const effectiveSessionId = config.sessionId.trim();
   const selectedSessionIsVerified = Boolean(effectiveSessionId && verifiedGroupIds.has(effectiveSessionId));
@@ -116,6 +119,14 @@ export function PersonaWorkspace() {
   const selectedJob = useMemo(
     () => jobs.find((item) => String(item.id) === String(jobId || "")) || null,
     [jobs, jobId],
+  );
+  const selectedAwaitingImportJob = useMemo(
+    () => (
+      selectedJob?.status === "awaiting_import"
+        ? selectedJob
+        : jobs.find((item) => item.status === "awaiting_import") || null
+    ),
+    [jobs, selectedJob],
   );
   const personaDisplayName = (profileName || targetName || profileSkillSlug).trim();
   const hasSaveablePersonaDraft = Boolean(
@@ -400,6 +411,9 @@ export function PersonaWorkspace() {
     const matched = sessions.find((item) => item.session_id === effectiveSessionId);
     setPersonaSessionName(matched?.session_name || "");
     setProfileSourceLabel(matched?.session_name || (effectiveSessionId ? "当前群" : ""));
+  }, [effectiveSessionId, sessions]);
+
+  useEffect(() => {
     setMembers([]);
     setJobs([]);
     setProfiles([]);
@@ -408,7 +422,7 @@ export function PersonaWorkspace() {
     setTargetName("");
     setProfileLoaded(false);
     setLoadedProfileFingerprint("");
-  }, [effectiveSessionId, sessions]);
+  }, [effectiveSessionId]);
 
   useEffect(() => {
     if (selectedSessionIsVerified) {
@@ -503,6 +517,10 @@ export function PersonaWorkspace() {
   };
 
   const createJob = async () => {
+    if (fullExtract) {
+      await createOfflineExport("full");
+      return;
+    }
     const groupId = requireSelectedGroup(config, verifiedGroupIds);
     const member = members.find((item) => item.wxid === targetUserId);
     if (!member) {
@@ -510,7 +528,7 @@ export function PersonaWorkspace() {
       setOutput(formatJson({ error: error.message }));
       throw error;
     }
-    const intent = `persona:create:${config.tenantId}:${groupId}:${targetUserId}:${fullExtract}:${daysLimit}:${maxMessages}`;
+    const intent = `persona:create:${config.tenantId}:${groupId}:${targetUserId}:${daysLimit}:${maxMessages}`;
     const clientRequestId = keyFor(intent);
     setJobNotice("");
     try {
@@ -539,8 +557,8 @@ export function PersonaWorkspace() {
             external_session_id: groupId,
             target_user_id: targetUserId,
             target_name: targetName,
-            days_limit: fullExtract ? 0 : daysLimit,
-            max_messages: fullExtract ? 0 : maxMessages,
+            days_limit: daysLimit,
+            max_messages: maxMessages,
             messages: parseJsonInput(messages, []),
           }),
         },
@@ -585,6 +603,129 @@ export function PersonaWorkspace() {
         error: message,
       }));
       throw new Error("提交结果未知，系统未核对到对应任务；请先刷新任务列表后再决定是否重试");
+    }
+  };
+
+  const createOfflineExport = async (mode: "full" | "incremental") => {
+    const groupId = requireSelectedGroup(config, verifiedGroupIds);
+    const member = members.find((item) => item.wxid === targetUserId);
+    if (!member) {
+      const error = new Error("离线蒸馏目标必须来自当前群的已验证成员名册");
+      setOutput(formatJson({ error: error.message }));
+      throw error;
+    }
+    const intent = `persona:offline:${mode}:${config.tenantId}:${groupId}:${targetUserId}`;
+    const clientRequestId = keyFor(intent);
+    setJobNotice("");
+    try {
+      const result = await apiRequest<PersonaJobMutationResponse>(
+        config,
+        "/plugins/persona_extract/offline-exports",
+        {
+          auth: true,
+          init: {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Idempotency-Key": clientRequestId,
+            },
+            body: JSON.stringify({
+              client_request_id: clientRequestId,
+              tenant_id: config.tenantId,
+              session_id: groupId,
+              session_name: personaSessionName,
+              connection_id: "legacy-wechat-default",
+              adapter_id: "wxbot",
+              external_session_id: groupId,
+              target_user_id: targetUserId,
+              target_name: targetName,
+              mode,
+            }),
+          },
+        },
+      );
+      if (result.job_id != null) setJobId(String(result.job_id));
+      if (result.job) {
+        mergeJobUpdate(result.job, { select: true, preserveDirtyArtifact: true });
+      } else {
+        await listJobs({ hydrateFirst: false });
+      }
+      setOutput(formatJson(result));
+      setJobNotice(
+        result.accepted === false
+          ? "离线导出任务已记录，但执行器暂未接收；请稍后刷新。"
+          : mode === "full"
+            ? "正在流式准备全量离线包；就绪后下载到本地处理。"
+            : "正在准备仅含新增消息和旧产物基线的增量包。",
+      );
+      clear(intent);
+    } catch (err) {
+      const recovered = await reconcileSubmittedJob(clientRequestId);
+      if (recovered) {
+        setJobNotice("提交响应中断，但已核对到离线导出任务；无需重复创建。");
+        clear(intent);
+        return;
+      }
+      const message = err instanceof Error ? err.message : "创建离线导出任务失败";
+      setOutput(formatJson({ error: message, client_request_id: clientRequestId }));
+      throw err;
+    }
+  };
+
+  const downloadOfflineBundle = async (job: PersonaJob) => {
+    try {
+      const blob = await apiBlobRequest(
+        config,
+        `/plugins/persona_extract/offline-exports/${job.id}/download`,
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `persona-${job.output_slug || job.target_name || "offline"}-${job.id}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setJobNotice("离线包已下载。按包内 PROMPT.md 生成 output/ 四个文件，再压缩 output/ 上传。");
+    } catch (err) {
+      setOutput(formatJson({ error: err instanceof Error ? err.message : "下载离线包失败" }));
+      throw err;
+    }
+  };
+
+  const uploadOfflineArtifact = async () => {
+    if (!selectedAwaitingImportJob) {
+      throw new Error("请先选择一个等待回传的离线任务");
+    }
+    if (!offlineArtifactFile) {
+      throw new Error("请选择只包含 output/ 生成结果的 ZIP");
+    }
+    const intent = `persona:offline-import:${config.tenantId}:${selectedAwaitingImportJob.id}:${offlineArtifactFile.name}:${offlineArtifactFile.size}`;
+    try {
+      const result = await apiRequest<PersonaJob>(
+        config,
+        `/plugins/persona_extract/offline-exports/${selectedAwaitingImportJob.id}/artifact`,
+        {
+          auth: true,
+          init: {
+            method: "PUT",
+            headers: {
+              "Content-Type": offlineArtifactFile.type || "application/zip",
+              "Idempotency-Key": keyFor(intent),
+            },
+            body: offlineArtifactFile,
+          },
+        },
+      );
+      mergeJobUpdate(result, { select: true, preserveDirtyArtifact: false });
+      setOfflineArtifactFile(null);
+      if (offlineArtifactInputRef.current) offlineArtifactInputRef.current.value = "";
+      setJobNotice("离线产物校验通过，任务已完成；现在可以“应用”到当前群。");
+      setOutput(formatJson(result));
+      clear(intent);
+    } catch (err) {
+      setOutput(formatJson({ error: err instanceof Error ? err.message : "上传离线产物失败" }));
+      throw err;
     }
   };
 
@@ -1019,8 +1160,8 @@ export function PersonaWorkspace() {
         />
         <div className="data-flow-note">
           <strong>当前链路</strong>
-          <span>控制台会通过 SDK 的 <code>ext/persona/messages</code> 拉取目标成员消息，再在本地生成工作记录、人物描述、技能说明和元数据产物。</span>
-          <span>增量蒸馏会尽量复用同一人物已有产物中的知识文本与技能标识，延续旧版 <code>distill_worker</code> 的技能累积流程。</span>
+          <span>有限样本仍可在线分块蒸馏；全量数据会流式导出成私有 ZIP，不再把全部消息塞进后台模型上下文。</span>
+          <span>下载后可让 Codex 或其他基于文件夹的工具按 <code>PROMPT.md</code> 处理，再只上传 <code>output/</code>。首次全量产物会记录游标，后续增量包只包含新增消息和旧产物基线。</span>
         </div>
         <div className="form-grid">
           <div className="field span-2">
@@ -1134,8 +1275,8 @@ export function PersonaWorkspace() {
               <span>提取范围</span>
               <label className="toggle-chip">
                 <input type="checkbox" checked={fullExtract} onChange={(event) => setFullExtract(event.target.checked)} />
-                <strong>全量刷新</strong>
-                <em>开启后会按全量重建语义重新生成风格技能，不再限制回溯天数和消息数。</em>
+                <strong>全量离线</strong>
+                <em>开启后只准备提示词和全量消息文件，不在后台调用大上下文模型。</em>
               </label>
             </div>
             <label className="field">
@@ -1177,6 +1318,19 @@ export function PersonaWorkspace() {
                 />
               </label>
             </details>
+            {selectedAwaitingImportJob ? (
+              <label className="field span-2">
+                <span>上传离线生成结果 ZIP</span>
+                <input
+                  ref={offlineArtifactInputRef}
+                  type="file"
+                  aria-label="上传离线生成结果 ZIP"
+                  accept=".zip,application/zip,application/x-zip-compressed"
+                  onChange={(event) => setOfflineArtifactFile(event.target.files?.[0] || null)}
+                />
+                <small>只能包含 output/SKILL.md、persona.md、work.md、meta.json；不要上传原始消息。</small>
+              </label>
+            ) : null}
           </div>
           <div className="action-row">
             <button className="button button-secondary" onClick={() => void listJobs()}>
@@ -1186,9 +1340,9 @@ export function PersonaWorkspace() {
               读取任务
             </button>
             <DangerAction
-              label="创建并执行蒸馏"
-              title="确认创建人物蒸馏任务"
-              confirmLabel="确认创建任务"
+              label={fullExtract ? "准备全量离线包" : "创建并执行蒸馏"}
+              title={fullExtract ? "确认准备全量离线包" : "确认创建人物蒸馏任务"}
+              confirmLabel={fullExtract ? "确认准备离线包" : "确认创建任务"}
               pendingLabel="正在创建…"
               disabled={
                 !selectedSessionIsVerified
@@ -1198,12 +1352,49 @@ export function PersonaWorkspace() {
                 <dl>
                   <div><dt>目标群</dt><dd><code>{effectiveSessionId || "未选择"}</code></dd></div>
                   <div><dt>目标成员</dt><dd>{targetName || "未选择"} <code>{targetUserId || ""}</code></dd></div>
-                  <div><dt>样本范围</dt><dd>{fullExtract ? "全量重建" : `最近 ${daysLimit} 天，最多 ${maxMessages} 条`}</dd></div>
-                  <div><dt>影响</dt><dd>会读取该成员在当前群内获授权的消息样本并生成可审计的风格产物。</dd></div>
+                  <div><dt>样本范围</dt><dd>{fullExtract ? "全量文件导出" : `最近 ${daysLimit} 天，最多 ${maxMessages} 条`}</dd></div>
+                  <div><dt>影响</dt><dd>{fullExtract ? "消息只会进入受限离线包，后台不做大上下文生成。" : "会读取获授权的有限消息样本并在线分块生成风格产物。"}</dd></div>
                 </dl>
               )}
               onConfirm={createJob}
             />
+            <DangerAction
+              label="准备增量更新包"
+              title="确认准备人格增量包"
+              confirmLabel="确认准备增量包"
+              pendingLabel="正在创建…"
+              disabled={
+                !selectedSessionIsVerified
+                || !members.some((item) => item.wxid === targetUserId)
+              }
+              impact={(
+                <dl>
+                  <div><dt>目标人物</dt><dd>{targetName || "未选择"}</dd></div>
+                  <div><dt>前提</dt><dd>该人物已完成并应用过一次新版离线全量产物。</dd></div>
+                  <div><dt>范围</dt><dd>从服务端游标之后提取新增消息，并附带旧产物作为基线。</dd></div>
+                </dl>
+              )}
+              onConfirm={() => createOfflineExport("incremental")}
+            />
+            {selectedAwaitingImportJob ? (
+              <>
+                <button
+                  className="button button-secondary"
+                  onClick={() => void downloadOfflineBundle(selectedAwaitingImportJob)}
+                >
+                  下载当前离线包
+                </button>
+                <DangerAction
+                  label="上传生成结果"
+                  title="确认上传离线人格产物"
+                  confirmLabel="确认上传"
+                  pendingLabel="正在校验…"
+                  disabled={!offlineArtifactFile}
+                  impact={<p>只导入结构化人格产物；上传包中的原始消息或额外文件会被拒绝。</p>}
+                  onConfirm={uploadOfflineArtifact}
+                />
+              </>
+            ) : null}
           </div>
           {jobNotice ? <p className="muted-copy" role="status">{jobNotice}</p> : null}
           <div
@@ -1276,6 +1467,18 @@ export function PersonaWorkspace() {
                           impact={<p>任务 #{item.id} 将重新读取当前群授权样本并执行，失败记录会保留。</p>}
                           onConfirm={() => rerunJob(item.id)}
                         />
+                      ) : null}
+                      {item.status === "awaiting_import" ? (
+                        <button
+                          type="button"
+                          className="button button-secondary button-compact"
+                          onClick={() => {
+                            hydrateJobSelection(item);
+                            void downloadOfflineBundle(item);
+                          }}
+                        >
+                          下载包
+                        </button>
                       ) : null}
                       {isActivePersonaJob(item) ? (
                         <DangerAction

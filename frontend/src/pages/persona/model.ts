@@ -133,6 +133,7 @@ export function personaJobStatusLabel(status?: string) {
     pending: "等待中",
     queued: "已排队",
     running: "运行中",
+    awaiting_import: "等待回传",
     completed: "已完成",
     failed: "失败",
     cancelled: "已取消",
@@ -147,6 +148,8 @@ export function personaJobStageLabel(stage?: string, checkpoint?: PersonaJob["ch
     claiming: "领取任务",
     collect_messages: "收集消息",
     collecting_messages: "收集消息",
+    streaming_export: "流式导出消息",
+    export_ready: "离线包已就绪",
     prepare: "准备样本",
     chunking: "拆分消息",
     map_chunks: "提取分段特征",
@@ -212,6 +215,8 @@ export function personaArtifactModeLabel(mode?: string) {
     incremental: "增量更新",
     rebuild: "全量重建",
     full: "全量生成",
+    offline_full: "离线全量",
+    offline_incremental: "离线增量",
   };
   return labels[mode || ""] || mode || "-";
 }

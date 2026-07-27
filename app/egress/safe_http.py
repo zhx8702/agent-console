@@ -187,13 +187,22 @@ async def safe_trusted_service_stream(
     base_url: str,
     path: str,
     *,
+    method: Literal["GET", "POST"] = "GET",
     params: Mapping[str, Any] | None = None,
     headers: Mapping[str, str] | None = None,
+    content: bytes | None = None,
+    json: Any | None = None,
     timeout_seconds: float,
     max_response_bytes: int,
     allowed_response_content_types: tuple[str, ...] = ("text/event-stream",),
 ) -> AsyncIterator[httpx.Response]:
-    """Open a bounded GET stream to one exact configured service origin."""
+    """Open a bounded stream to one exact configured service origin."""
+
+    normalized_method = method.upper()
+    if normalized_method not in {"GET", "POST"}:  # pragma: no cover - type guard
+        raise ValueError("safe trusted stream only supports GET and POST")
+    if content is not None and json is not None:
+        raise ValueError("safe trusted stream accepts either content or json, not both")
 
     policy = trusted_service_policy(
         base_url,
@@ -224,9 +233,11 @@ async def safe_trusted_service_stream(
             if pinned.sni_hostname:
                 extensions["sni_hostname"] = pinned.sni_hostname
             request = httpx.Request(
-                "GET",
+                normalized_method,
                 pinned.request_url,
                 headers=request_headers,
+                content=content,
+                json=json,
                 extensions=extensions,
             )
             async with _isolated_transport(client) as transport:
@@ -252,7 +263,7 @@ async def safe_trusted_service_stream(
                     status_code=upstream.status_code,
                     headers=upstream.headers,
                     stream=bounded_stream,
-                    request=httpx.Request("GET", pinned.logical_url),
+                    request=httpx.Request(normalized_method, pinned.logical_url),
                     extensions=upstream.extensions,
                 )
                 try:

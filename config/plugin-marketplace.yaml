@@ -247,7 +247,7 @@ items:
     package:
       type: builtin
       uri: plugins/persona_extract
-    capability_digest: sha256:5ed52cfe00cd1d63670c626ad5ad5874b8f4c22b277ed636753fa81024c34c24
+    capability_digest: sha256:2ae52bafbb7ef860db7a88377a39dd80675e8f494bc3e36f245670bfd7549beb
     compatibility:
       core_api: ">=0.1.0 <0.2.0"
       python: ">=3.11"

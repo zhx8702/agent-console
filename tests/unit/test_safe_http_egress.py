@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from collections.abc import Callable
 
@@ -406,6 +407,41 @@ async def test_trusted_service_stream_bounds_type_and_size(
             ) as response:
                 async for _ in response.aiter_bytes():
                     pass
+
+
+@pytest.mark.asyncio
+async def test_trusted_service_stream_supports_bounded_post_json() -> None:
+    transport = _CaptureTransport(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"messages":[]}',
+            request=request,
+        )
+    )
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with safe_trusted_service_stream(
+            client,
+            "http://127.0.0.1:5080",
+            "/ext/persona/messages",
+            method="POST",
+            json={"session_id": "room", "max_messages": 0},
+            headers={"Authorization": "Bearer sdk-secret"},
+            timeout_seconds=2.0,
+            max_response_bytes=1024,
+            allowed_response_content_types=("application/json",),
+        ) as response:
+            body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    assert body == b'{"messages":[]}'
+    assert len(transport.requests) == 1
+    assert transport.requests[0].method == "POST"
+    assert json.loads(transport.requests[0].content) == {
+        "session_id": "room",
+        "max_messages": 0,
+    }
+    assert transport.requests[0].headers["authorization"] == "Bearer sdk-secret"
 
 
 @pytest.mark.asyncio

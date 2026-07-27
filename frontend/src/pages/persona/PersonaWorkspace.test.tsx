@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { apiRequest } from "../../lib/api";
+import { apiBlobRequest, apiRequest } from "../../lib/api";
 import {
   personaJobDurationLabel,
   personaJobRetryLabel,
@@ -14,7 +14,7 @@ import { PersonaWorkspace } from "./PersonaWorkspace";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
-  return { ...actual, apiRequest: vi.fn() };
+  return { ...actual, apiBlobRequest: vi.fn(), apiRequest: vi.fn() };
 });
 
 vi.mock("../../state/console-config", async (importOriginal) => {
@@ -37,6 +37,7 @@ vi.mock("../../state/console-config", async (importOriginal) => {
 });
 
 const apiRequestMock = vi.mocked(apiRequest);
+const apiBlobRequestMock = vi.mocked(apiBlobRequest);
 
 const runningJob: PersonaJob = {
   id: 7,
@@ -94,6 +95,7 @@ describe("persona job presentation", () => {
 describe("PersonaWorkspace asynchronous jobs", () => {
   beforeEach(() => {
     apiRequestMock.mockReset();
+    apiBlobRequestMock.mockReset();
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
   });
 
@@ -268,6 +270,102 @@ describe("PersonaWorkspace asynchronous jobs", () => {
     expect(apiRequestMock.mock.calls.filter(([, path, options]) => (
       path === "/plugins/persona_extract/jobs" && options?.init?.method === "POST"
     ))).toHaveLength(1);
+  });
+
+  it("routes a full extraction to the offline export workflow", async () => {
+    let submittedBody: Record<string, unknown> | null = null;
+    installBaseApi(() => []);
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/profiles") return { items: [] };
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/offline-exports") {
+        submittedBody = JSON.parse(String(options?.init?.body)) as Record<string, unknown>;
+        return {
+          job_id: 19,
+          accepted: true,
+          job: {
+            ...runningJob,
+            id: 19,
+            status: "pending",
+            current_stage: "queued",
+            mode: "offline_full",
+          },
+        };
+      }
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "张三" }));
+    await user.click(screen.getByRole("checkbox", { name: /全量离线/ }));
+    await user.click(screen.getByRole("button", { name: "准备全量离线包" }));
+    await user.click(screen.getByRole("button", { name: "确认准备离线包" }));
+
+    await waitFor(() => expect(submittedBody).not.toBeNull());
+    expect(submittedBody).toMatchObject({
+      tenant_id: "default",
+      session_id: "room@chatroom",
+      target_user_id: "wxid-zhang",
+      mode: "full",
+    });
+    expect(apiRequestMock.mock.calls.some(([, path]) => (
+      path === "/plugins/persona_extract/offline-exports"
+    ))).toBe(true);
+  });
+
+  it("uploads only the generated ZIP for an awaiting offline task", async () => {
+    const awaitingJob: PersonaJob = {
+      ...runningJob,
+      id: 23,
+      status: "awaiting_import",
+      current_stage: "export_ready",
+      mode: "offline_full",
+      output_slug: "zhang-san",
+    };
+    let uploadedBody: BodyInit | null | undefined;
+    installBaseApi(() => [awaitingJob]);
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [awaitingJob] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [] };
+      if (path === "/plugins/persona_extract/offline-exports/23/artifact") {
+        uploadedBody = options?.init?.body;
+        return {
+          ...awaitingJob,
+          status: "completed",
+          current_stage: "completed",
+          artifact: { files: { skill_prompt: "# 张三" } },
+        };
+      }
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    const file = new File(["zip-body"], "output.zip", { type: "application/zip" });
+    await user.click(await screen.findByRole("button", { name: "23" }));
+    await screen.findByText("等待回传");
+    await user.upload(await screen.findByLabelText("上传离线生成结果 ZIP"), file);
+    await user.click(screen.getByRole("button", { name: "上传生成结果" }));
+    await user.click(screen.getByRole("button", { name: "确认上传" }));
+
+    await waitFor(() => expect(uploadedBody).toBe(file));
+    expect(apiRequestMock.mock.calls.some(([, path, options]) => (
+      path === "/plugins/persona_extract/offline-exports/23/artifact"
+      && options?.init?.method === "PUT"
+    ))).toBe(true);
   });
 
   it("restores the saved persona after the workspace is reloaded", async () => {

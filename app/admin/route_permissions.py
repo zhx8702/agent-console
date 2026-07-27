@@ -435,7 +435,10 @@ DANGER POST /plugins/memory/forget
 DANGER POST /plugins/memory/governance/cleanup
 DANGER POST /plugins/memory/graph/vector-rebuild
 DANGER POST /plugins/memory/items/vector-rebuild
+DANGER GET /plugins/persona_extract/offline-exports/{job_id}/download
+DANGER POST /plugins/persona_extract/offline-exports
 DANGER POST /plugins/persona_extract/profiles/apply-job
+DANGER PUT /plugins/persona_extract/offline-exports/{job_id}/artifact
 DANGER POST /plugins/repeater/config/{tenant_id}/{session_id:path}
 DANGER POST /plugins/tibo_reset/poll/run-once
 DANGER POST /plugins/wxbot/admin/agent-tools/policy/{tenant_id}/{session_id:path}

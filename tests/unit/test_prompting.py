@@ -81,6 +81,24 @@ def test_persona_becomes_named_runtime_role_without_making_style_data_executable
     )
 
 
+def test_persona_style_data_is_bounded_before_runtime_injection() -> None:
+    session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
+    session.variables["persona_skill"] = "海" * 50_000
+
+    prompt = augment_prompt_with_persona_and_memory(
+        "base",
+        session,
+        memory_intro="memory",
+    )
+
+    style = prompt.split("<persona_style_data>\n", 1)[1].split(
+        "\n</persona_style_data>",
+        1,
+    )[0]
+    assert len(style) == 12_000
+    assert style.endswith("…")
+
+
 def test_prompting_orders_structured_memory_layers() -> None:
     session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
     session.variables["user_memory"] = {
