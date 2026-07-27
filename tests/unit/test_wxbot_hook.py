@@ -489,7 +489,8 @@ async def test_voice_profile_merges_after_persona_without_overriding_safety() ->
     assert "语气=轻松克制" in prompt
     assert "接着聊聊" in prompt
     assert "不得改变事实、工具结果、安全决定、权限或记忆受众" in prompt
-    assert "普通回复不要主动添加固定身份前缀" in prompt
+    assert "普通的“你是谁/你叫什么”按当前已启用人格自然回答" in prompt
+    assert "不要固定复读“我是 AI 助手”" in prompt
     assert ctx.session.variables["voice_profile"]["version"] == 4
     assert "authorized_sample_session_ids" not in ctx.session.variables["voice_profile"]
     assert "authorization_reference" not in ctx.session.variables["voice_profile"]
@@ -529,7 +530,7 @@ async def test_voice_profile_always_identity_changes_ordinary_prompt() -> None:
     assert result.reason == "voice_profile_active"
     prompt = str(ctx.session.variables["persona_skill"])
     assert "每次普通回复都要明确以“我是 AI 助手”开头" in prompt
-    assert "普通回复不要主动添加固定身份前缀" not in prompt
+    assert "普通的“你是谁/你叫什么”按当前已启用人格自然回答" not in prompt
     assert ctx.session.variables["voice_profile"]["identity_disclosure"] == "always"
 
 

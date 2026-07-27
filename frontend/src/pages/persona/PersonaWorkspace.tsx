@@ -117,6 +117,10 @@ export function PersonaWorkspace() {
     () => jobs.find((item) => String(item.id) === String(jobId || "")) || null,
     [jobs, jobId],
   );
+  const personaDisplayName = (profileName || targetName || profileSkillSlug).trim();
+  const hasSaveablePersonaDraft = Boolean(
+    personaDisplayName && artifactSkillPrompt.trim(),
+  );
   const pollingJobId = useMemo(() => {
     if (isActivePersonaJob(selectedJob)) return String(selectedJob?.id || "");
     return String(jobs.find(isActivePersonaJob)?.id || "");
@@ -595,8 +599,12 @@ export function PersonaWorkspace() {
     }
 
     const slug = profileSkillSlug || targetUserId || "default";
+    const artifactPersonaName = targetName || personaDisplayName;
     const skillPrompt = artifactSkillPrompt.trim();
-    const skillMd = (artifactSkillMd.trim() || buildSkillFrontmatter(slug, targetName, skillPrompt)).trim();
+    const skillMd = (
+      artifactSkillMd.trim()
+      || buildSkillFrontmatter(slug, artifactPersonaName, skillPrompt)
+    ).trim();
     const messageCount =
       Number(artifactMessageCount) ||
       artifactKnowledgeText
@@ -608,7 +616,7 @@ export function PersonaWorkspace() {
       Object.keys(parsedMeta).length > 0
         ? parsedMeta
         : buildDefaultMeta({
-            targetName,
+            targetName: artifactPersonaName,
             targetUserId,
             slug,
             sessionName: personaSessionName,
@@ -625,7 +633,7 @@ export function PersonaWorkspace() {
       mode: artifactMode || "manual",
       target: {
         user_id: targetUserId,
-        name: targetName,
+        name: artifactPersonaName,
       },
       source: {
         tenant_id: config.tenantId,
@@ -665,8 +673,13 @@ export function PersonaWorkspace() {
       setProfileOutput(formatJson({ error: error.message }));
       throw error;
     }
-    if (!members.some((item) => item.wxid === targetUserId)) {
-      const error = new Error("目标人物必须来自当前群的已验证成员名册");
+    if (!personaDisplayName) {
+      const error = new Error("请填写人格名称或技能标识");
+      setProfileOutput(formatJson({ error: error.message }));
+      throw error;
+    }
+    if (!artifactSkillPrompt.trim()) {
+      const error = new Error("请填写技能提示词正文后再保存");
       setProfileOutput(formatJson({ error: error.message }));
       throw error;
     }
@@ -688,9 +701,9 @@ export function PersonaWorkspace() {
             channel: profileChannel,
             source_key: profileSourceKey || "wxbot",
             source_label: profileSourceLabel || personaSessionName || "当前群",
-            profile_name: profileName || targetName || "default",
+            profile_name: personaDisplayName,
             target_user_id: targetUserId,
-            target_name: targetName,
+            target_name: targetName || personaDisplayName,
             skill_slug: profileSkillSlug,
             prompt_text: artifactSkillPrompt,
             artifact,
@@ -728,7 +741,6 @@ export function PersonaWorkspace() {
       !jobForApply
       || jobForApply.session_id !== groupId
       || jobForApply.status !== "completed"
-      || !members.some((item) => item.wxid === jobForApply.target_user_id)
     ) {
       const error = new Error("只能应用当前已验证群内已完成的蒸馏任务");
       setProfileOutput(formatJson({ error: error.message }));
@@ -1299,7 +1311,7 @@ export function PersonaWorkspace() {
           </div>
           <div className="persona-scope-note">
             <strong>{personaSessionName || "未选择群"}</strong>
-            <span>保存范围由会话 ID、渠道和来源键共同确定；风格技能会保留完整产物，便于持续迭代。</span>
+            <span>保存范围由会话 ID、渠道和来源键共同确定；来源成员只用于蒸馏，保存后机器人会以所选人格参与当前群聊。</span>
           </div>
           <div className="form-grid">
             <label className="field">
@@ -1385,14 +1397,14 @@ export function PersonaWorkspace() {
               disabled={
                 !selectedSessionIsVerified
                 || !profileLoaded
-                || !members.some((item) => item.wxid === targetUserId)
+                || !hasSaveablePersonaDraft
               }
               impact={(
                 <dl>
                   <div><dt>目标群</dt><dd><code>{effectiveSessionId || "未选择"}</code></dd></div>
-                  <div><dt>目标人物</dt><dd>{targetName || targetUserId || "未选择"}</dd></div>
+                  <div><dt>运行人格</dt><dd>{personaDisplayName || "未填写"}</dd></div>
                   <div><dt>状态</dt><dd>{profileEnabled === "true" ? "保存后启用" : "保存但不启用"}</dd></div>
-                  <div><dt>影响</dt><dd>会更新当前群的回复风格；安全、事实和记忆受众规则仍优先。</dd></div>
+                  <div><dt>影响</dt><dd>会更新当前群的回复人格；机器人将以该人格自然说话，安全、事实和记忆受众规则仍优先。</dd></div>
                 </dl>
               )}
               onConfirm={saveProfile}

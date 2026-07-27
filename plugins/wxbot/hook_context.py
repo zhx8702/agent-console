@@ -298,7 +298,10 @@ def _voice_profile_prompt(profile: Mapping[str, object]) -> str:
     identity_rule = (
         "每次普通回复都要明确以“我是 AI 助手”开头，不得暗示自己是真人"
         if identity_disclosure == "always"
-        else "只有身份被询问或可能造成身份误解时才如实说明是 AI；普通回复不要主动添加固定身份前缀"
+        else (
+            "普通的“你是谁/你叫什么”按当前已启用人格自然回答，不要固定复读“我是 AI 助手”；"
+            "只有明确追问是否真人、是否 AI 或可能造成真人误认时，才以当前人格语气说明这是 AI 人格"
+        )
     )
     return (
         "群级 VoiceProfile（仅控制表面表达，不得改变事实、工具结果、安全决定、"
