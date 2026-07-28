@@ -1706,21 +1706,26 @@ class PersonaExtractStore:
         final_profile_name = profile_name or final_target_name or existing_profile_name
 
         if final_skill_slug:
-            collision_rows = await _exec(
+            collision_sql = (
                 "SELECT id FROM plugin_persona_profiles "
                 "WHERE tenant_id = :tid AND session_id = :sid "
                 "AND channel = :channel AND source_key = :source_key "
                 "AND skill_slug = :skill_slug "
-                "AND (:profile_id IS NULL OR id <> :profile_id) "
-                "LIMIT 1",
-                {
-                    "tid": tenant_id,
-                    "sid": session_id,
-                    "channel": channel,
-                    "source_key": source_key,
-                    "skill_slug": final_skill_slug,
-                    "profile_id": int(existing["id"]) if existing else None,
-                },
+            )
+            collision_params: dict[str, Any] = {
+                "tid": tenant_id,
+                "sid": session_id,
+                "channel": channel,
+                "source_key": source_key,
+                "skill_slug": final_skill_slug,
+            }
+            if existing:
+                collision_sql += "AND id <> :profile_id "
+                collision_params["profile_id"] = int(existing["id"])
+            collision_sql += "LIMIT 1"
+            collision_rows = await _exec(
+                collision_sql,
+                collision_params,
             )
             if collision_rows:
                 raise PersonaApplyJobError(
@@ -1744,20 +1749,25 @@ class PersonaExtractStore:
         }
         selected_profile_id = int(existing["id"]) if existing else None
         if enabled:
-            await _exec(
+            deactivate_sql = (
                 "UPDATE plugin_persona_profiles SET enabled = FALSE, "
                 "updated_at = CURRENT_TIMESTAMP "
                 "WHERE tenant_id = :tid AND session_id = :sid "
                 "AND channel = :channel AND source_key = :source_key "
                 "AND enabled = TRUE "
-                "AND (:profile_id IS NULL OR id <> :profile_id)",
-                {
-                    "tid": tenant_id,
-                    "sid": session_id,
-                    "channel": channel,
-                    "source_key": source_key,
-                    "profile_id": selected_profile_id,
-                },
+            )
+            deactivate_params: dict[str, Any] = {
+                "tid": tenant_id,
+                "sid": session_id,
+                "channel": channel,
+                "source_key": source_key,
+            }
+            if selected_profile_id is not None:
+                deactivate_sql += "AND id <> :profile_id"
+                deactivate_params["profile_id"] = selected_profile_id
+            await _exec(
+                deactivate_sql,
+                deactivate_params,
             )
         if existing:
             await _exec(
