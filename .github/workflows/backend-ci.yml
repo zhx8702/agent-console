@@ -207,6 +207,8 @@ jobs:
                       "docker-compose.production.yml",
                       "--profile",
                       "app",
+                      "--profile",
+                      "wxbot",
                       "config",
                       "--format",
                       "json",
