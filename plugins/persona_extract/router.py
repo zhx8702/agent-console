@@ -69,6 +69,7 @@ class OfflineExportRequest(StrictRequestModel):
 
 
 class PersonaProfileUpsertRequest(StrictRequestModel):
+    profile_id: int | None = Field(default=None, ge=1)
     tenant_id: str = Field(min_length=1, max_length=64)
     session_id: str = Field(min_length=1, max_length=256)
     session_name: str = Field(default="", max_length=256)
@@ -95,6 +96,11 @@ class PersonaProfileApplyJobRequest(StrictRequestModel):
     source_label: str = Field(default="", max_length=256)
     profile_name: str = Field(default="default", max_length=128)
     enabled: bool = True
+
+
+class PersonaProfileActivateRequest(StrictRequestModel):
+    tenant_id: str = Field(min_length=1, max_length=64)
+    session_id: str = Field(min_length=1, max_length=256)
 
 
 def _required_idempotency_key(value: str | None) -> str:
@@ -626,6 +632,7 @@ def build_persona_extract_router(
         actor, actor_kind, roles, trace_id = _mutation_actor(request)
         try:
             outcome = await store.upsert_profile_idempotent(
+                profile_id=body.profile_id,
                 tenant_id=body.tenant_id,
                 session_id=body.session_id,
                 session_name=body.session_name,
@@ -646,6 +653,34 @@ def build_persona_extract_router(
                 roles=roles,
                 trace_id=trace_id,
                 reason="profile workspace save",
+            )
+        except Exception as exc:
+            _handle_mutation_error(exc)
+        response.status_code = outcome.status_code
+        if outcome.replayed:
+            response.headers["Idempotent-Replayed"] = "true"
+        return outcome.response
+
+    @router.post("/profiles/{profile_id}/activate")
+    async def activate_profile(
+        profile_id: int,
+        body: PersonaProfileActivateRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ):
+        actor, actor_kind, roles, trace_id = _mutation_actor(request)
+        try:
+            outcome = await store.activate_profile_idempotent(
+                profile_id=profile_id,
+                tenant_id=body.tenant_id,
+                session_id=body.session_id,
+                idempotency_key=_required_idempotency_key(idempotency_key),
+                actor=actor,
+                actor_kind=actor_kind,
+                roles=roles,
+                trace_id=trace_id,
+                reason="activate saved persona profile",
             )
         except Exception as exc:
             _handle_mutation_error(exc)

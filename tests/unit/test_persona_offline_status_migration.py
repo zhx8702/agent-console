@@ -31,12 +31,18 @@ def _render(monkeypatch, operation: str) -> tuple[object, str]:
 def test_persona_offline_status_upgrade_extends_the_single_head(monkeypatch) -> None:
     migration, rendered = _render(monkeypatch, "upgrade")
 
-    assert migration.revision == RUNTIME_SCHEMA_REVISION
+    assert migration.revision == "0043_persona_offline_status"
     assert migration.down_revision == "0042_wxbot_report_delivery_ack"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 6
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]
+    assert (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision(RUNTIME_SCHEMA_REVISION)
+        .down_revision
+        == migration.revision
+    )
     assert "LOCK TABLE plugin_persona_jobs IN ACCESS EXCLUSIVE MODE" in rendered
     assert "DROP CONSTRAINT ck_persona_jobs_status" in rendered
     assert "'awaiting_import'" in rendered

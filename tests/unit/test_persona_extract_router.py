@@ -179,6 +179,19 @@ class _FakeStore:
             mutation_id="fake-apply",
         )
 
+    async def activate_profile_idempotent(self, **kwargs):
+        return MutationOutcome(
+            response={
+                "id": int(kwargs["profile_id"]),
+                "tenant_id": kwargs["tenant_id"],
+                "session_id": kwargs["session_id"],
+                "enabled": True,
+            },
+            status_code=200,
+            replayed=False,
+            mutation_id="fake-activate",
+        )
+
     async def delete_profile_idempotent(self, **kwargs):
         return MutationOutcome(
             response={"deleted": int(kwargs["profile_id"])},
@@ -617,11 +630,59 @@ def test_profile_mutations_require_idempotency_key() -> None:
                 "job_id": 41,
             },
         )
+        activate = client.post(
+            "/profiles/7/activate",
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+            },
+        )
         delete = client.delete(
             "/profiles/7",
             params={"tenant_id": "demo", "session_id": "group-1@chatroom"},
         )
 
-    for response in (upsert, apply, delete):
+    for response in (upsert, apply, activate, delete):
         assert response.status_code == 428
         assert response.json()["detail"]["code"] == "idempotency_key_required"
+
+
+def test_profile_upsert_targets_id_and_saved_profile_can_be_activated() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(
+        build_persona_extract_router(store, None, scope_gate=_allow_scope)
+    )
+
+    with TestClient(app) as client:
+        saved = client.post(
+            "/profiles",
+            headers={"Idempotency-Key": "save-profile-7"},
+            json={
+                "profile_id": 7,
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "skill_slug": "member-a",
+                "prompt_text": "style",
+                "enabled": False,
+            },
+        )
+        activated = client.post(
+            "/profiles/7/activate",
+            headers={"Idempotency-Key": "activate-profile-7"},
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+            },
+        )
+
+    assert saved.status_code == 200
+    assert saved.json()["profile_id"] == 7
+    assert saved.json()["enabled"] is False
+    assert activated.status_code == 200
+    assert activated.json() == {
+        "id": 7,
+        "tenant_id": "demo",
+        "session_id": "group-1@chatroom",
+        "enabled": True,
+    }

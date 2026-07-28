@@ -41,7 +41,7 @@ def test_runtime_hardening_histories_merge_after_both_shipped_heads(monkeypatch)
     )
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [RUNTIME_SCHEMA_REVISION]
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 6
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
     assert "plugin_wxbot_group_membership" in RUNTIME_SCHEMA_TABLES
     assert "idx_wxbot_group_membership_active" in RUNTIME_SCHEMA_INDEXES
     assert (

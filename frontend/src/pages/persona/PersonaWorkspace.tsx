@@ -847,6 +847,7 @@ export function PersonaWorkspace() {
             "Idempotency-Key": keyFor(intent),
           },
           body: JSON.stringify({
+            profile_id: profileId ? Number(profileId) : null,
             tenant_id: config.tenantId,
             session_id: groupId,
             session_name: personaSessionName,
@@ -928,6 +929,42 @@ export function PersonaWorkspace() {
       clear(intent);
     } catch (err) {
       setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "应用蒸馏任务失败" }));
+      throw err;
+    }
+  };
+
+  const activateProfile = async (profile: PersonaProfile) => {
+    const groupId = requireSelectedGroup(config, verifiedGroupIds);
+    if (profile.session_id !== groupId) {
+      throw new Error("只能启用当前群的风格技能");
+    }
+    const intent = `persona:activate:${config.tenantId}:${groupId}:${profile.id}`;
+    try {
+      const result = await apiRequest<PersonaProfile>(
+        config,
+        `/plugins/persona_extract/profiles/${profile.id}/activate`,
+        {
+          auth: true,
+          init: {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Idempotency-Key": keyFor(intent),
+            },
+            body: JSON.stringify({
+              tenant_id: config.tenantId,
+              session_id: groupId,
+            }),
+          },
+        },
+      );
+      hydrateProfileForm(result, { syncJobId: true });
+      await listProfiles({ hydrateFirst: false });
+      hydrateProfileForm(result, { syncJobId: true });
+      setProfileOutput(formatJson(result));
+      clear(intent);
+    } catch (err) {
+      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "启用风格技能失败" }));
       throw err;
     }
   };
@@ -1524,7 +1561,7 @@ export function PersonaWorkspace() {
           </div>
           <div className="persona-scope-note">
             <strong>{personaSessionName || "未选择群"}</strong>
-            <span>保存范围由会话 ID、渠道和来源键共同确定；来源成员只用于蒸馏，保存后机器人会以所选人格参与当前群聊。</span>
+            <span>当前群可以保存多个风格技能；同一消息渠道和来源键只启用一个，其余技能会保留以便随时切换。</span>
           </div>
           <div className="form-grid">
             <label className="field">
@@ -1542,7 +1579,9 @@ export function PersonaWorkspace() {
               >
                 <option value="">新建当前群风格技能</option>
                 {profiles.map((item) => (
-                  <option key={item.id} value={item.id}>{`#${item.id} · ${item.profile_name || item.target_name || "未命名"}`}</option>
+                  <option key={item.id} value={item.id}>
+                    {`#${item.id} · ${item.profile_name || item.target_name || "未命名"} · ${item.enabled ? "当前启用" : "已保存"}`}
+                  </option>
                 ))}
               </select>
             </label>
@@ -1654,6 +1693,8 @@ export function PersonaWorkspace() {
                   <th scope="col">名称</th>
                   <th scope="col">目标人物</th>
                   <th scope="col">技能标识</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -1667,11 +1708,30 @@ export function PersonaWorkspace() {
                     <td>{item.profile_name || "-"}</td>
                     <td>{item.target_name || item.target_user_id || "-"}</td>
                     <td className="mono">{item.skill_slug || "-"}</td>
+                    <td>
+                      <span className={item.enabled ? "pill pill-ok" : "pill pill-muted"}>
+                        {item.enabled ? "当前启用" : "已保存"}
+                      </span>
+                    </td>
+                    <td>
+                      {item.enabled ? (
+                        <span className="muted-copy">使用中</span>
+                      ) : (
+                        <DangerAction
+                          label="启用"
+                          title="确认切换当前群回复风格"
+                          confirmLabel="确认启用"
+                          className="button-compact"
+                          impact={<p>启用“{item.profile_name || item.target_name || item.skill_slug}”，当前同范围风格会保留但停用。</p>}
+                          onConfirm={() => activateProfile(item)}
+                        />
+                      )}
+                    </td>
                   </tr>
                 ))}
                 {!profiles.length && (
                   <tr>
-                    <td colSpan={4}>当前群还没有已应用的回复风格技能</td>
+                    <td colSpan={6}>当前群还没有已应用的回复风格技能</td>
                   </tr>
                 )}
               </tbody>

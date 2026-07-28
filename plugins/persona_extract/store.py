@@ -328,22 +328,34 @@ class PersonaExtractStore:
         session_id = str(profile_fields.get("session_id") or "")
         channel = str(profile_fields.get("channel") or "")
         source_key = str(profile_fields.get("source_key") or "")
+        profile_id = (
+            int(profile_fields["profile_id"])
+            if profile_fields.get("profile_id") is not None
+            else None
+        )
+        job_id = (
+            int(profile_fields["job_id"])
+            if profile_fields.get("job_id") is not None
+            else None
+        )
+        skill_slug = self._profile_skill_identity(
+            str(profile_fields.get("skill_slug") or ""),
+            profile_fields.get("artifact"),
+        )
         request_payload = dict(profile_fields)
 
         async with self._mutation_transaction() as conn:
             async def mutate() -> MutationChange:
-                existing_rows = await _exec(
-                    "SELECT * FROM plugin_persona_profiles "
-                    "WHERE tenant_id = :tid AND session_id = :sid "
-                    "AND channel = :channel AND source_key = :source_key",
-                    {
-                        "tid": tenant_id,
-                        "sid": session_id,
-                        "channel": channel,
-                        "source_key": source_key,
-                    },
+                before = await self._find_profile_for_write(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    channel=channel,
+                    source_key=source_key,
+                    profile_id=profile_id,
+                    job_id=job_id,
+                    skill_slug=skill_slug,
+                    artifact=profile_fields.get("artifact"),
                 )
-                before = self._hydrate_profile(existing_rows[0]) if existing_rows else None
                 profile = await self.upsert_profile(**profile_fields)
                 return MutationChange(
                     response=profile,
@@ -358,7 +370,10 @@ class PersonaExtractStore:
                     tenant_id=tenant_id,
                     plugin_name="persona_extract",
                     operation="persona.profile.upsert",
-                    resource_key=f"{session_id}:{channel}:{source_key}",
+                    resource_key=(
+                        f"{session_id}:{channel}:{source_key}:"
+                        f"{profile_id or skill_slug or job_id or 'new'}"
+                    ),
                     idempotency_key=idempotency_key,
                     request_payload=request_payload,
                 ),
@@ -441,6 +456,89 @@ class PersonaExtractStore:
                 mutate=mutate,
             )
 
+    async def activate_profile_idempotent(
+        self,
+        *,
+        profile_id: int,
+        tenant_id: str,
+        session_id: str,
+        idempotency_key: str,
+        actor: str,
+        actor_kind: str,
+        roles: Sequence[str],
+        trace_id: str,
+        reason: str = "",
+    ) -> MutationOutcome:
+        request_payload = {
+            "profile_id": int(profile_id),
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+        }
+        async with self._mutation_transaction() as conn:
+            async def mutate() -> MutationChange:
+                before = await self.get_profile(profile_id)
+                if before is None:
+                    raise PersonaApplyJobError("profile not found", status_code=404)
+                if str(before.get("tenant_id") or "") != tenant_id:
+                    raise PersonaApplyJobError("profile tenant does not match request")
+                if str(before.get("session_id") or "") != session_id:
+                    raise PersonaApplyJobError("profile session does not match request")
+                channel = str(before.get("channel") or "")
+                source_key = str(before.get("source_key") or "")
+                await _exec(
+                    "UPDATE plugin_persona_profiles SET enabled = FALSE, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE tenant_id = :tid AND session_id = :sid "
+                    "AND channel = :channel AND source_key = :source_key "
+                    "AND id <> :id AND enabled = TRUE",
+                    {
+                        "tid": tenant_id,
+                        "sid": session_id,
+                        "channel": channel,
+                        "source_key": source_key,
+                        "id": int(profile_id),
+                    },
+                )
+                await _exec(
+                    "UPDATE plugin_persona_profiles SET enabled = TRUE, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = :id",
+                    {"id": int(profile_id)},
+                )
+                after = await self.get_profile(profile_id)
+                if after is None:  # pragma: no cover - database invariant
+                    raise PersonaApplyJobError("profile not found", status_code=404)
+                return MutationChange(
+                    response=after,
+                    before_state=self._profile_audit_state(before),
+                    after_state=self._profile_audit_state(after),
+                    resource_version=str(after.get("updated_at") or after.get("id") or ""),
+                )
+
+            return await run_idempotent_mutation(
+                conn,
+                identity=MutationIdentity(
+                    tenant_id=tenant_id,
+                    plugin_name="persona_extract",
+                    operation="persona.profile.activate",
+                    resource_key=str(profile_id),
+                    idempotency_key=idempotency_key,
+                    request_payload=request_payload,
+                ),
+                audit=MutationAudit(
+                    actor=actor,
+                    actor_kind=actor_kind,
+                    roles=roles,
+                    scope={
+                        "profile_id": int(profile_id),
+                        "session_hash": hash_identifier(session_id),
+                    },
+                    reason_code="persona_profile_activate",
+                    reason=reason,
+                    trace_id=trace_id,
+                ),
+                mutate=mutate,
+            )
+
     async def apply_job_idempotent(
         self,
         *,
@@ -487,18 +585,20 @@ class PersonaExtractStore:
                 if not artifact and not prompt_text:
                     raise PersonaApplyJobError("job result is empty")
                 target = artifact.get("target") if isinstance(artifact, dict) else {}
-                existing_rows = await _exec(
-                    "SELECT * FROM plugin_persona_profiles "
-                    "WHERE tenant_id = :tid AND session_id = :sid "
-                    "AND channel = :channel AND source_key = :source_key",
-                    {
-                        "tid": tenant_id,
-                        "sid": session_id,
-                        "channel": channel,
-                        "source_key": source_key,
-                    },
+                applied_skill_slug = (
+                    str(artifact.get("slug") or job.get("output_slug") or "")
+                    if isinstance(artifact, dict)
+                    else str(job.get("output_slug") or "")
                 )
-                before = self._hydrate_profile(existing_rows[0]) if existing_rows else None
+                before = await self._find_profile_for_write(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    channel=channel,
+                    source_key=source_key,
+                    job_id=job_id,
+                    skill_slug=applied_skill_slug,
+                    artifact=artifact if isinstance(artifact, dict) else None,
+                )
                 profile = await self.upsert_profile(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -509,11 +609,7 @@ class PersonaExtractStore:
                     profile_name=profile_name or str(target.get("name") or "default"),
                     target_user_id=str(target.get("user_id") or job.get("target_user_id") or ""),
                     target_name=str(target.get("name") or job.get("target_name") or ""),
-                    skill_slug=(
-                        str(artifact.get("slug") or job.get("output_slug") or "")
-                        if isinstance(artifact, dict)
-                        else str(job.get("output_slug") or "")
-                    ),
+                    skill_slug=applied_skill_slug,
                     prompt_text=prompt_text,
                     artifact=artifact if isinstance(artifact, dict) else None,
                     enabled=enabled,
@@ -532,7 +628,7 @@ class PersonaExtractStore:
                     tenant_id=tenant_id,
                     plugin_name="persona_extract",
                     operation="persona.profile.apply_job",
-                    resource_key=f"{session_id}:{channel}:{source_key}",
+                    resource_key=f"{session_id}:{channel}:{source_key}:job:{job_id}",
                     idempotency_key=idempotency_key,
                     request_payload=request_payload,
                 ),
@@ -601,6 +697,68 @@ class PersonaExtractStore:
         if artifact and not row.get("target_user_id"):
             row["target_user_id"] = artifact.get("target", {}).get("user_id") or ""
         return row
+
+    @staticmethod
+    def _profile_skill_identity(
+        skill_slug: str,
+        artifact: dict[str, Any] | None,
+    ) -> str:
+        artifact_slug = (
+            str(artifact.get("slug") or "")
+            if isinstance(artifact, dict)
+            else ""
+        )
+        return str(skill_slug or artifact_slug).strip()
+
+    async def _find_profile_for_write(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        channel: str,
+        source_key: str,
+        profile_id: int | None = None,
+        job_id: int | None = None,
+        skill_slug: str = "",
+        artifact: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if profile_id is not None:
+            profile = await self.get_profile(profile_id)
+            if profile is None:
+                raise PersonaApplyJobError("profile not found", status_code=404)
+            if str(profile.get("tenant_id") or "") != tenant_id:
+                raise PersonaApplyJobError("profile tenant does not match request")
+            if str(profile.get("session_id") or "") != session_id:
+                raise PersonaApplyJobError("profile session does not match request")
+            return profile
+
+        resolved_slug = self._profile_skill_identity(skill_slug, artifact)
+        if job_id is None and not resolved_slug:
+            return None
+
+        conditions: list[str] = []
+        params: dict[str, Any] = {
+            "tid": tenant_id,
+            "sid": session_id,
+            "channel": channel,
+            "source_key": source_key,
+        }
+        if job_id is not None:
+            conditions.append("job_id = :job_id")
+            params["job_id"] = int(job_id)
+        if resolved_slug:
+            conditions.append("skill_slug = :skill_slug")
+            params["skill_slug"] = resolved_slug
+
+        rows = await _exec(
+            "SELECT * FROM plugin_persona_profiles "
+            "WHERE tenant_id = :tid AND session_id = :sid "
+            "AND channel = :channel AND source_key = :source_key "
+            f"AND ({' OR '.join(conditions)}) "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1",
+            params,
+        )
+        return self._hydrate_profile(rows[0]) if rows else None
 
     @staticmethod
     def persona_job_request_hash(payload: dict[str, Any]) -> str:
@@ -1471,7 +1629,7 @@ class PersonaExtractStore:
         rows = await _exec(
             "SELECT * FROM plugin_persona_profiles "
             "WHERE tenant_id = :tid AND session_id = :sid "
-            "ORDER BY channel ASC, source_key ASC, updated_at DESC",
+            "ORDER BY enabled DESC, channel ASC, source_key ASC, updated_at DESC",
             {"tid": tenant_id, "sid": session_id},
         )
         return [self._hydrate_profile(row) for row in rows]
@@ -1500,19 +1658,18 @@ class PersonaExtractStore:
         target_user_id: str = "",
         target_name: str = "",
         skill_slug: str = "",
+        profile_id: int | None = None,
     ) -> dict:
-        existing_rows = await _exec(
-            "SELECT * FROM plugin_persona_profiles "
-            "WHERE tenant_id = :tid AND session_id = :sid "
-            "AND channel = :channel AND source_key = :source_key",
-            {
-                "tid": tenant_id,
-                "sid": session_id,
-                "channel": channel,
-                "source_key": source_key,
-            },
+        existing = await self._find_profile_for_write(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            channel=channel,
+            source_key=source_key,
+            profile_id=profile_id,
+            job_id=job_id,
+            skill_slug=skill_slug,
+            artifact=artifact,
         )
-        existing = self._hydrate_profile(existing_rows[0]) if existing_rows else None
         previous_artifact = existing.get("artifact") if existing else None
         existing_target_user_id = str(existing.get("target_user_id") or "") if existing else ""
         existing_target_name = str(existing.get("target_name") or "") if existing else ""
@@ -1541,8 +1698,34 @@ class PersonaExtractStore:
         )
         final_target_user_id = target_user_id or str(artifact_target.get("user_id") or "") or existing_target_user_id
         final_target_name = target_name or str(artifact_target.get("name") or "") or existing_target_name
-        final_skill_slug = skill_slug or str(effective_artifact.get("slug") or "") or existing_skill_slug
+        final_skill_slug = (
+            skill_slug
+            or str(effective_artifact.get("slug") or "")
+            or existing_skill_slug
+        ).strip()
         final_profile_name = profile_name or final_target_name or existing_profile_name
+
+        if final_skill_slug:
+            collision_rows = await _exec(
+                "SELECT id FROM plugin_persona_profiles "
+                "WHERE tenant_id = :tid AND session_id = :sid "
+                "AND channel = :channel AND source_key = :source_key "
+                "AND skill_slug = :skill_slug "
+                "AND (:profile_id IS NULL OR id <> :profile_id) "
+                "LIMIT 1",
+                {
+                    "tid": tenant_id,
+                    "sid": session_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "skill_slug": final_skill_slug,
+                    "profile_id": int(existing["id"]) if existing else None,
+                },
+            )
+            if collision_rows:
+                raise PersonaApplyJobError(
+                    "another saved profile already uses this skill slug",
+                )
 
         params = {
             "tid": tenant_id,
@@ -1559,10 +1742,28 @@ class PersonaExtractStore:
             "enabled": enabled,
             "job_id": job_id,
         }
+        selected_profile_id = int(existing["id"]) if existing else None
+        if enabled:
+            await _exec(
+                "UPDATE plugin_persona_profiles SET enabled = FALSE, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE tenant_id = :tid AND session_id = :sid "
+                "AND channel = :channel AND source_key = :source_key "
+                "AND enabled = TRUE "
+                "AND (:profile_id IS NULL OR id <> :profile_id)",
+                {
+                    "tid": tenant_id,
+                    "sid": session_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "profile_id": selected_profile_id,
+                },
+            )
         if existing:
             await _exec(
                 "UPDATE plugin_persona_profiles "
-                "SET source_label = :source_label, profile_name = :profile_name, "
+                "SET channel = :channel, source_key = :source_key, "
+                "source_label = :source_label, profile_name = :profile_name, "
                 "target_user_id = :target_user_id, target_name = :target_name, "
                 "skill_slug = :skill_slug, prompt_text = :prompt_text, "
                 "artifact_json = :artifact_json, enabled = :enabled, job_id = :job_id, "
@@ -1570,7 +1771,7 @@ class PersonaExtractStore:
                 "WHERE id = :id",
                 {**params, "id": existing["id"]},
             )
-            profile_id = int(existing["id"])
+            selected_profile_id = int(existing["id"])
         else:
             inserted = await _exec(
                 "INSERT INTO plugin_persona_profiles "
@@ -1581,8 +1782,8 @@ class PersonaExtractStore:
                 "RETURNING id",
                 params,
             )
-            profile_id = int(inserted[0]["id"])
-        profile = await self.get_profile(profile_id)
+            selected_profile_id = int(inserted[0]["id"])
+        profile = await self.get_profile(selected_profile_id)
         assert profile is not None
         return profile
 

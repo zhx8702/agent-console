@@ -397,6 +397,7 @@ WRITE POST /plugins/persona_extract/jobs
 WRITE POST /plugins/persona_extract/jobs/{job_id}/cancel
 WRITE POST /plugins/persona_extract/jobs/{job_id}/run
 WRITE POST /plugins/persona_extract/profiles
+DANGER POST /plugins/persona_extract/profiles/{profile_id}/activate
 WRITE POST /plugins/wxbot/admin/reply-policy/global/{tenant_id}
 WRITE POST /plugins/wxbot/admin/reply-policy/{tenant_id}/{session_id:path}
 WRITE POST /plugins/wxbot/admin/reports/subscriptions
