@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -405,6 +405,60 @@ describe("PersonaWorkspace asynchronous jobs", () => {
     expect(screen.getByLabelText("配置名称")).toHaveValue("小海");
     expect(screen.getByLabelText("技能标识")).toHaveValue("xiaohai");
     expect(screen.getByLabelText("技能提示词正文（运行时注入）")).toHaveValue("# 小海\n\n说话直接、会接梗。");
+  });
+
+  it("keeps an explicitly applied distillation target instead of jumping back to the current skill", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "小海",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接、会接梗。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接、会接梗。" },
+      },
+    };
+    apiRequestMock.mockImplementation(async (_config, path) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return {
+          candidates: [
+            { wxid: "wxid-zhang", name: "张三", has_history: true },
+            { wxid: "wxid-li", name: "李四", has_history: true },
+          ],
+        };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [xiaohaiProfile] };
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    expect(await screen.findByLabelText("配置名称")).toHaveValue("小海");
+
+    await user.click(screen.getByRole("combobox", { name: "群成员候选" }));
+    await user.click(screen.getByRole("option", { name: "李四 (wxid-li)" }));
+    await user.click(screen.getByRole("button", { name: "应用到蒸馏目标" }));
+
+    const targetField = screen.getByText("蒸馏目标成员").closest(".field");
+    expect(targetField).not.toBeNull();
+    await waitFor(() => {
+      expect(within(targetField as HTMLElement).getByText("李四")).toBeInTheDocument();
+      expect(within(targetField as HTMLElement).getByText("wxid-li")).toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("配置名称")).toHaveValue("小海");
+    expect(apiRequestMock.mock.calls.filter(([, path]) => path === "/plugins/persona_extract/profiles")).toHaveLength(1);
   });
 
   it("saves an existing persona even when its source member is no longer in the group roster", async () => {

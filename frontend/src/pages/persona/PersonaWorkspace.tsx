@@ -103,6 +103,7 @@ export function PersonaWorkspace() {
   const artifactEditorDirtyRef = useRef(false);
   const jobRequestRef = useRef<AbortController | null>(null);
   const offlineArtifactInputRef = useRef<HTMLInputElement | null>(null);
+  const autoLoadedSessionRef = useRef("");
 
   const effectiveSessionId = config.sessionId.trim();
   const selectedSessionIsVerified = Boolean(effectiveSessionId && verifiedGroupIds.has(effectiveSessionId));
@@ -289,14 +290,12 @@ export function PersonaWorkspace() {
       );
       const candidates = result.candidates || [];
       setMembers(candidates);
-      if (candidates[0] && !selectedMemberWxid) {
-        setSelectedMemberWxid(candidates[0].wxid || "");
-      }
+      setSelectedMemberWxid((current) => current || candidates[0]?.wxid || "");
       setSelectionOutput(formatJson(result));
     } catch (err) {
       setSelectionOutput(formatJson({ error: err instanceof Error ? err.message : "读取群成员失败" }));
     }
-  }, [config, effectiveSessionId, selectedMemberWxid, selectedSessionIsVerified]);
+  }, [config, effectiveSessionId, selectedSessionIsVerified]);
 
   const listJobs = useCallback(async (options?: { hydrateFirst?: boolean; quiet?: boolean }) => {
     if (!selectedSessionIsVerified) {
@@ -414,6 +413,7 @@ export function PersonaWorkspace() {
   }, [effectiveSessionId, sessions]);
 
   useEffect(() => {
+    autoLoadedSessionRef.current = "";
     setMembers([]);
     setJobs([]);
     setProfiles([]);
@@ -422,15 +422,27 @@ export function PersonaWorkspace() {
     setTargetName("");
     setProfileLoaded(false);
     setLoadedProfileFingerprint("");
-  }, [effectiveSessionId]);
+  }, [config.tenantId, effectiveSessionId]);
 
   useEffect(() => {
-    if (selectedSessionIsVerified) {
-      void loadMembers();
-      void listJobs();
-      void listProfiles();
+    if (!selectedSessionIsVerified) {
+      autoLoadedSessionRef.current = "";
+      return;
     }
-  }, [listJobs, listProfiles, loadMembers, selectedSessionIsVerified]);
+    const sessionKey = `${config.tenantId}:${effectiveSessionId}`;
+    if (autoLoadedSessionRef.current === sessionKey) return;
+    autoLoadedSessionRef.current = sessionKey;
+    void loadMembers();
+    void listJobs();
+    void listProfiles();
+  }, [
+    config.tenantId,
+    effectiveSessionId,
+    listJobs,
+    listProfiles,
+    loadMembers,
+    selectedSessionIsVerified,
+  ]);
 
   useEffect(() => {
     if (!pollingJobId || !selectedSessionIsVerified) return undefined;
@@ -512,7 +524,6 @@ export function PersonaWorkspace() {
     }
     setTargetUserId(selectedMember.wxid || "");
     setTargetName(getMemberDisplayName(selectedMember));
-    setProfileName(getMemberDisplayName(selectedMember));
     setSelectionOutput(formatJson({ applied: true, session_id: effectiveSessionId, member: selectedMember }));
   };
 
@@ -1230,7 +1241,6 @@ export function PersonaWorkspace() {
                       setSelectedMemberWxid(item.wxid || "");
                       setTargetUserId(item.wxid || "");
                       setTargetName(getMemberDisplayName(item));
-                      setProfileName(getMemberDisplayName(item));
                       }}
                     >
                       {getMemberDisplayName(item)}
