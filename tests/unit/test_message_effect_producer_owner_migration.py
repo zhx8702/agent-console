@@ -35,7 +35,7 @@ def test_message_effect_producer_owner_upgrade_is_linear_and_backfilled(
 
     assert migration.revision == "0034_message_effect_producer_owner"
     assert migration.down_revision == "0033_wxbot_event_connection_scope"
-    assert RUNTIME_SCHEMA_REVISION == "0042_wxbot_report_delivery_ack"
+    assert RUNTIME_SCHEMA_REVISION == "0043_persona_offline_status"
     assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 6
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [RUNTIME_SCHEMA_REVISION]

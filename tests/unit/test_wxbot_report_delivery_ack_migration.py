@@ -36,12 +36,18 @@ def test_report_delivery_ack_upgrade_is_linear_and_quarantines_legacy_rows(
 ) -> None:
     migration, rendered = _render(monkeypatch, "upgrade")
 
-    assert migration.revision == RUNTIME_SCHEMA_REVISION
+    assert migration.revision == "0042_wxbot_report_delivery_ack"
     assert migration.down_revision == "0041_persona_job_queue"
     assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 6
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]
+    assert (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision(RUNTIME_SCHEMA_REVISION)
+        .down_revision
+        == migration.revision
+    )
     assert "LOCK TABLE plugin_wxbot_report_jobs IN ACCESS EXCLUSIVE MODE" in rendered
     assert "ADD COLUMN sdk_outbound_id BIGINT" in rendered
     assert "ADD COLUMN delivery_queued_at TIMESTAMP WITH TIME ZONE" in rendered

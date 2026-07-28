@@ -6,10 +6,11 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0042_wxbot_report_delivery_ack"
+RUNTIME_SCHEMA_REVISION = "0043_persona_offline_status"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
-# 0042 persists the SDK outbound row for report delivery reconciliation and is
-# not compatible with workers that treat an interrupted send as retryable.
+# 0042 persists the SDK outbound row for report delivery reconciliation and
+# defines compatibility level 6. 0043 only extends the persona job status
+# constraint with the durable offline hand-off state.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 6
 
 # Tables historically created by application/plugin startup code.  They are
