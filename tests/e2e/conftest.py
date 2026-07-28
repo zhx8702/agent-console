@@ -3,7 +3,7 @@ End-to-end test fixtures.
 
 Strategy
 --------
-* Use real Postgres + Redis (started by `docker compose up -d postgres redis`).
+* Use real Postgres + Redis + Qdrant (started by Docker Compose or CI services).
 * Override ``OUTBOUND_WEBHOOK_URL`` to point at an in-process "capture" server
   that records every delivered payload together with its HMAC signature.
 * Flush Redis DB 15 before each test to avoid cross-test pollution from the
@@ -118,7 +118,7 @@ os.environ["OUTBOUND_HMAC_SECRET"] = "e2e_outbound_secret"
 os.environ["ADMIN_BEARER_TOKEN"] = "e2e_admin_token"
 os.environ["TENANT_DEMO_SECRET"] = "e2e_demo_secret"
 os.environ["INBOUND_DEFAULT_RATE_LIMIT"] = "500"
-os.environ["QDRANT_URL"] = "http://127.0.0.1:1"  # force in-memory fallback
+os.environ["QDRANT_URL"] = "http://127.0.0.1:6333"
 
 
 # -- Fixtures ----------------------------------------------------------------
