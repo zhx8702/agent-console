@@ -296,7 +296,11 @@ async def test_credits_plugin_disable_blocks_new_settlement_but_shutdown_keeps_r
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _FakeCreditStore()
-    monkeypatch.setattr("plugins.credits.plugin.CreditStore", lambda settings: store)
+    monkeypatch.setitem(
+        CreditsPlugin.initialize.__globals__,
+        "CreditStore",
+        lambda settings: store,
+    )
     registry = _FakePluginRegistry()
     billing = BillingCoordinator()
     plugin = CreditsPlugin()
@@ -333,7 +337,11 @@ async def test_credits_plugin_without_registry_gate_cannot_reserve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _FakeCreditStore()
-    monkeypatch.setattr("plugins.credits.plugin.CreditStore", lambda settings: store)
+    monkeypatch.setitem(
+        CreditsPlugin.initialize.__globals__,
+        "CreditStore",
+        lambda settings: store,
+    )
     billing = BillingCoordinator()
     plugin = CreditsPlugin()
     await plugin.initialize(

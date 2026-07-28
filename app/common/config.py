@@ -83,9 +83,13 @@ def _looks_like_settings_env(name: str, known_names: frozenset[str]) -> bool:
     normalized = _normalize_env_name(name)
     if not normalized or normalized in known_names or _is_non_settings_env(normalized):
         return False
-    head, separator, _ = normalized.partition("_")
-    known_heads = {item.partition("_")[0] for item in known_names}
-    if separator and head in known_heads:
+    parts = normalized.split("_", 2)
+    known_namespaces = {
+        "_".join(item.split("_", 2)[:2])
+        for item in known_names
+        if "_" in item
+    }
+    if len(parts) >= 2 and "_".join(parts[:2]) in known_namespaces:
         return True
     return bool(get_close_matches(normalized, known_names, n=1, cutoff=0.82))
 
