@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import zipfile
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -369,6 +371,122 @@ async def test_collect_messages_revalidates_cross_owner_scope_after_sdk_call(
 
     with pytest.raises(RuntimeError, match="persona_or_wxbot_scope_disabled"):
         await store.collect_messages_for_job(7)
+
+
+@pytest.mark.asyncio
+async def test_offline_export_streams_to_private_bundle_without_persisting_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    job = {
+        "id": 7,
+        "tenant_id": "demo",
+        "session_id": "room@chatroom",
+        "session_name": "产品群",
+        "target_user_id": "wxid_alice",
+        "target_name": "Alice",
+        "days_limit": 0,
+        "max_messages": 0,
+        "status": "running",
+        "checkpoint": {
+            "workflow": "offline_export",
+            "export_mode": "full",
+            "source_identity": {
+                "connection_id": "legacy-wechat-default",
+                "external_session_id": "room@chatroom",
+            },
+        },
+    }
+    sql_calls: list[tuple[str, dict | None]] = []
+    settings = _settings(
+        wxbot_sdk_url="http://127.0.0.1:5080",
+        persona_extract_offline_export_dir=str(tmp_path),
+        persona_extract_offline_export_timeout_seconds=60.0,
+        persona_extract_offline_export_max_bytes=1024 * 1024,
+    )
+    store = PersonaExtractStore(
+        settings,
+        history_scope_gate=lambda _tenant, _session: _async_true(),
+    )
+
+    async def fake_get_job(_job_id: int) -> dict:
+        return dict(job)
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        sql_calls.append((sql, params))
+        if "status = 'awaiting_import'" in sql:
+            job["status"] = "awaiting_import"
+            return [{"id": 7}]
+        return []
+
+    async def fake_update_claimed_job(*args, **kwargs) -> bool:
+        _ = args, kwargs
+        return True
+
+    async def fake_cancel_requested(*args, **kwargs) -> bool:
+        _ = args, kwargs
+        return False
+
+    async def no_previous(**kwargs):
+        _ = kwargs
+        return None
+
+    async def no_slugs(_tenant_id: str) -> set[str]:
+        return set()
+
+    payload = json.dumps(
+        {
+            "messages": [
+                {
+                    "sender_name": "Alice",
+                    "text": "hello",
+                    "timestamp": "2026-07-18 10:00:00",
+                }
+            ]
+        }
+    ).encode()
+
+    @asynccontextmanager
+    async def fake_stream(*args, **kwargs):
+        _ = args, kwargs
+        yield httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=payload,
+            request=httpx.Request("POST", "http://127.0.0.1:5080/ext/persona/messages"),
+        )
+
+    monkeypatch.setattr(store, "get_job", fake_get_job)
+    monkeypatch.setattr(store, "update_claimed_job", fake_update_claimed_job)
+    monkeypatch.setattr(store, "job_cancel_requested", fake_cancel_requested)
+    monkeypatch.setattr(store, "_load_previous_artifact", no_previous)
+    monkeypatch.setattr(store, "_list_existing_slugs", no_slugs)
+    monkeypatch.setattr(store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store_module, "safe_trusted_service_stream", fake_stream)
+
+    result = await store.prepare_offline_export(
+        7,
+        run_attempt=1,
+        claim_owner="worker-a",
+    )
+
+    assert result["status"] == "awaiting_import"
+    archive = tmp_path / "persona-offline-7.zip"
+    assert archive.is_file()
+    with zipfile.ZipFile(archive) as bundle:
+        assert json.loads(bundle.read("input/messages.jsonl"))["text"] == "hello"
+    update_sql, update_params = next(
+        (sql, params)
+        for sql, params in sql_calls
+        if "status = 'awaiting_import'" in sql
+    )
+    assert "input_messages_json = '[]'" in update_sql
+    assert (update_params or {})["msg_count"] == 1
+    assert not (tmp_path / ".persona-offline-7.source.json.part").exists()
+
+
+async def _async_true() -> bool:
+    return True
 
 
 @pytest.mark.asyncio

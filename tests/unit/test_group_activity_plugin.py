@@ -51,14 +51,17 @@ class _FakeRegistry:
 async def test_group_activity_plugin_initializes_router_hook_and_scheduler_only_in_scheduler_role(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import plugins.group_activity.plugin as module
-
     _FakeStore.ensured = 0
-    monkeypatch.setattr(module, "GroupActivityStore", _FakeStore)
-    monkeypatch.setattr(module, "GroupActivityService", _FakeService)
-    monkeypatch.setattr(module, "WxbotStore", lambda settings: SimpleNamespace(settings=settings))
-    monkeypatch.setattr(
-        module,
+    plugin_globals = GroupActivityPlugin.initialize.__globals__
+    monkeypatch.setitem(plugin_globals, "GroupActivityStore", _FakeStore)
+    monkeypatch.setitem(plugin_globals, "GroupActivityService", _FakeService)
+    monkeypatch.setitem(
+        plugin_globals,
+        "WxbotStore",
+        lambda settings: SimpleNamespace(settings=settings),
+    )
+    monkeypatch.setitem(
+        plugin_globals,
         "WxbotChannelOutbound",
         lambda store, **kwargs: SimpleNamespace(store=store, **kwargs),
     )

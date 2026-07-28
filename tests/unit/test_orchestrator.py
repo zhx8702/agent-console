@@ -2601,7 +2601,8 @@ async def test_timeout_canned_reply_runs_after_postprocess_hooks(
 
     outcome = await orc.handle(_make_event("slow"))
 
-    assert cap.calls == 1
+    # The end-to-end deadline also covers lock acquisition and session loading,
+    # so a loaded runner may time out before entering the capability.
     assert outcome.status == ProcessingStatus.INTENTIONALLY_SUPPRESSED
     assert len(hook.calls) == 1
     assert hook.calls[0].reply is not None

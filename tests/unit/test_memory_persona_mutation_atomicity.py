@@ -152,10 +152,24 @@ async def test_persona_upsert_and_hard_delete_have_exact_durable_replay(
                     enabled BOOLEAN NOT NULL DEFAULT 1,
                     job_id INTEGER NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (tenant_id, session_id, channel, source_key)
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX ux_persona_profiles_active_scope "
+                "ON plugin_persona_profiles "
+                "(tenant_id, session_id, channel, source_key) WHERE enabled = 1"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX ux_persona_profiles_scope_skill "
+                "ON plugin_persona_profiles "
+                "(tenant_id, session_id, channel, source_key, skill_slug) "
+                "WHERE skill_slug <> ''"
             )
         )
         await conn.execute(
@@ -235,6 +249,23 @@ async def test_persona_upsert_and_hard_delete_have_exact_durable_replay(
             ),
             {"artifact": artifact_json},
         )
+        second_artifact_json = persona_store_module.serialize_artifact(
+            {
+                "slug": "member-b",
+                "target": {"user_id": "member-b", "name": "Member B"},
+                "files": {"skill_prompt": "second applied style"},
+            }
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO plugin_persona_jobs "
+                "(id, tenant_id, session_id, session_name, target_user_id, target_name, "
+                "status, artifact_json, result_text, output_slug) "
+                "VALUES (42, 'tenant-a', 'room-a', 'Room A', 'member-b', 'Member B', "
+                "'completed', :artifact, 'second applied style', 'member-b')"
+            ),
+            {"artifact": second_artifact_json},
+        )
     apply_fields = {
         "tenant_id": "tenant-a",
         "session_id": "room-a",
@@ -258,6 +289,39 @@ async def test_persona_upsert_and_hard_delete_have_exact_durable_replay(
     assert apply_replay.response == applied.response
     with pytest.raises(MutationIdempotencyConflictError):
         await store.apply_job_idempotent(**{**apply_fields, "enabled": False})
+
+    second = await store.apply_job_idempotent(
+        **{
+            **apply_fields,
+            "job_id": 42,
+            "profile_name": "Member B",
+            "idempotency_key": "profile-apply-job-42",
+        }
+    )
+    assert second.response["skill_slug"] == "member-b"
     async with engine.connect() as conn:
-        assert await conn.scalar(text("SELECT COUNT(*) FROM plugin_persona_profiles")) == 1
+        assert await conn.scalar(text("SELECT COUNT(*) FROM plugin_persona_profiles")) == 2
+        active_slug = await conn.scalar(
+            text("SELECT skill_slug FROM plugin_persona_profiles WHERE enabled = 1")
+        )
+        assert active_slug == "member-b"
+
+    first_profile_id = int(applied.response["id"])
+    activated = await store.activate_profile_idempotent(
+        profile_id=first_profile_id,
+        tenant_id="tenant-a",
+        session_id="room-a",
+        idempotency_key="profile-activate-41",
+        actor="operator-a",
+        actor_kind="session",
+        roles=("tenant_admin",),
+        trace_id="trace-activate",
+    )
+    assert bool(activated.response["enabled"]) is True
+    async with engine.connect() as conn:
+        assert await conn.scalar(text("SELECT COUNT(*) FROM plugin_persona_profiles")) == 2
+        active_slug = await conn.scalar(
+            text("SELECT skill_slug FROM plugin_persona_profiles WHERE enabled = 1")
+        )
+        assert active_slug == "member-a"
     await engine.dispose()

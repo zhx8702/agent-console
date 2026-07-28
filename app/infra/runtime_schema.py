@@ -6,11 +6,11 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0042_wxbot_report_delivery_ack"
+RUNTIME_SCHEMA_REVISION = "0044_persona_profile_catalog"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
-# 0042 persists the SDK outbound row for report delivery reconciliation and is
-# not compatible with workers that treat an interrupted send as retryable.
-RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 6
+# 0044 changes persona profile identity from one row per runtime scope to a
+# catalog of saved skills with one active row per scope.
+RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 7
 
 # Tables historically created by application/plugin startup code.  They are
 # now owned by Alembic and verified as one contract so a partially migrated
@@ -176,6 +176,8 @@ RUNTIME_SCHEMA_INDEXES = frozenset(
         "idx_persona_job_chunks_status",
         "ix_persona_profiles_scope",
         "ix_persona_profiles_target",
+        "ux_persona_profiles_active_scope",
+        "ux_persona_profiles_scope_skill",
         "ix_plugin_events_plugin_created",
         "ix_plugin_events_type_created",
         "ix_plugin_scope_state_plugin",
@@ -237,6 +239,18 @@ RUNTIME_SCHEMA_COLUMN_CONTRACTS = (
 # index with the wrong keys or without its partial predicate and still pass a
 # name-only readiness probe.
 RUNTIME_SCHEMA_INDEX_CONTRACTS = (
+    (
+        "ux_persona_profiles_active_scope",
+        "plugin_persona_profiles",
+        ("tenant_id", "session_id", "channel", "source_key"),
+        "enabled",
+    ),
+    (
+        "ux_persona_profiles_scope_skill",
+        "plugin_persona_profiles",
+        ("tenant_id", "session_id", "channel", "source_key", "skill_slug"),
+        "skill_slug<>''",
+    ),
     (
         "ix_plugin_lifecycle_in_progress_created",
         "plugin_lifecycle_operation",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable
 from typing import Any
@@ -11,6 +12,7 @@ from app.common.logging import get_logger
 from app.orchestrator.flow import FlowStepDefinition
 from app.plugin.base import Plugin, PluginContext, PluginMeta
 from plugins.persona_extract.hooks import PersonaSkillEnrichStep, PersonaSkillHook
+from plugins.persona_extract.offline import cleanup_expired_offline_exports
 from plugins.persona_extract.router import build_persona_extract_router
 from plugins.persona_extract.store import (
     PersonaExtractStore,
@@ -38,6 +40,7 @@ class PersonaExtractPlugin(Plugin):
         self._lifecycle_lock = asyncio.Lock()
         self._active_claim: tuple[int, int, str] | None = None
         self._worker_owner = f"persona-{uuid.uuid4().hex}"
+        self._last_offline_cleanup_at = 0.0
 
     @staticmethod
     async def _resolve_persistent_operation(
@@ -79,7 +82,6 @@ class PersonaExtractPlugin(Plugin):
         return bool(
             role in self._worker_roles()
             and bool(getattr(self._ctx, "db_ok", True))
-            and self._ctx.container.llm_service is not None
         )
 
     def _ensure_worker(self) -> None:
@@ -132,6 +134,19 @@ class PersonaExtractPlugin(Plugin):
             getattr(self._ctx.settings, "persona_extract_job_lease_seconds", 180.0)
         )
         while self._should_run_worker():
+            now = time.monotonic()
+            if now - self._last_offline_cleanup_at >= 60:
+                self._last_offline_cleanup_at = now
+                try:
+                    await asyncio.to_thread(
+                        cleanup_expired_offline_exports,
+                        self._ctx.settings,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "persona_extract.offline_cleanup_failed",
+                        error_type=exc.__class__.__name__,
+                    )
             try:
                 job = await self._store.claim_next_job(
                     claim_owner=self._worker_owner,
@@ -222,6 +237,19 @@ class PersonaExtractPlugin(Plugin):
                     transient=False,
                 )
                 return
+            checkpoint = (
+                job.get("checkpoint")
+                if isinstance(job.get("checkpoint"), dict)
+                else {}
+            )
+            if str(checkpoint.get("workflow") or "") == "offline_export":
+                await self._store.prepare_offline_export(
+                    job_id,
+                    run_attempt=run_attempt,
+                    claim_owner=claim_owner,
+                    execution_allowed=lambda: self._execution_allowed(job),
+                )
+                return
             messages = await self._store.get_job_input_messages(job_id)
             if not messages:
                 messages = await self._store.collect_messages_for_job(job_id)
@@ -234,6 +262,8 @@ class PersonaExtractPlugin(Plugin):
                     raise PersonaJobLeaseLost("persona job lease was lost")
             if not messages:
                 raise ValueError("no messages found")
+            if self._ctx.container.llm_service is None:
+                raise RuntimeError("persona_extract_llm_unavailable")
             await self._store.run_extraction(
                 job_id,
                 messages,

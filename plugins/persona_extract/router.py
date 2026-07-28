@@ -6,14 +6,25 @@ Mounted at ``/plugins/persona_extract/`` by the plugin framework.
 
 from __future__ import annotations
 
+import math
+import os
+import tempfile
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import Field
 
 from app.admin.mutation_ledger import MutationIdempotencyConflictError
 from app.common.request_models import StrictRequestModel
+from plugins.persona_extract.offline import (
+    OFFLINE_IMPORT_MAX_BYTES,
+    file_sha256,
+    offline_export_path,
+)
 from plugins.persona_extract.store import (
     PersonaApplyJobError,
     PersonaExtractStore,
@@ -44,7 +55,21 @@ class ExtractionRequest(StrictRequestModel):
     messages: list[PersonaSourceMessage] = Field(default_factory=list, max_length=5_000)
 
 
+class OfflineExportRequest(StrictRequestModel):
+    tenant_id: str = Field(min_length=1, max_length=64)
+    session_id: str = Field(min_length=1, max_length=256)
+    session_name: str = Field(default="", max_length=256)
+    connection_id: str = Field(default="", max_length=64)
+    adapter_id: str = Field(default="", max_length=64)
+    external_session_id: str = Field(default="", max_length=256)
+    target_user_id: str = Field(min_length=1, max_length=256)
+    target_name: str = Field(default="", max_length=256)
+    mode: Literal["full", "incremental"] = "full"
+    client_request_id: str = Field(default="", max_length=128)
+
+
 class PersonaProfileUpsertRequest(StrictRequestModel):
+    profile_id: int | None = Field(default=None, ge=1)
     tenant_id: str = Field(min_length=1, max_length=64)
     session_id: str = Field(min_length=1, max_length=256)
     session_name: str = Field(default="", max_length=256)
@@ -71,6 +96,11 @@ class PersonaProfileApplyJobRequest(StrictRequestModel):
     source_label: str = Field(default="", max_length=256)
     profile_name: str = Field(default="default", max_length=128)
     enabled: bool = True
+
+
+class PersonaProfileActivateRequest(StrictRequestModel):
+    tenant_id: str = Field(min_length=1, max_length=64)
+    session_id: str = Field(min_length=1, max_length=256)
 
 
 def _required_idempotency_key(value: str | None) -> str:
@@ -113,6 +143,28 @@ def _handle_mutation_error(exc: Exception) -> None:
             detail={"code": "idempotency_key_conflict"},
         ) from exc
     raise exc
+
+
+def _incremental_days_limit(cursor: dict[str, Any]) -> int:
+    raw = str(
+        cursor.get("overlap_start_timestamp")
+        or cursor.get("last_timestamp")
+        or ""
+    ).strip()
+    if not raw:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    elapsed = max(
+        0.0,
+        (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds(),
+    )
+    days = max(3, math.ceil(elapsed / 86_400) + 2)
+    return days if days <= 3_650 else 0
 
 
 async def _schedule_job(
@@ -215,6 +267,30 @@ def build_persona_extract_router(
             {"tenant_id": req.tenant_id, "session_id": req.session_id},
             scope_gate,
         )
+        if req.days_limit == 0 or req.max_messages == 0:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "persona_full_export_required",
+                    "message": "全量数据请使用离线导出流程",
+                },
+            )
+        online_max = int(
+            getattr(
+                getattr(store, "settings", None),
+                "persona_extract_online_max_messages",
+                10_000,
+            )
+        )
+        if req.max_messages > online_max:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "persona_online_limit_exceeded",
+                    "max_messages": online_max,
+                    "message": "在线生成范围过大，请使用离线导出流程",
+                },
+            )
         messages = [message.model_dump(exclude_defaults=True) for message in req.messages]
         create_kwargs = {
             "tenant_id": req.tenant_id,
@@ -246,6 +322,199 @@ def build_persona_extract_router(
         if replayed:
             response.headers["Idempotent-Replayed"] = "true"
         return result
+
+    @router.post("/offline-exports", status_code=202)
+    async def create_offline_export(
+        req: OfflineExportRequest,
+        response: Response,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ):
+        key = _required_idempotency_key(idempotency_key)
+        if req.client_request_id.strip() and req.client_request_id.strip() != key:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "client_request_id_mismatch"},
+            )
+        await _require_resource_scope(
+            {"tenant_id": req.tenant_id, "session_id": req.session_id},
+            scope_gate,
+        )
+        checkpoint_seed: dict[str, Any] = {"export_mode": req.mode}
+        days_limit = 0
+        if req.mode == "incremental":
+            baseline = await store.get_latest_artifact_for_target(
+                tenant_id=req.tenant_id,
+                session_id=req.session_id,
+                target_user_id=req.target_user_id,
+            )
+            baseline_meta = (
+                baseline.get("meta")
+                if isinstance(baseline, dict)
+                and isinstance(baseline.get("meta"), dict)
+                else {}
+            )
+            baseline_cursor = (
+                baseline_meta.get("offline_cursor")
+                if isinstance(baseline_meta.get("offline_cursor"), dict)
+                else None
+            )
+            if baseline_cursor is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "persona_incremental_baseline_required",
+                        "message": "请先完成一次离线全量生成并应用",
+                    },
+                )
+            checkpoint_seed["baseline_cursor"] = baseline_cursor
+            checkpoint_seed["slug"] = str(baseline.get("slug") or "")
+            days_limit = _incremental_days_limit(baseline_cursor)
+        try:
+            job, replayed = await store.create_job_idempotent(
+                tenant_id=req.tenant_id,
+                session_id=req.session_id,
+                session_name=req.session_name,
+                target_user_id=req.target_user_id,
+                target_name=req.target_name,
+                days_limit=days_limit,
+                max_messages=0,
+                connection_id=req.connection_id,
+                adapter_id=req.adapter_id,
+                external_session_id=req.external_session_id,
+                messages=None,
+                request_id=key,
+                workflow="offline_export",
+                checkpoint_seed=checkpoint_seed,
+            )
+        except Exception as exc:
+            _handle_mutation_error(exc)
+        result = await _schedule_job(
+            store,
+            scheduler,
+            job_id=int(job["id"]),
+            scope_gate=scope_gate,
+        )
+        result["replayed"] = replayed
+        result["offline_mode"] = req.mode
+        result["download_url"] = (
+            f"/plugins/persona_extract/offline-exports/{int(job['id'])}/download"
+        )
+        response.status_code = 202
+        if replayed:
+            response.headers["Idempotent-Replayed"] = "true"
+        return result
+
+    @router.get("/offline-exports/{job_id}/download")
+    async def download_offline_export(job_id: int):
+        job = await store.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        await _require_resource_scope(job, scope_gate)
+        checkpoint = (
+            job.get("checkpoint")
+            if isinstance(job.get("checkpoint"), dict)
+            else {}
+        )
+        export_meta = (
+            checkpoint.get("offline_export")
+            if isinstance(checkpoint.get("offline_export"), dict)
+            else {}
+        )
+        if (
+            str(checkpoint.get("workflow") or "") != "offline_export"
+            or str(job.get("status") or "") != "awaiting_import"
+            or export_meta.get("download_ready") is not True
+        ):
+            raise HTTPException(status_code=409, detail="offline export is not ready")
+        path = offline_export_path(store.settings, job_id)
+        expected_sha = str(export_meta.get("archive_sha256") or "")
+        if not path.is_file() or not expected_sha or file_sha256(path) != expected_sha:
+            raise HTTPException(status_code=410, detail="offline export is unavailable")
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=str(export_meta.get("filename") or path.name),
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.put("/offline-exports/{job_id}/artifact")
+    async def upload_offline_artifact(
+        job_id: int,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ):
+        job = await store.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "job not found")
+        await _require_resource_scope(job, scope_gate)
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+        if content_type not in {
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/octet-stream",
+        }:
+            raise HTTPException(status_code=415, detail="a ZIP artifact is required")
+        raw_length = request.headers.get("content-length", "")
+        if raw_length:
+            try:
+                content_length = int(raw_length)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="invalid content length") from exc
+            if content_length > OFFLINE_IMPORT_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="offline artifact is too large")
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=f"persona-import-{job_id}-",
+            suffix=".zip",
+            delete=False,
+        )
+        temp_path = Path(temp_file.name)
+        total = 0
+        try:
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            with temp_file:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > OFFLINE_IMPORT_MAX_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="offline artifact is too large",
+                        )
+                    temp_file.write(chunk)
+            if total == 0:
+                raise HTTPException(status_code=400, detail="offline artifact is empty")
+            actor, actor_kind, roles, trace_id = _mutation_actor(request)
+            try:
+                outcome = await store.import_offline_artifact_idempotent(
+                    job_id=job_id,
+                    tenant_id=str(job.get("tenant_id") or ""),
+                    archive_path=temp_path,
+                    idempotency_key=_required_idempotency_key(idempotency_key),
+                    actor=actor,
+                    actor_kind=actor_kind,
+                    roles=roles,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                _handle_mutation_error(exc)
+            response.status_code = outcome.status_code
+            if outcome.replayed:
+                response.headers["Idempotent-Replayed"] = "true"
+            return outcome.response
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     @router.get("/jobs")
     async def list_jobs(
@@ -363,6 +632,7 @@ def build_persona_extract_router(
         actor, actor_kind, roles, trace_id = _mutation_actor(request)
         try:
             outcome = await store.upsert_profile_idempotent(
+                profile_id=body.profile_id,
                 tenant_id=body.tenant_id,
                 session_id=body.session_id,
                 session_name=body.session_name,
@@ -383,6 +653,34 @@ def build_persona_extract_router(
                 roles=roles,
                 trace_id=trace_id,
                 reason="profile workspace save",
+            )
+        except Exception as exc:
+            _handle_mutation_error(exc)
+        response.status_code = outcome.status_code
+        if outcome.replayed:
+            response.headers["Idempotent-Replayed"] = "true"
+        return outcome.response
+
+    @router.post("/profiles/{profile_id}/activate")
+    async def activate_profile(
+        profile_id: int,
+        body: PersonaProfileActivateRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ):
+        actor, actor_kind, roles, trace_id = _mutation_actor(request)
+        try:
+            outcome = await store.activate_profile_idempotent(
+                profile_id=profile_id,
+                tenant_id=body.tenant_id,
+                session_id=body.session_id,
+                idempotency_key=_required_idempotency_key(idempotency_key),
+                actor=actor,
+                actor_kind=actor_kind,
+                roles=roles,
+                trace_id=trace_id,
+                reason="activate saved persona profile",
             )
         except Exception as exc:
             _handle_mutation_error(exc)

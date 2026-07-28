@@ -397,6 +397,7 @@ WRITE POST /plugins/persona_extract/jobs
 WRITE POST /plugins/persona_extract/jobs/{job_id}/cancel
 WRITE POST /plugins/persona_extract/jobs/{job_id}/run
 WRITE POST /plugins/persona_extract/profiles
+DANGER POST /plugins/persona_extract/profiles/{profile_id}/activate
 WRITE POST /plugins/wxbot/admin/reply-policy/global/{tenant_id}
 WRITE POST /plugins/wxbot/admin/reply-policy/{tenant_id}/{session_id:path}
 WRITE POST /plugins/wxbot/admin/reports/subscriptions
@@ -435,7 +436,10 @@ DANGER POST /plugins/memory/forget
 DANGER POST /plugins/memory/governance/cleanup
 DANGER POST /plugins/memory/graph/vector-rebuild
 DANGER POST /plugins/memory/items/vector-rebuild
+DANGER GET /plugins/persona_extract/offline-exports/{job_id}/download
+DANGER POST /plugins/persona_extract/offline-exports
 DANGER POST /plugins/persona_extract/profiles/apply-job
+DANGER PUT /plugins/persona_extract/offline-exports/{job_id}/artifact
 DANGER POST /plugins/repeater/config/{tenant_id}/{session_id:path}
 DANGER POST /plugins/tibo_reset/poll/run-once
 DANGER POST /plugins/wxbot/admin/agent-tools/policy/{tenant_id}/{session_id:path}

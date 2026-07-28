@@ -40,10 +40,15 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      qdrant:
+        image: qdrant/qdrant:v1.12.1@sha256:d774e7bb65744454984c6021637a0da89271f30df15e48601a9fafc926d26b1f
+        ports:
+          - 6333:6333
     env:
       APP_ENV: test
       DB_DSN: postgresql+asyncpg://cs:cs@localhost:5432/cs
       REDIS_URL: redis://localhost:6379/14
+      QDRANT_URL: http://localhost:6333
       LLM_PROVIDER: fake
       LLM_EMBED_PROVIDER: fake
       OUTBOUND_HMAC_SECRET: ci_outbound_secret
@@ -202,6 +207,8 @@ jobs:
                       "docker-compose.production.yml",
                       "--profile",
                       "app",
+                      "--profile",
+                      "wxbot",
                       "config",
                       "--format",
                       "json",

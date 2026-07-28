@@ -1,9 +1,9 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { apiRequest } from "../../lib/api";
+import { apiBlobRequest, apiRequest } from "../../lib/api";
 import {
   personaJobDurationLabel,
   personaJobRetryLabel,
@@ -14,7 +14,7 @@ import { PersonaWorkspace } from "./PersonaWorkspace";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
-  return { ...actual, apiRequest: vi.fn() };
+  return { ...actual, apiBlobRequest: vi.fn(), apiRequest: vi.fn() };
 });
 
 vi.mock("../../state/console-config", async (importOriginal) => {
@@ -37,6 +37,7 @@ vi.mock("../../state/console-config", async (importOriginal) => {
 });
 
 const apiRequestMock = vi.mocked(apiRequest);
+const apiBlobRequestMock = vi.mocked(apiBlobRequest);
 
 const runningJob: PersonaJob = {
   id: 7,
@@ -94,6 +95,7 @@ describe("persona job presentation", () => {
 describe("PersonaWorkspace asynchronous jobs", () => {
   beforeEach(() => {
     apiRequestMock.mockReset();
+    apiBlobRequestMock.mockReset();
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
   });
 
@@ -268,5 +270,383 @@ describe("PersonaWorkspace asynchronous jobs", () => {
     expect(apiRequestMock.mock.calls.filter(([, path, options]) => (
       path === "/plugins/persona_extract/jobs" && options?.init?.method === "POST"
     ))).toHaveLength(1);
+  });
+
+  it("routes a full extraction to the offline export workflow", async () => {
+    let submittedBody: Record<string, unknown> | null = null;
+    installBaseApi(() => []);
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/profiles") return { items: [] };
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/offline-exports") {
+        submittedBody = JSON.parse(String(options?.init?.body)) as Record<string, unknown>;
+        return {
+          job_id: 19,
+          accepted: true,
+          job: {
+            ...runningJob,
+            id: 19,
+            status: "pending",
+            current_stage: "queued",
+            mode: "offline_full",
+          },
+        };
+      }
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "张三" }));
+    await user.click(screen.getByRole("checkbox", { name: /全量离线/ }));
+    await user.click(screen.getByRole("button", { name: "准备全量离线包" }));
+    await user.click(screen.getByRole("button", { name: "确认准备离线包" }));
+
+    await waitFor(() => expect(submittedBody).not.toBeNull());
+    expect(submittedBody).toMatchObject({
+      tenant_id: "default",
+      session_id: "room@chatroom",
+      target_user_id: "wxid-zhang",
+      mode: "full",
+    });
+    expect(apiRequestMock.mock.calls.some(([, path]) => (
+      path === "/plugins/persona_extract/offline-exports"
+    ))).toBe(true);
+  });
+
+  it("uploads only the generated ZIP for an awaiting offline task", async () => {
+    const awaitingJob: PersonaJob = {
+      ...runningJob,
+      id: 23,
+      status: "awaiting_import",
+      current_stage: "export_ready",
+      mode: "offline_full",
+      output_slug: "zhang-san",
+    };
+    let uploadedBody: BodyInit | null | undefined;
+    installBaseApi(() => [awaitingJob]);
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [awaitingJob] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [] };
+      if (path === "/plugins/persona_extract/offline-exports/23/artifact") {
+        uploadedBody = options?.init?.body;
+        return {
+          ...awaitingJob,
+          status: "completed",
+          current_stage: "completed",
+          artifact: { files: { skill_prompt: "# 张三" } },
+        };
+      }
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    const file = new File(["zip-body"], "output.zip", { type: "application/zip" });
+    await user.click(await screen.findByRole("button", { name: "23" }));
+    await screen.findByText("等待回传");
+    await user.upload(await screen.findByLabelText("上传离线生成结果 ZIP"), file);
+    await user.click(screen.getByRole("button", { name: "上传生成结果" }));
+    await user.click(screen.getByRole("button", { name: "确认上传" }));
+
+    await waitFor(() => expect(uploadedBody).toBe(file));
+    expect(apiRequestMock.mock.calls.some(([, path, options]) => (
+      path === "/plugins/persona_extract/offline-exports/23/artifact"
+      && options?.init?.method === "PUT"
+    ))).toBe(true);
+  });
+
+  it("restores the saved persona after the workspace is reloaded", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "小海",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接、会接梗。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接、会接梗。" },
+      },
+    };
+    apiRequestMock.mockImplementation(async (_config, path) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [xiaohaiProfile] };
+      return {};
+    });
+
+    renderWorkspace();
+
+    expect(await screen.findByLabelText("当前风格技能")).toHaveValue("12");
+    expect(screen.getByLabelText("配置名称")).toHaveValue("小海");
+    expect(screen.getByLabelText("技能标识")).toHaveValue("xiaohai");
+    expect(screen.getByLabelText("技能提示词正文（运行时注入）")).toHaveValue("# 小海\n\n说话直接、会接梗。");
+  });
+
+  it("keeps an explicitly applied distillation target instead of jumping back to the current skill", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "小海",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接、会接梗。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接、会接梗。" },
+      },
+    };
+    apiRequestMock.mockImplementation(async (_config, path) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return {
+          candidates: [
+            { wxid: "wxid-zhang", name: "张三", has_history: true },
+            { wxid: "wxid-li", name: "李四", has_history: true },
+          ],
+        };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles") return { items: [xiaohaiProfile] };
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    expect(await screen.findByLabelText("配置名称")).toHaveValue("小海");
+
+    await user.click(screen.getByRole("combobox", { name: "群成员候选" }));
+    await user.click(screen.getByRole("option", { name: "李四 (wxid-li)" }));
+    await user.click(screen.getByRole("button", { name: "应用到蒸馏目标" }));
+
+    const targetField = screen.getByText("蒸馏目标成员").closest(".field");
+    expect(targetField).not.toBeNull();
+    await waitFor(() => {
+      expect(within(targetField as HTMLElement).getByText("李四")).toBeInTheDocument();
+      expect(within(targetField as HTMLElement).getByText("wxid-li")).toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("配置名称")).toHaveValue("小海");
+    expect(apiRequestMock.mock.calls.filter(([, path]) => path === "/plugins/persona_extract/profiles")).toHaveLength(1);
+  });
+
+  it("saves an existing persona even when its source member is no longer in the group roster", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "xiaohai",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接、会接梗。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接、会接梗。" },
+      },
+    };
+    let savedBody: Record<string, unknown> | null = null;
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles" && options?.init?.method === "POST") {
+        savedBody = JSON.parse(String(options.init.body)) as Record<string, unknown>;
+        return { ...xiaohaiProfile, ...savedBody };
+      }
+      if (path === "/plugins/persona_extract/profiles") return { items: [xiaohaiProfile] };
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    await user.selectOptions(await screen.findByLabelText("当前风格技能"), "12");
+    const saveButton = screen.getByRole("button", { name: "保存风格技能" });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    await user.click(saveButton);
+    await user.click(screen.getByRole("button", { name: "确认保存" }));
+
+    await waitFor(() => expect(savedBody).not.toBeNull());
+    expect(savedBody).toMatchObject({
+      profile_id: 12,
+      session_id: "room@chatroom",
+      profile_name: "xiaohai",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      enabled: true,
+    });
+  });
+
+  it("keeps multiple saved skills and activates the selected one", async () => {
+    const xiaohaiProfile = {
+      id: 12,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "小海",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      skill_slug: "xiaohai",
+      prompt_text: "# 小海\n\n说话直接。",
+      enabled: true,
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话直接。" },
+      },
+    };
+    const newProfile = {
+      id: 21,
+      session_id: "room@chatroom",
+      channel: "wechat",
+      source_key: "wxbot",
+      source_label: "产品群",
+      profile_name: "新人格",
+      target_user_id: "wxid-new",
+      target_name: "新人格",
+      skill_slug: "new-persona",
+      prompt_text: "# 新人格\n\n说话自然。",
+      enabled: false,
+      artifact: {
+        slug: "new-persona",
+        target: { user_id: "wxid-new", name: "新人格" },
+        files: { skill_prompt: "# 新人格\n\n说话自然。" },
+      },
+    };
+    let profiles = [xiaohaiProfile, newProfile];
+    let activateBody: Record<string, unknown> | null = null;
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [] };
+      if (path === "/plugins/persona_extract/profiles/21/activate") {
+        activateBody = JSON.parse(String(options?.init?.body)) as Record<string, unknown>;
+        profiles = [
+          { ...newProfile, enabled: true },
+          { ...xiaohaiProfile, enabled: false },
+        ];
+        return profiles[0];
+      }
+      if (path === "/plugins/persona_extract/profiles") return { items: profiles };
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+
+    expect(await screen.findByText("当前启用")).toBeInTheDocument();
+    expect(screen.getByText("已保存")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "启用" }));
+    await user.click(screen.getByRole("button", { name: "确认启用" }));
+
+    await waitFor(() => expect(activateBody).toEqual({
+      tenant_id: "default",
+      session_id: "room@chatroom",
+    }));
+    expect(screen.getByLabelText("当前风格技能")).toHaveValue("21");
+  });
+
+  it("applies a completed persona job after the source member has left the current roster", async () => {
+    const completedJob: PersonaJob = {
+      ...runningJob,
+      id: 19,
+      status: "completed",
+      current_stage: "completed",
+      target_user_id: "wxid-xiaohai",
+      target_name: "小海",
+      output_slug: "xiaohai",
+      result_text: "# 小海\n\n说话自然，会接梗。",
+      artifact: {
+        slug: "xiaohai",
+        target: { user_id: "wxid-xiaohai", name: "小海" },
+        files: { skill_prompt: "# 小海\n\n说话自然，会接梗。" },
+      },
+    };
+    let appliedBody: Record<string, unknown> | null = null;
+    apiRequestMock.mockImplementation(async (_config, path, options) => {
+      if (path === "/plugins/wxbot/admin/roster/groups") {
+        return { sessions: [{ session_id: "room@chatroom", session_name: "产品群", kind: "group" }] };
+      }
+      if (path.includes("/plugins/wxbot/admin/roster/groups/") && path.endsWith("/members")) {
+        return { candidates: [{ wxid: "wxid-zhang", name: "张三", has_history: true }] };
+      }
+      if (path === "/plugins/persona_extract/jobs") return { items: [completedJob] };
+      if (path === "/plugins/persona_extract/profiles/apply-job") {
+        appliedBody = JSON.parse(String(options?.init?.body)) as Record<string, unknown>;
+        return {
+          id: 19,
+          session_id: "room@chatroom",
+          profile_name: "小海",
+          target_user_id: "wxid-xiaohai",
+          target_name: "小海",
+          skill_slug: "xiaohai",
+          prompt_text: completedJob.result_text,
+          artifact: completedJob.artifact,
+          enabled: true,
+        };
+      }
+      if (path === "/plugins/persona_extract/profiles") return { items: [] };
+      return {};
+    });
+
+    renderWorkspace();
+    const user = userEvent.setup();
+    const applyButton = await screen.findByRole("button", { name: "从任务应用" });
+    await waitFor(() => expect(applyButton).toBeEnabled());
+    await user.click(applyButton);
+    await user.click(screen.getByRole("button", { name: "确认应用" }));
+
+    await waitFor(() => expect(appliedBody).not.toBeNull());
+    expect(appliedBody).toMatchObject({
+      session_id: "room@chatroom",
+      job_id: 19,
+      profile_name: "小海",
+      enabled: true,
+    });
   });
 });

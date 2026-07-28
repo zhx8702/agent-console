@@ -480,7 +480,10 @@ async def test_wxbot_background_task_failure_is_observed_and_logged(
     async def fail() -> None:
         raise RuntimeError("scheduled failure")
 
-    monkeypatch.setattr("plugins.wxbot.plugin.logger", _Logger())
+    # Other plugin-loading tests can reload the module after this test module
+    # was collected. Patch the globals used by this exact class object instead
+    # of whichever module object currently occupies sys.modules.
+    monkeypatch.setitem(plugin._track_task.__globals__, "logger", _Logger())
 
     assert await plugin.schedule_background("failing-job", fail)
     await _wait_until(lambda: not plugin._background_tasks)

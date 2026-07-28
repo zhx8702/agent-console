@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -14,6 +16,7 @@ async def _allow_scope(_tenant_id: str, _session_id: str) -> bool:
 
 class _FakeStore:
     def __init__(self) -> None:
+        self.settings = SimpleNamespace(persona_extract_online_max_messages=10_000)
         self.jobs: dict[int, dict] = {}
         self.next_id = 41
         self.update_calls: list[dict[str, object]] = []
@@ -61,11 +64,15 @@ class _FakeStore:
     async def create_job_idempotent(self, **kwargs):
         request_id = str(kwargs.pop("request_id"))
         messages = kwargs.pop("messages", None)
+        workflow = str(kwargs.pop("workflow", "online_extract"))
+        checkpoint_seed = dict(kwargs.pop("checkpoint_seed", {}) or {})
         if request_id in self.request_ids:
             return self.jobs[self.request_ids[request_id]], True
         job_id = await self.create_job(**kwargs)
         self.jobs[job_id]["client_request_id"] = request_id
         self.jobs[job_id]["input_messages"] = messages or []
+        self.jobs[job_id]["checkpoint"].update(checkpoint_seed)
+        self.jobs[job_id]["checkpoint"]["workflow"] = workflow
         self.request_ids[request_id] = job_id
         return self.jobs[job_id], False
 
@@ -105,6 +112,10 @@ class _FakeStore:
         _ = tenant_id
         _ = session_id
         return []
+
+    async def get_latest_artifact_for_target(self, **kwargs):
+        _ = kwargs
+        return None
 
     async def get_profile(self, profile_id: int) -> dict | None:
         _ = profile_id
@@ -166,6 +177,19 @@ class _FakeStore:
             status_code=200,
             replayed=False,
             mutation_id="fake-apply",
+        )
+
+    async def activate_profile_idempotent(self, **kwargs):
+        return MutationOutcome(
+            response={
+                "id": int(kwargs["profile_id"]),
+                "tenant_id": kwargs["tenant_id"],
+                "session_id": kwargs["session_id"],
+                "enabled": True,
+            },
+            status_code=200,
+            replayed=False,
+            mutation_id="fake-activate",
         )
 
     async def delete_profile_idempotent(self, **kwargs):
@@ -233,6 +257,87 @@ def test_create_job_schedules_background_execution() -> None:
     assert store.jobs[41]["input_messages"] == [
         {"sender_name": "成员A", "text": "你好"}
     ]
+
+
+def test_online_job_rejects_unbounded_full_history() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_persona_extract_router(store, scope_gate=_allow_scope))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/jobs",
+            headers={"Idempotency-Key": "online-full"},
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "target_user_id": "wxid_member_a",
+                "days_limit": 0,
+                "max_messages": 0,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "persona_full_export_required"
+    assert store.jobs == {}
+
+
+def test_full_offline_export_creates_a_file_workflow_job() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    scheduler = _FakeScheduler(store)
+    app.include_router(
+        build_persona_extract_router(store, scheduler, scope_gate=_allow_scope)
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/offline-exports",
+            headers={"Idempotency-Key": "offline-full"},
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "session_name": "测试群",
+                "connection_id": "legacy-wechat-default",
+                "adapter_id": "wxbot",
+                "external_session_id": "group-1@chatroom",
+                "target_user_id": "wxid_member_a",
+                "target_name": "成员A",
+                "mode": "full",
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["offline_mode"] == "full"
+    assert store.jobs[41]["days_limit"] == 0
+    assert store.jobs[41]["max_messages"] == 0
+    assert store.jobs[41]["checkpoint"]["workflow"] == "offline_export"
+    assert store.jobs[41]["checkpoint"]["export_mode"] == "full"
+
+
+def test_incremental_offline_export_requires_an_offline_cursor() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_persona_extract_router(store, scope_gate=_allow_scope))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/offline-exports",
+            headers={"Idempotency-Key": "offline-incremental"},
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "external_session_id": "group-1@chatroom",
+                "target_user_id": "wxid_member_a",
+                "mode": "incremental",
+            },
+        )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]["code"]
+        == "persona_incremental_baseline_required"
+    )
 
 
 def test_persona_request_models_reject_unknown_and_oversized_message_fields() -> None:
@@ -525,11 +630,59 @@ def test_profile_mutations_require_idempotency_key() -> None:
                 "job_id": 41,
             },
         )
+        activate = client.post(
+            "/profiles/7/activate",
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+            },
+        )
         delete = client.delete(
             "/profiles/7",
             params={"tenant_id": "demo", "session_id": "group-1@chatroom"},
         )
 
-    for response in (upsert, apply, delete):
+    for response in (upsert, apply, activate, delete):
         assert response.status_code == 428
         assert response.json()["detail"]["code"] == "idempotency_key_required"
+
+
+def test_profile_upsert_targets_id_and_saved_profile_can_be_activated() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(
+        build_persona_extract_router(store, None, scope_gate=_allow_scope)
+    )
+
+    with TestClient(app) as client:
+        saved = client.post(
+            "/profiles",
+            headers={"Idempotency-Key": "save-profile-7"},
+            json={
+                "profile_id": 7,
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "skill_slug": "member-a",
+                "prompt_text": "style",
+                "enabled": False,
+            },
+        )
+        activated = client.post(
+            "/profiles/7/activate",
+            headers={"Idempotency-Key": "activate-profile-7"},
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+            },
+        )
+
+    assert saved.status_code == 200
+    assert saved.json()["profile_id"] == 7
+    assert saved.json()["enabled"] is False
+    assert activated.status_code == 200
+    assert activated.json() == {
+        "id": 7,
+        "tenant_id": "demo",
+        "session_id": "group-1@chatroom",
+        "enabled": True,
+    }

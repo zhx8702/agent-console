@@ -131,10 +131,23 @@ def test_production_ignores_unrelated_process_environment(
     monkeypatch.setenv("PATH", "test-path")
     monkeypatch.setenv("APPDATA", "C:/Users/example/AppData")
     monkeypatch.setenv("CI_JOB_ID", "123")
+    monkeypatch.setenv("AGENT_TOOLSDIRECTORY", "/opt/hostedtoolcache")
+    monkeypatch.setenv("MEMORY_PRESSURE_WATCH", "1")
+    monkeypatch.setenv("MEMORY_PRESSURE_WRITE", "/sys/fs/cgroup/memory.events")
 
     settings = Settings(_env_file=None, app_env="prod")
 
     assert settings.app_env == "prod"
+
+
+def test_production_rejects_unknown_name_in_owned_setting_namespace(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("APP_LOG_FORMATTER", "json")
+
+    with pytest.raises(ValueError, match="APP_LOG_FORMATTER"):
+        Settings(_env_file=None)
 
 
 def test_quota_environment_is_part_of_the_settings_contract(monkeypatch) -> None:
