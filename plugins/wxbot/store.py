@@ -2559,6 +2559,38 @@ class WxbotStore(WxbotReportStoreMixin):
         )
         return [self._hydrate_group_observation(row) for row in rows]
 
+    async def list_group_observations_for_period(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        start_occurred_ts: int,
+        end_occurred_ts: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return observations in one ``occurred_ts`` [start, end) window."""
+        start_ts = max(0, int(start_occurred_ts or 0))
+        end_ts = max(0, int(end_occurred_ts or 0))
+        if end_ts <= start_ts:
+            return []
+        rows = await _exec(
+            "SELECT id, tenant_id, session_id, message_id, session_name, sender_wxid, sender_name, "
+            "msg_type, content, mentioned_me, bot_addressed, is_self_sent, occurred_ts, "
+            "metadata_json, received_at "
+            "FROM plugin_wxbot_group_observations "
+            "WHERE tenant_id = :tid AND session_id = :sid "
+            "AND occurred_ts >= :start_ts AND occurred_ts < :end_ts "
+            "ORDER BY occurred_ts ASC, id ASC LIMIT :lim",
+            {
+                "tid": str(tenant_id or "").strip(),
+                "sid": str(session_id or "").strip(),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "lim": max(1, min(int(limit or 1), 10001)),
+            },
+        )
+        return [self._hydrate_group_observation(row) for row in rows]
+
     async def get_participation_snapshot(
         self,
         tenant_id: str,

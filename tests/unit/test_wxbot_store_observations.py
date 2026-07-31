@@ -247,6 +247,72 @@ async def test_list_group_observations_can_exclude_current_message(
 
 
 @pytest.mark.asyncio
+async def test_list_group_observations_for_period_uses_half_open_chronological_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        calls.append((sql, params or {}))
+        return [
+            {
+                "id": 12,
+                "occurred_ts": 1777000000,
+                "metadata_json": '{"source":"managed"}',
+            }
+        ]
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fake_exec)
+
+    rows = await WxbotStore(SimpleNamespace()).list_group_observations_for_period(
+        " demo ",
+        " room@chatroom ",
+        start_occurred_ts=1776960000,
+        end_occurred_ts=1777046400,
+        limit=75000,
+    )
+
+    assert rows == [
+        {
+            "id": 12,
+            "occurred_ts": 1777000000,
+            "metadata": {"source": "managed"},
+        }
+    ]
+    sql, params = calls[0]
+    assert "tenant_id = :tid AND session_id = :sid" in sql
+    assert "occurred_ts >= :start_ts AND occurred_ts < :end_ts" in sql
+    assert "ORDER BY occurred_ts ASC, id ASC LIMIT :lim" in sql
+    assert params == {
+        "tid": "demo",
+        "sid": "room@chatroom",
+        "start_ts": 1776960000,
+        "end_ts": 1777046400,
+        "lim": 10001,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_group_observations_for_period_skips_empty_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_exec(sql: str, params: dict | None = None) -> list[dict]:
+        raise AssertionError((sql, params))
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fail_exec)
+
+    rows = await WxbotStore(SimpleNamespace()).list_group_observations_for_period(
+        "demo",
+        "room@chatroom",
+        start_occurred_ts=1777046400,
+        end_occurred_ts=1777046400,
+        limit=100,
+    )
+
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_compare_and_set_group_summary_creates_version_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

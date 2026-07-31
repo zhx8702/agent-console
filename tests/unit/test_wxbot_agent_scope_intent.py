@@ -9,7 +9,16 @@ from app.agent.scopes import (
     GROUP_PERSONAL_MAP_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
-from app.common.types import Channel, InboundEvent, Message, Role, Session, Turn
+from app.common.types import (
+    CapabilityResult,
+    Channel,
+    InboundEvent,
+    Message,
+    Role,
+    RouteType,
+    Session,
+    Turn,
+)
 from app.orchestrator.pipeline import PipelineContext
 from app.social.contracts import (
     GroupParticipationPolicyDocument,
@@ -204,6 +213,48 @@ async def test_group_file_send_scope_fails_closed_when_master_switch_is_off() ->
     assert ctx.extras["wxbot_file_send_denial_reason"] == "group_file_send_disabled"
     assert ctx.extras["router_signals"]["tool_intent_matched"] is True
     assert ctx.extras["router_signals"]["tools_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_group_file_send_denial_finalizes_with_actionable_web_setting_reply() -> None:
+    ctx = _group_context("把今天的群消息汇总成 TXT 文件发给我")
+
+    result = await WxbotAgentScopeEnrichStep(
+        social_policy_store=_FilePolicyStore(enabled=False),
+    ).run(ctx)
+
+    assert result.action == "stop"
+    assert result.reason == "wxbot_group_file_send_denied"
+    assert result.finalize is True
+    assert result.skip_output_safety is True
+    assert result.route_label == RouteType.CANNED.value
+    assert isinstance(result.result, CapabilityResult)
+    assert result.result.route is RouteType.CANNED
+    assert result.result.reply_text == (
+        "当前群尚未开启“允许群文件发送”。"
+        "请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
+    )
+    assert result.result.metadata == {
+        "wxbot_file_send_denied": True,
+        "wxbot_file_send_denial_reason": "group_file_send_disabled",
+    }
+    assert "agent_tool_scope" not in ctx.extras
+    assert ctx.extras["router_signals"] == {
+        "tool_intent_matched": True,
+        "tools_available": False,
+        "file_intent": ctx.extras["wxbot_file_intent"],
+        "file_send_denied": "group_file_send_disabled",
+    }
+    assert ctx.signals["router"] == {
+        "tool_intent_matched": True,
+        "tools_available": False,
+    }
+    assert ctx.signals["channel"]["wechat"]["agent_scope"] == {
+        "tool_scope": "",
+        "tool_intent_matched": True,
+        "tools_available": False,
+        "map_progress_enqueued": False,
+    }
 
 
 @pytest.mark.asyncio

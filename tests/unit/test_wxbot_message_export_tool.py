@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 
 from app.agent.scopes import MESSAGE_EXPORT_SCOPE
-from app.channel.identity import LEGACY_WXBOT_CONNECTION_ID
+from app.channel.identity import (
+    LEGACY_WXBOT_CONNECTION_ID,
+    canonical_conversation_id,
+)
 from app.common.config import Settings
 from app.common.types import Channel, Role, Session, Turn
 from app.social.contracts import (
@@ -23,9 +26,15 @@ from plugins.wxbot.agent_tools import (
 
 
 class _FakeStore:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        observations: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.enqueued: list[dict[str, Any]] = []
         self.active_file_path_reads = 0
+        self.observations = list(observations or [])
+        self.observation_period_calls: list[dict[str, Any]] = []
 
     async def enqueue_reply(self, **kwargs: Any) -> int:
         self.enqueued.append(dict(kwargs))
@@ -34,6 +43,26 @@ class _FakeStore:
     async def list_active_outbound_file_paths(self) -> list[str]:
         self.active_file_path_reads += 1
         return []
+
+    async def list_group_observations_for_period(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        start_occurred_ts: int,
+        end_occurred_ts: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        self.observation_period_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "start_occurred_ts": start_occurred_ts,
+                "end_occurred_ts": end_occurred_ts,
+                "limit": limit,
+            }
+        )
+        return list(self.observations[:limit])
 
 
 class _FakeReportService:
@@ -186,7 +215,7 @@ def _service(
     )
 
 
-def test_message_export_definition_is_current_session_only_and_group_admin_gated() -> None:
+def test_message_export_definition_is_current_session_only_and_group_switch_gated() -> None:
     service, _store = _service(
         Path("C:/tmp/wxbot-export-definition"),
         report_service=_FakeReportService(),
@@ -200,7 +229,7 @@ def test_message_export_definition_is_current_session_only_and_group_admin_gated
     assert tool.name == "export_current_messages_file"
     assert tool.metadata["channels"] == ["wechat"]
     assert tool.metadata["session_kinds"] == ["group", "private"]
-    assert tool.metadata["required_group_role"] == "admin"
+    assert "required_group_role" not in tool.metadata
     assert tool.metadata["requires_group_file_send"] is True
     properties = tool.parameters["properties"]
     assert set(properties) == {"report_type", "date", "year_month", "format"}
@@ -208,7 +237,7 @@ def test_message_export_definition_is_current_session_only_and_group_admin_gated
     assert "target" not in properties
 
 
-def test_file_delivery_tools_require_group_admin_and_master_switch() -> None:
+def test_file_delivery_tools_require_group_master_switch_without_admin_role() -> None:
     service, _store = _service(
         Path("C:/tmp/wxbot-file-definition"),
         report_service=_FakeReportService(),
@@ -221,7 +250,7 @@ def test_file_delivery_tools_require_group_admin_and_master_switch() -> None:
 
     assert "required_group_role" not in tools["inspect_current_file"].metadata
     for name in ("convert_current_file", "generate_text_file"):
-        assert tools[name].metadata["required_group_role"] == "admin"
+        assert "required_group_role" not in tools[name].metadata
         assert tools[name].metadata["requires_group_file_send"] is True
 
 
@@ -392,7 +421,75 @@ async def test_private_monthly_export_uses_current_private_target(
 
 
 @pytest.mark.asyncio
-async def test_group_export_rejects_managed_connection_history(
+async def test_group_export_uses_connection_scoped_managed_observations(
+    tmp_path: Path,
+) -> None:
+    report_service = _FakeReportService(period="2026-07-29")
+    connection_id = "managed-wechat-account"
+    canonical_session_id = canonical_conversation_id(
+        connection_id,
+        "room@chatroom",
+    )
+    occurred_ts = int(datetime(2026, 7, 29, 1, 30, tzinfo=UTC).timestamp())
+    store = _FakeStore(
+        observations=[
+            {
+                "message_id": "managed-msg-1",
+                "sender_wxid": "wxid_a",
+                "sender_name": "张三",
+                "msg_type": "text",
+                "content": "托管连接里的当天消息",
+                "is_self_sent": False,
+                "occurred_ts": occurred_ts,
+                "metadata": {},
+            }
+        ]
+    )
+    service, store = _service(
+        tmp_path,
+        report_service=report_service,
+        store=store,
+    )
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="msg-managed-group",
+    )
+    session.connection_id = connection_id
+    session.session_id = canonical_session_id
+    session.canonical_conversation_id = canonical_session_id
+
+    result = await service.export_current_messages_file(
+        session,
+        {"report_type": "daily", "date": "2026-07-29"},
+    )
+
+    assert report_service.message_calls == []
+    assert result["message_count"] == 1
+    assert store.observation_period_calls == [
+        {
+            "tenant_id": "demo",
+            "session_id": canonical_session_id,
+            "start_occurred_ts": int(
+                datetime(2026, 7, 28, 16, 0, tzinfo=UTC).timestamp()
+            ),
+            "end_occurred_ts": int(
+                datetime(2026, 7, 29, 16, 0, tzinfo=UTC).timestamp()
+            ),
+            "limit": 10001,
+        }
+    ]
+    assert store.enqueued == []
+    export_path = Path(
+        result["channel_reply_effects"][1]["payload"]["file"]["file_path"]
+    )
+    exported = export_path.read_text(encoding="utf-8-sig")
+    assert "[2026-07-29 09:30:00] 张三: 托管连接里的当天消息" in exported
+
+
+@pytest.mark.asyncio
+async def test_managed_group_export_fails_closed_on_canonical_scope_mismatch(
     tmp_path: Path,
 ) -> None:
     report_service = _FakeReportService(period="2026-07-29")
@@ -401,17 +498,18 @@ async def test_group_export_rejects_managed_connection_history(
         external_session_id="room@chatroom",
         session_kind="group",
         session_name="测试群",
-        source_message_id="msg-managed-group",
+        source_message_id="msg-managed-mismatch",
     )
     session.connection_id = "managed-wechat-account"
 
-    with pytest.raises(ValueError, match="connection_scoped_history_unavailable"):
+    with pytest.raises(ValueError, match="managed_wxbot_conversation_scope_mismatch"):
         await service.export_current_messages_file(
             session,
             {"report_type": "daily", "date": "2026-07-29"},
         )
 
     assert report_service.message_calls == []
+    assert store.observation_period_calls == []
     assert store.enqueued == []
 
 

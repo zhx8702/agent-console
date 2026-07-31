@@ -31,6 +31,10 @@ from plugins.wxbot.store import WxbotStore
 logger = get_logger(__name__)
 
 _DELIVERY_CONTRACT_METADATA_KEY = "_wxbot_delivery_contract"
+_GROUP_FILE_SEND_DISABLED_REPLY = (
+    "当前群尚未开启“允许群文件发送”。"
+    "请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
+)
 
 
 def _complete_async_delivery_contract(contract: dict[str, object]) -> bool:
@@ -235,9 +239,20 @@ class WxbotAgentIntentHook:
         if file_intent.file_requested:
             router_signals["file_intent"] = file_intent.as_dict()
         if outbound_file_required and not group_file_send_enabled:
-            router_signals["file_send_denied"] = str(
+            denial_reason = str(
                 ctx.extras.get("wxbot_file_send_denial_reason")
                 or "group_file_send_disabled"
+            )
+            router_signals["file_send_denied"] = denial_reason
+            ctx.extras["wxbot_file_send_denial_reply"] = (
+                _GROUP_FILE_SEND_DISABLED_REPLY
+            )
+            logger.info(
+                "wxbot.agent_intent.file_send_denied",
+                session_id=ctx.event.session_id,
+                msg_svr_id=ctx.event.metadata.get("msg_svr_id"),
+                scope=scope,
+                reason=denial_reason,
             )
             return
         ctx.extras["agent_tool_scope"] = scope

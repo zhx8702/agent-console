@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import quote, unquote, urlsplit
@@ -16,6 +16,7 @@ import httpx
 
 from app.channel.identity import (
     LEGACY_WXBOT_CONNECTION_ID,
+    canonical_conversation_id,
     require_legacy_wxbot_history_scope,
 )
 from app.common.config import Settings
@@ -66,6 +67,7 @@ from plugins.wxbot.store import WxbotStore
 
 _OwnedReadResult = TypeVar("_OwnedReadResult")
 _DELIVERY_CONTRACT_METADATA_KEY = "_wxbot_delivery_contract"
+_MANAGED_MESSAGE_EXPORT_MAX_RECORDS = 10_000
 logger = get_logger(__name__)
 WxbotDataOwnerScopeExecutionAllowed = Callable[
     [str, str, str],
@@ -195,36 +197,45 @@ class WxbotAgentToolService:
             session_kind=session_kind,
         )
         if session_kind == "group":
-            require_legacy_wxbot_history_scope(
-                self._settings,
-                tenant_id=tenant_id,
-                connection_id=(
-                    str(getattr(session, "connection_id", "") or "").strip()
-                    or LEGACY_WXBOT_CONNECTION_ID
-                ),
+            connection_id = (
+                str(getattr(session, "connection_id", "") or "").strip()
+                or LEGACY_WXBOT_CONNECTION_ID
             )
-            report_service = self._report_service
-            if report_service is None:
-                raise RuntimeError("wxbot report service is unavailable")
-            messages_payload = await report_service.fetch_report_messages_payload(
-                session_id,
-                session_name=session_name,
-                report_type=report_type,
-                date=date if report_type == "daily" else "",
-                year_month=year_month if report_type == "monthly" else "",
-            )
-            if messages_payload.get("ok") is False:
-                raise RuntimeError(
-                    str(messages_payload.get("error") or "wxbot report messages failed")
+            period = date if report_type == "daily" else year_month
+            if connection_id == LEGACY_WXBOT_CONNECTION_ID:
+                require_legacy_wxbot_history_scope(
+                    self._settings,
+                    tenant_id=tenant_id,
+                    connection_id=connection_id,
                 )
-            raw_messages = messages_payload.get("messages")
-            if not isinstance(raw_messages, list):
-                raise RuntimeError("wxbot report messages payload missing messages list")
-            messages = [item for item in raw_messages if isinstance(item, dict)]
-            period = str(
-                messages_payload.get("period")
-                or (date if report_type == "daily" else year_month)
-            ).strip()
+                report_service = self._report_service
+                if report_service is None:
+                    raise RuntimeError("wxbot report service is unavailable")
+                messages_payload = await report_service.fetch_report_messages_payload(
+                    session_id,
+                    session_name=session_name,
+                    report_type=report_type,
+                    date=date if report_type == "daily" else "",
+                    year_month=year_month if report_type == "monthly" else "",
+                )
+                if messages_payload.get("ok") is False:
+                    raise RuntimeError(
+                        str(messages_payload.get("error") or "wxbot report messages failed")
+                    )
+                raw_messages = messages_payload.get("messages")
+                if not isinstance(raw_messages, list):
+                    raise RuntimeError("wxbot report messages payload missing messages list")
+                messages = [item for item in raw_messages if isinstance(item, dict)]
+                period = str(messages_payload.get("period") or period).strip()
+            else:
+                messages = await self._managed_group_message_records(
+                    session,
+                    tenant_id=tenant_id,
+                    external_session_id=session_id,
+                    connection_id=connection_id,
+                    report_type=report_type,
+                    period=period,
+                )
         else:
             period = date if report_type == "daily" else year_month
             messages = self._current_private_message_records(
@@ -1098,6 +1109,122 @@ class WxbotAgentToolService:
             )
         except Exception:
             return ZoneInfo("Asia/Shanghai")
+
+    def _message_export_period_bounds(
+        self,
+        *,
+        report_type: str,
+        period: str,
+    ) -> tuple[int, int]:
+        timezone = self._message_export_timezone()
+        if report_type == "daily":
+            start = datetime.strptime(period, "%Y-%m-%d").replace(tzinfo=timezone)
+            end = start + timedelta(days=1)
+        else:
+            parsed = datetime.strptime(period, "%Y-%m")
+            start = datetime(parsed.year, parsed.month, 1, tzinfo=timezone)
+            if parsed.month == 12:
+                end = datetime(parsed.year + 1, 1, 1, tzinfo=timezone)
+            else:
+                end = datetime(parsed.year, parsed.month + 1, 1, tzinfo=timezone)
+        return int(start.timestamp()), int(end.timestamp())
+
+    async def _managed_group_message_records(
+        self,
+        session: Any,
+        *,
+        tenant_id: str,
+        external_session_id: str,
+        connection_id: str,
+        report_type: str,
+        period: str,
+    ) -> list[dict[str, Any]]:
+        canonical_session_id = canonical_conversation_id(
+            connection_id,
+            external_session_id,
+        )
+        declared_canonical_id = str(
+            getattr(session, "canonical_conversation_id", "")
+            or getattr(session, "session_id", "")
+            or ""
+        ).strip()
+        if declared_canonical_id and declared_canonical_id != canonical_session_id:
+            raise ValueError("managed_wxbot_conversation_scope_mismatch")
+
+        start_ts, end_ts = self._message_export_period_bounds(
+            report_type=report_type,
+            period=period,
+        )
+        observations = await self._wxbot_store.list_group_observations_for_period(
+            tenant_id,
+            canonical_session_id,
+            start_occurred_ts=start_ts,
+            end_occurred_ts=end_ts,
+            limit=_MANAGED_MESSAGE_EXPORT_MAX_RECORDS + 1,
+        )
+        if len(observations) > _MANAGED_MESSAGE_EXPORT_MAX_RECORDS:
+            raise ValueError(
+                "当前时间范围内的群消息超过 10000 条，请缩小导出时间范围"
+            )
+        return [
+            self._managed_group_observation_record(item)
+            for item in observations
+            if isinstance(item, dict)
+        ]
+
+    def _managed_group_observation_record(
+        self,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            occurred_ts = max(0, int(observation.get("occurred_ts") or 0))
+        except (TypeError, ValueError):
+            occurred_ts = 0
+        timestamp = ""
+        if occurred_ts:
+            try:
+                timestamp = datetime.fromtimestamp(
+                    occurred_ts,
+                    tz=self._message_export_timezone(),
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                timestamp = ""
+
+        metadata = observation.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        attachment = metadata.get("file_attachment")
+        attachment = attachment if isinstance(attachment, dict) else {}
+        record: dict[str, Any] = {
+            "timestamp": timestamp,
+            "occurred_ts": occurred_ts,
+            "sender_wxid": str(observation.get("sender_wxid") or "").strip(),
+            "sender_name": str(observation.get("sender_name") or "").strip(),
+            "msg_type": str(observation.get("msg_type") or "text").strip().lower()
+            or "text",
+            "text": str(observation.get("content") or ""),
+            "is_self_sent": bool(observation.get("is_self_sent")),
+        }
+        if record["msg_type"] == "file":
+            record["file_attachment"] = {
+                "name": str(
+                    metadata.get("file_name") or attachment.get("name") or ""
+                ).strip(),
+                "size": metadata.get("file_size", attachment.get("size")),
+                "sha256": str(
+                    metadata.get("file_sha256") or attachment.get("sha256") or ""
+                )
+                .strip()
+                .lower(),
+                "download_status": str(
+                    metadata.get("file_download_status")
+                    or attachment.get("download_status")
+                    or metadata.get("media_status")
+                    or ""
+                )
+                .strip()
+                .lower(),
+            }
+        return record
 
     async def _require_session_group_file_send_enabled(
         self,

@@ -604,7 +604,6 @@ def build_wxbot_message_export_agent_tools(
             metadata={
                 "channels": ["wechat"],
                 "session_kinds": ["group", "private"],
-                "required_group_role": "admin",
                 "requires_group_file_send": True,
             },
         )
@@ -662,7 +661,6 @@ def build_wxbot_file_analysis_agent_tools(
             handler=service.convert_current_file,
             metadata={
                 **metadata,
-                "required_group_role": "admin",
                 "requires_group_file_send": True,
                 "embed_text": "转换当前收到的文件格式生成文件并发送",
                 "tree_text": "convert current inbound file and send",
@@ -698,7 +696,6 @@ def build_wxbot_file_analysis_agent_tools(
             handler=service.generate_text_file,
             metadata={
                 **metadata,
-                "required_group_role": "admin",
                 "requires_group_file_send": True,
                 "embed_text": "把当前回答整理成文件并发送",
                 "tree_text": "generate text file and send",

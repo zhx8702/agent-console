@@ -689,6 +689,7 @@ class WxbotAgentScopeEnrichStep:
     outputs: set[str] = field(
         default_factory=lambda: {
             "effects.enqueue_channel_reply",
+            "result",
             "signals.agent.tool_scope",
             "signals.router.tool_intent_matched",
             "signals.router.tools_available",
@@ -705,6 +706,30 @@ class WxbotAgentScopeEnrichStep:
         ).run(ctx)
         signal = _sync_wxbot_agent_scope_signal(ctx)
         effects = _wxbot_map_progress_effects(ctx)
+        denial_reply = str(
+            ctx.extras.get("wxbot_file_send_denial_reply") or ""
+        ).strip()
+        if denial_reply:
+            denial_reason = str(
+                ctx.extras.get("wxbot_file_send_denial_reason")
+                or "group_file_send_disabled"
+            )
+            return StepResult(
+                action="stop",
+                reason="wxbot_group_file_send_denied",
+                result=CapabilityResult(
+                    route=RouteType.CANNED,
+                    reply_text=denial_reply,
+                    metadata={
+                        "wxbot_file_send_denied": True,
+                        "wxbot_file_send_denial_reason": denial_reason,
+                    },
+                ),
+                finalize=True,
+                skip_output_safety=True,
+                route_label=RouteType.CANNED.value,
+                effects=effects,
+            )
         return StepResult(
             reason="enriched" if signal["tool_scope"] else "not_matched",
             effects=effects,

@@ -818,7 +818,7 @@ async def test_agent_capability_hides_privacy_sensitive_tools_from_regular_membe
     assert "build_group_member_profile_report" not in tools
 
 
-def test_group_admin_cannot_bypass_disabled_group_file_master_switch() -> None:
+def test_group_member_requires_enabled_group_file_master_switch() -> None:
     definition = AgentToolDefinition(
         scope="file_analysis",
         name="generate_text_file",
@@ -828,14 +828,13 @@ def test_group_admin_cannot_bypass_disabled_group_file_master_switch() -> None:
         metadata={
             "channels": ["wechat"],
             "session_kinds": ["group", "private"],
-            "required_group_role": "admin",
             "requires_group_file_send": True,
         },
     )
     session = Session(
         session_id="room@chatroom",
         tenant_id="demo",
-        user_id="wxid_admin",
+        user_id="wxid_member",
         channel=Channel.WECHAT,
         metadata={"session_kind": "group", "group_file_send_enabled": False},
         turns=[
@@ -843,7 +842,7 @@ def test_group_admin_cannot_bypass_disabled_group_file_master_switch() -> None:
                 session_id="room@chatroom",
                 role=Role.USER,
                 content="生成文件发我",
-                metadata={"sender_is_group_admin": True},
+                metadata={"sender_is_group_admin": False},
             )
         ],
     )
