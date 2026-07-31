@@ -72,29 +72,54 @@ class MemoryGroupGraphStoreMixin:
         channel: str | None = None,
         source_key: str | None = None,
         user_id: str | None = None,
+        session_id: str | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        conditions = ["tenant_id = :tid"]
+        conditions = ["entity.tenant_id = :tid"]
         params: dict[str, Any] = {"tid": tenant_id, "lim": max(1, min(int(limit or 100), 500))}
         if channel is not None:
-            conditions.append("channel = :channel")
+            conditions.append("entity.channel = :channel")
             params["channel"] = channel
         if source_key is not None:
-            conditions.append("source_key = :source_key")
+            conditions.append("entity.source_key = :source_key")
             params["source_key"] = source_key
         if user_id is not None:
-            conditions.append("user_id = :uid")
+            conditions.append("entity.user_id = :uid")
             params["uid"] = user_id
+        if session_id is not None:
+            conditions.append(
+                "EXISTS ("
+                "SELECT 1 FROM plugin_memory_fact scope_fact "
+                "JOIN plugin_memory_item scope_item "
+                "ON scope_item.id = scope_fact.memory_item_id "
+                "AND scope_item.tenant_id = scope_fact.tenant_id "
+                "AND scope_item.channel = scope_fact.channel "
+                "AND scope_item.source_key = scope_fact.source_key "
+                "AND scope_item.user_id = scope_fact.user_id "
+                "WHERE scope_fact.tenant_id = entity.tenant_id "
+                "AND scope_fact.channel = entity.channel "
+                "AND scope_fact.source_key = entity.source_key "
+                "AND scope_fact.user_id = entity.user_id "
+                "AND (scope_fact.subject_entity_id = entity.id "
+                "OR scope_fact.object_entity_id = entity.id) "
+                "AND scope_item.session_id = :sid "
+                "AND scope_item.deleted_at IS NULL "
+                "AND scope_item.status NOT IN ('deleted', 'invalidated')"
+                ")"
+            )
+            params["sid"] = session_id
         if status is not None:
-            conditions.append("status = :status")
+            conditions.append("entity.status = :status")
             params["status"] = status
         rows = await _exec(
-            "SELECT id, tenant_id, channel, source_key, user_id, entity_type, name, "
-            "normalized_name, aliases_json, confidence, status, created_at, updated_at "
-            "FROM plugin_memory_entity "
+            "SELECT entity.id, entity.tenant_id, entity.channel, entity.source_key, "
+            "entity.user_id, entity.entity_type, entity.name, entity.normalized_name, "
+            "entity.aliases_json, entity.confidence, entity.status, "
+            "entity.created_at, entity.updated_at "
+            "FROM plugin_memory_entity entity "
             f"WHERE {' AND '.join(conditions)} "
-            "ORDER BY updated_at DESC, id DESC LIMIT :lim",
+            "ORDER BY entity.updated_at DESC, entity.id DESC LIMIT :lim",
             params,
         )
         for row in rows:
@@ -109,6 +134,7 @@ class MemoryGroupGraphStoreMixin:
         channel: str | None = None,
         source_key: str | None = None,
         user_id: str | None = None,
+        session_id: str | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -123,6 +149,21 @@ class MemoryGroupGraphStoreMixin:
         if user_id is not None:
             conditions.append("fact.user_id = :uid")
             params["uid"] = user_id
+        if session_id is not None:
+            conditions.append(
+                "EXISTS ("
+                "SELECT 1 FROM plugin_memory_item scope_item "
+                "WHERE scope_item.id = fact.memory_item_id "
+                "AND scope_item.tenant_id = fact.tenant_id "
+                "AND scope_item.channel = fact.channel "
+                "AND scope_item.source_key = fact.source_key "
+                "AND scope_item.user_id = fact.user_id "
+                "AND scope_item.session_id = :sid "
+                "AND scope_item.deleted_at IS NULL "
+                "AND scope_item.status NOT IN ('deleted', 'invalidated')"
+                ")"
+            )
+            params["sid"] = session_id
         if status is not None:
             conditions.append("fact.status = :status")
             params["status"] = status

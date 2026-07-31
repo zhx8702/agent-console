@@ -4,7 +4,13 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from app.agent.registry import AgentToolDefinition
-from app.agent.scopes import DEFAULT_AGENT_SCOPE, GROUP_PLUGIN_STATUS_SCOPE
+from app.agent.scopes import (
+    DEFAULT_AGENT_SCOPE,
+    FILE_ANALYSIS_SCOPE,
+    GROUP_PLUGIN_STATUS_SCOPE,
+    MESSAGE_EXPORT_SCOPE,
+)
+from plugins.wxbot.file_artifacts import SUPPORTED_FILE_FORMATS
 
 if TYPE_CHECKING:
     from plugins.wxbot.agent_tool_service import WxbotAgentToolService
@@ -556,6 +562,148 @@ def build_wxbot_group_plugin_status_agent_tools(
         _clone_tool_with_scope(item, GROUP_PLUGIN_STATUS_SCOPE)
         for item in build_wxbot_group_agent_tools(service)
         if item.name in allowed
+    ]
+
+
+def build_wxbot_message_export_agent_tools(
+    service: WxbotAgentToolService,
+) -> list[AgentToolDefinition]:
+    return [
+        AgentToolDefinition(
+            scope=MESSAGE_EXPORT_SCOPE,
+            name="export_current_messages_file",
+            description=(
+                "把当前群聊或当前私聊指定日期/月度的消息记录整理成文件并发送回当前会话。"
+                "仅当用户同时明确要求消息汇总和发送/导出文件时调用；不能指定、改写或跨越目的会话。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "report_type": {
+                        "type": "string",
+                        "description": "导出时间范围类型，daily=按日，monthly=按月；默认 daily。",
+                        "enum": ["daily", "monthly"],
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "日报日期，格式 YYYY-MM-DD；默认今天。",
+                    },
+                    "year_month": {
+                        "type": "string",
+                        "description": "月报月份，格式 YYYY-MM；仅 report_type=monthly 时使用。",
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "文件格式；默认 txt。",
+                        "enum": list(SUPPORTED_FILE_FORMATS),
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=service.export_current_messages_file,
+            metadata={
+                "channels": ["wechat"],
+                "session_kinds": ["group", "private"],
+                "required_group_role": "admin",
+                "requires_group_file_send": True,
+            },
+        )
+    ]
+
+
+def build_wxbot_file_analysis_agent_tools(
+    service: WxbotAgentToolService,
+) -> list[AgentToolDefinition]:
+    """Expose file operations only after the deterministic file-intent gate."""
+
+    metadata = {
+        "channels": ["wechat"],
+        "session_kinds": ["group", "private"],
+    }
+    return [
+        AgentToolDefinition(
+            scope=FILE_ANALYSIS_SCOPE,
+            name="inspect_current_file",
+            description=(
+                "读取当前会话最近收到的文件并返回有限的文本预览，用于回答‘总结/解析/看看这个文件’。"
+                "只接受当前会话的 SDK 文件，不接受用户路径、URL 或跨会话文件。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            handler=service.inspect_current_file,
+            metadata={
+                **metadata,
+                "embed_text": "读取解析总结当前收到的文件附件内容",
+                "tree_text": "inspect current inbound file attachment",
+            },
+        ),
+        AgentToolDefinition(
+            scope=FILE_ANALYSIS_SCOPE,
+            name="convert_current_file",
+            description=(
+                "把当前会话最近收到的 txt、md、csv 或 json 文件转换为另一种安全文本格式。"
+                "只有用户明确要求生成/转换并发送或下载时才会排队发送；普通总结不会发送文件。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "description": "目标格式。",
+                        "enum": list(SUPPORTED_FILE_FORMATS),
+                    }
+                },
+                "required": ["format"],
+                "additionalProperties": False,
+            },
+            handler=service.convert_current_file,
+            metadata={
+                **metadata,
+                "required_group_role": "admin",
+                "requires_group_file_send": True,
+                "embed_text": "转换当前收到的文件格式生成文件并发送",
+                "tree_text": "convert current inbound file and send",
+            },
+        ),
+        AgentToolDefinition(
+            scope=FILE_ANALYSIS_SCOPE,
+            name="generate_text_file",
+            description=(
+                "把当前回答或已整理的正文生成 txt、md、csv 或 json 文件并发送到当前会话。"
+                "仅在用户明确要求生成/整理文件并发送时调用，不接受用户路径或 URL。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要写入文件的正文内容，由当前回答整理得到。",
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "目标格式，默认 txt。",
+                        "enum": list(SUPPORTED_FILE_FORMATS),
+                    },
+                    "file_name": {
+                        "type": "string",
+                        "description": "可选的文件名（只允许文件名，不含路径）。",
+                    },
+                },
+                "required": ["content"],
+                "additionalProperties": False,
+            },
+            handler=service.generate_text_file,
+            metadata={
+                **metadata,
+                "required_group_role": "admin",
+                "requires_group_file_send": True,
+                "embed_text": "把当前回答整理成文件并发送",
+                "tree_text": "generate text file and send",
+            },
+        ),
     ]
 
 

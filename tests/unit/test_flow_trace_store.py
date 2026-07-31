@@ -53,6 +53,38 @@ async def test_flow_trace_snapshot_roundtrip_is_safe_and_ttl_backed() -> None:
                 "payload": {"must_not": "persist"},
             }
         ],
+        decision_trace={
+            "intent": {
+                "coarse": "business",
+                "language": "zh",
+                "sensitive": False,
+                "raw_text": "must_not_persist",
+            },
+            "route": {
+                "type": "agent",
+                "confidence": 0.92,
+                "rule": "tool_intent",
+                "matched_conditions": ["tool_intent_matched", "tools_available"],
+            },
+            "router_signals": {
+                "tool_intent_matched": True,
+                "effective_tool_count": 2,
+                "tool_preflight_failed": False,
+                "faq_similarity": float("nan"),
+                "payload": {"must_not": "persist"},
+            },
+            "result": {
+                "route": "agent",
+                "tool_preselection_verdict": "AMBIGUOUS",
+                "tool_preselection_selected": ["search", "export"],
+                "tool_preselection_scores": {
+                    "search": 3,
+                    "export": 2.5,
+                    "invalid": float("inf"),
+                },
+            },
+            "raw_text": "must_not_persist",
+        },
     )
 
     await write_flow_trace_snapshot(
@@ -75,6 +107,7 @@ async def test_flow_trace_snapshot_roundtrip_is_safe_and_ttl_backed() -> None:
     assert runtime is not None
     assert runtime["trace_id"] == "tr_test"
     assert runtime["mode"] == "runtime"
+    assert runtime["schema_version"] == 2
     assert runtime["steps"][0]["id"] == "capability"
     assert runtime["effect_commits"][0] == {
         "owner": "wxbot",
@@ -82,4 +115,29 @@ async def test_flow_trace_snapshot_roundtrip_is_safe_and_ttl_backed() -> None:
         "status": "recorded",
         "dry_run": False,
     }
+    assert runtime["decision_trace"] == {
+        "intent": {
+            "coarse": "business",
+            "language": "zh",
+            "sensitive": False,
+        },
+        "route": {
+            "type": "agent",
+            "confidence": 0.92,
+            "rule": "tool_intent",
+            "matched_conditions": ["tool_intent_matched", "tools_available"],
+        },
+        "router_signals": {
+            "tool_intent_matched": True,
+            "effective_tool_count": 2,
+            "tool_preflight_failed": False,
+        },
+        "result": {
+            "route": "agent",
+            "tool_preselection_verdict": "AMBIGUOUS",
+            "tool_preselection_selected": ["search", "export"],
+            "tool_preselection_scores": {"search": 3.0, "export": 2.5},
+        },
+    }
+    assert "raw_text" not in runtime["decision_trace"]
     assert snapshots["shadow"] is None

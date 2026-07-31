@@ -81,6 +81,17 @@ def test_intent_handoff():
     assert classify_intent("我要转人工") == IntentCoarse.HANDOFF_REQUEST
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "你是 AI 吗？如果是，请帮我转人工客服",
+        "Are you a bot? Please connect me to a human agent.",
+    ],
+)
+def test_intent_explicit_handoff_beats_identity_inquiry(text: str) -> None:
+    assert classify_intent(text) == IntentCoarse.HANDOFF_REQUEST
+
+
 def test_intent_complaint():
     assert classify_intent("我要投诉你们") == IntentCoarse.COMPLAINT
 
@@ -99,6 +110,121 @@ def test_intent_chitchat():
 
 def test_intent_unknown():
     assert classify_intent("xyz random text 123") == IntentCoarse.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "人工客服",
+        "麻烦人工客服",
+        "请帮我找个真人客服",
+        "我需要联系人工客服",
+        "先别转人工，还是帮我转人工吧",
+        "取消转人工，还是直接转人工吧",
+        "I need a human agent",
+        "Please connect me to a live agent.",
+        "Can I talk to a real person?",
+        "Customer service, please.",
+    ],
+)
+def test_intent_handoff_common_zh_and_en(text: str):
+    assert classify_intent(text) == IntentCoarse.HANDOFF_REQUEST
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("不要转人工", IntentCoarse.UNKNOWN),
+        ("帮我转人工，算了不用了", IntentCoarse.UNKNOWN),
+        ("给我转人工，不用了", IntentCoarse.UNKNOWN),
+        ("给我转人工，还是不用了", IntentCoarse.UNKNOWN),
+        ("“转人工”是什么意思？", IntentCoarse.FAQ),
+        ("他说：“给我转人工”", IntentCoarse.UNKNOWN),
+        ("我们讨论一下转人工功能", IntentCoarse.UNKNOWN),
+        ("真人电影挺好看", IntentCoarse.UNKNOWN),
+        ("你是真人吗", IntentCoarse.UNKNOWN),
+        ("Don't transfer me to a human agent.", IntentCoarse.UNKNOWN),
+        (
+            'How do I say "connect me to a human agent" in Chinese?',
+            IntentCoarse.FAQ,
+        ),
+    ],
+)
+def test_intent_handoff_negation_cancellation_and_references(
+    text: str,
+    expected: IntentCoarse,
+):
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我要举报这个商家",
+        "客服态度太差了",
+        "给你们一条差评",
+        "I want to complain about the service.",
+        "Please file a complaint.",
+        "This support experience was unacceptable.",
+    ],
+)
+def test_intent_complaint_common_zh_and_en(text: str):
+    assert classify_intent(text) == IntentCoarse.COMPLAINT
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("我不想投诉，只想问物流", IntentCoarse.BUSINESS),
+        ("不要举报，我要申请退款", IntentCoarse.BUSINESS),
+        ("我要投诉，算了", IntentCoarse.UNKNOWN),
+        ("“投诉”这个词是什么意思？", IntentCoarse.FAQ),
+        ("I don't want to complain; track my package.", IntentCoarse.BUSINESS),
+        ("I want to complain, never mind.", IntentCoarse.UNKNOWN),
+    ],
+)
+def test_intent_complaint_negation_and_reference(
+    text: str,
+    expected: IntentCoarse,
+):
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我的包裹什么时候到",
+        "申请退货",
+        "帮我开一张发票",
+        "会员订阅被扣款了",
+        "Where is my order?",
+        "Track my package.",
+        "I need a refund.",
+        "My payment was charged twice.",
+    ],
+)
+def test_intent_business_common_zh_and_en(text: str):
+    assert classify_intent(text) == IntentCoarse.BUSINESS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "您好",
+        "早上好",
+        "多谢啦",
+        "回头见",
+        "Hello!",
+        "Good morning",
+        "Thank you",
+        "See you",
+        "How are you?",
+        "Hi, how are you?",
+        "Hey, what's up?",
+    ],
+)
+def test_intent_chitchat_common_zh_and_en(text: str):
+    assert classify_intent(text) == IntentCoarse.CHITCHAT
 
 
 # ---- emotion ---------------------------------------------------------------

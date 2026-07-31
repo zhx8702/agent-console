@@ -17,6 +17,19 @@ from plugins.memory.store import (
 )
 
 
+@pytest.fixture
+def _bind_unit_memory_transaction():
+    """Inject a non-Postgres transaction for storage mutation unit tests."""
+
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+
 @pytest.mark.asyncio
 async def test_ensure_tables_only_verifies_migrated_schema(
     monkeypatch: pytest.MonkeyPatch,
@@ -482,6 +495,7 @@ async def test_insert_memory_item_sql_has_single_returning(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_bind_unit_memory_transaction")
 async def test_create_memory_item_manual_is_pinned_and_refreshes_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -587,6 +601,26 @@ async def test_apply_action_updates_existing_active_auto_without_manual_overwrit
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params))
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
+        if "deleted_at IS NOT NULL" in sql:
+            return []
         if "FROM plugin_memory_item" in sql and "normalized_key = :normalized_key" in sql:
             return [existing]
         if sql.startswith("SELECT id, tenant_id"):
@@ -661,6 +695,24 @@ async def test_apply_action_invalidates_old_auto_and_adds_replacement(
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params))
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
         if "FROM plugin_memory_item" in sql and "normalized_key = :normalized_key" in sql:
             if params and params.get("normalized_key") == adidas_key:
                 return [old_item]
@@ -784,6 +836,24 @@ async def test_apply_action_manual_same_key_creates_pending_conflict(
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params))
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             return []
         if sql.startswith("SELECT id, audience_scope"):
@@ -850,6 +920,7 @@ async def test_list_memory_items_filters_non_item_rows_from_legacy_monkeypatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_bind_unit_memory_transaction")
 async def test_import_legacy_identity_marks_sensitive_auto_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -862,9 +933,13 @@ async def test_import_legacy_identity_marks_sensitive_auto_pending(
     async def fake_refresh(item: dict) -> None:
         return None
 
+    async def fake_member_write_blocked(**kwargs) -> bool:
+        return False
+
     store = MemoryStore(SimpleNamespace())
     monkeypatch.setattr(store, "_insert_or_touch_memory_item", fake_insert)
     monkeypatch.setattr(store, "_refresh_legacy_cache_for_item_scope", fake_refresh)
+    monkeypatch.setattr(store, "_member_memory_write_blocked", fake_member_write_blocked)
 
     await store._import_legacy_identity_items(
         {
@@ -886,6 +961,7 @@ async def test_import_legacy_identity_marks_sensitive_auto_pending(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_bind_unit_memory_transaction")
 async def test_soft_delete_marks_deleted_and_refreshes(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, dict | None]] = []
     row = {
@@ -921,6 +997,10 @@ async def test_soft_delete_marks_deleted_and_refreshes(monkeypatch: pytest.Monke
         calls.append((sql, params))
         if sql.startswith("SELECT id, tenant_id"):
             return [row]
+        if "UPDATE plugin_memory_item SET status = 'deleted'" in sql:
+            row["status"] = "deleted"
+            row["deleted_at"] = "2026-07-30T00:00:00"
+            return [{"id": 1}]
         return []
 
     async def fake_refresh(item: dict) -> None:

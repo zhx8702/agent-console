@@ -89,7 +89,12 @@ class _Router:
         if self.boom:
             raise RuntimeError("router boom")
         self.signals = dict(signals or {})
-        return RouteDecision(type=self.route, confidence=0.9, hints={})
+        return RouteDecision(
+            type=self.route,
+            confidence=0.9,
+            reason="test route",
+            hints={"rule": "test_rule"},
+        )
 
 
 class _Safety:
@@ -196,6 +201,45 @@ class _LLMCapability:
         _ = pre, session
         self.hints = dict(hints or {})
         return CapabilityResult(route=RouteType.LLM, reply_text="通用聊天回复")
+
+
+class _AgentCapability:
+    def __init__(
+        self,
+        *,
+        effective_tool_count: int = 0,
+        preflight_error: Exception | None = None,
+    ) -> None:
+        self.effective_tool_count = effective_tool_count
+        self.preflight_error = preflight_error
+        self.preview_hints: dict[str, Any] | None = None
+
+    async def preview_availability(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        hints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = pre, session
+        self.preview_hints = dict(hints or {})
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        return {
+            "effective_tool_count": self.effective_tool_count,
+            "policy_allowed": self.effective_tool_count > 0,
+            "denial_reason": (
+                "" if self.effective_tool_count > 0 else "role_denied"
+            ),
+        }
+
+    async def answer(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        hints: dict[str, Any] | None = None,
+    ) -> CapabilityResult:
+        _ = pre, session, hints
+        return CapabilityResult(route=RouteType.AGENT, reply_text="agent answer")
 
 
 class _Bus:
@@ -384,6 +428,9 @@ async def test_core_steps_run_happy_path_flow() -> None:
     assert ctx.session.pii_map["<PII:phone:1>"] == "13800000000"
     assert router.signals is not None
     assert router.signals["faq_similarity"] == 0.91
+    assert router.signals["faq_matched"] is True
+    assert router.signals["faq_verdict"] == "CLEAR"
+    assert router.signals["consecutive_fallbacks"] == 0
     assert capability.hints is not None
     assert capability.hints["faq_preview"]["faq_id"] == "faq-1"
     assert bus.messages[0][2] == "demo:s1"
@@ -397,6 +444,13 @@ async def test_core_steps_run_happy_path_flow() -> None:
     session = sessions.sessions["s1"]
     assert session.state == SessionState.CHATTING
     assert [turn.role.value for turn in session.turns] == ["user", "assistant"]
+    assert session.variables["consecutive_fallbacks"] == 0
+    assert session.turns[-1].metadata == {
+        "route": "faq",
+        "intent_coarse": "unknown",
+        "route_confidence": 0.9,
+        "route_rule": "test_rule",
+    }
 
 
 @pytest.mark.asyncio
@@ -412,6 +466,132 @@ async def test_core_route_continues_when_faq_preview_is_unavailable() -> None:
     assert router.signals["faq_preview_failed"] is True
     assert router.signals["faq_preview_error_class"] == "RuntimeError"
     assert bus.messages[0][1]["segments"][0]["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_core_route_uses_effective_agent_tool_preflight() -> None:
+    capability = _AgentCapability(effective_tool_count=0)
+    deps, _sessions, router, _capability, _bus = _deps(
+        capability=capability,  # type: ignore[arg-type]
+        route=RouteType.AGENT,
+    )
+    ctx = PipelineContext(event=_event("查地图"), trace_id="trace")
+    ctx.signals["router"] = {
+        "tool_intent_matched": True,
+        "tools_available": True,
+    }
+    ctx.signals["agent"] = {"tool_scope": "map"}
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(
+        _happy_flow(),
+        ctx,
+    )
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert router.signals is not None
+    assert router.signals["tool_intent_matched"] is True
+    assert router.signals["tools_available"] is False
+    assert router.signals["effective_tool_count"] == 0
+    assert router.signals["policy_allowed"] is False
+    assert router.signals["tool_denial_reason"] == "role_denied"
+    assert capability.preview_hints is not None
+    assert capability.preview_hints["agent_tool_scope"] == "map"
+
+
+@pytest.mark.asyncio
+async def test_core_tool_preflight_failure_fails_closed() -> None:
+    capability = _AgentCapability(preflight_error=RuntimeError("unavailable"))
+    deps, _sessions, router, _capability, _bus = _deps(
+        capability=capability,  # type: ignore[arg-type]
+        route=RouteType.AGENT,
+    )
+    ctx = PipelineContext(event=_event("查地图"), trace_id="trace")
+    ctx.signals["router"] = {
+        "tool_intent_matched": True,
+        "tools_available": True,
+    }
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(
+        _happy_flow(),
+        ctx,
+    )
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert router.signals is not None
+    assert router.signals["tools_available"] is False
+    assert router.signals["effective_tool_count"] == 0
+    assert router.signals["policy_allowed"] is False
+    assert router.signals["tool_denial_reason"] == "preflight_failed"
+    assert router.signals["tool_preflight_failed"] is True
+    assert router.signals["tool_preflight_error_class"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_core_flow_reads_increments_and_clears_fallback_counter() -> None:
+    deps, sessions, router, _capability, _bus = _deps(capability_boom=True)
+    sessions.sessions["s1"] = Session(
+        tenant_id="demo",
+        user_id="u1",
+        session_id="s1",
+        channel=Channel.WEB,
+        variables={"consecutive_fallbacks": 1},
+    )
+    failed_ctx = PipelineContext(event=_event("hello"), trace_id="trace")
+
+    failed = await FlowRunner(build_core_step_executors(deps)).run(
+        _default_compatible_core_flow(),
+        failed_ctx,
+    )
+
+    assert failed.status == FLOW_RUN_STOPPED
+    assert router.signals is not None
+    assert router.signals["consecutive_fallbacks"] == 1
+    assert sessions.sessions["s1"].variables["consecutive_fallbacks"] == 2
+
+    success_deps, success_sessions, success_router, _capability, _bus = _deps()
+    success_sessions.sessions["s1"] = Session(
+        tenant_id="demo",
+        user_id="u1",
+        session_id="s1",
+        channel=Channel.WEB,
+        variables={"consecutive_fallbacks": 2},
+    )
+    success_ctx = PipelineContext(event=_event("hello"), trace_id="trace-success")
+
+    succeeded = await FlowRunner(build_core_step_executors(success_deps)).run(
+        _happy_flow(),
+        success_ctx,
+    )
+
+    assert succeeded.status == FLOW_RUN_COMPLETED
+    assert success_router.signals is not None
+    assert success_router.signals["consecutive_fallbacks"] == 2
+    assert success_sessions.sessions["s1"].variables["consecutive_fallbacks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_core_flow_never_injects_shared_group_fallback_counter() -> None:
+    deps, sessions, router, _capability, _bus = _deps()
+    sessions.sessions["s1"] = Session(
+        tenant_id="demo",
+        user_id="u1",
+        session_id="s1",
+        channel=Channel.WEB,
+        variables={"consecutive_fallbacks": 9},
+        metadata={"session_kind": "group"},
+    )
+    ctx = PipelineContext(event=_event("hello"), trace_id="trace")
+    ctx.signals["router"] = {"consecutive_fallbacks": 99}
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(
+        _happy_flow(),
+        ctx,
+    )
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert router.signals is not None
+    assert "consecutive_fallbacks" not in router.signals
+    assert sessions.sessions["s1"].variables["consecutive_fallbacks"] == 9
 
 
 @pytest.mark.asyncio
@@ -442,6 +622,12 @@ async def test_core_rag_miss_falls_back_to_generic_llm_chat() -> None:
     assert user_turn.metadata["user_id"] == "u1"
     assert user_turn.metadata["external_participant_id"] == "u1"
     assert user_turn.metadata["canonical_participant_id"] == "u1"
+    assert sessions.sessions["s1"].turns[-1].metadata["fallback_from"] == "rag"
+    assert (
+        sessions.sessions["s1"].turns[-1].metadata["fallback_reason"]
+        == "no_context"
+    )
+    assert sessions.sessions["s1"].variables["consecutive_fallbacks"] == 1
 
 
 @pytest.mark.asyncio
@@ -577,7 +763,7 @@ async def test_core_steps_dry_run_stops_before_capability_without_side_effects()
     assert result.status == FLOW_RUN_STOPPED
     assert result.stop_reason == "dry_run_skip_capability"
     assert [step.id for step in result.steps][-1] == "capability"
-    assert router.signals == {}
+    assert router.signals == {"consecutive_fallbacks": 0}
     assert capability.hints is None
     assert bus.messages == []
     assert sessions.sessions["s1"].turns == []

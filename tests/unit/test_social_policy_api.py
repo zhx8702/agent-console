@@ -101,6 +101,7 @@ def _group_payload(
     group_enabled: bool = True,
     mention_sender_strategy: str = "never",
     prompt_context_retention_seconds: int = 3600,
+    file_send_enabled: bool = False,
 ) -> dict:
     return {
         "kill_switches": {
@@ -113,6 +114,7 @@ def _group_payload(
             "proactive_enabled": False,
             "mention_sender_strategy": mention_sender_strategy,
             "prompt_context_retention_seconds": prompt_context_retention_seconds,
+            "file_send_enabled": file_send_enabled,
         },
         "voice_profile": {
             "profile_id": "natural-v1",
@@ -149,6 +151,7 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
             threshold=72,
             mention_sender_strategy="reply_or_ambiguous",
             prompt_context_retention_seconds=7200,
+            file_send_enabled=True,
         ),
     )
 
@@ -161,6 +164,7 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
     assert initial.json()["policy"]["proactive_enabled"] is False
     assert initial.json()["policy"]["mention_sender_strategy"] == "never"
     assert initial.json()["policy"]["prompt_context_retention_seconds"] == 3600
+    assert initial.json()["policy"]["file_send_enabled"] is False
     assert missing_precondition.status_code == 428
     assert missing_precondition.json()["detail"] == "if_match_required"
     assert updated.status_code == 200
@@ -169,6 +173,7 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
     assert updated.json()["policy"]["threshold"] == 72
     assert updated.json()["policy"]["mention_sender_strategy"] == "reply_or_ambiguous"
     assert updated.json()["policy"]["prompt_context_retention_seconds"] == 7200
+    assert updated.json()["policy"]["file_send_enabled"] is True
     assert updated.json()["voice_profile"]["version"] == 1
     assert updated.json()["voice_profile"]["enabled"] is True
 

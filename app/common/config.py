@@ -480,6 +480,38 @@ class Settings(BaseSettings):
     wxbot_group_reply_burst_window_seconds: float = Field(default=10.0, gt=0, le=120.0)
     wxbot_group_reply_adaptive_cooldown_max_seconds: float = Field(default=8.0, ge=0.0, le=60.0)
     wxbot_media_base_url: str = ""
+    wxbot_file_download_max_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=4 * 1024 * 1024 * 1024,
+    )
+    # Agent-side text inspection/conversion is intentionally much smaller
+    # than the raw SDK download allowance to keep prompt/tool work bounded.
+    wxbot_file_analysis_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=100 * 1024 * 1024,
+    )
+    wxbot_pending_media_ttl_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
+    wxbot_pending_media_max_items: int = Field(default=1000, ge=1, le=100_000)
+    # Outbound artifacts must live at the same absolute path in Agent Console
+    # and the companion SDK container.  The SDK receives this path verbatim.
+    wxbot_outbound_file_dir: str = "/data/wxbot-outbound"
+    wxbot_outbound_file_max_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=64 * 1024,
+        le=100 * 1024 * 1024,
+    )
+    wxbot_outbound_file_retention_seconds: int = Field(
+        default=24 * 60 * 60,
+        ge=5 * 60,
+        le=30 * 24 * 60 * 60,
+    )
+    wxbot_outbound_file_cleanup_grace_seconds: int = Field(
+        default=5 * 60,
+        ge=0,
+        le=60 * 60,
+    )
     wxbot_preview_wait_seconds: float = 30.0
     wxbot_preview_poll_interval_seconds: float = 0.7
     # Organization-specific polling is inert until both the feature flag and
@@ -600,6 +632,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "outbound_transport_retry_max_seconds must be greater than or "
                 "equal to outbound_transport_retry_base_seconds"
+            )
+        if (
+            self.memory_llm_extraction_job_lock_ttl_seconds
+            <= self.memory_llm_extraction_job_timeout_seconds
+        ):
+            raise ValueError(
+                "memory_llm_extraction_job_lock_ttl_seconds must be greater than "
+                "memory_llm_extraction_job_timeout_seconds"
             )
         if self.tibo_reset_enabled and not self.tibo_reset_api_url.strip():
             raise ValueError(

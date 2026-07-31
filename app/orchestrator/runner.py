@@ -9,6 +9,7 @@ real step executors.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -91,6 +92,17 @@ DELEGATED_RESULT_STEP_KINDS = {
     "plugin.commands.dispatch",
 }
 DELEGATED_HOOK_RESULT_STEP_PREFIX = "core.legacy_hooks."
+_TURN_SCOPED_PERSONA_VARIABLES = ("persona_skill", "persona_profile")
+
+
+def clear_turn_scoped_persona_variables(session: object | None) -> None:
+    """Discard reply-style state that must be resolved independently each turn."""
+
+    variables = getattr(session, "variables", None)
+    if not isinstance(variables, dict):
+        return
+    for key in _TURN_SCOPED_PERSONA_VARIABLES:
+        variables.pop(key, None)
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,7 @@ class FlowRunResult:
     effect_dispatches: list[dict[str, object]] = field(default_factory=list)
     stop_reason: str = ""
     error: str = ""
+    decision_trace: dict[str, object] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -177,8 +190,12 @@ class FlowRunner:
                 error=f"flow_not_active:{flow.status}",
             )
 
+        if not self._shadow:
+            clear_turn_scoped_persona_variables(ctx.session)
         for index, step in enumerate(flow.steps):
             result, trace = await self._run_step(step, ctx)
+            if not self._shadow and step.kind == "core.load_session":
+                clear_turn_scoped_persona_variables(ctx.session)
             traces.append(trace)
             if trace.status in {STEP_TRACE_ERROR, STEP_TRACE_TIMEOUT}:
                 return self._flow_result(
@@ -340,6 +357,7 @@ class FlowRunner:
             effect_dispatches=_effect_signal_records(effects.get("dispatches")),
             stop_reason=stop_reason,
             error=error,
+            decision_trace=_decision_trace(ctx),
         )
 
     async def _run_step(
@@ -908,6 +926,148 @@ def _format_dispatch_errors(records: list[EffectDispatchRecord]) -> str:
         error = record.error or EFFECT_HANDLER_STATUS_HANDLER_ERROR
         errors.append(f"{effect_name}:{error}")
     return "effect_handler_failed:" + ";".join(errors)
+
+
+_DECISION_ROUTER_SIGNAL_KEYS = (
+    "faq_matched",
+    "faq_similarity",
+    "faq_verdict",
+    "faq_preview_failed",
+    "faq_preview_error_class",
+    "tool_intent_matched",
+    "tools_available",
+    "effective_tool_count",
+    "policy_allowed",
+    "tool_denial_reason",
+    "tool_preflight_failed",
+    "tool_preflight_error_class",
+    "consecutive_fallbacks",
+)
+
+
+def _decision_trace(ctx: PipelineContext) -> dict[str, object]:
+    """Build a bounded, payload-free trace of intent and routing decisions."""
+
+    trace: dict[str, object] = {}
+    if ctx.pre is not None:
+        trace["intent"] = {
+            "coarse": str(getattr(ctx.pre.intent_coarse, "value", ctx.pre.intent_coarse) or ""),
+            "language": str(ctx.pre.language or ""),
+            "sensitive": bool(ctx.pre.sensitive),
+        }
+
+    if ctx.route is not None:
+        route_trace: dict[str, object] = {
+            "type": str(getattr(ctx.route.type, "value", ctx.route.type) or ""),
+            "confidence": _bounded_trace_float(ctx.route.confidence),
+            "reason": _bounded_trace_text(ctx.route.reason),
+        }
+        if isinstance(ctx.route.hints, dict):
+            rule = ctx.route.hints.get("rule")
+            if rule:
+                route_trace["rule"] = _bounded_trace_text(rule)
+            confidence_basis = ctx.route.hints.get("confidence_basis")
+            if confidence_basis:
+                route_trace["confidence_basis"] = _bounded_trace_text(confidence_basis)
+            matched_conditions = _bounded_trace_text_list(
+                ctx.route.hints.get("matched_conditions")
+            )
+            if matched_conditions:
+                route_trace["matched_conditions"] = matched_conditions
+        trace["route"] = route_trace
+
+    router_signals: dict[str, object] = {}
+    structured = ctx.signals.get("router")
+    if isinstance(structured, dict):
+        router_signals.update(structured)
+    legacy = ctx.extras.get("router_signals")
+    if isinstance(legacy, dict):
+        for key, value in legacy.items():
+            router_signals.setdefault(str(key), value)
+    safe_signals: dict[str, object] = {}
+    for key in _DECISION_ROUTER_SIGNAL_KEYS:
+        if key not in router_signals:
+            continue
+        value = _safe_decision_scalar(router_signals[key])
+        if value is not None:
+            safe_signals[key] = value
+    if safe_signals:
+        trace["router_signals"] = safe_signals
+
+    scope = ""
+    agent_signals = ctx.signals.get("agent")
+    if isinstance(agent_signals, dict):
+        scope = str(agent_signals.get("tool_scope") or "").strip()
+    scope = scope or str(ctx.extras.get("agent_tool_scope") or "").strip()
+    if scope:
+        trace["agent"] = {"tool_scope": _bounded_trace_text(scope)}
+
+    if ctx.result is not None:
+        metadata = dict(ctx.result.metadata or {})
+        result_trace: dict[str, object] = {
+            "route": str(getattr(ctx.result.route, "value", ctx.result.route) or ""),
+        }
+        for key in (
+            "fallback_from",
+            "fallback_reason",
+            "degradation_reason",
+            "tool_preselection_verdict",
+        ):
+            value = metadata.get(key)
+            if value:
+                result_trace[key] = _bounded_trace_text(value)
+        selected = _bounded_trace_text_list(metadata.get("tool_preselection_selected"))
+        if selected:
+            result_trace["tool_preselection_selected"] = selected
+        scores = _bounded_trace_score_map(metadata.get("tool_preselection_scores"))
+        if scores:
+            result_trace["tool_preselection_scores"] = scores
+        trace["result"] = result_trace
+    return trace
+
+
+def _safe_decision_scalar(value: object) -> object | None:
+    if isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _bounded_trace_text(value)
+    return None
+
+
+def _bounded_trace_float(value: object) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
+
+
+def _bounded_trace_text(value: object, *, limit: int = 256) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _bounded_trace_text_list(value: object, *, limit: int = 32) -> list[str]:
+    if not isinstance(value, list | tuple | set):
+        return []
+    return [
+        text
+        for item in list(value)[:limit]
+        if (text := _bounded_trace_text(item, limit=128))
+    ]
+
+
+def _bounded_trace_score_map(value: object, *, limit: int = 32) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    scores: dict[str, float] = {}
+    for raw_name, raw_score in list(value.items())[:limit]:
+        name = _bounded_trace_text(raw_name, limit=128)
+        score = _bounded_trace_float(raw_score)
+        if name:
+            scores[name] = score
+    return scores
 
 
 def _effect_signal_records(value: object) -> list[dict[str, object]]:

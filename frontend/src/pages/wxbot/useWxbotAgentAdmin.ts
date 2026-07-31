@@ -62,6 +62,8 @@ export function useWxbotAgentAdmin({
     if (agentScope === "group_plugin_status") return "群插件状态智能体";
     if (agentScope === "group_draw_generation") return "群绘图智能体";
     if (agentScope === "group_personal_map") return "高德个人地图智能体";
+    if (agentScope === "file_analysis") return "群文件处理智能体";
+    if (agentScope === "message_export") return "群消息文件导出智能体";
     return "群资料 / 成员查询智能体";
   }, [agentScope]);
 

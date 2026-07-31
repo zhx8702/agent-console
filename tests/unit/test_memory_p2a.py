@@ -8,6 +8,23 @@ import plugins.memory.store as memory_store_module
 from plugins.memory.store import MemoryItemProtectedError, MemoryStore
 
 
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    """Keep mutation tests inside a non-Postgres transaction.
+
+    Production forget/delete paths require one transaction so the member
+    advisory fence and the post-lock row re-read cover the whole mutation.
+    """
+
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+
 def _item(**kwargs):
     data = {
         "id": 1,
@@ -85,6 +102,13 @@ async def test_forget_by_query_filters_scope_before_delete(monkeypatch: pytest.M
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params))
+        if sql.startswith("SELECT id, tenant_id"):
+            assert params is not None
+            return (
+                [_item(id=1, user_id="wxid_a", source_key="wxbot", content="匹配本人")]
+                if params.get("id") == 1
+                else []
+            )
         if sql.startswith("UPDATE plugin_memory_item SET status = 'deleted'"):
             assert params is not None
             assert params["uid"] == "wxid_a"

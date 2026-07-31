@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from app.agent.scopes import GROUP_PERSONAL_MAP_SCOPE
+from app.agent.scopes import FILE_ANALYSIS_SCOPE, GROUP_PERSONAL_MAP_SCOPE, MESSAGE_EXPORT_SCOPE
 from app.common.logging import get_logger
 from app.common.types import Channel, Role
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
@@ -12,10 +12,18 @@ from app.plugin.hooks import HookPoint
 from app.social import ParticipationContext, ParticipationStatus, SocialParticipationService
 from app.social.speech_ledger import GroupSpeechBudgetExceeded
 from plugins.wxbot.channel import captured_group_delivery_contract
+from plugins.wxbot.group_file_policy import (
+    GroupFilePolicyReader,
+    GroupFileSendDenied,
+    require_group_file_send_enabled,
+)
 from plugins.wxbot.hook_context import (
     _agent_query_text,
     _event_mentioned_me,
+    _event_policy_session_id,
     _explicit_map_generation_requested,
+    _file_intent_requested,
+    _message_export_requested,
     _resolve_group_agent_scope,
 )
 from plugins.wxbot.store import WxbotStore
@@ -40,10 +48,101 @@ def _complete_async_delivery_contract(contract: dict[str, object]) -> bool:
     return isinstance(contract.get("send_revalidation_enabled"), bool)
 
 
+def _event_has_file_attachment(ctx: PipelineContext) -> bool:
+    """Detect an inbound file from the normalized event without trusting paths."""
+
+    message = getattr(ctx.event, "message", None)
+    for attachment in list(getattr(message, "attachments", []) or []):
+        raw_type = getattr(
+            getattr(attachment, "type", None),
+            "value",
+            getattr(attachment, "type", ""),
+        )
+        if str(raw_type or "").strip().lower() == "file":
+            return True
+    metadata = dict(getattr(ctx.event, "metadata", {}) or {})
+    media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+    attachment = (
+        metadata.get("file_attachment")
+        if isinstance(metadata.get("file_attachment"), dict)
+        else {}
+    )
+    if str(attachment.get("type") or "").strip().lower() == "file":
+        return True
+    return str(
+        metadata.get("file_name")
+        or metadata.get("file_url")
+        or media.get("file_name")
+        or media.get("file_url")
+        or ""
+    ).strip() != ""
+
+
+def _event_is_group(ctx: PipelineContext) -> bool:
+    metadata = dict(getattr(ctx.event, "metadata", {}) or {})
+    if str(metadata.get("session_kind") or "").strip().lower() == "group":
+        return True
+    for value in (
+        getattr(ctx.event, "external_conversation_id", ""),
+        metadata.get("external_conversation_id"),
+        getattr(ctx.event, "session_id", ""),
+    ):
+        if str(value or "").strip().endswith("@chatroom"):
+            return True
+    return False
+
+
+def _session_has_file_attachment(ctx: PipelineContext) -> bool:
+    """Return whether this session has a recent user file available to act on."""
+
+    session = ctx.session
+    if session is None:
+        return False
+    is_group = _event_is_group(ctx)
+    requester_id = str(
+        ctx.event.metadata.get("sender_wxid")
+        or ctx.event.metadata.get("sender_id")
+        or ctx.event.user_id
+        or ""
+    ).strip()
+    for turn in reversed(list(getattr(session, "turns", []) or [])):
+        raw_role = getattr(turn, "role", "")
+        role = str(getattr(raw_role, "value", raw_role) or "").strip().lower()
+        if role != "user":
+            continue
+        metadata = dict(getattr(turn, "metadata", {}) or {})
+        if is_group and requester_id:
+            file_sender = str(
+                metadata.get("sender_wxid") or metadata.get("sender_id") or ""
+            ).strip()
+            if file_sender and file_sender != requester_id:
+                continue
+        media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+        attachment = (
+            metadata.get("file_attachment")
+            if isinstance(metadata.get("file_attachment"), dict)
+            else {}
+        )
+        if (
+            str(metadata.get("msg_type") or "").strip().lower() == "file"
+            or str(attachment.get("type") or "").strip().lower() == "file"
+            or str(
+                metadata.get("file_name")
+                or metadata.get("file_url")
+                or media.get("file_name")
+                or media.get("file_url")
+                or ""
+            ).strip()
+        ):
+            return True
+    return False
+
+
 @dataclass
 class WxbotAgentIntentHook:
     store: WxbotStore | None = None
     effect_handler_enabled: bool = False
+    social_policy_store: GroupFilePolicyReader | None = None
     name: str = "wxbot.agent_intent"
     point: HookPoint = HookPoint.BEFORE_ROUTE
     priority: int = 30
@@ -51,23 +150,99 @@ class WxbotAgentIntentHook:
     async def run(self, ctx: PipelineContext) -> None:
         if ctx.event.channel != Channel.WECHAT:
             return
-        if not str(ctx.event.session_id or "").endswith("@chatroom"):
-            return
         if bool(ctx.event.metadata.get("is_self_sent")):
             return
-        if not _event_mentioned_me(ctx):
-            return
+        is_group = _event_is_group(ctx)
         text = _agent_query_text(ctx)
-        scope = _resolve_group_agent_scope(text)
+        file_available = _event_has_file_attachment(ctx) or _session_has_file_attachment(ctx)
+        file_intent = _file_intent_requested(
+            text,
+            has_attachment=file_available,
+        )
+        if file_intent.file_requested:
+            ctx.extras["wxbot_file_intent"] = file_intent.as_dict()
+        if is_group:
+            if not _event_mentioned_me(ctx):
+                return
+            scope = _resolve_group_agent_scope(text)
+            if (
+                scope is None
+                and file_intent.operation in {"inspect_incoming", "convert"}
+                and file_intent.has_attachment
+                and file_intent.source == "incoming_attachment"
+            ):
+                scope = FILE_ANALYSIS_SCOPE
+            if (
+                scope is None
+                and file_intent.operation == "generate"
+                and file_intent.delivery_required
+            ):
+                scope = FILE_ANALYSIS_SCOPE
+        else:
+            # Private sessions do not require an @ mention, but only the
+            # narrowly defined combined summary + file-delivery intent may
+            # activate tools.  Group-only query scopes remain unavailable.
+            scope = (
+                MESSAGE_EXPORT_SCOPE
+                if _message_export_requested(text)
+                else FILE_ANALYSIS_SCOPE
+                if (
+                    file_intent.operation in {"inspect_incoming", "convert"}
+                    and file_intent.has_attachment
+                    and file_intent.source == "incoming_attachment"
+                )
+                or (
+                    file_intent.operation == "generate"
+                    and file_intent.delivery_required
+                )
+                else None
+            )
         if not scope:
             return
         router_signals = ctx.extras.setdefault("router_signals", {})
         if not isinstance(router_signals, dict):
             router_signals = {}
             ctx.extras["router_signals"] = router_signals
-        router_signals["tools_available"] = True
+        group_file_send_enabled = True
+        if is_group and scope in {FILE_ANALYSIS_SCOPE, MESSAGE_EXPORT_SCOPE}:
+            try:
+                await require_group_file_send_enabled(
+                    self.social_policy_store,
+                    tenant_id=ctx.event.tenant_id,
+                    session_id=_event_policy_session_id(ctx),
+                )
+            except GroupFileSendDenied as exc:
+                group_file_send_enabled = False
+                ctx.extras["wxbot_file_send_denial_reason"] = exc.reason
+            ctx.event.metadata["group_file_send_enabled"] = group_file_send_enabled
+            if ctx.session is not None:
+                ctx.session.metadata["group_file_send_enabled"] = group_file_send_enabled
+        outbound_file_required = bool(
+            scope == MESSAGE_EXPORT_SCOPE
+            or (
+                scope == FILE_ANALYSIS_SCOPE
+                and file_intent.operation in {"convert", "generate", "send_existing"}
+                and file_intent.delivery_required
+            )
+        )
+        # `tool_intent_matched` describes what this hook actually knows.
+        # Keep the legacy routing flag until router rules migrate to the
+        # intent-specific signal; availability is still enforced downstream.
+        router_signals["tool_intent_matched"] = True
+        router_signals["tools_available"] = not (
+            outbound_file_required and not group_file_send_enabled
+        )
+        if file_intent.file_requested:
+            router_signals["file_intent"] = file_intent.as_dict()
+        if outbound_file_required and not group_file_send_enabled:
+            router_signals["file_send_denied"] = str(
+                ctx.extras.get("wxbot_file_send_denial_reason")
+                or "group_file_send_disabled"
+            )
+            return
         ctx.extras["agent_tool_scope"] = scope
-        self._capture_async_delivery_contract(ctx)
+        if is_group:
+            self._capture_async_delivery_contract(ctx)
         if scope == GROUP_PERSONAL_MAP_SCOPE and _explicit_map_generation_requested(text):
             await self._enqueue_map_progress(
                 ctx,
@@ -87,7 +262,6 @@ class WxbotAgentIntentHook:
             text_length=len(text),
             scope=scope,
         )
-
     @staticmethod
     def _capture_async_delivery_contract(ctx: PipelineContext) -> dict[str, object]:
         source_message_id = str(
@@ -102,6 +276,12 @@ class WxbotAgentIntentHook:
             policy_state=(policy_state if isinstance(policy_state, dict) else None),
             response_kind="tool_result",
         )
+        features = ctx.extras.get("wxbot_humanization_features")
+        if isinstance(features, dict):
+            contract["style_eligible"] = bool(features.get("style_guard_enabled"))
+        voice_profile = ctx.extras.get("wxbot_voice_profile")
+        if isinstance(voice_profile, dict) and voice_profile:
+            contract["voice_profile"] = dict(voice_profile)
         ctx.extras["wxbot_async_delivery_contract"] = dict(contract)
         ctx.event.metadata[_DELIVERY_CONTRACT_METADATA_KEY] = dict(contract)
         if ctx.session is None:
@@ -128,7 +308,7 @@ class WxbotAgentIntentHook:
         command_id = f"wxbot-progress:{ctx.event.tenant_id}:{source_message_id}:amap-map"
         session_kind = str(
             ctx.event.metadata.get("session_kind")
-            or ("group" if str(ctx.event.session_id or "").endswith("@chatroom") else "private")
+            or ("group" if _event_is_group(ctx) else "private")
         )
         mention_sender = False
         feature_state = ctx.extras.get("wxbot_humanization_features")

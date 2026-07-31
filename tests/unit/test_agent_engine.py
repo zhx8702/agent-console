@@ -327,6 +327,7 @@ class _FakeAgentStore:
             "available_tools": available,
             "effective_tools": effective,
             "inherits_default_tools": self.effective_tools is None,
+            "denial_reason": "" if self.enabled else "policy_disabled",
         }
 
     async def create_tool_audit(self, **kwargs) -> int:
@@ -815,6 +816,41 @@ async def test_agent_capability_hides_privacy_sensitive_tools_from_regular_membe
     assert "search_group_messages" not in tools
     assert "research_group_messages" not in tools
     assert "build_group_member_profile_report" not in tools
+
+
+def test_group_admin_cannot_bypass_disabled_group_file_master_switch() -> None:
+    definition = AgentToolDefinition(
+        scope="file_analysis",
+        name="generate_text_file",
+        description="generate file",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda *_args, **_kwargs: None,
+        metadata={
+            "channels": ["wechat"],
+            "session_kinds": ["group", "private"],
+            "required_group_role": "admin",
+            "requires_group_file_send": True,
+        },
+    )
+    session = Session(
+        session_id="room@chatroom",
+        tenant_id="demo",
+        user_id="wxid_admin",
+        channel=Channel.WECHAT,
+        metadata={"session_kind": "group", "group_file_send_enabled": False},
+        turns=[
+            Turn(
+                session_id="room@chatroom",
+                role=Role.USER,
+                content="生成文件发我",
+                metadata={"sender_is_group_admin": True},
+            )
+        ],
+    )
+
+    assert AgentCapabilityEngine._definition_matches_session(definition, session) is False
+    session.metadata["group_file_send_enabled"] = True
+    assert AgentCapabilityEngine._definition_matches_session(definition, session) is True
 
 
 @pytest.mark.asyncio
@@ -1479,6 +1515,69 @@ def _preselection_session(text: str) -> Session:
 
 
 @pytest.mark.asyncio
+async def test_agent_capability_previews_effective_tools_without_invoking_llm() -> None:
+    llm = _NoToolAgentLLM()
+    registry = AgentToolRegistry()
+    _register_preselection_tool(
+        registry,
+        name="credit_tool",
+        embed_text="积分 查询",
+        required_params=["积分"],
+    )
+    _register_preselection_tool(registry, name="moderation_tool", embed_text="审核 状态")
+    engine = AgentCapabilityEngine(
+        llm,
+        settings=Settings(customer_service_prompt_enabled=False),
+        agent_tool_registry=registry,
+        tool_owner_gate=_strict_allow_tool_owner_gate(),
+    )
+
+    preview = await engine.preview_availability(
+        make_preprocessed("帮我查积分"),
+        _preselection_session("帮我查积分"),
+        {"agent_tool_scope": "group_info"},
+    )
+
+    assert preview == {
+        "effective_tool_count": 1,
+        "policy_allowed": True,
+        "denial_reason": "",
+        "effective_tools": ["credit_tool"],
+        "tool_preselection_verdict": "CLEAR",
+    }
+    assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_agent_capability_preview_reports_policy_denial_without_tools() -> None:
+    llm = _NoToolAgentLLM()
+    registry = AgentToolRegistry()
+    _register_preselection_tool(registry, name="credit_tool", embed_text="积分")
+    engine = AgentCapabilityEngine(
+        llm,
+        settings=Settings(customer_service_prompt_enabled=False),
+        agent_store=_FakeAgentStore(enabled=False, effective_tools=[]),
+        agent_tool_registry=registry,
+        tool_owner_gate=_strict_allow_tool_owner_gate(),
+    )
+
+    preview = await engine.preview_availability(
+        make_preprocessed("积分"),
+        _preselection_session("积分"),
+        {"agent_tool_scope": "group_info"},
+    )
+
+    assert preview == {
+        "effective_tool_count": 0,
+        "policy_allowed": False,
+        "denial_reason": "policy_disabled",
+        "effective_tools": [],
+        "tool_preselection_verdict": "LOW",
+    }
+    assert llm.requests == []
+
+
+@pytest.mark.asyncio
 async def test_agent_capability_preselects_tool_with_clear_verdict() -> None:
     llm = _NoToolAgentLLM()
     registry = AgentToolRegistry()
@@ -1526,6 +1625,47 @@ async def test_agent_capability_preselection_marks_ambiguous_when_multiple_match
 
 
 @pytest.mark.asyncio
+async def test_agent_capability_preselection_keeps_close_runner_up_when_margin_is_small() -> None:
+    llm = _NoToolAgentLLM()
+    registry = AgentToolRegistry()
+    _register_preselection_tool(
+        registry,
+        name="credit_summary_tool",
+        embed_text="积分",
+        required_params=["积分"],
+    )
+    _register_preselection_tool(registry, name="credit_member_tool", tree_text="积分")
+    _register_preselection_tool(registry, name="moderation_tool", embed_text="审核")
+    engine = AgentCapabilityEngine(
+        llm,
+        settings=Settings(customer_service_prompt_enabled=False),
+        agent_tool_registry=registry,
+        tool_owner_gate=_strict_allow_tool_owner_gate(),
+    )
+
+    result = await engine.answer(
+        make_preprocessed("积分"),
+        _preselection_session("积分"),
+        {"agent_tool_scope": "group_info"},
+    )
+
+    assert [tool.name for tool in llm.requests[0].tools] == [
+        "credit_summary_tool",
+        "credit_member_tool",
+    ]
+    assert result.metadata["tool_preselection_verdict"] == "AMBIGUOUS"
+    assert result.metadata["tool_preselection_selected"] == [
+        "credit_summary_tool",
+        "credit_member_tool",
+    ]
+    assert result.metadata["tool_preselection_scores"] == {
+        "credit_summary_tool": 3,
+        "credit_member_tool": 2,
+        "moderation_tool": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_capability_preselection_marks_insufficient_when_weak_match() -> None:
     llm = _NoToolAgentLLM()
     registry = AgentToolRegistry()
@@ -1544,8 +1684,13 @@ async def test_agent_capability_preselection_marks_insufficient_when_weak_match(
         {"agent_tool_scope": "group_info"},
     )
 
-    assert [tool.name for tool in llm.requests[0].tools] == ["query_tool"]
+    assert [tool.name for tool in llm.requests[0].tools] == ["query_tool", "status_tool"]
     assert result.metadata["tool_preselection_verdict"] == "INSUFFICIENT"
+    assert result.metadata["tool_preselection_selected"] == ["query_tool", "status_tool"]
+    assert result.metadata["tool_preselection_scores"] == {
+        "query_tool": 1,
+        "status_tool": 0,
+    }
 
 
 @pytest.mark.asyncio

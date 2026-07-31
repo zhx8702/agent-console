@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 import plugins.memory.store as memory_store_module
+from app.social.contracts import MemberPrivacyValues
 from plugins.memory.store import (
     GROUP_HISTORY_USER_ID_SCOPE,
     MEMORY_DDL_CONSISTENCY_GUARD,
@@ -20,6 +21,17 @@ from plugins.memory.store import (
     _llm_extraction_job_enqueue_eligible,
     _redact_profile_enrichment_payload,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
 
 
 @pytest.mark.parametrize(
@@ -1032,6 +1044,9 @@ async def test_backfill_writes_events_items_and_is_idempotent(
                 "assistant_text": params["assistant_text"],
                 "trace_id": params["trace"],
                 "event_key": key,
+                "source_member_id": params.get("source_member_id") or "",
+                "source_message_id": params.get("source_message_id") or "",
+                "expires_at": params.get("expires_at"),
                 "created_at": params["created_at"],
             }
             next_event_id += 1
@@ -1040,6 +1055,20 @@ async def test_backfill_writes_events_items_and_is_idempotent(
         if "FROM plugin_memory_event WHERE event_key" in sql:
             event = events_by_key.get(params["event_key"])
             return [dict(event)] if event else []
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            source_event_id = int(params["source_event_id"])
+            return [
+                dict(event)
+                for event in events_by_key.values()
+                if int(event["id"]) == source_event_id
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            event_ids = {int(value) for value in params["event_ids"]}
+            return [
+                dict(event)
+                for event in events_by_key.values()
+                if int(event["id"]) in event_ids
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             key = params["normalized_key"]
             item = items_by_key.get(key)
@@ -1174,7 +1203,6 @@ async def test_backfill_sanitizes_nul_text_before_event_item_and_job_insert(
     next_event_id = 1
     next_item_id = 1
     next_job_id = 1
-
     async def fake_collect_session_history(**kwargs: Any) -> list[dict[str, Any]]:
         return [
             {
@@ -1243,6 +1271,9 @@ async def test_backfill_sanitizes_nul_text_before_event_item_and_job_insert(
                 "assistant_text": params["assistant_text"],
                 "trace_id": params["trace"],
                 "event_key": key,
+                "source_member_id": params.get("source_member_id") or "",
+                "source_message_id": params.get("source_message_id") or "",
+                "expires_at": params.get("expires_at"),
                 "created_at": params["created_at"],
             }
             next_event_id += 1
@@ -1251,6 +1282,20 @@ async def test_backfill_sanitizes_nul_text_before_event_item_and_job_insert(
         if "FROM plugin_memory_event WHERE event_key" in sql:
             event = events_by_key.get(str(params["event_key"]))
             return [dict(event)] if event else []
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            source_event_id = int(params["source_event_id"])
+            return [
+                dict(event)
+                for event in events_by_key.values()
+                if int(event["id"]) == source_event_id
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            event_ids = {int(value) for value in params["event_ids"]}
+            return [
+                dict(event)
+                for event in events_by_key.values()
+                if int(event["id"]) in event_ids
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             item = items_by_key.get(str(params["normalized_key"]))
             return [{"id": item["id"]}] if item else []
@@ -1675,6 +1720,17 @@ async def test_group_backfill_closed_loop_persists_group_scoped_events_items_job
     next_event_id = 1
     next_item_id = 1
     next_job_id = 1
+    member_policy = MemberPrivacyValues(
+        memory_enabled=True,
+        audience_scope="session",
+        retention_days=365,
+    )
+
+    async def fake_get_group_member_privacy_policy(**kwargs: Any) -> MemberPrivacyValues:
+        assert kwargs["tenant_id"] == "demo"
+        assert kwargs["session_id"] == "room-a@chatroom"
+        assert kwargs["user_id"] in {"wxid_member_a", "wxid_member_b"}
+        return member_policy
 
     async def fake_collect_session_history(**kwargs: Any) -> list[dict[str, Any]]:
         assert kwargs["session_id"] == "room-a@chatroom"
@@ -1720,6 +1776,17 @@ async def test_group_backfill_closed_loop_persists_group_scoped_events_items_job
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_event_id, next_item_id, next_job_id
         params = params or {}
+        if "FROM social_member_policy_history" in sql:
+            return [
+                {
+                    "snapshot_json": {
+                        "policy": member_policy.model_dump(mode="json"),
+                    },
+                    "created_at": datetime(2026, 1, 1),
+                }
+            ]
+        if "FROM audit_events" in sql:
+            return []
         if "INSERT INTO plugin_memory_event" in sql:
             key = str(params["event_key"])
             if key in events_by_key:
@@ -1735,6 +1802,9 @@ async def test_group_backfill_closed_loop_persists_group_scoped_events_items_job
                 "assistant_text": params["assistant_text"],
                 "trace_id": params["trace"],
                 "event_key": key,
+                "source_member_id": params.get("source_member_id") or "",
+                "source_message_id": params.get("source_message_id") or "",
+                "expires_at": params.get("expires_at"),
                 "created_at": params["created_at"],
             }
             next_event_id += 1
@@ -1743,6 +1813,28 @@ async def test_group_backfill_closed_loop_persists_group_scoped_events_items_job
         if "FROM plugin_memory_event WHERE event_key" in sql:
             event = events_by_key.get(str(params["event_key"]))
             return [dict(event)] if event else []
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            requested_ids = {int(value) for value in params.get("event_ids") or []}
+            return [
+                {
+                    "id": event["id"],
+                    "source_member_id": event["source_member_id"],
+                    "source_message_id": event["source_message_id"],
+                }
+                for event in events_by_key.values()
+                if int(event["id"]) in requested_ids
+            ]
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            source_event_id = int(params["source_event_id"])
+            return [
+                {
+                    "id": event["id"],
+                    "source_member_id": event["source_member_id"],
+                    "source_message_id": event["source_message_id"],
+                }
+                for event in events_by_key.values()
+                if int(event["id"]) == source_event_id
+            ]
         if (
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type"
             in sql
@@ -1904,6 +1996,11 @@ async def test_group_backfill_closed_loop_persists_group_scoped_events_items_job
         return []
 
     monkeypatch.setattr(store, "_collect_session_history", fake_collect_session_history)
+    monkeypatch.setattr(
+        store,
+        "get_group_member_privacy_policy",
+        fake_get_group_member_privacy_policy,
+    )
     monkeypatch.setattr(store, "_apply_backfill_session_messages", fake_apply_session)
     monkeypatch.setattr(store, "_apply_backfill_identity_messages", fake_apply_identity)
     monkeypatch.setattr(store, "list_session_profiles", fake_list_session_profiles)

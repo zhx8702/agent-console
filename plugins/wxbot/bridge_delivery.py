@@ -28,11 +28,44 @@ from plugins.wxbot.bridge_contract import (
     _send_time_participation_policy,
 )
 from plugins.wxbot.bridge_state import WxbotBridgeState
+from plugins.wxbot.group_file_policy import (
+    GroupFileSendDenied,
+    require_group_file_send_enabled,
+)
 
 log = get_logger(__name__)
 
 _GROUP_ACTIVITY_EXECUTION_OWNERS = frozenset({"group_activity", "wxbot"})
 _EXECUTION_OWNER_GATE_TIMEOUT_SECONDS = 1.0
+
+
+def _sdk_content_payload(reply: dict[str, Any], *, msg_type: str) -> dict[str, Any]:
+    content: dict[str, Any] = {
+        "msg_type": msg_type,
+        "text": reply["reply_text"],
+    }
+    if msg_type != "file":
+        content.update(
+            {
+                "image_path": reply.get("image_path", ""),
+                "image_url": reply.get("image_url", ""),
+            }
+        )
+        return content
+
+    content["file_path"] = str(reply.get("file_path") or "")
+    file_name = str(reply.get("file_name") or "").strip()
+    if file_name:
+        content["file_name"] = file_name
+    if reply.get("file_size") is not None:
+        content["file_size"] = int(reply["file_size"])
+    file_md5 = str(reply.get("file_md5") or "").strip()
+    if file_md5:
+        content["file_md5"] = file_md5
+    file_sha256 = str(reply.get("file_sha256") or "").strip()
+    if file_sha256:
+        content["file_sha256"] = file_sha256
+    return content
 
 
 class WxbotBridgeDeliveryMixin(WxbotBridgeState):
@@ -82,29 +115,19 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                     "requested_proactive": True,
                     "delivery_outcome": str(outcome or "unknown")[:32],
                     "transition_applied": bool(transition_applied),
-                    "source_message_bound": bool(
-                        str(reply.get("source_message_id") or "").strip()
-                    ),
+                    "source_message_bound": bool(str(reply.get("source_message_id") or "").strip()),
                     "reply_queue_id": int(reply.get("id") or 0),
                     "actual_delay_seconds": round(
                         self._reply_delivery_delay_seconds(reply),
                         3,
                     ),
-                    "humanization_stage": str(
-                        delivery.get("humanization_stage") or "legacy"
-                    )[:32],
-                    "humanization_cohort": str(
-                        delivery.get("humanization_cohort") or "legacy"
-                    )[:32],
-                    "speech_class": str(
-                        delivery.get("speech_class") or "scheduled"
-                    )[:32],
-                    "speech_budget_enabled": bool(
-                        delivery.get("speech_budget_enabled", True)
-                    ),
-                    "duplicate_guard_enabled": bool(
-                        delivery.get("duplicate_guard_enabled", True)
-                    ),
+                    "humanization_stage": str(delivery.get("humanization_stage") or "legacy")[:32],
+                    "humanization_cohort": str(delivery.get("humanization_cohort") or "legacy")[
+                        :32
+                    ],
+                    "speech_class": str(delivery.get("speech_class") or "scheduled")[:32],
+                    "speech_budget_enabled": bool(delivery.get("speech_budget_enabled", True)),
+                    "duplicate_guard_enabled": bool(delivery.get("duplicate_guard_enabled", True)),
                     "duplicate_guard_outcome": str(
                         duplicate_guard.get("action")
                         or delivery.get("duplicate_guard_outcome")
@@ -118,9 +141,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                         observation.get("superseded_by_newer_message")
                     ),
                 },
-                trace_id=str(
-                    reply.get("trace_id") or delivery.get("trace_id") or ""
-                ),
+                trace_id=str(reply.get("trace_id") or delivery.get("trace_id") or ""),
                 runtime_stage="revalidation",
                 delivery_stage=str(outcome or "unknown")[:32],
             )
@@ -397,9 +418,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         if not all(callable(item) for item in required):
             # Production WxbotStore always provides these methods.  Keeping old
             # test adapters operable does not weaken the real bridge path.
-            if self._social_policy_store is not None or bool(
-                delivery.get("requested_proactive")
-            ):
+            if self._social_policy_store is not None or bool(delivery.get("requested_proactive")):
                 raise RuntimeError("send_revalidation_dependencies_unavailable")
             log.warning(
                 "wxbot.bridge.send_revalidation_unavailable",
@@ -562,9 +581,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         owners_value = delivery.get("execution_owners")
         versions_value = delivery.get("execution_owner_versions")
         contract_required = bool(
-            source == "group_activity"
-            or owners_value is not None
-            or versions_value is not None
+            source == "group_activity" or owners_value is not None or versions_value is not None
         )
         if not contract_required:
             return None, ""
@@ -578,24 +595,18 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         ):
             return None, "execution_owner_contract_invalid"
         owner_set = frozenset(owners)
-        if (
-            source == "group_activity"
-            and owner_set != _GROUP_ACTIVITY_EXECUTION_OWNERS
-        ) or ("group_activity" in owner_set and source != "group_activity"):
+        if (source == "group_activity" and owner_set != _GROUP_ACTIVITY_EXECUTION_OWNERS) or (
+            "group_activity" in owner_set and source != "group_activity"
+        ):
             return None, "execution_owner_contract_invalid"
         if not isinstance(versions_value, dict) or set(versions_value) != set(owners):
             return None, "execution_owner_versions_invalid"
-        owner_versions = {
-            owner: str(versions_value.get(owner) or "").strip()
-            for owner in owners
-        }
+        owner_versions = {owner: str(versions_value.get(owner) or "").strip() for owner in owners}
         if any(not version or len(version) > 64 for version in owner_versions.values()):
             return None, "execution_owner_versions_invalid"
         tenant_id = str(delivery.get("execution_tenant_id") or "").strip()
         session_id = str(delivery.get("execution_session_id") or "").strip()
-        if tenant_id != self._tenant_id or session_id != str(
-            reply.get("session_id") or ""
-        ).strip():
+        if tenant_id != self._tenant_id or session_id != str(reply.get("session_id") or "").strip():
             return None, "execution_owner_scope_mismatch"
         return owner_versions, ""
 
@@ -689,9 +700,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         delivery: dict[str, Any],
         decision: dict[str, Any],
     ) -> bool:
-        reason = str(
-            decision.get("reason") or "execution_owner_disabled"
-        )[:64]
+        reason = str(decision.get("reason") or "execution_owner_disabled")[:64]
         claim_active = await self._store.update_reply_command(
             int(reply["id"]),
             tenant_id=self._tenant_id,
@@ -718,6 +727,51 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         )
         return bool(cancelled)
 
+    async def _require_group_file_send_before_sdk(
+        self,
+        reply: dict[str, Any],
+        *,
+        claim_token: str,
+    ) -> bool:
+        if str(reply.get("msg_type") or "text").strip().lower() != "file":
+            return True
+        delivery_value = reply.get("delivery")
+        delivery = delivery_value if isinstance(delivery_value, dict) else {}
+        session_id = str(
+            delivery.get("external_conversation_id")
+            or reply.get("external_conversation_id")
+            or reply.get("session_id")
+            or ""
+        ).strip()
+        session_kind = str(
+            delivery.get("session_kind") or reply.get("session_kind") or ""
+        ).strip().lower()
+        if session_kind != "group" and not session_id.endswith("@chatroom"):
+            return True
+        try:
+            await require_group_file_send_enabled(
+                self._social_policy_store,
+                tenant_id=self._tenant_id,
+                session_id=session_id,
+            )
+        except GroupFileSendDenied as exc:
+            cancelled = await self._store.cancel_claimed_reply(
+                int(reply["id"]),
+                tenant_id=self._tenant_id,
+                connection_id=self._connection_id,
+                claim_token=claim_token,
+                reason=exc.reason,
+            )
+            log.warning(
+                "wxbot.bridge.group_file_send_cancelled",
+                reply_id=reply.get("id"),
+                session_id=session_id,
+                reason=exc.reason,
+                cancelled=cancelled,
+            )
+            return False
+        return True
+
     async def _send_one_reply(self, reply: dict[str, Any]) -> None:
         reply_id = reply["id"]
         claim_token = str(reply.get("claim_token") or "").strip()
@@ -725,6 +779,11 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
             log.warning("wxbot.bridge.reply_missing_claim", reply_id=reply_id)
             return
         try:
+            if not await self._require_group_file_send_before_sdk(
+                reply,
+                claim_token=claim_token,
+            ):
+                return
             revalidation = await self._revalidate_reply_for_send(
                 reply,
                 claim_token=claim_token,
@@ -761,9 +820,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                     "reason_codes": list(revalidation.get("reason_codes") or []),
                     "final_status": str(revalidation.get("final_status") or ""),
                     "outcome": str(revalidation.get("outcome") or ""),
-                    "actual_delay_seconds": float(
-                        revalidation.get("actual_delay_seconds") or 0.0
-                    ),
+                    "actual_delay_seconds": float(revalidation.get("actual_delay_seconds") or 0.0),
                 }
             claim_active = await self._store.update_reply_command(
                 reply_id,
@@ -863,12 +920,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                     "wxid": reply.get("sender_wxid", ""),
                     "name": reply.get("sender_name", ""),
                 },
-                "content": {
-                    "msg_type": msg_type,
-                    "text": reply["reply_text"],
-                    "image_path": reply.get("image_path", ""),
-                    "image_url": reply.get("image_url", ""),
-                },
+                "content": _sdk_content_payload(reply, msg_type=msg_type),
                 "reply": {
                     "mention_sender": bool(reply.get("mention_sender")),
                     "reply_to_msg_svr_id": reply.get("reply_to_msg_svr_id", ""),
@@ -913,31 +965,29 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                         decision=fallback_gate,
                     )
                     return
+                legacy_payload = {
+                    "session_id": str(
+                        delivery.get("external_conversation_id")
+                        or reply.get("external_conversation_id")
+                        or reply["session_id"]
+                    ),
+                    "session_name": reply.get("session_name", ""),
+                    "sender_name": reply.get("sender_name", ""),
+                    "sender_wxid": reply.get("sender_wxid", ""),
+                    "mention_sender": bool(reply.get("mention_sender")),
+                    "reply_to_msg_svr_id": reply.get("reply_to_msg_svr_id", ""),
+                    "session_kind": reply.get("session_kind", ""),
+                    **_sdk_content_payload(reply, msg_type=msg_type),
+                    "source_message": reply.get("source_message", {}),
+                    "delivery": delivery,
+                    "command_id": command_id,
+                }
                 resp = await self._request_sdk(
                     self._client,
                     "POST",
                     self._sdk_url,
                     "/send",
-                    json={
-                        "session_id": str(
-                            delivery.get("external_conversation_id")
-                            or reply.get("external_conversation_id")
-                            or reply["session_id"]
-                        ),
-                        "session_name": reply.get("session_name", ""),
-                        "sender_name": reply.get("sender_name", ""),
-                        "sender_wxid": reply.get("sender_wxid", ""),
-                        "mention_sender": bool(reply.get("mention_sender")),
-                        "reply_to_msg_svr_id": reply.get("reply_to_msg_svr_id", ""),
-                        "session_kind": reply.get("session_kind", ""),
-                        "text": reply["reply_text"],
-                        "msg_type": msg_type,
-                        "image_path": reply.get("image_path", ""),
-                        "image_url": reply.get("image_url", ""),
-                        "source_message": reply.get("source_message", {}),
-                        "delivery": delivery,
-                        "command_id": command_id,
-                    },
+                    json=legacy_payload,
                     headers={
                         "Accept": "application/json",
                         "Content-Type": "application/json",

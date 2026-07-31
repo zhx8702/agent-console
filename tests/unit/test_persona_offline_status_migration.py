@@ -33,13 +33,13 @@ def test_persona_offline_status_upgrade_extends_the_single_head(monkeypatch) -> 
 
     assert migration.revision == "0043_persona_offline_status"
     assert migration.down_revision == "0042_wxbot_report_delivery_ack"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 9
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]
     assert (
         ScriptDirectory.from_config(Config("alembic.ini"))
-        .get_revision(RUNTIME_SCHEMA_REVISION)
+        .get_revision("0044_persona_profile_catalog")
         .down_revision
         == migration.revision
     )

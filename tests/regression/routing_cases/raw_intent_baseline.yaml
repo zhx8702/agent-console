@@ -1,0 +1,98 @@
+cases:
+  - id: zh_explicit_handoff
+    text: "请帮我转人工客服"
+    expect:
+      intent: handoff_request
+      route: handoff
+      rule: user_requested_handoff
+
+  - id: zh_negated_handoff
+    text: "不要转人工"
+    expect:
+      intent: unknown
+      route: llm
+      rule: default
+
+  - id: zh_handoff_then_cancel
+    text: "帮我转人工，算了不用了"
+    expect:
+      intent: unknown
+      route: llm
+      rule: default
+
+  - id: zh_cancel_then_handoff
+    text: "先别转人工，还是帮我转人工吧"
+    expect:
+      intent: handoff_request
+      route: handoff
+      rule: user_requested_handoff
+
+  - id: zh_quoted_handoff_question
+    text: "“转人工”是什么意思？"
+    expect:
+      intent: faq
+      route: rag
+      rule: faq_intent
+
+  - id: zh_human_movie_false_positive
+    text: "真人电影挺好看"
+    expect:
+      intent: unknown
+      route: llm
+      rule: default
+
+  - id: en_explicit_handoff
+    text: "I need a human agent."
+    expect:
+      intent: handoff_request
+      route: handoff
+      rule: user_requested_handoff
+
+  - id: en_negated_handoff
+    text: "Don't transfer me to a human agent."
+    expect:
+      intent: unknown
+      route: llm
+      rule: default
+
+  - id: en_business_order
+    text: "Where is my order?"
+    expect:
+      intent: business
+      route: rag
+      rule: business_knowledge
+
+  - id: zh_negated_complaint_business
+    text: "我不想投诉，只想问物流到哪了"
+    expect:
+      intent: business
+      route: rag
+      rule: business_knowledge
+
+  - id: zh_explicit_complaint
+    text: "我要投诉你们的服务"
+    expect:
+      intent: complaint
+      route: llm
+      rule: complaint_safe_default
+
+  - id: en_explicit_complaint
+    text: "I want to file a complaint."
+    expect:
+      intent: complaint
+      route: llm
+      rule: complaint_safe_default
+
+  - id: en_chitchat
+    text: "Hello, nice to meet you."
+    expect:
+      intent: chitchat
+      route: llm
+      rule: default
+
+  - id: en_faq_password
+    text: "How do I reset my password?"
+    expect:
+      intent: faq
+      route: rag
+      rule: faq_intent

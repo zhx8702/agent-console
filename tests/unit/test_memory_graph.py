@@ -12,6 +12,19 @@ import plugins.memory.store as memory_store_module
 from plugins.memory.store import MemoryStore, _semantic_key
 
 
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    """Keep storage unit tests inside an injected non-Postgres transaction."""
+
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+
 class _GraphSqlFake:
     def __init__(self) -> None:
         self.entities: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
@@ -1479,6 +1492,8 @@ async def test_daily_group_relationship_extraction_stats_only_idempotent_and_saf
                     "created_at": "2026-05-15T09:00:00",
                 },
             ]
+        if "deleted_at IS NOT NULL" in sql:
+            return []
         if (
             "FROM plugin_memory_item" in sql
             and "normalized_key = :normalized_key" in sql
@@ -1900,6 +1915,15 @@ async def test_group_relationship_window_extraction_fake_llm_applies_and_is_idem
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_item_id
         params = params or {}
+        if "SELECT id, source_member_id, source_message_id" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in params.get("event_ids", [])
+            ]
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             return [
                 {
@@ -1929,6 +1953,8 @@ async def test_group_relationship_window_extraction_fake_llm_applies_and_is_idem
                     "created_at": "2026-05-15T08:01:00",
                 },
             ]
+        if "deleted_at IS NOT NULL" in sql:
+            return []
         if (
             "FROM plugin_memory_item" in sql
             and "normalized_key = :normalized_key" in sql
@@ -2095,6 +2121,15 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_item_id
         params = params or {}
+        if "SELECT id, source_member_id, source_message_id" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in params.get("event_ids", [])
+            ]
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             cursor = int(params["cursor_event_id"])
             if cursor < 501:
@@ -2128,6 +2163,8 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
                     "created_at": "2026-05-15T08:01:00",
                 }
             ]
+        if "deleted_at IS NOT NULL" in sql:
+            return []
         if "normalized_key = :normalized_key" in sql and "FROM plugin_memory_item" in sql:
             item = items_by_key.get(str(params["normalized_key"]))
             return [dict(item)] if item else []
@@ -2483,6 +2520,15 @@ async def test_group_relationship_window_extraction_no_llm_builds_person_person_
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_item_id
         params = params or {}
+        if "SELECT id, source_member_id, source_message_id" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in params.get("event_ids", [])
+            ]
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             return [
                 {
@@ -2621,6 +2667,15 @@ async def test_group_relationship_window_extraction_no_llm_creates_person_person
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_item_id
         params = params or {}
+        if "SELECT id, source_member_id, source_message_id" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in params.get("event_ids", [])
+            ]
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             return [
                 {

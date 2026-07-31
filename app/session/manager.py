@@ -110,6 +110,18 @@ end
 """
 
 
+# These values are rebuilt from privacy-gated stores for each inbound turn.
+# Keep this an exact allowlist: other session variables can be durable
+# operator/plugin configuration and must survive a session reload.
+_RUNTIME_DERIVED_VARIABLE_KEYS = frozenset(
+    {
+        "group_memory",
+        "group_observation_context",
+        "user_memory",
+    }
+)
+
+
 def _lock_token_matches(current: object, token: str) -> bool:
     return current in {token, token.encode()}
 
@@ -187,23 +199,24 @@ def _is_group_session(session: Session) -> bool:
 
 
 def _persisted_variables(session: Session) -> dict[str, Any]:
-    """Remove request-private memory from a shared group session snapshot."""
+    """Return durable variables without per-inbound prompt context."""
     variables = dict(session.variables or {})
-    if _is_group_session(session):
-        variables.pop("user_memory", None)
-        variables.pop("group_memory", None)
-        variables.pop("group_observation_context", None)
+    for key in _RUNTIME_DERIVED_VARIABLE_KEYS:
+        variables.pop(key, None)
     return variables
 
 
 def _serialize_session_for_cache(session: Session) -> str:
     snapshot = session.model_copy(deep=True)
+    snapshot.variables = _persisted_variables(snapshot)
+    # Placeholder-to-original mappings are needed only while post-processing
+    # the current response. Persisting them would retain raw PII beyond the
+    # inbound turn and could rehydrate stale secrets on a later request.
+    snapshot.pii_map = {}
     if _is_group_session(snapshot):
         # A group conversation has no single durable user owner.  The active
         # actor is refreshed from every inbound event by load().
         snapshot.user_id = snapshot.session_id
-        snapshot.variables = _persisted_variables(snapshot)
-        snapshot.pii_map = {}
     return _serialize_session(snapshot)
 
 
@@ -228,6 +241,28 @@ def _refresh_loaded_session(
         )
     session.user_id = user_id
     session.channel = channel
+    return session
+
+
+def _prepare_inbound_session(
+    session: Session,
+    *,
+    tenant_id: str,
+    session_id: str,
+    user_id: str,
+    channel: ChannelId,
+) -> Session:
+    """Refresh event scope and discard context that must be authorized anew."""
+    session = _refresh_loaded_session(
+        session,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=user_id,
+        channel=channel,
+    )
+    for key in _RUNTIME_DERIVED_VARIABLE_KEYS:
+        session.variables.pop(key, None)
+    session.pii_map = {}
     return session
 
 
@@ -407,7 +442,7 @@ class SessionManager:
         blob = await self._redis.hget(cache_key, "blob")
         if blob:
             try:
-                session = _refresh_loaded_session(
+                session = _prepare_inbound_session(
                     _deserialize_session(blob),
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -442,7 +477,7 @@ class SessionManager:
             row = await self._get_session_row(db, tenant_id, session_id)
             if row is not None:
                 turns = await self._load_recent_turns(db, tenant_id, session_id)
-                session = _refresh_loaded_session(
+                session = _prepare_inbound_session(
                     _row_to_session(row, turns),
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -557,7 +592,7 @@ class SessionManager:
                 state=session.state.value,
                 summary=session.summary,
                 variables=_persisted_variables(session),
-                pii_map={} if _is_group_session(session) else dict(session.pii_map),
+                pii_map={},
                 meta=dict(session.metadata),
                 fence_token=lease.fence if lease is not None else 0,
                 last_active_at=session.last_active_at,
@@ -581,11 +616,7 @@ class SessionManager:
                     state=session.state.value,
                     summary=session.summary,
                     variables=_persisted_variables(session),
-                    pii_map=(
-                        {}
-                        if _is_group_session(session)
-                        else dict(session.pii_map)
-                    ),
+                    pii_map={},
                     meta=dict(session.metadata),
                     last_active_at=session.last_active_at,
                     fence_token=lease.fence,
@@ -606,7 +637,7 @@ class SessionManager:
             row.state = session.state.value
             row.summary = session.summary
             row.variables = _persisted_variables(session)
-            row.pii_map = {} if _is_group_session(session) else dict(session.pii_map)
+            row.pii_map = {}
             row.meta = dict(session.metadata)
             row.last_active_at = session.last_active_at
         return row

@@ -16,6 +16,7 @@ from app.common.config import Settings
 from app.common.types import (
     CapabilityResult,
     Channel,
+    ChatResponse,
     InboundEvent,
     Message,
     MessageType,
@@ -43,6 +44,7 @@ from app.orchestrator.outcome import (
     ProcessingStatus,
 )
 from app.orchestrator.pipeline import PipelineContext
+from app.orchestrator.simple_capabilities import LLMCapabilityEngine
 from app.plugin.hooks import HookAbort, HookPoint, HookRunner
 from app.reliability import MessageOutboxRelay, MessageReliabilityStore
 from app.session.manager import SessionManager
@@ -73,7 +75,10 @@ from plugins.moderation.hooks import (
     ModerationReplaceReminderHook,
 )
 from plugins.moderation.plugin import plugin as moderation_plugin
+from plugins.persona_extract import store as persona_store_module
+from plugins.persona_extract.hooks import PersonaSkillHook
 from plugins.persona_extract.plugin import plugin as persona_extract_plugin
+from plugins.persona_extract.store import PersonaExtractStore
 from plugins.repeater.hooks import RepeaterDetectStep, RepeaterHook
 from plugins.repeater.plugin import plugin as repeater_plugin
 from plugins.wxbot.hooks import (
@@ -114,7 +119,12 @@ class FakeRouter:
         signals: dict[str, Any] | None = None,
     ) -> RouteDecision:
         self.last_signals = dict(signals or {})
-        return RouteDecision(type=self.route_type, confidence=0.9, reason="test")
+        return RouteDecision(
+            type=self.route_type,
+            confidence=0.9,
+            reason="test",
+            hints={"rule": "test_rule"},
+        )
 
 
 class FakeSafety:
@@ -164,6 +174,16 @@ class FakeCapability:
         return CapabilityResult(route=RouteType.FAQ, reply_text=self.reply_text)
 
 
+class RecordingLLM:
+    def __init__(self, content: str = "llm-answer") -> None:
+        self.content = content
+        self.requests: list[Any] = []
+
+    async def chat(self, request: Any) -> ChatResponse:
+        self.requests.append(request)
+        return ChatResponse(content=self.content)
+
+
 class FakeRouteCapability(FakeCapability):
     def __init__(
         self,
@@ -201,6 +221,37 @@ class FakeFAQCapability(FakeCapability):
             "question": pre.cleaned_text,
             "answer": self.reply_text,
             "faq_id": "faq-1",
+        }
+
+
+class FakeAgentPreviewCapability(FakeRouteCapability):
+    def __init__(
+        self,
+        *,
+        effective_tool_count: int = 0,
+        preflight_error: Exception | None = None,
+    ) -> None:
+        super().__init__(RouteType.AGENT, reply_text="agent-answer")
+        self.effective_tool_count = effective_tool_count
+        self.preflight_error = preflight_error
+        self.preview_hints: dict[str, Any] | None = None
+
+    async def preview_availability(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        hints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = pre, session
+        self.preview_hints = dict(hints or {})
+        if self.preflight_error is not None:
+            raise self.preflight_error
+        return {
+            "effective_tool_count": self.effective_tool_count,
+            "policy_allowed": self.effective_tool_count > 0,
+            "denial_reason": (
+                "" if self.effective_tool_count > 0 else "role_denied"
+            ),
         }
 
 
@@ -846,6 +897,98 @@ async def test_happy_path_publishes_reply(session_manager, settings):
     assert stream == settings.bus_outbound_stream
     assert pk == "demo:se_orc_01"
     assert payload["segments"][0]["content"] == "answer"
+
+
+async def test_wxbot_simulator_persona_reaches_llm_prompt_and_disable_clears_stale_style(
+    session_manager,
+    settings,
+    monkeypatch,
+):
+    resolve_calls: list[dict[str, Any]] = []
+
+    async def resolve_profile_query(
+        sql: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        assert "FROM plugin_persona_profiles" in sql
+        resolve_calls.append(dict(params or {}))
+        return [
+            {
+                "id": 41,
+                "profile_name": "模拟群风格",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "source_label": "微信机器人",
+                "prompt_text": "SIMULATOR_STYLE_SENTINEL：回复简短直接。",
+                "job_id": 9,
+                "artifact_json": None,
+            }
+        ]
+
+    monkeypatch.setattr(persona_store_module, "_exec", resolve_profile_query)
+    persona_store = PersonaExtractStore(settings)
+    hooks = HookRunner()
+    hooks.register(PersonaSkillHook(persona_store), owner="persona_extract")
+    llm = RecordingLLM(content="收到")
+    llm_capability = LLMCapabilityEngine(llm, settings=settings)  # type: ignore[arg-type]
+    orc, _bus, _ = _build(
+        session_manager,
+        settings,
+        router=FakeRouter(RouteType.LLM),
+        hook_runner=hooks,
+        extra_capabilities={RouteType.LLM: llm_capability},
+    )
+    canonical_session_id = "cx1:c:admin-simulator@chatroom"
+    external_session_id = "room@chatroom"
+
+    def simulator_event(message_id: str, trace_id: str, content: str) -> InboundEvent:
+        return InboundEvent(
+            message_id=message_id,
+            trace_id=trace_id,
+            tenant_id="demo",
+            channel=Channel.WECHAT,
+            connection_id="wechat-main",
+            user_id="cx1:p:admin-simulator",
+            session_id=canonical_session_id,
+            external_conversation_id=external_session_id,
+            canonical_conversation_id=canonical_session_id,
+            message=Message(content=content),
+            metadata={
+                "source": "admin_console_simulator",
+                "profile_source_key": "wxbot",
+                "admin_simulation": True,
+                "session_kind": "group",
+            },
+        )
+
+    first = await orc.handle(simulator_event("sim-1", "trace-sim-1", "第一轮"))
+
+    assert first.status == ProcessingStatus.COMPLETED
+    assert resolve_calls == [
+        {
+            "tid": "demo",
+            "sid": external_session_id,
+            "channel": "wechat",
+            "source_key": "wxbot",
+        }
+    ]
+    assert len(llm.requests) == 1
+    assert "SIMULATOR_STYLE_SENTINEL" in str(llm.requests[0].system)
+
+    hooks.unregister_owner("persona_extract")
+    second = await orc.handle(simulator_event("sim-2", "trace-sim-2", "第二轮"))
+
+    assert second.status == ProcessingStatus.COMPLETED
+    assert len(llm.requests) == 2
+    assert "SIMULATOR_STYLE_SENTINEL" not in str(llm.requests[1].system)
+    persisted = await session_manager.load(
+        "demo",
+        "cx1:p:admin-simulator",
+        canonical_session_id,
+        Channel.WECHAT,
+    )
+    assert "persona_skill" not in persisted.variables
+    assert "persona_profile" not in persisted.variables
 
 
 async def test_transactional_pipeline_commits_inbox_turns_and_outbox_once(
@@ -2445,8 +2588,136 @@ async def test_faq_preview_verdict_is_injected_into_router_signals(session_manag
     await orc.handle(_make_event("hello"))
 
     assert router.last_signals is not None
+    assert router.last_signals["faq_matched"] is True
     assert router.last_signals["faq_verdict"] == "CLEAR"
     assert router.last_signals["faq_similarity"] == 0.97
+
+
+class _ToolIntentSignalsHook:
+    name = "test.tool_intent_signals"
+    point = HookPoint.BEFORE_ROUTE
+    priority = 1
+
+    async def run(self, ctx: PipelineContext) -> None:
+        ctx.extras["router_signals"] = {
+            "tool_intent_matched": True,
+            "tools_available": True,
+        }
+        ctx.extras["agent_tool_scope"] = "map"
+
+
+async def test_legacy_route_uses_effective_agent_tool_preflight(
+    session_manager,
+    settings,
+):
+    hooks = HookRunner()
+    hooks.register(_ToolIntentSignalsHook())
+    agent = FakeAgentPreviewCapability(effective_tool_count=0)
+    router = FakeRouter(RouteType.AGENT)
+    orc, _bus, _ = _build(
+        session_manager,
+        settings,
+        router=router,
+        extra_capabilities={RouteType.AGENT: agent},
+        hook_runner=hooks,
+    )
+
+    await orc.handle(_make_event("查地图"))
+
+    assert router.last_signals is not None
+    assert router.last_signals["tool_intent_matched"] is True
+    assert router.last_signals["tools_available"] is False
+    assert router.last_signals["effective_tool_count"] == 0
+    assert router.last_signals["policy_allowed"] is False
+    assert router.last_signals["tool_denial_reason"] == "role_denied"
+    assert agent.preview_hints is not None
+    assert agent.preview_hints["agent_tool_scope"] == "map"
+
+
+async def test_legacy_tool_preflight_failure_is_fail_closed(
+    session_manager,
+    settings,
+):
+    hooks = HookRunner()
+    hooks.register(_ToolIntentSignalsHook())
+    agent = FakeAgentPreviewCapability(
+        preflight_error=RuntimeError("availability unavailable")
+    )
+    router = FakeRouter(RouteType.AGENT)
+    orc, _bus, _ = _build(
+        session_manager,
+        settings,
+        router=router,
+        extra_capabilities={RouteType.AGENT: agent},
+        hook_runner=hooks,
+    )
+
+    await orc.handle(_make_event("查地图"))
+
+    assert router.last_signals is not None
+    assert router.last_signals["tool_intent_matched"] is True
+    assert router.last_signals["tools_available"] is False
+    assert router.last_signals["effective_tool_count"] == 0
+    assert router.last_signals["policy_allowed"] is False
+    assert router.last_signals["tool_denial_reason"] == "preflight_failed"
+    assert router.last_signals["tool_preflight_failed"] is True
+    assert router.last_signals["tool_preflight_error_class"] == "RuntimeError"
+
+
+async def test_legacy_fallback_counter_is_read_updated_and_success_clears(
+    session_manager,
+    settings,
+):
+    session = await session_manager.load(
+        "demo",
+        "u1",
+        "se_fallback_success",
+        Channel.WEB,
+    )
+    session.variables["consecutive_fallbacks"] = 2
+    await session_manager.save(session)
+    router = FakeRouter(RouteType.FAQ)
+    orc, _bus, _ = _build(session_manager, settings, router=router)
+
+    await orc.handle(_make_event("hello", session_id="se_fallback_success"))
+
+    assert router.last_signals is not None
+    assert router.last_signals["consecutive_fallbacks"] == 2
+    persisted = await session_manager.load(
+        "demo",
+        "u1",
+        "se_fallback_success",
+        Channel.WEB,
+    )
+    assert persisted.variables["consecutive_fallbacks"] == 0
+    assistant = persisted.turns[-1]
+    assert assistant.metadata["intent_coarse"] == "unknown"
+    assert assistant.metadata["route_rule"] == "test_rule"
+    assert assistant.metadata["route_confidence"] == 0.9
+
+    failing_capability = FakeCapability(raise_exc=True)
+    failing_router = FakeRouter(RouteType.FAQ)
+    failing_orc, _bus, _ = _build(
+        session_manager,
+        settings,
+        capability=failing_capability,
+        router=failing_router,
+    )
+    await failing_orc.handle(
+        _make_event("boom", session_id="se_fallback_increment")
+    )
+    failed = await session_manager.load(
+        "demo",
+        "u1",
+        "se_fallback_increment",
+        Channel.WEB,
+    )
+    assert failed.variables["consecutive_fallbacks"] == 1
+    assert failed.turns[-1].metadata["fallback_from"] == "faq"
+    assert (
+        failed.turns[-1].metadata["fallback_reason"]
+        == "capability_failed:faq"
+    )
 
 
 async def test_first_message_transitions_idle_to_chatting(session_manager, settings):
@@ -2612,12 +2883,14 @@ async def test_timeout_canned_reply_runs_after_postprocess_hooks(
     assert bus.messages == []
 
 
-async def test_pii_map_is_merged_onto_session(session_manager, settings):
+async def test_pii_map_is_turn_scoped_and_not_rehydrated(session_manager, settings):
     orc, _bus, _cap = _build(session_manager, settings)
     await orc.handle(_make_event("my phone is here"))
 
     session = await session_manager.load("demo", "u1", "se_orc_01", Channel.WEB)
-    assert session.pii_map.get("<PII:phone:1>") == "13800000000"
+    # Restoration maps may serve the current postprocess only; rehydrating
+    # them on another turn would persist and expose the original PII.
+    assert session.pii_map == {}
 
 
 # ---------------------------------------------------------------------------

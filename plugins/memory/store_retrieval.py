@@ -485,19 +485,30 @@ class MemoryRetrievalStoreMixin:
         channel: str | None = None,
         source_key: str | None = None,
         user_id: str | None = None,
+        session_id: str | None = None,
         limit: int = 1000,
         dry_run: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
         if bool(getattr(self, "runtime_scope_gates_required", False)) and not tenant_id:
             raise RuntimeError("tenant_id required for memory vector rebuild")
+        normalized_session_id: str | None = None
+        if session_id is not None:
+            normalized_session_id = str(session_id or "").strip()
+            if not normalized_session_id:
+                raise ValueError("session_id must be non-empty when supplied")
         if tenant_id:
-            await self._require_vector_scope(tenant_id=tenant_id)
+            await self._require_vector_scope(
+                tenant_id=tenant_id,
+                session_id=normalized_session_id or "",
+            )
         safe_limit = max(1, min(int(limit or 1000), 5000))
         conditions = [
             "status = 'active'",
             "sensitivity = 'normal'",
+            "sensitivity_category = 'normal'",
             "deleted_at IS NULL",
+            "(expires_at IS NULL OR expires_at > NOW())",
             "scope_type IN ('identity', 'session')",
         ]
         params: dict[str, Any] = {"lim": safe_limit}
@@ -513,10 +524,19 @@ class MemoryRetrievalStoreMixin:
         if user_id:
             conditions.append("user_id = :uid")
             params["uid"] = user_id
+        if normalized_session_id is not None:
+            # A group-scoped maintenance request must not turn its authorized
+            # session into a tenant-wide embedding pass. Identity rows use an
+            # empty session_id and are deliberately excluded as well.
+            conditions.append("scope_type = 'session'")
+            conditions.append("session_id = :sid")
+            params["sid"] = normalized_session_id
         rows = await _exec(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, content, value_json, normalized_key, confidence, status, pinned, priority, "
-            "sensitivity, source_event_id, source_trace_id, original_text, occurrence_count, "
+            "sensitivity, audience_scope, origin_session_kind, allowed_session_ids, source_kind, "
+            "sensitivity_category, expires_at, source_evidence_json, source_event_id, "
+            "source_trace_id, original_text, occurrence_count, "
             "first_seen_at, last_seen_at, created_at, updated_at, deleted_at "
             "FROM plugin_memory_item "
             f"WHERE {' AND '.join(conditions)} "
@@ -526,12 +546,59 @@ class MemoryRetrievalStoreMixin:
         items = [
             self._finalize_memory_item(row) for row in rows if _looks_like_memory_item_row(row)
         ]
-        return await self.vector_index.rebuild_items(
-            items,
-            dry_run=dry_run,
-            force=force,
-            scope_execution_allowed=self._vector_scope_gate(),
-        )
+        scope_gate = self._vector_scope_gate()
+        if dry_run:
+            return await self.vector_index.rebuild_items(
+                items,
+                dry_run=True,
+                force=force,
+                scope_execution_allowed=scope_gate,
+            )
+
+        result: dict[str, Any] = {
+            "enabled": self.vector_index.is_enabled,
+            "available": self.vector_index.is_available,
+            "dry_run": False,
+            "collection": self.vector_index.collection,
+            "scanned": len(items),
+            "indexed": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+        available = self.vector_index.is_available if force else self.vector_index.is_enabled
+        if not available:
+            result["skipped"] = len(items)
+            return result
+
+        # Candidate rows are only an inventory. Each external publication
+        # reopens the committed DB state, takes the same member fence used by
+        # erasure, and rechecks expiry/member control immediately before the
+        # vector upsert. This prevents a stale rebuild snapshot from restoring
+        # a point after forget/expiry has already removed its source row.
+        for item in items:
+            try:
+                status = await self._publish_current_memory_vectors(
+                    int(item["id"]),
+                    fallback_item=item,
+                    force=force,
+                    scope_execution_allowed=scope_gate,
+                )
+                if status in {"published", "indexed"}:
+                    result["indexed"] += 1
+                elif status == "deleted":
+                    result["deleted"] += 1
+                else:
+                    result["skipped"] += 1
+            except Exception as exc:
+                result["errors"] += 1
+                logger.warning(
+                    "memory.vector_rebuild_item_failed",
+                    item_id=item.get("id"),
+                    error_type=exc.__class__.__name__,
+                    error=str(exc)[:500],
+                )
+        return result
 
     async def smoke_memory_item_vector_search(
         self,
@@ -626,6 +693,7 @@ class MemoryRetrievalStoreMixin:
             channel=channel,
             source_key=source_key,
             user_id=user_id,
+            session_id=str(session_id or "").strip() or None,
             limit=safe_limit,
             dry_run=dry_run,
             force=True,
@@ -769,11 +837,58 @@ class MemoryRetrievalStoreMixin:
                 "skipped": 0 if enabled else len(graph_objects),
                 "errors": 0,
             }
-        result = await self.vector_index.rebuild_graph(
-            graph_objects,
-            scope_execution_allowed=self._vector_scope_gate(),
-        )
-        return {**result, "dry_run": False}
+        result: dict[str, Any] = {
+            "enabled": self.vector_index.is_enabled,
+            "collection": self.vector_index.collection,
+            "dry_run": False,
+            "scanned": len(graph_objects),
+            "indexed": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+        if not self.vector_index.is_enabled:
+            result["skipped"] = len(graph_objects)
+            return result
+
+        scope_gate = self._vector_scope_gate()
+        # Facts and episodes must each be reloaded and published under the
+        # erase/expiry-compatible fences. A batch snapshot followed by direct
+        # vector upserts can otherwise restore a point after its relational
+        # source has already been forgotten or physically expired.
+        for graph_object in graph_objects:
+            object_type = str(graph_object.get("object_type") or "")
+            row = graph_object.get("row")
+            object_id = _safe_int(
+                row.get("id") if isinstance(row, dict) else None,
+                0,
+            )
+            if object_type not in {"fact", "episode"} or object_id <= 0:
+                result["skipped"] += 1
+                continue
+            try:
+                status = await self._publish_current_memory_graph_vector(
+                    object_type,
+                    object_id,
+                    fallback_row=row,
+                    scope_execution_allowed=scope_gate,
+                )
+                if status in {"published", "indexed"}:
+                    result["indexed"] += 1
+                elif status == "deleted":
+                    result["deleted"] += 1
+                else:
+                    result["skipped"] += 1
+            except Exception as exc:
+                result["errors"] += 1
+                logger.warning(
+                    "memory.vector_rebuild_graph_failed",
+                    object_type=object_type,
+                    object_id=object_id,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc)[:500],
+                )
+        return result
 
     async def retrieve_memory_graph(
         self,

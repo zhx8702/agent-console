@@ -56,7 +56,8 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
               </div>
             </div>
             <ul className="route-list">
-              <li>控制台不会接受任意会话 ID 或本地文件路径。</li>
+              <li>控制台不会接受任意会话 ID；文件发送仅接受 SDK 主机授权目录中的绝对路径。</li>
+              <li>文件消息不支持 file_url 或浏览器上传，文件名、大小与摘要会随发送队列透传。</li>
               <li>图片发送仍必须使用后端签发、绑定当前租户且未过期的媒体 ID。</li>
               <li>日报周报月报的自动发送最终也是通过这里同一套 SDK 队列投递出去。</li>
             </ul>
@@ -115,7 +116,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
                       <td className="mono">{item.sender_name || item.sender_wxid || "-"}</td>
                       <td className="mono">{item.reply_to_msg_svr_id || "-"}</td>
                       <td>{wxbotMessageTypeLabel(item.msg_type || "text")}</td>
-                      <td className="mono">{item.reply_text || item.media_id || "-"}</td>
+                      <td className="mono">{item.file_name || item.reply_text || item.media_id || "-"}</td>
                       <td className="mono">{item.trace_id || "-"}</td>
                       <td className="mono">{replyParticipationSummary(item)}</td>
                       <td>{wxbotQueueStatusLabel(item.status)}</td>
@@ -190,7 +191,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
                       <td className="mono">{item.sender_name || item.sender_wxid || "-"}</td>
                       <td className="mono">{item.reply_to_msg_svr_id || "-"}</td>
                       <td>{wxbotMessageTypeLabel(item.msg_type || "text")}</td>
-                      <td className="mono">{item.reply_text || item.media_id || "-"}</td>
+                      <td className="mono">{item.file_name || item.reply_text || item.media_id || "-"}</td>
                       <td>{wxbotBooleanLabel(Boolean(item.mention_sender))}</td>
                       <td>
                         <strong>{wxbotQueueStatusLabel(item.status)}</strong>

@@ -181,7 +181,7 @@ items:
     package:
       type: builtin
       uri: plugins/memory
-    capability_digest: sha256:dde3aeb2284d3f06f79d943fc9734a9976e61c625f6da3359a2f1851cc04df1b
+    capability_digest: sha256:9e33bd7a4b1c954cd2b2e846daf10907a81a96a29494b59fce6cab55830e421d
     compatibility:
       core_api: ">=0.1.0 <0.2.0"
       python: ">=3.11"
@@ -396,7 +396,7 @@ items:
     package:
       type: builtin
       uri: plugins/wxbot
-    capability_digest: sha256:1583e4eaf0684207905a59cefc2ccdaa3d12f1bdbb74fff4263f24dd4cdb8b89
+    capability_digest: sha256:8efb0fdbe5fa309d9cd14c72a3154a40deabc25a0a3edbeed93f9c48de0c11e1
     compatibility:
       core_api: ">=0.1.0 <0.2.0"
       python: ">=3.11"
@@ -423,6 +423,9 @@ items:
       routes: ["/plugins/wxbot"]
       hooks: ["after_postprocess", "before_capability", "before_preprocess", "before_route"]
       agent_tools:
+        - convert_current_file
+        - export_current_messages_file
+        - generate_text_file
         - get_group_info
         - list_group_members
         - get_group_member_avatar
@@ -440,6 +443,7 @@ items:
         - get_group_credits_leaderboard
         - get_group_recent_moderation_events
         - get_group_activity_ranking
+        - inspect_current_file
       commands:
         - /ban
         - /banlist

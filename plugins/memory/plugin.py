@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 
+from app.common.logging import get_logger
 from app.infra.db import get_session_factory
 from app.infra.metrics import MEMORY_GOVERNANCE_EVENTS
 from app.orchestrator.effect_handlers import MemorySaveEffectHandler
@@ -27,6 +28,8 @@ from plugins.memory.hooks import (
 )
 from plugins.memory.router import build_memory_router
 from plugins.memory.store import MemoryStore
+
+logger = get_logger(__name__)
 
 
 class MemoryPlugin(Plugin):
@@ -155,12 +158,16 @@ class MemoryPlugin(Plugin):
                 await self._store.run_governance_cleanup(dry_run=False)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # The next interval retries; startup and message handling must
                 # remain available when a maintenance pass fails.
                 MEMORY_GOVERNANCE_EVENTS.labels(
                     action="cleanup", result="failure"
                 ).inc()
+                logger.exception(
+                    "memory.governance_cleanup_failed",
+                    error_type=exc.__class__.__name__,
+                )
             interval = float(
                 getattr(self._ctx.settings, "memory_governance_interval_seconds", 86_400.0)
                 or 86_400.0
@@ -270,7 +277,7 @@ class MemoryPlugin(Plugin):
                 permissions=["storage:shared"],
                 inputs={"event", "session", "pre", "route"},
                 outputs={"signals.memory.user_profile"},
-                timeout_seconds=1.5,
+                timeout_seconds=3.5,
                 error_policy="fail_open",
             ),
             FlowStepDefinition(

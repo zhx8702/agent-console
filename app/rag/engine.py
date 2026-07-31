@@ -125,6 +125,7 @@ class RAGEngine:
         *,
         answer: str,
         hits: list[RetrievalHit],
+        session: Session,
         tenant_id: str,
         trace_id: str,
     ) -> ChatResponse:
@@ -149,7 +150,15 @@ class RAGEngine:
                     ),
                 )
             ],
-            system="你是引用校验器。只输出修正后的回答，不解释校验过程。",
+            system=augment_prompt_with_persona_and_memory(
+                "你是引用校验器。只输出修正后的回答，不解释校验过程。"
+                "在不影响引用准确性的前提下，保留原回答的语气和表达风格。",
+                session,
+                memory_intro=(
+                    "以下历史记忆只用于保持个性化表达，不得据此新增、删除或改写"
+                    "任何需要参考资料支持的事实："
+                ),
+            ),
             max_tokens=self._max_tokens,
         )
         return await self._llm.chat(request)
@@ -231,6 +240,7 @@ class RAGEngine:
                     repair_response = await self._repair_citations(
                         answer=answer,
                         hits=hits,
+                        session=session,
                         tenant_id=tenant_id,
                         trace_id=trace_id,
                     )

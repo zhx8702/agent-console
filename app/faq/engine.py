@@ -40,6 +40,18 @@ if TYPE_CHECKING:
 
 
 _FAQ_NORMALIZE_RE = re.compile(r"[\s\?\？!！,，。.:：'\"“”‘’`()（）\[\]【】]+")
+_FAQ_NEGATION_RESET_RE = re.compile(
+    r"(?:但(?:是)?|不过|然而|而是|改(?:问|成|为)|转而|我是问)|"
+    r"(?:but|however|instead)",
+    re.IGNORECASE,
+)
+_FAQ_NEGATION_MARKER_RE = re.compile(
+    r"(?:不是|并非|不要|无需|不用|不必|不想|不打算|没打算|"
+    r"不需要|别|无意)|"
+    r"(?:donot|dont|cannot|cant|noneedto|neednot|without|"
+    r"not(?!only|ification|ice|able|ebook|hing))",
+    re.IGNORECASE,
+)
 
 
 class FAQEngine:
@@ -81,25 +93,21 @@ class FAQEngine:
     def _is_negated_phrase(query: str, phrase: str) -> bool:
         if not query or not phrase or phrase not in query:
             return False
-        index = query.find(phrase)
-        prefix = query[max(0, index - 6) : index]
-        return any(
-            prefix.endswith(marker)
-            for marker in (
-                "不是",
-                "不是问",
-                "并不是问",
-                "并非",
-                "不问",
-                "不想问",
-                "别问",
-                "不要",
-                "无关",
-                "not",
-                "donot",
-                "dont",
+        occurrences: list[bool] = []
+        offset = 0
+        while True:
+            index = query.find(phrase, offset)
+            if index < 0:
+                break
+            prefix = query[:index]
+            reset_matches = list(_FAQ_NEGATION_RESET_RE.finditer(prefix))
+            if reset_matches:
+                prefix = prefix[reset_matches[-1].end() :]
+            occurrences.append(
+                bool(_FAQ_NEGATION_MARKER_RE.search(prefix[-80:]))
             )
-        )
+            offset = index + max(1, len(phrase))
+        return bool(occurrences) and all(occurrences)
 
     @classmethod
     def _partial_match_score(cls, query: str, candidate: str) -> float | None:
@@ -179,13 +187,49 @@ class FAQEngine:
 
     def _should_rewrite(self, session: Session) -> bool:
         persona_skill = session.variables.get("persona_skill")
-        user_memory = session.variables.get("user_memory")
-        return (
-            isinstance(persona_skill, str)
-            and bool(persona_skill.strip())
-        ) or (
-            isinstance(user_memory, dict)
-            and any(str(user_memory.get(key) or "").strip() for key in ("short_term", "long_term", "manual_notes"))
+        if isinstance(persona_skill, str) and bool(persona_skill.strip()):
+            return True
+        persona_profile = session.variables.get("persona_profile")
+        if isinstance(persona_profile, dict) and any(
+            isinstance(persona_profile.get(key), str)
+            and bool(str(persona_profile.get(key)).strip())
+            for key in ("target_name", "name", "skill_slug")
+        ):
+            return True
+
+        def has_memory_context(value: object) -> bool:
+            if not isinstance(value, dict):
+                return False
+            if any(
+                str(value.get(key) or "").strip()
+                for key in (
+                    "short_term",
+                    "long_term",
+                    "manual_notes",
+                    "session_summary",
+                )
+            ):
+                return True
+            if any(
+                isinstance(value.get(key), list) and bool(value.get(key))
+                for key in (
+                    "open_items",
+                    "decisions",
+                    "recent_turns",
+                    "relevant_memory_items",
+                    "relevant_graph_facts",
+                    "relevant_graph_episodes",
+                )
+            ):
+                return True
+            memory_items = value.get("memory_items")
+            return isinstance(memory_items, dict) and any(
+                isinstance(memory_items.get(scope), list) and bool(memory_items.get(scope))
+                for scope in ("identity", "session")
+            )
+
+        return has_memory_context(session.variables.get("user_memory")) or has_memory_context(
+            session.variables.get("group_memory")
         )
 
     def _compose_rewrite_system_prompt(self, session: Session) -> str:

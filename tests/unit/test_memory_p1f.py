@@ -29,6 +29,29 @@ def test_recent_turns_rolls_to_bounded_limit() -> None:
     assert profile["recent_turns"][-1]["user_text"] == "turn 11"
 
 
+def test_recent_turns_compact_evicted_user_context_and_advance_version() -> None:
+    profile: dict = {}
+
+    for index in range(8):
+        profile = _apply(profile, f"turn {index}", assistant_text=f"reply {index}", index=index)
+
+    assert profile["last_compacted_at"] is None
+    assert profile["summary_version"] == 1
+
+    profile = _apply(profile, "turn 8", assistant_text="private assistant suggestion", index=8)
+
+    assert profile["last_compacted_at"] == "2026-05-10T00:00:08"
+    assert profile["summary_version"] == 2
+    assert "Earlier context: turn 0" in profile["session_summary"]
+    assert "reply 0" not in profile["session_summary"]
+
+    profile = _apply(profile, "turn 9", index=9)
+
+    assert profile["summary_version"] == 3
+    assert "Earlier context: turn 0 / turn 1" in profile["session_summary"]
+    assert profile["recent_turns"][0]["user_text"] == "turn 2"
+
+
 def test_open_items_add_and_close() -> None:
     profile: dict = {}
 
@@ -39,6 +62,21 @@ def test_open_items_add_and_close() -> None:
     assert profile["open_items"] == []
     assert any(item["kind"] == "close" for item in profile["decisions"])
     assert "Closed open item" in profile["decisions"][-1]["text"]
+
+
+def test_unrelated_completion_does_not_close_only_open_item() -> None:
+    profile = _apply({}, "todo check invoice later", index=1)
+
+    profile = _apply(profile, "done deploy release", index=2)
+
+    assert [item["text"] for item in profile["open_items"]] == ["todo check invoice later"]
+
+
+def test_future_step_containing_complete_word_is_not_closed_immediately() -> None:
+    profile = _apply({}, "下一步完成部署", index=1)
+
+    assert [item["text"] for item in profile["open_items"]] == ["下一步完成部署"]
+    assert profile["decisions"] == []
 
 
 def test_decisions_extract_and_preserve_existing() -> None:

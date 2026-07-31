@@ -11,6 +11,8 @@ SESSION_RECENT_TURN_LIMIT = 8
 SESSION_OPEN_ITEM_LIMIT = 12
 SESSION_DECISION_LIMIT = 20
 SESSION_SUMMARY_LIMIT = 1200
+SESSION_COMPACTED_CONTEXT_LIMIT = 600
+SESSION_COMPACTED_SNIPPET_LIMIT = 10
 SESSION_STATE_VERSION = 1
 
 
@@ -125,8 +127,8 @@ _DECISION_MARKERS = (
     "选择", "改用", "就用", "不用", "不使用",
 )
 _CLOSE_ITEM_MARKERS = (
-    "done", "completed", "finished", "cancel", "cancelled", "canceled", "完成", "已完成",
-    "做完", "取消", "关闭",
+    "done", "completed", "finished", "cancel", "cancelled", "canceled", "已完成",
+    "已经完成", "完成了", "做完", "搞定", "已搞定", "取消", "关闭",
 )
 
 
@@ -212,8 +214,6 @@ def _close_matching_open_items(
     close_indexes: set[int] = set()
     if scored and scored[0][0] > 0:
         close_indexes.add(scored[0][1])
-    elif len(active_items) == 1:
-        close_indexes.add(open_items.index(active_items[0]))
     if not close_indexes:
         return open_items, []
     next_items: list[dict[str, Any]] = []
@@ -231,11 +231,57 @@ def _close_matching_open_items(
     return next_items[-SESSION_OPEN_ITEM_LIMIT:], closed
 
 
+def _extract_compacted_context(summary: Any) -> str:
+    for raw_line in str(summary or "").splitlines():
+        line = _normalize_line(raw_line)
+        if line.lower().startswith("earlier context:"):
+            return _normalize_line(line.split(":", 1)[1])
+    return ""
+
+
+def _merge_compacted_context(
+    *,
+    previous_summary: Any,
+    evicted_turns: list[dict[str, Any]],
+) -> str:
+    snippets = [
+        _bounded_text(snippet, 180)
+        for snippet in _extract_compacted_context(previous_summary).split(" / ")
+        if _bounded_text(snippet, 180)
+    ]
+    for turn in evicted_turns:
+        user_text = _bounded_text(turn.get("user_text"), 180)
+        if user_text:
+            snippets.append(user_text)
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for snippet in snippets:
+        key = _normalize_line(snippet).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(snippet)
+
+    selected: list[str] = []
+    used = 0
+    for snippet in reversed(deduplicated):
+        added = len(snippet) + (3 if selected else 0)
+        if selected and used + added > SESSION_COMPACTED_CONTEXT_LIMIT:
+            break
+        selected.append(snippet[:SESSION_COMPACTED_CONTEXT_LIMIT])
+        used += added
+        if len(selected) >= SESSION_COMPACTED_SNIPPET_LIMIT:
+            break
+    return " / ".join(reversed(selected))[:SESSION_COMPACTED_CONTEXT_LIMIT]
+
+
 def _build_session_summary(
     *,
     recent_turns: list[dict[str, Any]],
     open_items: list[dict[str, Any]],
     decisions: list[dict[str, Any]],
+    compacted_context: str = "",
 ) -> str:
     lines: list[str] = []
     active_open = [
@@ -255,6 +301,8 @@ def _build_session_summary(
         lines.append("Decisions: " + "; ".join(recent_decisions[-5:]))
     if recent_user_lines:
         lines.append("Recent context: " + " / ".join(recent_user_lines))
+    if compacted_context:
+        lines.append("Earlier context: " + _bounded_text(compacted_context, 600))
     return "\n".join(lines)[:SESSION_SUMMARY_LIMIT]
 
 
@@ -282,7 +330,21 @@ def _update_session_state(
             "created_at": created_at,
         }
     )
+    evicted_turns = recent_turns[:-SESSION_RECENT_TURN_LIMIT]
     recent_turns = recent_turns[-SESSION_RECENT_TURN_LIMIT:]
+    compacted_context = _merge_compacted_context(
+        previous_summary=profile.get("session_summary"),
+        evicted_turns=evicted_turns,
+    )
+    previous_summary_version = max(
+        SESSION_STATE_VERSION,
+        int(profile.get("summary_version") or SESSION_STATE_VERSION),
+    )
+    last_compacted_at = profile.get("last_compacted_at")
+    summary_version = previous_summary_version
+    if evicted_turns:
+        last_compacted_at = created_at
+        summary_version = previous_summary_version + 1
 
     # Assistant suggestions stay in context but never become user commitments.
     for chunk in _session_sentence_chunks(user_text):
@@ -336,7 +398,8 @@ def _update_session_state(
             recent_turns=recent_turns,
             open_items=open_items,
             decisions=decisions,
+            compacted_context=compacted_context,
         ),
-        "last_compacted_at": profile.get("last_compacted_at"),
-        "summary_version": int(profile.get("summary_version") or SESSION_STATE_VERSION),
+        "last_compacted_at": last_compacted_at,
+        "summary_version": summary_version,
     }

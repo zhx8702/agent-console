@@ -35,12 +35,24 @@ def test_persona_profile_catalog_upgrade_restores_saved_skill_catalog(
 ) -> None:
     migration, rendered = _render(monkeypatch, "upgrade")
 
-    assert migration.revision == RUNTIME_SCHEMA_REVISION
+    assert migration.revision == "0044_persona_profile_catalog"
     assert migration.down_revision == "0043_persona_offline_status"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 9
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]
+    assert (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision("0045_wxbot_outbound_files")
+        .down_revision
+        == migration.revision
+    )
+    assert (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision(RUNTIME_SCHEMA_REVISION)
+        .down_revision
+        == "0045_wxbot_outbound_files"
+    )
     assert "LOCK TABLE plugin_persona_profiles IN ACCESS EXCLUSIVE MODE" in rendered
     assert (
         "DROP CONSTRAINT "

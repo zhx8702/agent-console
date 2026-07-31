@@ -1254,6 +1254,31 @@ async def test_send_report_job_remains_queued_until_sdk_row_is_sent() -> None:
     assert store.jobs[1]["sdk_outbound_id"] == 1
 
 
+async def test_send_report_job_treats_sdk_sending_as_non_terminal() -> None:
+    store = _ReportStore()
+    store.jobs[1].update(
+        {
+            "status": "completed",
+            "result_text": "日报正文",
+            "delivery_status": "pending",
+        }
+    )
+    bridge = _CaptureBridge()
+    bridge.outbound_status = "sending"
+    service = reports.WxbotReportService(
+        store,
+        SimpleNamespace(llm_service=None),
+        bridge=bridge,
+        scope_execution_allowed=_allow_scope,
+    )
+
+    sent = await service.send_report_job(1)
+
+    assert sent is False
+    assert store.jobs[1]["delivery_status"] == "queued"
+    assert store.jobs[1]["sdk_outbound_id"] == 1
+
+
 async def test_report_delivery_reconciles_against_list_only_sdk() -> None:
     store = _ReportStore()
     store.jobs[1].update(

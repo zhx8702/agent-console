@@ -6,14 +6,20 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
+from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.channel.identity import LEGACY_WXBOT_CONNECTION_ID
+from app.channel.identity import (
+    LEGACY_WXBOT_CONNECTION_ID,
+    require_legacy_wxbot_history_scope,
+)
 from app.common.config import Settings
+from app.common.logging import get_logger
 from app.common.safe_url import configure_http_client, safe_get
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.egress.safe_http import safe_trusted_service_request
@@ -37,10 +43,30 @@ from plugins.wxbot.agent_analysis import (
     _profile_score_external_candidate,
     _score_research_message,
 )
+from plugins.wxbot.file_artifacts import (
+    SUPPORTED_FILE_FORMATS,
+    convert_file_bytes,
+    infer_file_format,
+    normalize_file_format,
+    stage_outbound_artifact,
+)
+from plugins.wxbot.file_intent import classify_file_intent
+from plugins.wxbot.group_file_policy import (
+    GroupFilePolicyReader,
+    require_group_file_send_enabled,
+)
+from plugins.wxbot.message_exports import (
+    build_message_export_summary,
+    cleanup_message_exports,
+    stage_message_export,
+)
 from plugins.wxbot.message_reader import WxbotMessageReader
+from plugins.wxbot.reports import WxbotReportService
 from plugins.wxbot.store import WxbotStore
 
 _OwnedReadResult = TypeVar("_OwnedReadResult")
+_DELIVERY_CONTRACT_METADATA_KEY = "_wxbot_delivery_contract"
+logger = get_logger(__name__)
 WxbotDataOwnerScopeExecutionAllowed = Callable[
     [str, str, str],
     Awaitable[bool],
@@ -76,24 +102,1381 @@ class WxbotAgentToolService:
         credits_store: CreditStore | None = None,
         moderation_store: ModerationStore | None = None,
         repeater_store: RepeaterStore | None = None,
+        report_service: WxbotReportService | None = None,
+        effect_reply_enabled: bool = False,
+        message_export_root: str | Path | None = None,
+        message_export_max_bytes: int | None = None,
         data_owner_scope_execution_allowed: (
             WxbotDataOwnerScopeExecutionAllowed | None
         ) = None,
         data_owners_scope_execution_allowed: (
             WxbotDataOwnersScopeExecutionAllowed | None
         ) = None,
+        social_policy_store: GroupFilePolicyReader | None = None,
     ) -> None:
         self._settings = settings
         self._wxbot_store = wxbot_store or WxbotStore(settings)
         self._credits_store = credits_store or CreditStore(settings)
         self._moderation_store = moderation_store or ModerationStore(settings)
         self._repeater_store = repeater_store or RepeaterStore(settings)
+        self._report_service = report_service
+        self._effect_reply_enabled = bool(effect_reply_enabled)
+        self._message_export_root = str(
+            message_export_root
+            or getattr(settings, "wxbot_outbound_file_dir", "/data/wxbot-outbound")
+            or "/data/wxbot-outbound"
+        )
+        configured_max_bytes = (
+            message_export_max_bytes
+            if message_export_max_bytes is not None
+            else getattr(
+                settings,
+                "wxbot_outbound_file_max_bytes",
+                10 * 1024 * 1024,
+            )
+        )
+        self._message_export_max_bytes = int(configured_max_bytes)
         self._data_owner_scope_execution_allowed = data_owner_scope_execution_allowed
         self._data_owners_scope_execution_allowed = data_owners_scope_execution_allowed
+        self._social_policy_store = social_policy_store
         self._sdk_scope: ContextVar[dict[str, str] | None] = ContextVar(
             f"wxbot_agent_sdk_scope_{id(self)}",
             default=None,
         )
+
+    async def export_current_messages_file(
+        self,
+        session: Any,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Export current-conversation records and queue the selected file format."""
+
+        tenant_id = str(getattr(session, "tenant_id", "") or "").strip() or "default"
+        session_id = self._external_session_id(session).strip()
+        if not session_id:
+            raise ValueError("当前会话标识不可用")
+        await self._cleanup_message_export_artifacts()
+        latest_turn, latest_metadata = self._latest_user_context(session)
+        session_metadata = dict(getattr(session, "metadata", {}) or {})
+        session_name = str(
+            latest_metadata.get("session_name")
+            or session_metadata.get("session_name")
+            or session_id
+        ).strip() or session_id
+
+        report_type = str(arguments.get("report_type") or "daily").strip().lower()
+        if report_type not in {"daily", "monthly"}:
+            raise ValueError("report_type 仅支持 daily 或 monthly")
+        export_format = normalize_file_format(arguments.get("format") or "txt")
+        request_intent = classify_file_intent(
+            str(getattr(latest_turn, "content", "") or ""),
+        )
+        if request_intent.requested_format:
+            if request_intent.requested_format not in {"txt", "md", "csv", "json"}:
+                raise ValueError(
+                    f"当前版本不支持 {request_intent.requested_format} 导出，请选择 txt、md、csv 或 json"
+                )
+            if export_format != request_intent.requested_format:
+                raise ValueError("工具格式与用户明确要求的文件格式不一致")
+
+        date, year_month = self._message_export_period_arguments(
+            report_type,
+            date=str(arguments.get("date") or "").strip(),
+            year_month=str(arguments.get("year_month") or "").strip(),
+        )
+        session_kind = self._message_export_session_kind(
+            session,
+            latest_metadata=latest_metadata,
+            session_id=session_id,
+        )
+        await self._require_session_group_file_send_enabled(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            session_kind=session_kind,
+        )
+        if session_kind == "group":
+            require_legacy_wxbot_history_scope(
+                self._settings,
+                tenant_id=tenant_id,
+                connection_id=(
+                    str(getattr(session, "connection_id", "") or "").strip()
+                    or LEGACY_WXBOT_CONNECTION_ID
+                ),
+            )
+            report_service = self._report_service
+            if report_service is None:
+                raise RuntimeError("wxbot report service is unavailable")
+            messages_payload = await report_service.fetch_report_messages_payload(
+                session_id,
+                session_name=session_name,
+                report_type=report_type,
+                date=date if report_type == "daily" else "",
+                year_month=year_month if report_type == "monthly" else "",
+            )
+            if messages_payload.get("ok") is False:
+                raise RuntimeError(
+                    str(messages_payload.get("error") or "wxbot report messages failed")
+                )
+            raw_messages = messages_payload.get("messages")
+            if not isinstance(raw_messages, list):
+                raise RuntimeError("wxbot report messages payload missing messages list")
+            messages = [item for item in raw_messages if isinstance(item, dict)]
+            period = str(
+                messages_payload.get("period")
+                or (date if report_type == "daily" else year_month)
+            ).strip()
+        else:
+            period = date if report_type == "daily" else year_month
+            messages = self._current_private_message_records(
+                session,
+                report_type=report_type,
+                period=period,
+            )
+        summary_text = build_message_export_summary(
+            session_name,
+            period,
+            messages,
+            report_type=report_type,
+        )
+
+        source_message_id = self._message_export_source_id(
+            session,
+            latest_turn=latest_turn,
+            latest_metadata=latest_metadata,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        request_digest = hashlib.sha256(
+            "\0".join(
+                (
+                    tenant_id,
+                    session_id,
+                    source_message_id,
+                    report_type,
+                    period,
+                    export_format,
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        request_id = f"wxbot-message-export-{request_digest}"
+        artifact = stage_message_export(
+            self._message_export_root,
+            tenant_id,
+            session_id,
+            request_id,
+            session_name,
+            period,
+            summary_text,
+            messages,
+            max_bytes=self._message_export_max_bytes,
+            export_format=export_format,
+        )
+
+        delivery_contract = self._message_export_delivery_contract(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_message_id,
+        )
+        effects = self._message_export_reply_effects(
+            session,
+            latest_metadata=latest_metadata,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            session_name=session_name,
+            source_message_id=source_message_id,
+            request_id=request_id,
+            request_digest=request_digest,
+            period=period,
+            artifact=artifact,
+            delivery_contract=delivery_contract,
+        )
+        if self._effect_reply_enabled:
+            channel_reply_effects = effects
+        else:
+            await self._enqueue_message_export_replies(effects)
+            channel_reply_effects = []
+
+        return {
+            "ok": True,
+            "report_type": report_type,
+            "period": period,
+            "format": export_format,
+            "message_count": int(artifact.get("message_count") or 0),
+            "file_name": str(artifact.get("file_name") or ""),
+            "sent_to_current_session": True,
+            "delivery_status": "queued",
+            "delivery_acknowledged": False,
+            "self_enqueued_reply": True,
+            "suppress_final_reply": True,
+            "channel_reply_effects": channel_reply_effects,
+            "message": "消息记录已整理并排队发送到当前会话。",
+        }
+
+    async def inspect_current_file(
+        self,
+        session: Any,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Read only the recent file attached by the current requester.
+
+        The returned text is explicitly marked as untrusted so prompt-like
+        strings inside a document cannot be mistaken for agent instructions.
+        """
+
+        _ = arguments
+        latest_turn, _ = self._latest_user_context(session)
+        if latest_turn is None:
+            raise ValueError("当前轮次没有收到文件")
+        file_turn, file_metadata = self._latest_file_context(session)
+        if file_turn is None:
+            raise ValueError("当前会话没有可用的文件附件")
+        downloaded = await self._download_current_file(file_metadata, session=session)
+        file_name = str(downloaded.get("file_name") or "当前文件").strip()
+        content_type = str(downloaded.get("content_type") or "")
+        source_format = infer_file_format(file_name, content_type)
+        descriptor = {
+            key: downloaded.get(key)
+            for key in (
+                "file_name",
+                "file_size",
+                "file_sha256",
+                "content_type",
+                "download_status",
+            )
+        }
+        if source_format not in SUPPORTED_FILE_FORMATS:
+            return {
+                "ok": True,
+                "file": descriptor,
+                "extractable": False,
+                "reason": "当前版本只支持读取 txt、md、csv、json 文本文件；可以先让用户转换格式。",
+            }
+        preview = convert_file_bytes(
+            bytes(downloaded["content"]),
+            source_name=file_name,
+            target_format="txt",
+            source_content_type=str(downloaded.get("content_type") or ""),
+        ).decode("utf-8", errors="replace")
+        preview = preview[:12_000]
+        return {
+            "ok": True,
+            "file": descriptor,
+            "extractable": True,
+            "content": (
+                "[UNTRUSTED_FILE_CONTENT_BEGIN]\n"
+                + preview
+                + "\n[UNTRUSTED_FILE_CONTENT_END]"
+            ),
+            "truncated": len(preview) >= 12_000,
+        }
+
+    async def convert_current_file(
+        self,
+        session: Any,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Convert the current inbound text file and send it only when asked."""
+
+        target_format = normalize_file_format(arguments.get("format") or "txt")
+        latest_turn, latest_metadata = self._latest_user_context(session)
+        if latest_turn is None:
+            raise ValueError("当前轮次没有收到文件")
+        file_turn, file_metadata = self._latest_file_context(session)
+        if file_turn is None:
+            raise ValueError("当前会话没有可用的文件附件")
+        intent = classify_file_intent(
+            str(getattr(latest_turn, "content", "") or ""),
+            has_attachment=True,
+        )
+        if intent.operation != "convert":
+            raise ValueError("未检测到明确的文件转换意图")
+        if not intent.delivery_required:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "delivery_not_requested": True,
+                "message": "请先确认目标格式以及是否需要把转换后的文件发送给你。",
+            }
+        if not intent.requested_format:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "format_required": True,
+                "message": "请先指定要转换成 txt、md、csv 还是 json，再发送文件。",
+            }
+        if intent.requested_format:
+            if intent.requested_format not in {"txt", "md", "csv", "json"}:
+                raise ValueError(
+                    f"当前版本不支持转换为 {intent.requested_format}，请使用 txt、md、csv 或 json"
+                )
+            if target_format != intent.requested_format:
+                raise ValueError("工具格式与用户明确要求的目标格式不一致")
+        tenant_id = str(getattr(session, "tenant_id", "") or "default").strip() or "default"
+        session_id = self._external_session_id(session).strip()
+        session_kind = self._message_export_session_kind(
+            session,
+            latest_metadata=latest_metadata,
+            session_id=session_id,
+        )
+        await self._require_session_group_file_send_enabled(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            session_kind=session_kind,
+        )
+        downloaded = await self._download_current_file(file_metadata, session=session)
+        file_name = str(downloaded.get("file_name") or "当前文件").strip()
+        source_format = infer_file_format(
+            file_name,
+            str(downloaded.get("content_type") or ""),
+        )
+        if source_format not in SUPPORTED_FILE_FORMATS:
+            raise ValueError(
+                "当前版本只支持转换 txt、md、csv、json；PDF、Word、Excel 等格式请先转成文本文件"
+            )
+        content = convert_file_bytes(
+            bytes(downloaded["content"]),
+            source_name=file_name,
+            target_format=target_format,
+            source_content_type=str(downloaded.get("content_type") or ""),
+        )
+        source_id = self._message_export_source_id(
+            session,
+            latest_turn=latest_turn,
+            latest_metadata=latest_metadata,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        digest = hashlib.sha256(
+            "\0".join((tenant_id, session_id, source_id, target_format, file_name)).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:32]
+        request_id = f"wxbot-file-convert-{digest}"
+        artifact = stage_outbound_artifact(
+            self._message_export_root,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            request_id=request_id,
+            file_name=Path(file_name).stem or "转换文件",
+            content=content,
+            file_format=target_format,
+            max_bytes=self._message_export_max_bytes,
+        )
+        delivery_contract = self._message_export_delivery_contract(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_id,
+        )
+        channel = str(getattr(getattr(session, "channel", "wechat"), "value", "wechat"))
+        sender_id = str(
+            latest_metadata.get("sender_id")
+            or latest_metadata.get("sender_wxid")
+            or getattr(session, "external_participant_id", "")
+            or getattr(session, "user_id", "")
+            or ""
+        ).strip()
+        command_id = f"channel-reply:{tenant_id}:wxbot-file-convert:{digest}"
+        payload = {
+            "tenant_id": tenant_id,
+            "channel": channel,
+            "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+            "connection_id": str(getattr(session, "connection_id", "") or ""),
+            "session_id": session_id,
+            "external_conversation_id": session_id,
+            "canonical_conversation_id": str(
+                getattr(session, "canonical_conversation_id", "") or session_id
+            ),
+            "session_name": str(latest_metadata.get("session_name") or session_id),
+            "session_kind": session_kind,
+            "user_id": str(getattr(session, "user_id", "") or ""),
+            "sender_id": sender_id,
+            "sender_name": str(latest_metadata.get("sender_name") or ""),
+            "reply_to_message_id": source_id,
+            "trace_id": str(latest_metadata.get("trace_id") or source_id)[:64],
+            "source_message": {
+                "agent_tool": "convert_current_file",
+                "message_id": source_id,
+                "session_id": session_id,
+            },
+            "file": {
+                "file_path": artifact["file_path"],
+                "file_name": artifact["file_name"],
+                "file_size": artifact["file_size"],
+                "file_md5": artifact["file_md5"],
+                "file_sha256": artifact["file_sha256"],
+            },
+            "delivery": {
+                "channel": channel,
+                "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+                "connection_id": str(getattr(session, "connection_id", "") or ""),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "external_conversation_id": session_id,
+                "session_kind": session_kind,
+                "sender_wxid": sender_id,
+                "command_id": command_id,
+                "idempotency_key": command_id,
+                **delivery_contract,
+                "must_deliver_file": True,
+            },
+            "command_id": command_id,
+        }
+        effect = {
+            "type": "enqueue_channel_reply",
+            "owner": "wxbot" if channel == "wechat" else channel,
+            "idempotency_key": command_id,
+            "payload": payload,
+        }
+        if self._effect_reply_enabled:
+            channel_reply_effects = [effect]
+        else:
+            await self._enqueue_message_export_replies([effect])
+            channel_reply_effects = []
+        return {
+            "ok": True,
+            "file_name": artifact["file_name"],
+            "format": target_format,
+            "file_size": artifact["file_size"],
+            "sent_to_current_session": True,
+            "delivery_status": "queued",
+            "delivery_acknowledged": False,
+            "self_enqueued_reply": True,
+            "suppress_final_reply": True,
+            "channel_reply_effects": channel_reply_effects,
+            "message": "文件已转换并排队发送到当前会话。",
+        }
+
+    async def generate_text_file(
+        self,
+        session: Any,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stage explicitly requested answer content as a file and queue it."""
+
+        target_format = normalize_file_format(arguments.get("format") or "txt")
+        latest_turn, latest_metadata = self._latest_user_context(session)
+        if latest_turn is None:
+            raise ValueError("当前轮次没有可生成文件的请求")
+        intent = classify_file_intent(str(getattr(latest_turn, "content", "") or ""))
+        if intent.operation != "generate":
+            raise ValueError("未检测到明确的文件生成意图")
+        if not intent.delivery_required:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "delivery_not_requested": True,
+                "message": "请先确认是否需要把整理后的内容生成文件并发送给你。",
+            }
+        if intent.requested_format:
+            if intent.requested_format not in SUPPORTED_FILE_FORMATS:
+                raise ValueError(
+                    f"当前版本不支持生成 {intent.requested_format}，请使用 txt、md、csv 或 json"
+                )
+            if target_format != intent.requested_format:
+                raise ValueError("工具格式与用户明确要求的文件格式不一致")
+        raw_content = str(arguments.get("content") or "").strip()
+        if not raw_content:
+            return {
+                "ok": False,
+                "needs_content": True,
+                "message": "请先整理出要写入文件的正文内容，再生成文件。",
+            }
+        tenant_id = str(getattr(session, "tenant_id", "") or "default").strip() or "default"
+        session_id = self._external_session_id(session).strip()
+        if not session_id:
+            raise ValueError("当前会话标识不可用")
+        session_kind = self._message_export_session_kind(
+            session,
+            latest_metadata=latest_metadata,
+            session_id=session_id,
+        )
+        await self._require_session_group_file_send_enabled(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            session_kind=session_kind,
+        )
+        source_id = self._message_export_source_id(
+            session,
+            latest_turn=latest_turn,
+            latest_metadata=latest_metadata,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        digest = hashlib.sha256(
+            "\0".join((tenant_id, session_id, source_id, target_format, raw_content)).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:32]
+        content = convert_file_bytes(
+            raw_content.encode("utf-8"),
+            source_name="generated.json" if target_format == "json" else "generated.txt",
+            target_format=target_format,
+            source_content_type=(
+                "application/json" if target_format == "json" else "text/plain"
+            ),
+        )
+        artifact = stage_outbound_artifact(
+            self._message_export_root,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            request_id=f"wxbot-file-generate-{digest}",
+            file_name=str(arguments.get("file_name") or "整理内容").strip(),
+            content=content,
+            file_format=target_format,
+            max_bytes=self._message_export_max_bytes,
+        )
+        delivery_contract = self._message_export_delivery_contract(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_id,
+        )
+        channel = str(getattr(getattr(session, "channel", "wechat"), "value", "wechat"))
+        sender_id = str(
+            latest_metadata.get("sender_id")
+            or latest_metadata.get("sender_wxid")
+            or getattr(session, "external_participant_id", "")
+            or getattr(session, "user_id", "")
+            or ""
+        ).strip()
+        command_id = f"channel-reply:{tenant_id}:wxbot-file-generate:{digest}"
+        payload = {
+            "tenant_id": tenant_id,
+            "channel": channel,
+            "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+            "connection_id": str(getattr(session, "connection_id", "") or ""),
+            "session_id": session_id,
+            "external_conversation_id": session_id,
+            "canonical_conversation_id": str(
+                getattr(session, "canonical_conversation_id", "") or session_id
+            ),
+            "session_name": str(latest_metadata.get("session_name") or session_id),
+            "session_kind": session_kind,
+            "user_id": str(getattr(session, "user_id", "") or ""),
+            "sender_id": sender_id,
+            "sender_name": str(latest_metadata.get("sender_name") or ""),
+            "reply_to_message_id": source_id,
+            "trace_id": str(latest_metadata.get("trace_id") or source_id)[:64],
+            "source_message": {
+                "agent_tool": "generate_text_file",
+                "message_id": source_id,
+                "session_id": session_id,
+            },
+            "file": {
+                "file_path": artifact["file_path"],
+                "file_name": artifact["file_name"],
+                "file_size": artifact["file_size"],
+                "file_md5": artifact["file_md5"],
+                "file_sha256": artifact["file_sha256"],
+            },
+            "delivery": {
+                "channel": channel,
+                "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+                "connection_id": str(getattr(session, "connection_id", "") or ""),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "external_conversation_id": session_id,
+                "session_kind": session_kind,
+                "sender_wxid": sender_id,
+                "command_id": command_id,
+                "idempotency_key": command_id,
+                **delivery_contract,
+                "must_deliver_file": True,
+            },
+            "command_id": command_id,
+        }
+        effect = {
+            "type": "enqueue_channel_reply",
+            "owner": "wxbot" if channel == "wechat" else channel,
+            "idempotency_key": command_id,
+            "payload": payload,
+        }
+        if self._effect_reply_enabled:
+            effects = [effect]
+        else:
+            await self._enqueue_message_export_replies([effect])
+            effects = []
+        return {
+            "ok": True,
+            "file_name": artifact["file_name"],
+            "format": target_format,
+            "file_size": artifact["file_size"],
+            "sent_to_current_session": True,
+            "delivery_status": "queued",
+            "delivery_acknowledged": False,
+            "self_enqueued_reply": True,
+            "suppress_final_reply": True,
+            "channel_reply_effects": effects,
+            "message": "文件已生成并排队发送到当前会话。",
+        }
+
+    @staticmethod
+    def _metadata_has_file(metadata: dict[str, Any]) -> bool:
+        media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+        attachment = (
+            metadata.get("file_attachment")
+            if isinstance(metadata.get("file_attachment"), dict)
+            else {}
+        )
+        return bool(
+            str(metadata.get("msg_type") or "").strip().lower() == "file"
+            or str(attachment.get("type") or "").strip().lower() == "file"
+            or str(
+                metadata.get("file_name")
+                or metadata.get("file_url")
+                or media.get("file_name")
+                or media.get("file_url")
+                or ""
+            ).strip()
+        )
+
+    @classmethod
+    def _latest_file_context(cls, session: Any) -> tuple[Any | None, dict[str, Any]]:
+        session_id = str(getattr(session, "external_conversation_id", "") or getattr(session, "session_id", "") or "")
+        is_group = session_id.endswith("@chatroom") or str(
+            dict(getattr(session, "metadata", {}) or {}).get("session_kind") or ""
+        ).strip().lower() == "group"
+        _request_turn, request_metadata = cls._latest_user_context(session)
+        requester_id = str(
+            request_metadata.get("sender_wxid")
+            or request_metadata.get("sender_id")
+            or getattr(session, "external_participant_id", "")
+            or getattr(session, "user_id", "")
+            or ""
+        ).strip()
+        for turn in reversed(list(getattr(session, "turns", []) or [])):
+            raw_role = getattr(turn, "role", "")
+            role = str(getattr(raw_role, "value", raw_role) or "").strip().lower()
+            if role != "user":
+                continue
+            metadata = dict(getattr(turn, "metadata", {}) or {})
+            if is_group and requester_id:
+                file_sender = str(
+                    metadata.get("sender_wxid") or metadata.get("sender_id") or ""
+                ).strip()
+                if file_sender and file_sender != requester_id:
+                    continue
+            if cls._metadata_has_file(metadata):
+                return turn, metadata
+        return None, {}
+
+    async def _enrich_media_ready_metadata(
+        self,
+        metadata: dict[str, Any],
+        *,
+        session: Any | None,
+    ) -> dict[str, Any]:
+        """Recover a deferred SDK URL without trusting arbitrary user paths."""
+
+        media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+        attachment = (
+            metadata.get("file_attachment")
+            if isinstance(metadata.get("file_attachment"), dict)
+            else {}
+        )
+        if str(
+            metadata.get("file_url") or media.get("file_url") or attachment.get("url") or ""
+        ).strip():
+            return metadata
+        getter = getattr(self._wxbot_store, "get_media_ready_event", None)
+        if not callable(getter) or session is None:
+            return metadata
+        tenant_id = str(getattr(session, "tenant_id", "") or "default").strip() or "default"
+        connection_id = str(
+            metadata.get("connection_id")
+            or getattr(session, "connection_id", "")
+            or getattr(self._settings, "channel_connection_id", "")
+            or ""
+        ).strip()
+        message_ids = []
+        for value in (
+            metadata.get("msg_svr_id"),
+            metadata.get("external_message_id"),
+            metadata.get("message_id"),
+        ):
+            cleaned = str(value or "").strip()
+            if cleaned and cleaned not in message_ids:
+                message_ids.append(cleaned)
+        for message_id in message_ids:
+            try:
+                row = await getter(
+                    tenant_id,
+                    message_id=message_id,
+                    connection_id=connection_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "wxbot.file_media_ready_lookup_failed",
+                    tenant_id=tenant_id,
+                    connection_id=connection_id,
+                    message_id=message_id,
+                )
+                continue
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            ready_message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+            ready_media = payload.get("media") if isinstance(payload.get("media"), dict) else {}
+            merged = dict(metadata)
+            merged_media = {**media, **ready_media}
+            file_url = str(
+                ready_message.get("file_url")
+                or ready_media.get("file_url")
+                or row.get("media_url")
+                or ""
+            ).strip()
+            if file_url:
+                merged["file_url"] = file_url
+            for key in (
+                "file_name",
+                "file_ext",
+                "file_size",
+                "file_md5",
+                "file_sha256",
+                "file_download_status",
+                "file_failure_reason",
+                "media_status",
+            ):
+                value = ready_message.get(key) or ready_media.get(key)
+                if value in (None, "") and key == "media_status":
+                    value = ready_media.get("status") or row.get("event_type")
+                if value not in (None, ""):
+                    merged[key] = value
+            merged["media"] = merged_media
+            if file_url:
+                return merged
+        return metadata
+
+    async def _download_current_file(
+        self,
+        metadata: dict[str, Any],
+        *,
+        session: Any | None = None,
+    ) -> dict[str, Any]:
+        metadata = await self._enrich_media_ready_metadata(metadata, session=session)
+        connection_id = str(
+            metadata.get("connection_id")
+            or getattr(session, "connection_id", "")
+            or getattr(self._settings, "channel_connection_id", "")
+            or ""
+        ).strip()
+        configured_connection_id = str(
+            getattr(self._settings, "channel_connection_id", "") or ""
+        ).strip()
+        if connection_id and connection_id not in {
+            LEGACY_WXBOT_CONNECTION_ID,
+            configured_connection_id,
+        }:
+            raise ValueError("当前文件所属连接未配置受控下载通道")
+        media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+        attachment = (
+            metadata.get("file_attachment")
+            if isinstance(metadata.get("file_attachment"), dict)
+            else {}
+        )
+        file_url = str(
+            metadata.get("file_url") or media.get("file_url") or attachment.get("url") or ""
+        ).strip()
+        if not file_url:
+            raise ValueError("当前文件尚未下载完成，请稍后再试")
+        base_url = str(getattr(self._settings, "wxbot_sdk_url", "") or "").rstrip("/")
+        parsed = urlsplit(file_url)
+        if not base_url or parsed.scheme not in {"http", "https"}:
+            raise ValueError("当前文件地址不可用")
+        base_origin = urlsplit(base_url)
+        if (parsed.scheme.lower(), parsed.netloc.lower()) != (
+            base_origin.scheme.lower(),
+            base_origin.netloc.lower(),
+        ):
+            raise ValueError("当前文件地址不是受信任的 wxbot SDK")
+        decoded_path = unquote(parsed.path)
+        if (
+            not decoded_path.startswith("/files/")
+            or ".." in decoded_path.replace("\\", "/").split("/")
+            or parsed.fragment
+        ):
+            raise ValueError("当前文件地址格式不安全")
+        request_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        configured_limit = int(
+            getattr(self._settings, "wxbot_file_analysis_max_bytes", 8 * 1024 * 1024)
+            or 8 * 1024 * 1024
+        )
+        sdk_download_limit = int(
+            getattr(self._settings, "wxbot_file_download_max_bytes", 2 * 1024 * 1024 * 1024)
+            or 2 * 1024 * 1024 * 1024
+        )
+        max_bytes = max(
+            1024 * 1024,
+            min(configured_limit, sdk_download_limit, 100 * 1024 * 1024),
+        )
+        async with httpx.AsyncClient(timeout=None, trust_env=False, follow_redirects=False) as client:
+            response = await safe_trusted_service_request(
+                client,
+                "GET",
+                base_url,
+                request_path,
+                headers=wxbot_sdk_headers(self._settings),
+                timeout_seconds=30.0,
+                max_response_bytes=max_bytes,
+                allowed_response_content_types=(
+                    "text/",
+                    "application/json",
+                    "application/octet-stream",
+                    "binary/octet-stream",
+                    "application/x-download",
+                    "application/force-download",
+                    "application/pdf",
+                    "application/zip",
+                    "application/msword",
+                    "application/vnd.ms-excel",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            )
+        if response.status_code == 404:
+            raise ValueError("当前文件在 wxbot SDK 中不存在")
+        if response.status_code < 200 or response.status_code >= 300:
+            raise ValueError("wxbot SDK 文件下载失败")
+        content = bytes(response.content)
+        if not content:
+            raise ValueError("当前文件为空")
+        if len(content) > max_bytes:
+            raise ValueError("当前文件超过处理大小限制")
+        raw_expected_size = metadata.get("file_size")
+        if raw_expected_size in (None, ""):
+            raw_expected_size = media.get("file_size", media.get("size", attachment.get("size")))
+        if raw_expected_size not in (None, ""):
+            try:
+                expected_size = int(raw_expected_size)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("当前文件大小元数据无效") from exc
+            if expected_size > 0 and expected_size != len(content):
+                raise ValueError("当前文件大小校验失败，已拒绝继续处理")
+        expected_sha256 = str(
+            metadata.get("file_sha256")
+            or media.get("file_sha256")
+            or media.get("sha256")
+            or attachment.get("sha256")
+            or ""
+        ).strip().lower()
+        if expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("当前文件校验值格式无效")
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(content).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise ValueError("当前文件校验失败，已拒绝继续处理")
+        expected_md5 = str(
+            metadata.get("file_md5")
+            or media.get("file_md5")
+            or media.get("md5")
+            or attachment.get("md5")
+            or ""
+        ).strip().lower()
+        if expected_md5 and not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
+            raise ValueError("当前文件校验值格式无效")
+        if expected_md5:
+            if hashlib.md5(content).hexdigest() != expected_md5:
+                raise ValueError("当前文件校验失败，已拒绝继续处理")
+        file_name = str(
+            metadata.get("file_name")
+            or media.get("file_name")
+            or attachment.get("name")
+            or "当前文件"
+        ).strip()
+        extension = Path(file_name).suffix.lower().lstrip(".")
+        content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].lower()
+        binary_types = {
+            "application/pdf",
+            "application/zip",
+            "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        binary_magic = (
+            content.startswith(b"%PDF-")
+            or content.startswith(b"PK\x03\x04")
+            or content.startswith(b"\xd0\xcf\x11\xe0")
+        )
+        if extension in {"txt", "md", "csv", "json"} and (
+            content_type in binary_types or binary_magic
+        ):
+            raise ValueError("当前文件内容类型与扩展名不一致，已拒绝继续处理")
+        return {
+            "content": content,
+            "file_name": file_name,
+            "file_size": len(content),
+            "file_sha256": hashlib.sha256(content).hexdigest(),
+            "content_type": content_type,
+            "download_status": "ready",
+        }
+
+    async def _cleanup_message_export_artifacts(self) -> None:
+        try:
+            list_active = getattr(
+                self._wxbot_store,
+                "list_active_outbound_file_paths",
+                None,
+            )
+            active_paths = await list_active() if callable(list_active) else []
+            export_root = Path(self._message_export_root).resolve(strict=False)
+            protected_paths = []
+            for raw_path in active_paths:
+                candidate = Path(str(raw_path or ""))
+                if not candidate.is_absolute():
+                    continue
+                resolved = candidate.resolve(strict=False)
+                if resolved.is_relative_to(export_root):
+                    protected_paths.append(resolved)
+            result = cleanup_message_exports(
+                self._message_export_root,
+                protected_paths=protected_paths,
+                retention_seconds=getattr(
+                    self._settings,
+                    "wxbot_outbound_file_retention_seconds",
+                    24 * 60 * 60,
+                ),
+                cleanup_grace_seconds=getattr(
+                    self._settings,
+                    "wxbot_outbound_file_cleanup_grace_seconds",
+                    5 * 60,
+                ),
+            )
+            if result.get("errors"):
+                logger.warning(
+                    "wxbot.message_export_cleanup_partial",
+                    error_count=len(result["errors"]),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "wxbot.message_export_cleanup_failed",
+                error_type=exc.__class__.__name__,
+            )
+
+    def _message_export_period_arguments(
+        self,
+        report_type: str,
+        *,
+        date: str,
+        year_month: str,
+    ) -> tuple[str, str]:
+        timezone = self._message_export_timezone()
+        now = datetime.now(timezone)
+        if report_type == "daily":
+            if year_month:
+                raise ValueError("daily 导出不能使用 year_month")
+            resolved_date = date or now.strftime("%Y-%m-%d")
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", resolved_date) is None:
+                raise ValueError("date 必须是 YYYY-MM-DD")
+            try:
+                datetime.strptime(resolved_date, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValueError("date 必须是 YYYY-MM-DD") from exc
+            return resolved_date, ""
+
+        if date:
+            raise ValueError("monthly 导出不能使用 date")
+        resolved_year_month = year_month or now.strftime("%Y-%m")
+        if re.fullmatch(r"\d{4}-\d{2}", resolved_year_month) is None:
+            raise ValueError("year_month 必须是 YYYY-MM")
+        try:
+            datetime.strptime(resolved_year_month, "%Y-%m")
+        except ValueError as exc:
+            raise ValueError("year_month 必须是 YYYY-MM") from exc
+        return "", resolved_year_month
+
+    def _message_export_timezone(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(
+                str(
+                    getattr(self._settings, "timezone", "Asia/Shanghai")
+                    or "Asia/Shanghai"
+                )
+            )
+        except Exception:
+            return ZoneInfo("Asia/Shanghai")
+
+    async def _require_session_group_file_send_enabled(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        session_kind: str,
+    ) -> None:
+        if session_kind != "group":
+            return
+        await require_group_file_send_enabled(
+            self._social_policy_store,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+
+    @staticmethod
+    def _message_export_session_kind(
+        session: Any,
+        *,
+        latest_metadata: dict[str, Any],
+        session_id: str,
+    ) -> str:
+        declared = str(
+            latest_metadata.get("session_kind")
+            or dict(getattr(session, "metadata", {}) or {}).get("session_kind")
+            or ""
+        ).strip().lower()
+        if declared in {"group", "private"}:
+            return declared
+        return "group" if session_id.endswith("@chatroom") else "private"
+
+    def _current_private_message_records(
+        self,
+        session: Any,
+        *,
+        report_type: str,
+        period: str,
+    ) -> list[dict[str, Any]]:
+        timezone = self._message_export_timezone()
+        fallback_created_at = getattr(session, "last_active_at", None)
+        if not isinstance(fallback_created_at, datetime):
+            fallback_created_at = datetime.now(timezone)
+        records: list[dict[str, Any]] = []
+        for turn in list(getattr(session, "turns", []) or []):
+            raw_role = getattr(turn, "role", "")
+            role = str(getattr(raw_role, "value", raw_role) or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            created_at = getattr(turn, "created_at", None)
+            if not isinstance(created_at, datetime):
+                created_at = fallback_created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            local_created_at = created_at.astimezone(timezone)
+            local_period = (
+                local_created_at.strftime("%Y-%m-%d")
+                if report_type == "daily"
+                else local_created_at.strftime("%Y-%m")
+            )
+            if local_period != period:
+                continue
+            metadata = dict(getattr(turn, "metadata", {}) or {})
+            if role == "assistant":
+                sender_wxid = "assistant"
+                sender_name = "助手"
+            else:
+                sender_wxid = str(
+                    metadata.get("sender_wxid")
+                    or metadata.get("sender_id")
+                    or getattr(session, "user_id", "")
+                    or ""
+                ).strip()
+                sender_name = str(
+                    metadata.get("sender_name") or sender_wxid or "当前用户"
+                ).strip()
+            msg_type = str(metadata.get("msg_type") or "text").strip().lower() or "text"
+            turn_text = str(getattr(turn, "content", "") or "")
+            if msg_type == "file" and not turn_text:
+                turn_text = f"[文件] {str(metadata.get('file_name') or '').strip()}".rstrip()
+            attachment = (
+                metadata.get("file_attachment")
+                if isinstance(metadata.get("file_attachment"), dict)
+                else {}
+            )
+            file_name = str(
+                metadata.get("file_name") or attachment.get("name") or ""
+            ).strip()
+            file_size = metadata.get("file_size", attachment.get("size"))
+            try:
+                file_size = max(0, int(file_size or 0))
+            except (TypeError, ValueError):
+                file_size = 0
+            file_sha256 = str(
+                metadata.get("file_sha256") or attachment.get("sha256") or ""
+            ).strip().lower()
+            file_status = str(
+                metadata.get("file_download_status")
+                or attachment.get("download_status")
+                or metadata.get("media_status")
+                or ""
+            ).strip().lower()
+            records.append(
+                {
+                    "ts": int(local_created_at.timestamp()),
+                    "timestamp": local_created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "sender_wxid": sender_wxid,
+                    "sender_name": sender_name,
+                    "msg_type": msg_type,
+                    "text": turn_text,
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "file_sha256": file_sha256,
+                    "file_status": file_status,
+                }
+            )
+        records.sort(key=lambda item: (int(item.get("ts") or 0), str(item["sender_wxid"])))
+        return records
+
+    @staticmethod
+    def _latest_user_context(session: Any) -> tuple[Any | None, dict[str, Any]]:
+        for turn in reversed(list(getattr(session, "turns", []) or [])):
+            raw_role = getattr(turn, "role", "")
+            role = str(getattr(raw_role, "value", raw_role) or "").strip().lower()
+            if role == "user":
+                return turn, dict(getattr(turn, "metadata", {}) or {})
+        return None, {}
+
+    @classmethod
+    def _message_export_source_id(
+        cls,
+        session: Any,
+        *,
+        latest_turn: Any | None,
+        latest_metadata: dict[str, Any],
+        tenant_id: str,
+        session_id: str,
+    ) -> str:
+        session_metadata = dict(getattr(session, "metadata", {}) or {})
+        captured = latest_metadata.get(_DELIVERY_CONTRACT_METADATA_KEY)
+        if not isinstance(captured, dict):
+            captured = session_metadata.get(_DELIVERY_CONTRACT_METADATA_KEY)
+        captured_contract = dict(captured) if isinstance(captured, dict) else {}
+        for value in (
+            captured_contract.get("source_message_id"),
+            latest_metadata.get("message_id"),
+            latest_metadata.get("msg_svr_id"),
+            latest_metadata.get("reply_to_message_id"),
+            session_metadata.get("message_id"),
+            session_metadata.get("msg_svr_id"),
+        ):
+            normalized = str(value or "").strip()
+            if normalized:
+                return normalized[:128]
+
+        turn_created_at = str(getattr(latest_turn, "created_at", "") or "")
+        turn_content = str(getattr(latest_turn, "content", "") or "")
+        fallback = hashlib.sha256(
+            "\0".join(
+                (
+                    tenant_id,
+                    session_id,
+                    str(getattr(session, "user_id", "") or ""),
+                    turn_created_at,
+                    turn_content,
+                    str(getattr(session, "last_active_at", "") or ""),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        return f"message-export-source-{fallback}"
+
+    @staticmethod
+    def _message_export_delivery_contract(
+        session: Any,
+        *,
+        latest_metadata: dict[str, Any],
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        captured = latest_metadata.get(_DELIVERY_CONTRACT_METADATA_KEY)
+        if not isinstance(captured, dict):
+            captured = dict(getattr(session, "metadata", {}) or {}).get(
+                _DELIVERY_CONTRACT_METADATA_KEY
+            )
+        delivery = dict(captured) if isinstance(captured, dict) else {}
+        delivery.update(
+            {
+                "participation_status": "must_reply",
+                "source_message_id": source_message_id,
+                "response_kind": "tool_result",
+                "speech_output_kind": "ordinary",
+                "speech_class": "obligation",
+                "participation_reason_codes": ["direct_tool_request"],
+            }
+        )
+        return delivery
+
+    @staticmethod
+    def _message_export_reply_effects(
+        session: Any,
+        *,
+        latest_metadata: dict[str, Any],
+        tenant_id: str,
+        session_id: str,
+        session_name: str,
+        source_message_id: str,
+        request_id: str,
+        request_digest: str,
+        period: str,
+        artifact: dict[str, Any],
+        delivery_contract: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        raw_channel = getattr(session, "channel", "wechat")
+        channel = str(getattr(raw_channel, "value", raw_channel) or "wechat")
+        session_kind = WxbotAgentToolService._message_export_session_kind(
+            session,
+            latest_metadata=latest_metadata,
+            session_id=session_id,
+        )
+        sender_id = str(
+            latest_metadata.get("sender_id")
+            or latest_metadata.get("sender_wxid")
+            or getattr(session, "external_participant_id", "")
+            or getattr(session, "user_id", "")
+            or ""
+        ).strip()
+        sender_name = str(latest_metadata.get("sender_name") or "").strip()
+        trace_id = str(
+            latest_metadata.get("trace_id")
+            or dict(getattr(session, "metadata", {}) or {}).get("trace_id")
+            or source_message_id
+        ).strip()[:64]
+        source_message = {
+            "agent_tool": "export_current_messages_file",
+            "request_id": request_id,
+            "message_id": source_message_id,
+            "session_id": session_id,
+            "external_conversation_id": session_id,
+            "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+            "connection_id": str(getattr(session, "connection_id", "") or ""),
+            _DELIVERY_CONTRACT_METADATA_KEY: dict(delivery_contract),
+        }
+        delivery_target = {
+            "request_id": request_id,
+            "channel": channel,
+            "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+            "connection_id": str(getattr(session, "connection_id", "") or ""),
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+            "external_conversation_id": session_id,
+            "session_name": session_name,
+            "session_kind": session_kind,
+            "sender_name": sender_name,
+            "sender_wxid": sender_id,
+        }
+        base_payload = {
+            "tenant_id": tenant_id,
+            "channel": channel,
+            "adapter_id": str(getattr(session, "adapter_id", "") or ""),
+            "connection_id": str(getattr(session, "connection_id", "") or ""),
+            "session_id": session_id,
+            "external_conversation_id": session_id,
+            "canonical_conversation_id": str(
+                getattr(session, "canonical_conversation_id", "") or session_id
+            ),
+            "session_name": session_name,
+            "session_kind": session_kind,
+            "user_id": str(getattr(session, "user_id", "") or ""),
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "reply_to_message_id": source_message_id,
+            "trace_id": trace_id,
+            "source_message": source_message,
+        }
+        command_prefix = (
+            f"channel-reply:{tenant_id}:wxbot-message-export:{request_digest}"
+        )
+        confirmation_command = f"{command_prefix}:text"
+        file_command = f"{command_prefix}:file"
+        message_count = int(artifact.get("message_count") or 0)
+        confirmation_text = (
+            f"已整理 {period} 的消息记录，共 {message_count} 条，文件已排队发送。"
+        )
+        # The confirmation reserves the one conversational obligation.  The
+        # file is the payload of that same response and must not consume a
+        # second group speech-budget slot or be suppressed as a duplicate.
+        file_delivery = {
+            **delivery_contract,
+            "speech_budget_enabled": False,
+            "duplicate_guard_enabled": False,
+            "must_deliver_file": True,
+        }
+        owner = "wxbot" if channel == "wechat" else channel
+        return [
+            {
+                "type": "enqueue_channel_reply",
+                "owner": owner,
+                "idempotency_key": confirmation_command,
+                "payload": {
+                    **base_payload,
+                    "body": {"type": "text", "text": confirmation_text},
+                    "delivery": {
+                        **delivery_target,
+                        "command_id": confirmation_command,
+                        "idempotency_key": confirmation_command,
+                        **delivery_contract,
+                    },
+                    "command_id": confirmation_command,
+                },
+            },
+            {
+                "type": "enqueue_channel_reply",
+                "owner": owner,
+                "idempotency_key": file_command,
+                "payload": {
+                    **base_payload,
+                    "file": {
+                        "file_path": str(artifact.get("file_path") or ""),
+                        "file_name": str(artifact.get("file_name") or ""),
+                        "file_size": int(artifact.get("file_size") or 0),
+                        "file_md5": str(artifact.get("file_md5") or ""),
+                        "file_sha256": str(artifact.get("file_sha256") or ""),
+                    },
+                    "delivery": {
+                        **delivery_target,
+                        "command_id": file_command,
+                        "idempotency_key": file_command,
+                        **file_delivery,
+                    },
+                    "command_id": file_command,
+                },
+            },
+        ]
+
+    async def _enqueue_message_export_replies(
+        self,
+        effects: list[dict[str, Any]],
+    ) -> None:
+        for effect in effects:
+            payload = dict(effect.get("payload") or {})
+            delivery = dict(payload.get("delivery") or {})
+            source_message = dict(payload.get("source_message") or {})
+            body = payload.get("body")
+            file_payload = payload.get("file")
+            is_file = isinstance(file_payload, dict)
+            await self._wxbot_store.enqueue_reply(
+                tenant_id=str(payload.get("tenant_id") or "default"),
+                session_id=str(payload.get("session_id") or ""),
+                session_name=str(payload.get("session_name") or ""),
+                sender_name=str(payload.get("sender_name") or ""),
+                sender_wxid=str(payload.get("sender_id") or ""),
+                reply_text=(
+                    str(body.get("text") or "")
+                    if isinstance(body, dict)
+                    else ""
+                ),
+                trace_id=str(payload.get("trace_id") or ""),
+                msg_type="file" if is_file else "text",
+                file_path=(
+                    str(file_payload.get("file_path") or "") if is_file else ""
+                ),
+                file_name=(
+                    str(file_payload.get("file_name") or "") if is_file else ""
+                ),
+                file_size=(
+                    int(file_payload.get("file_size") or 0) if is_file else None
+                ),
+                file_md5=(
+                    str(file_payload.get("file_md5") or "") if is_file else ""
+                ),
+                file_sha256=(
+                    str(file_payload.get("file_sha256") or "") if is_file else ""
+                ),
+                mention_sender=False,
+                reply_to_msg_svr_id=str(payload.get("reply_to_message_id") or ""),
+                session_kind=str(payload.get("session_kind") or ""),
+                source_message=source_message,
+                delivery=delivery,
+                command_id=str(payload.get("command_id") or ""),
+            )
 
     async def _require_data_owner_scope(
         self,

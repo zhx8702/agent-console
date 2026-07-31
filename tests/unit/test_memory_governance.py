@@ -4,7 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 
+import plugins.memory.store as memory_store_module
 from plugins.memory.store import MemoryStore
+
+
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
 
 
 @pytest.mark.asyncio
@@ -53,5 +65,12 @@ async def test_memory_governance_dry_run_and_bounded_cleanup(monkeypatch) -> Non
     assert applied["stale_auto_expired"] == 1
     assert vector_index.deleted == [1, 2, 3]
     assert any("plugin_memory_fact" in sql for sql, _params in calls)
+    item_expiry_sql = next(
+        sql
+        for sql, _params in calls
+        if sql.startswith("UPDATE plugin_memory_item") and "acceptance,status" in sql
+    )
+    assert "status = 'archived'" in item_expiry_sql
+    assert "status = 'expired'" not in item_expiry_sql
     select_sql = next(sql for sql, _params in calls if sql.startswith("SELECT id"))
     assert "explicit_user" in select_sql

@@ -1120,6 +1120,7 @@ async def test_memory_save_effect_handler_persists_after_commit() -> None:
             "user_text": "我要看物流",
             "assistant_text": "物流今天会继续更新",
             "trace_id": "trace-2",
+            "source_message_id": "m-2",
             "origin_session_kind": "unknown",
             "audience_scope": "private",
             "allowed_session_ids": [],
@@ -1129,6 +1130,15 @@ async def test_memory_save_effect_handler_persists_after_commit() -> None:
         }
     ]
     assert ctx.signals["memory"]["user_profile"]["message_count"] == 4
+    assert "user_id" not in ctx.signals["memory"]["user_profile"]
+    assert "short_term_memory" not in ctx.signals["memory"]["user_profile"]
+    assert "manual_notes" not in ctx.signals["memory"]["user_profile"]
+    assert "我要看物流" not in repr(ctx.signals["memory"]["user_profile"])
+    assert "人工标记为 VIP" not in repr(ctx.signals["memory"]["user_profile"])
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "success",
+        "reason": "saved",
+    }
     assert ctx.extras["user_memory_profile"]["message_count"] == 4
     assert session.variables["user_memory"]["user_id"] == "discord-user-b"
     assert session.variables["user_memory"]["session_profile"]["updated_at"] == (
@@ -1141,3 +1151,33 @@ async def test_memory_save_effect_handler_persists_after_commit() -> None:
     assert session.variables["user_memory"]["memory_items"]["identity"][0]["created_at"] == (
         "2026-04-21T12:02:00+00:00"
     )
+
+
+@pytest.mark.asyncio
+async def test_memory_save_effect_handler_records_safe_failure_signal() -> None:
+    class _FailingMemoryStore:
+        async def remember_interaction(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError("backend included private memory text")
+
+    registry = EffectHandlerRegistry()
+    register_memory_save_handler(registry, _FailingMemoryStore())
+    dispatcher = EffectDispatcher(registry, InMemoryEffectCommitter())
+    ctx = _ctx()
+    effect = MessageEffect(
+        type="save_memory",
+        owner="memory",
+        payload={"user_text": "请记住我的私密偏好"},
+        idempotency_key="memory:save:failure-signal",
+    )
+
+    result = await dispatcher.dispatch(effect, ctx)
+
+    assert result.status == EFFECT_HANDLER_STATUS_HANDLER_ERROR
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "error",
+        "reason": "persistence_failed",
+        "error_type": "runtimeerror",
+    }
+    assert "私密偏好" not in repr(ctx.signals["memory"])
+    assert "backend included private memory text" not in repr(ctx.signals["memory"])

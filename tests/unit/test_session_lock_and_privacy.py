@@ -141,3 +141,34 @@ def test_group_session_snapshot_strips_private_memory_and_actor_owner() -> None:
     assert "user_memory" not in payload
     assert "group_observation_context" not in payload
     assert "13800138000" not in payload
+
+
+def test_private_session_snapshot_strips_runtime_memory_only() -> None:
+    session = Session(
+        session_id="private-session",
+        tenant_id="demo",
+        user_id="wxid_private",
+        channel=Channel.WECHAT,
+        variables={
+            "user_memory": {"manual_notes": "request scoped"},
+            "group_memory": {"session_summary": "request scoped"},
+            "group_observation_context": {"recent_text": "request scoped"},
+            "memory_settings": {"retrieval_enabled": False},
+            "persona_profile": {"name": "bot"},
+        },
+        pii_map={"<PII:phone:1>": "13800138000"},
+    )
+
+    durable = {
+        "memory_settings": {"retrieval_enabled": False},
+        "persona_profile": {"name": "bot"},
+    }
+    assert _persisted_variables(session) == durable
+
+    payload = _serialize_session_for_cache(session)
+    assert "user_memory" not in payload
+    assert "group_memory" not in payload
+    assert "group_observation_context" not in payload
+    assert "memory_settings" in payload
+    assert "persona_profile" in payload
+    assert "13800138000" not in payload

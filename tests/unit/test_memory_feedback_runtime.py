@@ -97,9 +97,13 @@ async def test_forget_member_repeats_tenant_channel_and_member_scope_on_mutation
         if item[0].startswith("DELETE FROM plugin_memory_item ")
     )
     assert "tenant_id = :tid" in item_delete_sql
-    assert "channel = 'wechat'" in item_delete_sql
+    assert "channel = :memory_channel" in item_delete_sql
     assert "user_id = :uid" in item_delete_sql
-    assert item_delete_params == {"tid": "tenant-a", "uid": "member-a"}
+    assert item_delete_params == {
+        "tid": "tenant-a",
+        "uid": "member-a",
+        "memory_channel": "wechat",
+    }
     profile_deletes = [sql for sql, _ in calls if sql.startswith("DELETE FROM")]
     assert all("tenant_id = :tid" in sql and "user_id = :uid" in sql for sql in profile_deletes)
     assert not any(sql.startswith("UPDATE plugin_memory_item") for sql, _ in calls)

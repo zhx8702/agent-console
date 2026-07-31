@@ -6,6 +6,7 @@ import {
   sdkImageDisplayPath,
   sdkImageProxyPath,
 } from "../components/AuthenticatedImage";
+import { AuthenticatedFileDownload } from "../components/AuthenticatedFileDownload";
 import { OutputPanel } from "../components/OutputPanel";
 import { PageHeader } from "../components/PageHeader";
 import { StatusTile } from "../components/StatusTile";
@@ -60,6 +61,14 @@ type QueueQuote = {
   text: string;
   sender: string;
   messageId: string;
+};
+
+type QueueFile = {
+  mediaId: string;
+  fileName: string;
+  fileSize: number | null;
+  status: string;
+  sha256: string;
 };
 
 const AUTO_REFRESH_INTERVAL_MS = 5_000;
@@ -172,6 +181,89 @@ function quoteRecords(payload: Record<string, unknown>) {
     asRecord(quote?.quoted),
     asRecord(quote?.raw),
   ];
+}
+
+function readNumber(record: Record<string, unknown> | null, key: string) {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nestedFileRecords(
+  value: unknown,
+  depth = 0,
+): Array<Record<string, unknown>> {
+  if (depth > 4 || !value || typeof value !== "object") {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => nestedFileRecords(item, depth + 1));
+  }
+  const record = value as Record<string, unknown>;
+  const records = [record];
+  for (const key of [
+    "message",
+    "metadata",
+    "media",
+    "attachments",
+    "payload",
+    "media_ready_event",
+  ]) {
+    records.push(...nestedFileRecords(record[key], depth + 1));
+  }
+  return records;
+}
+
+function extractQueueFiles(payload: Record<string, unknown>) {
+  const records = nestedFileRecords(payload);
+  const files: QueueFile[] = [];
+  const seen = new Set<string>();
+  for (const record of records) {
+    const mediaId = readString(record, "file_media_id");
+    const type = readString(record, "type").toLowerCase();
+    if (!mediaId || (type && type !== "file" && !readString(record, "file_name"))) {
+      continue;
+    }
+    if (seen.has(mediaId)) {
+      continue;
+    }
+    seen.add(mediaId);
+    files.push({
+      mediaId,
+      fileName:
+        readString(record, "file_name") ||
+        firstRecordString(records, ["file_name", "file_raw_name"]) ||
+        "未命名文件",
+      fileSize:
+        readNumber(record, "file_size") ??
+        records.map((item) => readNumber(item, "file_size")).find((item) => item !== null) ??
+        null,
+      status:
+        readString(record, "file_download_status") ||
+        readString(record, "media_status") ||
+        readString(record, "status") ||
+        "ready",
+      sha256:
+        readString(record, "file_sha256") ||
+        readString(record, "sha256"),
+    });
+  }
+  return files;
+}
+
+function formatFileSize(value: number | null) {
+  if (value === null || value < 0) {
+    return "大小未知";
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  if (value < 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 function firstRecordString(
@@ -358,6 +450,13 @@ function formatMessagePreview(payload: Record<string, unknown>) {
   ];
   if (imageTypes.some((value) => value.toLowerCase() === "image")) {
     return "[图片]";
+  }
+  if (imageTypes.some((value) => value.toLowerCase() === "file")) {
+    const fileName = firstRecordString(
+      nestedFileRecords(payload),
+      ["file_name", "file_raw_name"],
+    );
+    return fileName ? `[文件] ${fileName}` : "[文件]";
   }
   const replyId = payload.reply_id;
   if (typeof replyId === "string" && replyId.trim()) {
@@ -559,6 +658,7 @@ export function MessageQueuesPage() {
   const selectedDirectImages = selectedImages.filter((image) => image.label === "图片");
   const selectedQuoteImages = selectedImages.filter((image) => image.label === "引用");
   const selectedQuote = selectedMessage ? extractQueueQuote(selectedMessage.payload) : null;
+  const selectedFiles = selectedMessage ? extractQueueFiles(selectedMessage.payload) : [];
   const selectedPreview = selectedMessage ? formatMessagePreview(selectedMessage.payload) : "";
   const refreshStatus = pageCursor
     ? "正在浏览历史消息，自动刷新已暂停"
@@ -739,6 +839,7 @@ export function MessageQueuesPage() {
           <div className="queue-message-feed" role="list" aria-label="当前消息流最近消息">
             {items.map((item, index) => {
               const images = extractQueueImages(item.payload);
+              const files = extractQueueFiles(item.payload);
               const quote = extractQueueQuote(item.payload);
               const quoteImage = images.some((image) => image.label === "引用");
               const preview = formatMessagePreview(item.payload);
@@ -780,6 +881,7 @@ export function MessageQueuesPage() {
                         {item.tenant_id && <span>租户已标记</span>}
                         {item.trace_id && <span>可追踪</span>}
                         {item.attempts > 0 && <span>尝试 {item.attempts} 次</span>}
+                        {!!files.length && <span>文件 {files.length} 个</span>}
                       </span>
                     </span>
                     {!!images.length && (
@@ -888,6 +990,29 @@ export function MessageQueuesPage() {
                           {" · "}
                           {sdkImageDisplayPath(image.previewUrl || image.thumbnailUrl)}
                         </p>
+                      </div>
+                    ))}
+                  </section>
+                )}
+                {!!selectedFiles.length && (
+                  <section className="queue-quote-preview" aria-label="消息文件">
+                    <div className="queue-quote-preview-heading">
+                      <strong>消息文件</strong>
+                      <span>{selectedFiles.length} 个</span>
+                    </div>
+                    {selectedFiles.map((file) => (
+                      <div className="queue-image-preview-item" key={file.mediaId}>
+                        <div className="queue-image-preview-title">{file.fileName}</div>
+                        <p className="muted-copy">
+                          {formatFileSize(file.fileSize)} · {file.status || "ready"}
+                        </p>
+                        {file.sha256 && (
+                          <p className="muted-copy mono">SHA-256 {file.sha256}</p>
+                        )}
+                        <AuthenticatedFileDownload
+                          source={file.mediaId}
+                          fileName={file.fileName}
+                        />
                       </div>
                     ))}
                   </section>

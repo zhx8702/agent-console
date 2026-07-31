@@ -3,6 +3,10 @@
 # The API, workers, and scheduler all call WXBOT_SDK_URL. Keep every process
 # that can execute wxbot work attached to the SDK network; otherwise scheduled
 # reports can be created successfully but fail while collecting messages.
+#
+# Message-export writers bind a common host outbox at the same absolute
+# container path. The companion SDK deployment must mount this exact host
+# directory at the same target and allow it in file_send_allowed_dirs.
 services:
   postgres:
     restart: unless-stopped
@@ -17,15 +21,33 @@ services:
     restart: unless-stopped
     ports: !override ["127.0.0.1:8000:8000"]
     networks: [default, wxbot-sdk]
+    volumes:
+      - type: bind
+        source: ${WXBOT_OUTBOUND_FILE_HOST_DIR:-/opt/wxbot-shared/outbox}
+        target: ${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
+        bind:
+          create_host_path: true
   inbound-worker:
     restart: unless-stopped
     networks: [default, wxbot-sdk]
+    volumes:
+      - type: bind
+        source: ${WXBOT_OUTBOUND_FILE_HOST_DIR:-/opt/wxbot-shared/outbox}
+        target: ${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
+        bind:
+          create_host_path: true
   outbound-worker:
     restart: unless-stopped
     networks: [default, wxbot-sdk]
   scheduler:
     restart: unless-stopped
     networks: [default, wxbot-sdk]
+    volumes:
+      - type: bind
+        source: ${WXBOT_OUTBOUND_FILE_HOST_DIR:-/opt/wxbot-shared/outbox}
+        target: ${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
+        bind:
+          create_host_path: true
   wxbot-bridge-worker:
     restart: unless-stopped
     networks: [default, wxbot-sdk]

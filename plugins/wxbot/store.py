@@ -20,10 +20,12 @@ Tables:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
@@ -211,6 +213,119 @@ def _delivery_dict(value: Any) -> dict[str, Any]:
             return {}
         return dict(parsed) if isinstance(parsed, dict) else {}
     return {}
+
+
+def _is_absolute_outbound_file_path(value: str) -> bool:
+    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def _normalize_outbound_file_size(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise ValueError("file_size must be a non-negative integer")
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("file_size must be a non-negative integer") from exc
+    if size < 0:
+        raise ValueError("file_size must be a non-negative integer")
+    return size
+
+
+def _normalize_outbound_file_digest(value: object, *, algorithm: str) -> str:
+    digest = str(value or "").strip().lower()
+    length = 32 if algorithm == "md5" else 64
+    if digest and (
+        len(digest) != length or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"file_{algorithm} must be a {length}-character lowercase hex digest")
+    return digest
+
+
+def _validate_configured_outbound_file(
+    settings: Any,
+    *,
+    file_path: str,
+    file_size: int | None,
+    file_md5: str,
+    file_sha256: str,
+) -> None:
+    """Fail closed for production settings while keeping legacy test doubles usable."""
+
+    if not hasattr(settings, "wxbot_outbound_file_dir"):
+        return
+    raw_root = str(getattr(settings, "wxbot_outbound_file_dir", "") or "").strip()
+    if not raw_root:
+        raise ValueError("wxbot_outbound_file_dir must be configured for file messages")
+    root = Path(raw_root).expanduser()
+    if not root.is_absolute():
+        raise ValueError("wxbot_outbound_file_dir must be absolute")
+    root = root.resolve(strict=False)
+    raw_candidate = Path(file_path).expanduser()
+    if raw_candidate.is_symlink():
+        raise ValueError("file_path must not be a symbolic link")
+    candidate = raw_candidate.resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("file_path must be inside wxbot_outbound_file_dir") from exc
+    if not candidate.exists() or not candidate.is_file():
+        raise ValueError("file_path must reference an existing regular file")
+    actual_size = candidate.stat().st_size
+    configured_max = int(
+        getattr(settings, "wxbot_outbound_file_max_bytes", 100 * 1024 * 1024)
+        or 100 * 1024 * 1024
+    )
+    if actual_size > configured_max:
+        raise ValueError("file_path exceeds wxbot_outbound_file_max_bytes")
+    if file_size is not None and actual_size != file_size:
+        raise ValueError("file_size does not match the staged file")
+    if file_md5 or file_sha256:
+        digest_md5 = hashlib.md5()
+        digest_sha256 = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest_md5.update(chunk)
+                digest_sha256.update(chunk)
+        if file_md5 and digest_md5.hexdigest() != file_md5:
+            raise ValueError("file_md5 does not match the staged file")
+        if file_sha256 and digest_sha256.hexdigest() != file_sha256:
+            raise ValueError("file_sha256 does not match the staged file")
+
+
+def _outbound_file_idempotency_material(
+    *,
+    file_path: str,
+    file_name: str,
+    file_size: int | None,
+    file_md5: str,
+    file_sha256: str,
+) -> str:
+    return json.dumps(
+        {
+            "file_path": file_path,
+            "file_name": file_name,
+            "file_size": file_size,
+            "file_md5": file_md5,
+            "file_sha256": file_sha256,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _reply_idempotency_material(reply: dict[str, Any]) -> str:
+    if str(reply.get("msg_type") or "text").strip().lower() == "file":
+        return _outbound_file_idempotency_material(
+            file_path=str(reply.get("file_path") or ""),
+            file_name=str(reply.get("file_name") or ""),
+            file_size=_normalize_outbound_file_size(reply.get("file_size")),
+            file_md5=str(reply.get("file_md5") or ""),
+            file_sha256=str(reply.get("file_sha256") or ""),
+        )
+    return str(reply.get("reply_text") or reply.get("image_url") or reply.get("image_path") or "")
 
 
 def _normalize_reply_queue_connection_id(connection_id: str) -> str:
@@ -802,6 +917,11 @@ class WxbotStore(WxbotReportStoreMixin):
         msg_type: str = "text",
         image_path: str = "",
         image_url: str = "",
+        file_path: str = "",
+        file_name: str = "",
+        file_size: int | None = None,
+        file_md5: str = "",
+        file_sha256: str = "",
         mention_sender: bool = False,
         sender_wxid: str = "",
         reply_to_msg_svr_id: str = "",
@@ -810,6 +930,44 @@ class WxbotStore(WxbotReportStoreMixin):
         delivery: dict[str, Any] | None = None,
         command_id: str = "",
     ) -> int:
+        msg_type = str(msg_type or "text").strip().lower() or "text"
+        file_path = str(file_path or "").strip()
+        file_name = str(file_name or "").strip()
+        file_md5 = _normalize_outbound_file_digest(file_md5, algorithm="md5")
+        file_sha256 = _normalize_outbound_file_digest(file_sha256, algorithm="sha256")
+        file_size = _normalize_outbound_file_size(file_size)
+        if msg_type == "file":
+            if image_url:
+                raise ValueError("file_url is not supported; use an SDK-local file_path")
+            if not file_path:
+                raise ValueError("file_path is required for file messages")
+            if not _is_absolute_outbound_file_path(file_path):
+                raise ValueError("file_path must be absolute on the SDK machine")
+            if file_name and (
+                "\x00" in file_name
+                or "/" in file_name
+                or "\\" in file_name
+                or file_name in {".", ".."}
+            ):
+                raise ValueError("file_name must be a basename")
+            _validate_configured_outbound_file(
+                self.settings,
+                file_path=file_path,
+                file_size=file_size,
+                file_md5=file_md5,
+                file_sha256=file_sha256,
+            )
+        file_idempotency_material = (
+            _outbound_file_idempotency_material(
+                file_path=file_path,
+                file_name=file_name,
+                file_size=file_size,
+                file_md5=file_md5,
+                file_sha256=file_sha256,
+            )
+            if msg_type == "file"
+            else ""
+        )
         initial_delivery = dict(delivery or {})
         source_payload = source_message if isinstance(source_message, dict) else {}
         clean_connection_id = _normalize_reply_queue_connection_id(
@@ -850,7 +1008,7 @@ class WxbotStore(WxbotReportStoreMixin):
                 trace_id=trace_id,
                 source_message_id=source_message_id,
                 output_kind=output_kind,
-                text=reply_text or image_url or image_path,
+                text=file_idempotency_material or reply_text or image_url or image_path,
             )
             style_result = None
             if (
@@ -929,7 +1087,7 @@ class WxbotStore(WxbotReportStoreMixin):
                     idempotency_key=clean_command_id,
                     output_kind=output_kind,
                     speech_class=speech_class,
-                    text=reply_text or image_url or image_path,
+                    text=file_idempotency_material or reply_text or image_url or image_path,
                     emoji=style_result.emoji if style_result is not None else "",
                     catchphrase=(style_result.catchphrase if style_result is not None else ""),
                     metadata={
@@ -953,12 +1111,14 @@ class WxbotStore(WxbotReportStoreMixin):
                 "INSERT INTO plugin_wxbot_reply_queue "
                 "(tenant_id, connection_id, session_id, session_name, sender_name, sender_wxid, "
                 "mention_sender, reply_to_msg_svr_id, session_kind, reply_text, "
-                "msg_type, image_path, image_url, source_message_json, delivery_json, "
+                "msg_type, image_path, image_url, file_path, file_name, file_size, "
+                "file_md5, file_sha256, source_message_json, delivery_json, "
                 "trace_id, command_id, participation_status, source_message_id, "
                 "not_before, expires_at) VALUES "
                 "(:tid, :connection_id, :sid, :sname, :sender, :sender_wxid, :mention_sender, "
                 ":reply_to_msg_svr_id, :session_kind, :reply, :msg_type, :image_path, "
-                ":image_url, :source_message_json, :delivery_json, :trace, :command_id, "
+                ":image_url, :file_path, :file_name, :file_size, :file_md5, :file_sha256, "
+                ":source_message_json, :delivery_json, :trace, :command_id, "
                 ":participation_status, :source_message_id, :not_before, :expires_at) "
                 "ON CONFLICT (tenant_id, connection_id, command_id) "
                 "WHERE command_id <> '' DO NOTHING "
@@ -977,6 +1137,11 @@ class WxbotStore(WxbotReportStoreMixin):
                     "msg_type": msg_type,
                     "image_path": image_path,
                     "image_url": image_url,
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "file_md5": file_md5,
+                    "file_sha256": file_sha256,
                     "source_message_json": json.dumps(
                         source_message or {},
                         ensure_ascii=False,
@@ -1084,9 +1249,7 @@ class WxbotStore(WxbotReportStoreMixin):
             trace_id=str(reply.get("trace_id") or delivery.get("trace_id") or ""),
             source_message_id=str(reply.get("source_message_id") or ""),
             output_kind=output_kind,
-            text=str(
-                reply.get("reply_text") or reply.get("image_url") or reply.get("image_path") or ""
-            ),
+            text=_reply_idempotency_material(reply),
         )
         reply_text = str(reply.get("reply_text") or "")
         if (
@@ -1125,7 +1288,11 @@ class WxbotStore(WxbotReportStoreMixin):
             idempotency_key=command_id,
             output_kind=output_kind,
             speech_class=speech_class,
-            text=reply_text or str(reply.get("image_url") or reply.get("image_path") or ""),
+            text=(
+                _reply_idempotency_material(reply)
+                if str(reply.get("msg_type") or "text").strip().lower() == "file"
+                else reply_text or _reply_idempotency_material(reply)
+            ),
             emoji=str(style_metadata.get("emoji") or ""),
             catchphrase=str(style_metadata.get("catchphrase") or ""),
             metadata={
@@ -1268,7 +1435,8 @@ class WxbotStore(WxbotReportStoreMixin):
             "RETURNING q.id, q.tenant_id, q.connection_id, q.session_id, q.session_name, "
             "q.sender_name, q.sender_wxid, "
             "q.mention_sender, q.reply_to_msg_svr_id, q.session_kind, q.reply_text, q.msg_type, "
-            "q.image_path, q.image_url, q.source_message_json, q.delivery_json, q.command_id, "
+            "q.image_path, q.image_url, q.file_path, q.file_name, q.file_size, "
+            "q.file_md5, q.file_sha256, q.source_message_json, q.delivery_json, q.command_id, "
             "q.trace_id, q.participation_status, q.source_message_id, q.not_before, "
             "q.expires_at, q.attempt_count, q.claim_owner, q.claim_token, "
             "q.claim_until, q.created_at",
@@ -1665,6 +1833,22 @@ class WxbotStore(WxbotReportStoreMixin):
         )
         return {r["status"]: r["n"] for r in rows}
 
+    async def list_active_outbound_file_paths(self, *, limit: int = 10000) -> list[str]:
+        """Return every in-flight file path that staging cleanup must preserve."""
+
+        rows = await _exec(
+            "SELECT DISTINCT file_path FROM plugin_wxbot_reply_queue "
+            "WHERE msg_type = 'file' AND file_path <> '' "
+            "AND status IN ('pending', 'sending', 'queued') "
+            "ORDER BY file_path LIMIT :lim",
+            {"lim": max(1, min(int(limit or 10000), 50000))},
+        )
+        return [
+            path
+            for row in rows
+            if (path := str(row.get("file_path") or "").strip())
+        ]
+
     async def list_reply_queue(
         self,
         tenant_id: str,
@@ -1693,6 +1877,7 @@ class WxbotStore(WxbotReportStoreMixin):
             "SELECT id, tenant_id, connection_id, session_id, session_name, sender_name, "
             "sender_wxid, mention_sender, "
             "reply_to_msg_svr_id, session_kind, reply_text, msg_type, image_path, image_url, "
+            "file_path, file_name, file_size, file_md5, file_sha256, "
             "source_message_json, delivery_json, command_id, sdk_outbound_id, trace_id, status, "
             "participation_status, source_message_id, not_before, expires_at, "
             "attempt_count, claim_owner, claim_token, claim_until, error, "
@@ -2119,6 +2304,44 @@ class WxbotStore(WxbotReportStoreMixin):
             item.pop("payload_json", None)
             out.append(item)
         return out
+
+    async def get_media_ready_event(
+        self,
+        tenant_id: str,
+        *,
+        message_id: str,
+        connection_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Return the newest deferred-media update for one inbound message."""
+
+        clean_message_id = str(message_id or "").strip()
+        if not clean_message_id:
+            return None
+        clean_connection_id = normalize_wxbot_event_connection_id(connection_id)
+        rows = await _exec(
+            "SELECT connection_id, sdk_event_id, event_type, stream_event_id, message_id, "
+            " session_id, session_name, sender_wxid, sender_name, msg_type, media_type, "
+            " media_path, media_url, payload_json, created_ts, received_at "
+            "FROM plugin_wxbot_media_ready_events "
+            "WHERE tenant_id = :tid AND connection_id = :connection_id AND message_id = :mid "
+            "ORDER BY created_ts DESC, sdk_event_id DESC LIMIT 1",
+            {
+                "tid": tenant_id,
+                "connection_id": clean_connection_id,
+                "mid": clean_message_id,
+            },
+        )
+        if not rows:
+            return None
+        item = dict(rows[0])
+        payload_raw = item.get("payload_json") or "{}"
+        try:
+            payload = json.loads(payload_raw)
+        except Exception:
+            payload = {}
+        item["payload"] = payload
+        item.pop("payload_json", None)
+        return item
 
     async def media_ready_stats(
         self,

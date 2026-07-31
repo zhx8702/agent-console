@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from time import monotonic as monotonic
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -60,12 +60,18 @@ from plugins.memory.store_session_state import (
     _update_session_state,
 )
 from plugins.memory.structured_extractor import MemoryStructuredExtractor
-from plugins.memory.vector_index import MemoryItemVectorIndex
+from plugins.memory.vector_index import MemoryItemVectorIndex, ScopeExecutionAllowed
 
 logger = get_logger(__name__)
 _ACTIVE_MUTATION_CONNECTION: ContextVar[AsyncConnection | None] = ContextVar(
     "memory_mutation_connection",
     default=None,
+)
+_DEFERRED_MEMORY_VECTOR_ITEMS: ContextVar[dict[int, dict[str, Any]] | None] = (
+    ContextVar(
+        "memory_deferred_vector_items",
+        default=None,
+    )
 )
 
 try:
@@ -87,7 +93,19 @@ _TOKEN_RE = re.compile(r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|密�
 _TOKEN_VALUE_RE = re.compile(
     r"(?i)\b(?:sk-[a-z0-9_-]{12,}|[a-z0-9_-]{24,}\.[a-z0-9_-]{12,}\.[a-z0-9_-]{12,}|[a-f0-9]{32,})\b"
 )
-_ADDRESS_RE = re.compile(r"[\u4e00-\u9fff]{2,}(?:省|市|区|县|镇|乡|街道|路|街|弄|号楼?|单元|室)")
+_ADDRESS_RE = re.compile(
+    r"(?:"
+    r"(?:收货地址|家庭住址|家庭地址|住址|地址)\s*[:：=]\s*"
+    r"[^\n,，;；]{4,100}"
+    r"|"
+    r"(?:[\u4e00-\u9fff]{2,}(?:省|自治区))?"
+    r"[\u4e00-\u9fff]{2,}市"
+    r"[\u4e00-\u9fff]{2,}(?:区|县)"
+    r"[^\n,，;；]{0,40}(?:路|街|街道|巷|弄)"
+    r"[^\n,，;；]{0,30}\d{1,6}号"
+    r"(?:楼|栋|单元|室)?"
+    r")"
+)
 
 ACTIVE_MEMORY_STATUSES = {"active"}
 MEMORY_ITEM_STATUSES = {"active", "pending", "archived", "deleted", "invalidated"}
@@ -265,12 +283,38 @@ class MemoryItemConflictError(RuntimeError):
     """Raised when a memory item update would duplicate an existing item."""
 
 
+class MemoryProfileConflictError(RuntimeError):
+    """Raised when a profile compare-and-swap version is stale."""
+
+    def __init__(self, *, expected_version: str, actual_version: str) -> None:
+        self.code = "memory_profile_version_conflict"
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(self.code)
+
+
+class MemoryErasureIncompleteError(RuntimeError):
+    """Raised when a scoped erase still has an in-flight writer."""
+
+    def __init__(self, *, count: int, residual_tables: Iterable[str]) -> None:
+        self.code = "memory_erasure_incomplete"
+        self.count = max(0, int(count or 0))
+        self.residual_tables = tuple(
+            sorted({str(value) for value in residual_tables if str(value)})
+        )
+        super().__init__(self.code)
+
+
 class MemoryItemProtectedError(RuntimeError):
     """Raised when a pinned/manual memory item deletion needs confirmation."""
 
     def __init__(self, protected_ids: Iterable[int]) -> None:
         self.protected_ids = [int(item_id) for item_id in protected_ids]
         super().__init__("memory item deletion requires allow_pinned confirmation")
+
+
+class _MemoryVectorPublicationRetry(RuntimeError):
+    """Internal signal to reacquire a changed group-evidence lock set."""
 
 
 async def _exec(sql: str, params: dict | None = None) -> list[dict]:
@@ -296,7 +340,13 @@ def _sanitize_db_text(value: Any) -> str:
     return str(value or "").replace("\x00", "")
 
 
-def _redact_profile_enrichment_text(value: Any) -> str:
+def _redact_memory_storage_text(value: Any) -> str:
+    """Remove common secret/PII forms before any durable memory write.
+
+    Unlike the profile-enrichment presentation helper, this function preserves
+    newlines so manual-note and transcript structure remains intact.
+    """
+
     text_value = _sanitize_db_text(value)
     if not text_value:
         return ""
@@ -306,11 +356,17 @@ def _redact_profile_enrichment_text(value: Any) -> str:
     text_value = _BANK_CARD_RE.sub("[redacted-bank-card]", text_value)
     text_value = _TOKEN_VALUE_RE.sub("[redacted-token]", text_value)
     text_value = _ADDRESS_RE.sub("[redacted-address]", text_value)
-    text_value = re.sub(
+    return re.sub(
         r"(?i)\b(api[_-]?key|secret|token|password|passwd|密钥|令牌|密码)\s*[:=]\s*\S+",
         r"\1=[redacted-token]",
         text_value,
     )
+
+
+def _redact_profile_enrichment_text(value: Any) -> str:
+    text_value = _redact_memory_storage_text(value)
+    if not text_value:
+        return ""
     return re.sub(r"\s+", " ", text_value).strip()
 
 
@@ -844,6 +900,61 @@ def _job_idempotency_key(
     return f"memory:llm:trace:{readable_trace}:{digest[:32]}"
 
 
+def _interaction_event_key(
+    *,
+    tenant_id: str,
+    channel: str,
+    source_key: str,
+    user_id: str,
+    session_id: str,
+    source_message_id: str,
+    trace_id: str,
+    user_text: str,
+    assistant_text: str,
+) -> str:
+    """Return a stable key for one normal persistence request.
+
+    A source message id is preferred, with trace id as the compatibility
+    fallback. Content hashes only label otherwise-unkeyed legacy writes; a
+    nonce prevents unrelated identical turns from being merged forever.
+    """
+
+    message_id = _normalize_line(source_message_id)
+    trace = _normalize_line(trace_id)
+    components: dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "channel": channel,
+        "source_key": source_key,
+        "user_id": user_id,
+        "session_id": session_id,
+    }
+    if message_id:
+        components["source_message_id"] = message_id
+    elif trace:
+        components["trace_id"] = trace
+    else:
+        # Legacy callers without a message or trace identity cannot receive
+        # strong idempotency without falsely merging future identical turns.
+        # Keep their event keys unique and require upgraded callers to supply
+        # ``source_message_id`` for retry dedupe.
+        components["unkeyed_nonce"] = uuid4().hex
+        components["user_text_sha256"] = hashlib.sha256(
+            user_text.encode("utf-8")
+        ).hexdigest()
+        components["assistant_text_sha256"] = hashlib.sha256(
+            assistant_text.encode("utf-8")
+        ).hexdigest()
+    digest = hashlib.sha256(
+        json.dumps(
+            components,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"memory:interaction:{digest}"
+
+
 def _backfill_event_key(
     *,
     tenant_id: str,
@@ -853,6 +964,8 @@ def _backfill_event_key(
     session_id: str,
     timestamp: Any,
     user_text: str,
+    source_member_id: str = "",
+    source_message_id: str = "",
 ) -> str:
     normalized_text = _normalize_line(user_text)
     content_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
@@ -864,6 +977,8 @@ def _backfill_event_key(
         "session_id": session_id,
         "timestamp": str(timestamp or ""),
         "content_hash": content_hash,
+        "source_member_id": str(source_member_id or ""),
+        "source_message_id": str(source_message_id or ""),
     }
     digest_payload = json.dumps(
         components, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -1760,6 +1875,113 @@ def _coerce_int_set(values: Iterable[Any] | None) -> set[int]:
     return result
 
 
+_MEMORY_EVIDENCE_EVENT_ID_KEYS = {
+    "source_event_id",
+    "source_event_ids",
+    "evidence_event_ids",
+    "event_ids",
+}
+
+
+def _memory_evidence_event_ids(
+    value: Any,
+    *,
+    source_event_id: int | None = None,
+) -> list[int]:
+    """Collect explicit event evidence ids from nested memory metadata."""
+
+    result: set[int] = set()
+    if source_event_id is not None:
+        result.update(_coerce_int_set([source_event_id]))
+
+    def visit(node: Any, *, key: str = "") -> None:
+        if key in _MEMORY_EVIDENCE_EVENT_ID_KEYS:
+            values = node if isinstance(node, (list, tuple, set)) else [node]
+            result.update(_coerce_int_set(values))
+            return
+        if isinstance(node, dict):
+            for child_key, child_value in node.items():
+                visit(child_value, key=str(child_key))
+        elif isinstance(node, (list, tuple)):
+            for child_value in node:
+                visit(child_value)
+
+    visit(value)
+    return sorted(result)
+
+
+def _memory_source_evidence(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence_by_event: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        event_id = _safe_int(row.get("id"), 0)
+        if event_id <= 0:
+            continue
+        evidence_by_event[event_id] = {
+            "source_event_id": event_id,
+            "source_member_id": str(row.get("source_member_id") or "")[:128],
+            "source_message_id": str(row.get("source_message_id") or "")[:256],
+        }
+    return [evidence_by_event[event_id] for event_id in sorted(evidence_by_event)]
+
+
+def _memory_source_evidence_from_value(value: Any) -> list[dict[str, Any]]:
+    decoded = _safe_json_loads(value, []) if isinstance(value, str) else value
+    if not isinstance(decoded, list):
+        return []
+    return _memory_source_evidence(
+        {
+            "id": item.get("source_event_id"),
+            "source_member_id": item.get("source_member_id"),
+            "source_message_id": item.get("source_message_id"),
+        }
+        for item in decoded
+        if isinstance(item, dict)
+    )
+
+
+def _remove_event_evidence_from_value(value: Any, event_ids: set[int]) -> Any:
+    """Remove only explicit event-id evidence while retaining other metadata."""
+
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, child in value.items():
+            if key in _MEMORY_EVIDENCE_EVENT_ID_KEYS:
+                if isinstance(child, list):
+                    cleaned[key] = [
+                        item
+                        for item in child
+                        if _safe_int(item, 0) <= 0 or _safe_int(item, 0) not in event_ids
+                    ]
+                elif _safe_int(child, 0) in event_ids:
+                    cleaned[key] = None
+                else:
+                    cleaned[key] = child
+                continue
+            cleaned[key] = _remove_event_evidence_from_value(child, event_ids)
+        return cleaned
+    if isinstance(value, list):
+        return [_remove_event_evidence_from_value(item, event_ids) for item in value]
+    return value
+
+
+def _memory_payload_mentions_member(value: Any, member_id: str) -> bool:
+    member = str(member_id or "").strip()
+    if not member:
+        return False
+    if isinstance(value, dict):
+        return any(_memory_payload_mentions_member(item, member) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_memory_payload_mentions_member(item, member) for item in value)
+    if not isinstance(value, str):
+        return False
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_@.\-]){re.escape(member)}(?![A-Za-z0-9_@.\-])",
+            value,
+        )
+    )
+
+
 def _graph_query_match_count(values: Iterable[Any], tokens: list[str]) -> int:
     if not tokens:
         return 0
@@ -1929,6 +2151,37 @@ def _coerce_datetime(value: Any) -> datetime | None:
     if timestamp.tzinfo is not None:
         timestamp = timestamp.astimezone(UTC).replace(tzinfo=None)
     return timestamp
+
+
+def _normalized_profile_version(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    timestamp = _coerce_datetime(normalized)
+    return timestamp.isoformat() if timestamp is not None else normalized
+
+
+def _memory_event_expiry(
+    settings: Any,
+    *,
+    created_at: Any,
+    expires_at: Any,
+) -> datetime:
+    """Apply the tighter of policy expiry and raw-event retention."""
+
+    created = _coerce_datetime(created_at) or datetime.now(UTC).replace(tzinfo=None)
+    retention_days = _settings_int(
+        settings,
+        "memory_auto_expire_days",
+        180,
+        minimum=1,
+        maximum=3650,
+    )
+    retention_expiry = created + timedelta(days=retention_days)
+    explicit_expiry = _coerce_datetime(expires_at)
+    if explicit_expiry is None:
+        return retention_expiry
+    return min(retention_expiry, explicit_expiry)
 
 
 def _member_memory_etag(item: dict[str, Any]) -> str:
@@ -2623,12 +2876,36 @@ class MemoryStore(
     async def _mutation_transaction(self) -> AsyncIterator[AsyncConnection]:
         """Bind all nested ``_exec`` calls to one database transaction."""
 
-        async with get_engine().begin() as conn:
-            token = _ACTIVE_MUTATION_CONNECTION.set(conn)
-            try:
-                yield conn
-            finally:
-                _ACTIVE_MUTATION_CONNECTION.reset(token)
+        deferred = _DEFERRED_MEMORY_VECTOR_ITEMS.get()
+        owns_deferred_queue = deferred is None
+        deferred_token = None
+        if owns_deferred_queue:
+            deferred = {}
+            deferred_token = _DEFERRED_MEMORY_VECTOR_ITEMS.set(deferred)
+        committed = False
+        try:
+            async with get_engine().begin() as conn:
+                token = _ACTIVE_MUTATION_CONNECTION.set(conn)
+                try:
+                    yield conn
+                finally:
+                    _ACTIVE_MUTATION_CONNECTION.reset(token)
+            committed = True
+        finally:
+            if deferred_token is not None:
+                _DEFERRED_MEMORY_VECTOR_ITEMS.reset(deferred_token)
+        if committed and owns_deferred_queue and deferred:
+            # Publish only after commit, then reacquire the same member/source
+            # fences and re-read the relational row.  Without that second
+            # fence a completed erase could run between commit and this
+            # external write, allowing a cached active item to resurrect an
+            # orphan vector after the erase had reported success.
+            for item_id in sorted(deferred):
+                item = deferred[item_id]
+                await self._publish_current_memory_vectors(
+                    item_id,
+                    fallback_item=item,
+                )
 
     async def _lock_member_memory_mutation(
         self,
@@ -2667,6 +2944,267 @@ class MemoryStore(
             rows[0].get("deletion_state") or "none"
         ) in {"requested", "failed"}
 
+    async def member_memory_write_blocked(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        channel: str = "wechat",
+    ) -> bool:
+        """Public fail-closed preflight for expensive member-memory builders.
+
+        The authoritative write paths repeat this check under the member
+        mutation lock, so callers may use this only to avoid unnecessary LLM
+        or report work—not as the sole authorization decision.
+        """
+
+        if str(channel or "").strip().lower() != "wechat":
+            return False
+        return await self._member_memory_write_blocked(
+            tenant_id=str(tenant_id or "").strip(),
+            user_id=str(user_id or "").strip(),
+        )
+
+    @staticmethod
+    def _memory_vector_payload_member_ids(
+        item: dict[str, Any] | None,
+    ) -> set[str]:
+        if not isinstance(item, dict):
+            return set()
+        user_id = str(item.get("user_id") or "").strip()
+        if user_id and user_id != GROUP_HISTORY_USER_ID_SCOPE:
+            return {user_id}
+        evidence = item.get("source_evidence")
+        if not isinstance(evidence, list):
+            evidence = _memory_source_evidence_from_value(
+                item.get("source_evidence_json")
+            )
+        return {
+            str(entry.get("source_member_id") or "").strip()
+            for entry in evidence
+            if isinstance(entry, dict)
+            and str(entry.get("source_member_id") or "").strip()
+        }
+
+    async def _memory_vector_publication_state(
+        self,
+        item_id: int,
+        *,
+        for_update: bool = False,
+    ) -> tuple[dict[str, Any] | None, set[str]]:
+        active_conn = _ACTIVE_MUTATION_CONNECTION.get()
+        dialect = (
+            str(active_conn.dialect.name or "").lower()
+            if active_conn is not None
+            else ""
+        )
+        lock_clause = (
+            " FOR UPDATE"
+            if for_update and active_conn is not None and dialect != "sqlite"
+            else ""
+        )
+        rows = await _exec(
+            "SELECT id, tenant_id, channel, user_id, source_event_id, "
+            "source_evidence_json, status, sensitivity, "
+            "sensitivity_category, expires_at, deleted_at "
+            "FROM plugin_memory_item WHERE id = :id"
+            f"{lock_clause}",
+            {"id": int(item_id)},
+        )
+        if not rows:
+            return None, set()
+        state = dict(rows[0])
+        members = self._memory_vector_payload_member_ids(state)
+        if str(state.get("user_id") or "") == GROUP_HISTORY_USER_ID_SCOPE:
+            evidence = _memory_source_evidence_from_value(
+                state.get("source_evidence_json")
+            )
+            event_ids = _memory_evidence_event_ids(
+                evidence,
+                source_event_id=(
+                    int(state["source_event_id"])
+                    if state.get("source_event_id") is not None
+                    else None
+                ),
+            )
+            if event_ids:
+                event_rows = await _exec(
+                    "SELECT id, source_member_id FROM plugin_memory_event "
+                    "WHERE id = ANY(:event_ids)",
+                    {"event_ids": event_ids},
+                )
+                members.update(
+                    str(row.get("source_member_id") or "").strip()
+                    for row in event_rows
+                    if str(row.get("source_member_id") or "").strip()
+                )
+        return state, members
+
+    async def _delete_memory_and_graph_vectors_for_item(
+        self,
+        item_id: int,
+    ) -> None:
+        """Fail-closed vector cleanup while the member fence is held."""
+
+        if self.vector_index.vector_store is None:
+            return
+        fact_rows = await _exec(
+            "SELECT id FROM plugin_memory_fact WHERE memory_item_id = :item_id",
+            {"item_id": int(item_id)},
+        )
+        episode_rows = await _exec(
+            "SELECT id FROM plugin_memory_episode "
+            "WHERE memory_item_ids_json @> CAST(:item_ids AS JSONB)",
+            {"item_ids": _to_json([int(item_id)])},
+        )
+        try:
+            await self.vector_index.delete_item(item_id, force=True)
+            for row in fact_rows:
+                await self.vector_index.delete_fact(row.get("id"), force=True)
+            for row in episode_rows:
+                await self.vector_index.delete_episode(row.get("id"), force=True)
+        except Exception as exc:
+            logger.warning(
+                "memory.vector_fenced_delete_failed",
+                item_id=int(item_id),
+                error_type=exc.__class__.__name__,
+                error=_truncate_error(exc),
+            )
+
+    async def _publish_current_memory_vectors(
+        self,
+        item_id: int,
+        *,
+        fallback_item: dict[str, Any] | None = None,
+        force: bool = False,
+        scope_execution_allowed: ScopeExecutionAllowed | None = None,
+    ) -> str:
+        """Publish the current DB state under the erase-compatible member fence.
+
+        This method is intentionally post-commit.  Callers inside a normal
+        mutation transaction should enqueue through the ``_sync_*_safe``
+        methods instead.
+        """
+
+        item_id = int(item_id)
+        available = self.vector_index.is_available if force else self.vector_index.is_enabled
+        if item_id <= 0 or not available:
+            return "skipped"
+        if _ACTIVE_MUTATION_CONNECTION.get() is not None:
+            raise RuntimeError(
+                "current memory vector publication requires a committed transaction"
+            )
+
+        _initial_state, initial_members = (
+            await self._memory_vector_publication_state(item_id)
+        )
+        expected_members = (
+            set(initial_members)
+            | self._memory_vector_payload_member_ids(fallback_item)
+        )
+
+        for attempt in range(4):
+            retry_members: set[str] = set()
+            async with get_engine().begin() as conn:
+                token = _ACTIVE_MUTATION_CONNECTION.set(conn)
+                try:
+                    await self._lock_governance_expiry()
+                    for member_id in sorted(expected_members):
+                        await self._lock_member_memory_mutation(
+                            tenant_id=str(
+                                (_initial_state or fallback_item or {}).get(
+                                    "tenant_id"
+                                )
+                                or ""
+                            ),
+                            user_id=member_id,
+                        )
+                    state, current_members = (
+                        await self._memory_vector_publication_state(
+                            item_id,
+                            for_update=True,
+                        )
+                    )
+                    retry_members = current_members - expected_members
+                    if retry_members:
+                        # Roll back this read/lock transaction and retry with
+                        # the complete, sorted member set to preserve a stable
+                        # advisory-lock order.
+                        raise _MemoryVectorPublicationRetry
+
+                    current = await self.get_memory_item(
+                        item_id,
+                        for_update=True,
+                    )
+                    effective_members = current_members or expected_members
+                    channel = str(
+                        (state or current or fallback_item or {}).get("channel")
+                        or ""
+                    ).strip().lower()
+                    tenant_id = str(
+                        (state or current or fallback_item or {}).get("tenant_id")
+                        or ""
+                    ).strip()
+                    blocked = False
+                    if channel == "wechat":
+                        for member_id in sorted(effective_members):
+                            if await self._member_memory_write_blocked(
+                                tenant_id=tenant_id,
+                                user_id=member_id,
+                            ):
+                                blocked = True
+                                break
+                    expires_at = _coerce_datetime(
+                        (state or current or {}).get("expires_at")
+                    )
+                    expired = (
+                        expires_at is not None
+                        and expires_at
+                        <= datetime.now(UTC).replace(tzinfo=None)
+                    )
+                    if (
+                        current is None
+                        or current.get("deleted_at") is not None
+                        or str(current.get("status") or "") == "deleted"
+                        or blocked
+                        or expired
+                    ):
+                        await self._delete_memory_and_graph_vectors_for_item(
+                            item_id
+                        )
+                        return "deleted"
+
+                    # External publication occurs while the xact-scoped
+                    # member locks remain held.  An erase can run either
+                    # before this transaction (then the row is absent above)
+                    # or after it (then erase performs the final delete), but
+                    # can never complete in the middle and be followed by a
+                    # stale upsert.
+                    await self._sync_memory_vector_for_item_safe(
+                        current,
+                        force=force,
+                        scope_execution_allowed=scope_execution_allowed,
+                    )
+                    await self._sync_graph_vectors_for_memory_item_safe(
+                        current,
+                        scope_execution_allowed=scope_execution_allowed,
+                    )
+                    return "published"
+                except _MemoryVectorPublicationRetry:
+                    pass
+                finally:
+                    _ACTIVE_MUTATION_CONNECTION.reset(token)
+            expected_members.update(retry_members)
+            if attempt == 3:
+                break
+
+        logger.warning(
+            "memory.vector_publication_member_set_unstable",
+            item_id=item_id,
+            member_count=len(expected_members),
+        )
+        return "deferred"
+
     def _can_enqueue_llm_extraction_jobs(self) -> bool:
         return _llm_extraction_job_enqueue_eligible(
             job_enabled=_settings_bool(self.settings, "memory_llm_extraction_job_enabled", True),
@@ -2675,6 +3213,440 @@ class MemoryStore(
             graph_enabled=bool(self.graph_extractor.config.enabled),
             graph_llm_available=self.graph_extractor.llm_service is not None,
         )
+
+    async def _try_lock_governance_sweep(self) -> bool:
+        active_connection = _ACTIVE_MUTATION_CONNECTION.get()
+        if active_connection is None:
+            raise RuntimeError("memory governance requires an active transaction")
+        if str(active_connection.dialect.name or "").lower() != "postgresql":
+            return True
+        rows = await _exec(
+            "SELECT pg_try_advisory_xact_lock("
+            "hashtextextended('memory-governance-expiry-v1', 0)) AS locked"
+        )
+        return bool(rows and rows[0].get("locked"))
+
+    async def _lock_governance_expiry(self) -> None:
+        """Serialize post-commit publication with physical expiry."""
+
+        active_connection = _ACTIVE_MUTATION_CONNECTION.get()
+        if active_connection is None:
+            raise RuntimeError("memory governance requires an active transaction")
+        if str(active_connection.dialect.name or "").lower() != "postgresql":
+            return
+        await _exec(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('memory-governance-expiry-v1', 0)) AS locked"
+        )
+
+    async def _run_physical_expiry_sweep(
+        self,
+        *,
+        dry_run: bool,
+        batch: int,
+    ) -> dict[str, Any]:
+        """Physically purge explicit expiries after strict vector cleanup.
+
+        Vector failures leave the source row in place (already invisible due
+        to ``expires_at``) so the next governance run retries the deletion.
+        """
+
+        expired_items = await _exec(
+            "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+            "scope_type, source_evidence_json, source_event_id "
+            "FROM plugin_memory_item "
+            "WHERE expires_at IS NOT NULL AND expires_at <= NOW() "
+            "ORDER BY expires_at ASC, id ASC LIMIT :limit",
+            {"limit": batch},
+        )
+        expired_events = await _exec(
+            "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+            "source_member_id "
+            "FROM plugin_memory_event "
+            "WHERE expires_at IS NOT NULL AND expires_at <= NOW() "
+            "ORDER BY expires_at ASC, id ASC LIMIT :limit",
+            {"limit": batch},
+        )
+        expired_event_ids = sorted(
+            _coerce_int_set(row.get("id") for row in expired_events)
+        )
+        expired_jobs = await _exec(
+            "SELECT id, tenant_id, channel, user_id, source_event_id "
+            "FROM plugin_memory_extraction_job "
+            "WHERE (source_event_id = ANY(:event_ids)) "
+            "OR ("
+            "CASE WHEN "
+            "COALESCE(NULLIF(result_json, '')::jsonb #>> '{audience,expires_at}', '') "
+            "~ '^\\d{4}-\\d{2}-\\d{2}' THEN "
+            "CAST(NULLIF(result_json, '')::jsonb #>> '{audience,expires_at}' "
+            "AS TIMESTAMPTZ) ELSE NULL END <= NOW()) "
+            "ORDER BY id ASC LIMIT :limit",
+            {
+                "event_ids": expired_event_ids or [0],
+                "limit": batch,
+            },
+        )
+        expired_item_ids = sorted(
+            _coerce_int_set(row.get("id") for row in expired_items)
+        )
+        result: dict[str, Any] = {
+            "selected": len(expired_item_ids)
+            + len(expired_event_ids)
+            + len(expired_jobs),
+            "items_selected": len(expired_item_ids),
+            "events_selected": len(expired_event_ids),
+            "jobs_selected": len(expired_jobs),
+            "items_purged": 0,
+            "events_purged": 0,
+            "jobs_purged": 0,
+            "episodes_archived": 0,
+            "rebuild_required_episode_ids": [],
+            "retry_item_ids": [],
+            "retry_event_ids": [],
+        }
+        if dry_run or not result["selected"]:
+            return result
+
+        # Use the same tenant/member advisory fence as saves, jobs and full
+        # erasure.  The governance lock is already held by the caller, so the
+        # deterministic order is governance -> sorted member locks.
+        expiry_member_scopes: set[tuple[str, str]] = set()
+        for item in expired_items:
+            tenant_id = str(item.get("tenant_id") or "").strip()
+            user_id = str(item.get("user_id") or "").strip()
+            if tenant_id and user_id and user_id != GROUP_HISTORY_USER_ID_SCOPE:
+                expiry_member_scopes.add((tenant_id, user_id))
+            for evidence in _memory_source_evidence_from_value(
+                item.get("source_evidence_json")
+            ):
+                member_id = str(
+                    evidence.get("source_member_id") or ""
+                ).strip()
+                if tenant_id and member_id:
+                    expiry_member_scopes.add((tenant_id, member_id))
+        for event in expired_events:
+            tenant_id = str(event.get("tenant_id") or "").strip()
+            member_id = str(event.get("source_member_id") or "").strip()
+            direct_user_id = str(event.get("user_id") or "").strip()
+            if (
+                not member_id
+                and direct_user_id
+                and direct_user_id != GROUP_HISTORY_USER_ID_SCOPE
+            ):
+                member_id = direct_user_id
+            if tenant_id and member_id:
+                expiry_member_scopes.add((tenant_id, member_id))
+        for job in expired_jobs:
+            tenant_id = str(job.get("tenant_id") or "").strip()
+            user_id = str(job.get("user_id") or "").strip()
+            if tenant_id and user_id and user_id != GROUP_HISTORY_USER_ID_SCOPE:
+                expiry_member_scopes.add((tenant_id, user_id))
+        for tenant_id, member_id in sorted(expiry_member_scopes):
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=member_id,
+            )
+
+        fact_rows = (
+            await _exec(
+                "SELECT id, memory_item_id FROM plugin_memory_fact "
+                "WHERE memory_item_id = ANY(:item_ids) ORDER BY id ASC",
+                {"item_ids": expired_item_ids},
+            )
+            if expired_item_ids
+            else []
+        )
+        candidate_episodes = (
+            await _exec(
+                "SELECT id, event_ids_json, memory_item_ids_json "
+                "FROM plugin_memory_episode ORDER BY id ASC",
+            )
+            if expired_item_ids or expired_event_ids
+            else []
+        )
+        episodes_by_item: dict[int, set[int]] = {}
+        episodes_with_expired_events: set[int] = set()
+        episode_backing: dict[int, tuple[set[int], set[int]]] = {}
+        for episode in candidate_episodes:
+            episode_id = _safe_int(episode.get("id"), 0)
+            if episode_id <= 0:
+                continue
+            item_ids = _coerce_int_set(
+                _safe_json_loads(episode.get("memory_item_ids_json"), [])
+            )
+            event_ids = _coerce_int_set(
+                _safe_json_loads(episode.get("event_ids_json"), [])
+            )
+            episode_backing[episode_id] = (item_ids, event_ids)
+            for item_id in item_ids.intersection(expired_item_ids):
+                episodes_by_item.setdefault(item_id, set()).add(episode_id)
+            if event_ids.intersection(expired_event_ids):
+                episodes_with_expired_events.add(episode_id)
+        facts_by_item: dict[int, set[int]] = {}
+        for fact in fact_rows:
+            item_id = _safe_int(fact.get("memory_item_id"), 0)
+            fact_id = _safe_int(fact.get("id"), 0)
+            if item_id > 0 and fact_id > 0:
+                facts_by_item.setdefault(item_id, set()).add(fact_id)
+
+        successful_items: set[int] = set()
+        failed_items: set[int] = set()
+        deleted_fact_vectors: set[int] = set()
+        deleted_episode_vectors: set[int] = set()
+        for item_id in expired_item_ids:
+            try:
+                await self.vector_index.delete_item(item_id, force=True)
+                for fact_id in sorted(facts_by_item.get(item_id, set())):
+                    if fact_id not in deleted_fact_vectors:
+                        await self.vector_index.delete_fact(fact_id, force=True)
+                        deleted_fact_vectors.add(fact_id)
+                for episode_id in sorted(episodes_by_item.get(item_id, set())):
+                    if episode_id not in deleted_episode_vectors:
+                        await self.vector_index.delete_episode(episode_id, force=True)
+                        deleted_episode_vectors.add(episode_id)
+            except Exception as exc:
+                failed_items.add(item_id)
+                logger.warning(
+                    "memory.expiry_vector_cleanup_failed",
+                    item_id=item_id,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+            else:
+                successful_items.add(item_id)
+
+        # A shared episode remains retryable as a unit if any expired backing
+        # item could not be cleaned from the vector store.
+        for item_id, episode_ids in episodes_by_item.items():
+            if item_id not in failed_items:
+                continue
+            for other_item_id, other_episode_ids in episodes_by_item.items():
+                if episode_ids.intersection(other_episode_ids):
+                    successful_items.discard(other_item_id)
+                    failed_items.add(other_item_id)
+
+        failed_event_episode_ids: set[int] = set()
+        for episode_id in sorted(episodes_with_expired_events):
+            if episode_id in deleted_episode_vectors:
+                continue
+            try:
+                await self.vector_index.delete_episode(episode_id, force=True)
+            except Exception as exc:
+                failed_event_episode_ids.add(episode_id)
+                logger.warning(
+                    "memory.expiry_episode_vector_cleanup_failed",
+                    episode_id=episode_id,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+            else:
+                deleted_episode_vectors.add(episode_id)
+
+        successful_item_ids = sorted(successful_items)
+        purge_fact_ids = sorted(
+            {
+                fact_id
+                for item_id in successful_items
+                for fact_id in facts_by_item.get(item_id, set())
+            }
+        )
+        event_ids_to_purge = (
+            [] if failed_event_episode_ids else expired_event_ids
+        )
+        if failed_event_episode_ids:
+            result["retry_event_ids"] = expired_event_ids
+        event_id_set_to_purge = set(event_ids_to_purge)
+        impacted_episode_ids = {
+            episode_id
+            for item_id in successful_items
+            for episode_id in episodes_by_item.get(item_id, set())
+        } | (
+            episodes_with_expired_events
+            if event_ids_to_purge
+            else set()
+        )
+        purge_episode_ids: list[int] = []
+        archive_episode_rows: list[tuple[int, list[int], list[int]]] = []
+        for episode_id in sorted(impacted_episode_ids):
+            item_ids, event_ids = episode_backing.get(episode_id, (set(), set()))
+            remaining_item_ids = sorted(item_ids - successful_items)
+            remaining_event_ids = sorted(event_ids - event_id_set_to_purge)
+            if remaining_item_ids or remaining_event_ids:
+                # Episode summaries can blend multiple sources and cannot be
+                # deterministically redacted in-place.  Keep the legitimate
+                # backing references, remove the vector from recall, and
+                # archive for an explicit rebuild instead of deleting other
+                # members' still-valid memory.
+                archive_episode_rows.append(
+                    (episode_id, remaining_item_ids, remaining_event_ids)
+                )
+            else:
+                purge_episode_ids.append(episode_id)
+        if purge_fact_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_fact WHERE id = ANY(:ids)",
+                {"ids": purge_fact_ids},
+            )
+        for episode_id, remaining_item_ids, remaining_event_ids in archive_episode_rows:
+            await _exec(
+                "UPDATE plugin_memory_episode SET status = 'archived', "
+                "memory_item_ids_json = :item_ids_json, "
+                "event_ids_json = :event_ids_json, updated_at = NOW() "
+                "WHERE id = :id",
+                {
+                    "id": episode_id,
+                    "item_ids_json": _to_json(remaining_item_ids),
+                    "event_ids_json": _to_json(remaining_event_ids),
+                },
+            )
+        if purge_episode_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_episode WHERE id = ANY(:ids)",
+                {"ids": purge_episode_ids},
+            )
+        if successful_item_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_acceptance_audit "
+                "WHERE item_id = ANY(:ids)",
+                {"ids": successful_item_ids},
+            )
+            await _exec(
+                "DELETE FROM plugin_memory_item WHERE id = ANY(:ids)",
+                {"ids": successful_item_ids},
+            )
+            successful_item_id_set = set(successful_item_ids)
+            for expired_item in expired_items:
+                if _safe_int(expired_item.get("id"), 0) in successful_item_id_set:
+                    await self._refresh_legacy_cache_for_item_scope(
+                        expired_item
+                    )
+        result["items_purged"] = len(successful_item_ids)
+        result["episodes_archived"] = len(archive_episode_rows)
+        result["rebuild_required_episode_ids"] = [
+            episode_id for episode_id, _item_ids, _event_ids in archive_episode_rows
+        ]
+        result["retry_item_ids"] = sorted(failed_items)
+
+        # Raw-event expiry removes evidence copies from surviving projections
+        # before deleting the transcript and its extraction jobs.
+        if event_ids_to_purge:
+            surviving_items = await _exec(
+                "SELECT id, value_json, source_evidence_json, source_event_id "
+                "FROM plugin_memory_item "
+                "WHERE source_event_id = ANY(:event_ids) "
+                "OR source_evidence_json @? "
+                "'$[*] ? (@.source_event_id != null)'",
+                {"event_ids": event_ids_to_purge},
+            )
+            expired_event_id_set = set(event_ids_to_purge)
+            for item in surviving_items:
+                evidence = _memory_source_evidence_from_value(
+                    item.get("source_evidence_json")
+                )
+                if not any(
+                    _safe_int(entry.get("source_event_id"), 0)
+                    in expired_event_id_set
+                    for entry in evidence
+                ) and _safe_int(item.get("source_event_id"), 0) not in expired_event_id_set:
+                    continue
+                remaining = [
+                    entry
+                    for entry in evidence
+                    if _safe_int(entry.get("source_event_id"), 0)
+                    not in expired_event_id_set
+                ]
+                remaining_ids = sorted(
+                    _coerce_int_set(
+                        entry.get("source_event_id") for entry in remaining
+                    )
+                )
+                value = _remove_event_evidence_from_value(
+                    _safe_json_loads(item.get("value_json"), {}),
+                    expired_event_id_set,
+                )
+                await _exec(
+                    "UPDATE plugin_memory_item SET value_json = :value_json, "
+                    "source_evidence_json = CAST(:source_evidence AS JSONB), "
+                    "source_event_id = :source_event_id, "
+                    "original_text = '', updated_at = NOW() WHERE id = :id",
+                    {
+                        "id": int(item["id"]),
+                        "value_json": _to_json(value),
+                        "source_evidence": _to_json(remaining),
+                        "source_event_id": remaining_ids[0] if remaining_ids else None,
+                    },
+                )
+            await _exec(
+                "UPDATE plugin_memory_fact SET source_event_id = NULL, updated_at = NOW() "
+                "WHERE source_event_id = ANY(:event_ids)",
+                {"event_ids": event_ids_to_purge},
+            )
+            await _exec(
+                "DELETE FROM plugin_memory_extraction_job "
+                "WHERE source_event_id = ANY(:event_ids)",
+                {"event_ids": event_ids_to_purge},
+            )
+            await _exec(
+                "DELETE FROM plugin_memory_event "
+                "WHERE id = ANY(:event_ids) AND expires_at IS NOT NULL "
+                "AND expires_at <= NOW()",
+                {"event_ids": event_ids_to_purge},
+            )
+            expired_group_scopes: dict[str, set[str]] = {}
+            purged_event_id_set = set(event_ids_to_purge)
+            for expired_event in expired_events:
+                if (
+                    _safe_int(expired_event.get("id"), 0)
+                    not in purged_event_id_set
+                    or str(expired_event.get("channel") or "") != "wechat"
+                    or str(expired_event.get("user_id") or "")
+                    != GROUP_HISTORY_USER_ID_SCOPE
+                ):
+                    continue
+                tenant_id = str(expired_event.get("tenant_id") or "")
+                session_id = str(expired_event.get("session_id") or "")
+                if tenant_id and session_id:
+                    expired_group_scopes.setdefault(tenant_id, set()).add(
+                        session_id
+                    )
+            for tenant_id, session_ids in sorted(expired_group_scopes.items()):
+                remaining_group_events = await _exec(
+                    "SELECT id, tenant_id, channel, source_key, user_id, "
+                    "session_id, user_text, assistant_text, source_member_id, "
+                    "source_message_id, expires_at, created_at "
+                    "FROM plugin_memory_event WHERE tenant_id = :tid "
+                    "AND channel = 'wechat' AND user_id = :group_uid "
+                    "AND session_id = ANY(:session_ids) "
+                    "AND (expires_at IS NULL OR expires_at > NOW()) "
+                    "ORDER BY created_at ASC, id ASC",
+                    {
+                        "tid": tenant_id,
+                        "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                        "session_ids": sorted(session_ids),
+                    },
+                )
+                consented_group_events = (
+                    await self._consented_group_event_rows(
+                        tenant_id=tenant_id,
+                        rows=remaining_group_events,
+                    )
+                )
+                await self._rebuild_group_session_profiles(
+                    tenant_id=tenant_id,
+                    session_ids=session_ids,
+                    event_rows=consented_group_events,
+                )
+            result["events_purged"] = len(event_ids_to_purge)
+        expired_job_ids = sorted(
+            _coerce_int_set(row.get("id") for row in expired_jobs)
+        )
+        if expired_job_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_extraction_job WHERE id = ANY(:ids)",
+                {"ids": expired_job_ids},
+            )
+            result["jobs_purged"] = len(expired_job_ids)
+        return result
 
     async def run_governance_cleanup(
         self,
@@ -2691,6 +3663,42 @@ class MemoryStore(
         bounded and idempotent so it can run on a schedule and from the admin
         maintenance endpoint.
         """
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.run_governance_cleanup(
+                    dry_run=dry_run,
+                    needs_review_days=needs_review_days,
+                    rejected_days=rejected_days,
+                    auto_expire_days=auto_expire_days,
+                    limit=limit,
+                )
+        if not await self._try_lock_governance_sweep():
+            return {
+                "dry_run": dry_run,
+                "skipped_locked": True,
+                "needs_review_expired": 0,
+                "rejected_purged": 0,
+                "stale_auto_expired": 0,
+                "selected": 0,
+                "ids": {
+                    "needs_review": [],
+                    "rejected": [],
+                    "stale_auto": [],
+                },
+                "physical_expiry": {
+                    "selected": 0,
+                    "items_selected": 0,
+                    "events_selected": 0,
+                    "jobs_selected": 0,
+                    "items_purged": 0,
+                    "events_purged": 0,
+                    "jobs_purged": 0,
+                    "episodes_archived": 0,
+                    "rebuild_required_episode_ids": [],
+                    "retry_item_ids": [],
+                    "retry_event_ids": [],
+                },
+            }
         review_days = max(
             1,
             int(
@@ -2742,6 +3750,7 @@ class MemoryStore(
         )
         result = {
             "dry_run": dry_run,
+            "skipped_locked": False,
             "needs_review_expired": len(review_ids),
             "rejected_purged": len(rejected_ids),
             "stale_auto_expired": len(stale_ids),
@@ -2752,14 +3761,22 @@ class MemoryStore(
                 "stale_auto": stale_ids,
             },
         }
-        if dry_run or not result["selected"]:
+        physical_expiry = await self._run_physical_expiry_sweep(
+            dry_run=dry_run,
+            batch=batch,
+        )
+        result["physical_expiry"] = physical_expiry
+        total_selected = int(result["selected"]) + int(
+            physical_expiry.get("selected") or 0
+        )
+        if dry_run or total_selected <= 0:
             MEMORY_GOVERNANCE_EVENTS.labels(action="cleanup", result="dry_run").inc()
             return result
 
         expire_ids = sorted(set(review_ids + stale_ids))
         if expire_ids:
             await _exec(
-                "UPDATE plugin_memory_item SET status = 'expired', "
+                "UPDATE plugin_memory_item SET status = 'archived', "
                 "value_json = jsonb_set(COALESCE(NULLIF(value_json, '')::jsonb, '{}'::jsonb), "
                 "'{acceptance,status}', '\"expired\"'::jsonb, TRUE)::text, updated_at = NOW() "
                 "WHERE id = ANY(:ids)",
@@ -2969,6 +3986,31 @@ class MemoryStore(
     ) -> dict[str, Any] | None:
         if not policy.correction_enabled:
             return None
+        tenant_id = str(tenant_id or "").strip()
+        user_id = str(user_id or "").strip()
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.correct_group_member_memory_item(
+                    item_id,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    policy=policy,
+                    expected_etag=expected_etag,
+                    content=content,
+                )
+        await self._lock_member_memory_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if await self._member_memory_write_blocked(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        ):
+            raise MemoryMutationError(
+                "member_memory_write_blocked",
+                status_code=409,
+            )
         current = await self.get_group_member_memory_item(
             item_id,
             tenant_id=tenant_id,
@@ -2980,7 +4022,9 @@ class MemoryStore(
             return None
         if _member_memory_etag(current) != str(expected_etag or "").strip():
             raise MemoryItemConflictError("member memory etag conflict")
-        normalized = _normalize_line(str(content or ""))[:500]
+        normalized = _normalize_line(
+            _redact_memory_storage_text(content)
+        )[:500]
         if not normalized:
             raise ValueError("content is required")
         rows = await _exec(
@@ -3007,17 +4051,11 @@ class MemoryStore(
             policy=policy,
         )
         if updated is not None:
-            await self._refresh_legacy_cache_for_item_scope(
-                {
-                    **updated,
-                    "tenant_id": tenant_id,
-                    "channel": "wechat",
-                    "user_id": user_id,
-                    "source_key": current.get("source_key", "*"),
-                    "session_id": current.get("session_id", ""),
-                }
-            )
-            await self._sync_memory_vector_for_item_safe(updated)
+            full_item = await self.get_memory_item(int(item_id), for_update=True)
+            if full_item is not None:
+                await self._refresh_legacy_cache_for_item_scope(full_item)
+                await self._sync_memory_graph_for_item_safe(full_item)
+                await self._sync_memory_vector_for_item_safe(full_item)
         return updated
 
     async def delete_group_member_memory_item(
@@ -3033,6 +4071,23 @@ class MemoryStore(
     ) -> bool:
         if not policy.deletion_enabled:
             return False
+        tenant_id = str(tenant_id or "").strip()
+        user_id = str(user_id or "").strip()
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.delete_group_member_memory_item(
+                    item_id,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    policy=policy,
+                    expected_etag=expected_etag,
+                    allow_pinned=allow_pinned,
+                )
+        await self._lock_member_memory_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         current = await self.get_group_member_memory_item(
             item_id,
             tenant_id=tenant_id,
@@ -3046,6 +4101,20 @@ class MemoryStore(
             raise MemoryItemConflictError("member memory etag conflict")
         if current.get("pinned") and not allow_pinned:
             raise MemoryItemProtectedError([int(item_id)])
+        full_item = await self.get_memory_item(int(item_id), for_update=True)
+        if (
+            full_item is None
+            or str(full_item.get("tenant_id") or "") != tenant_id
+            or str(full_item.get("channel") or "").lower() != "wechat"
+            or str(full_item.get("user_id") or "") != user_id
+        ):
+            raise MemoryItemConflictError("member memory etag conflict")
+        episode_rows = await _exec(
+            "SELECT id, memory_item_ids_json FROM plugin_memory_episode "
+            "WHERE memory_item_ids_json @> CAST(:item_ids AS JSONB) "
+            "ORDER BY id ASC",
+            {"item_ids": _to_json([int(item_id)])},
+        )
         rows = await _exec(
             "UPDATE plugin_memory_item SET status = 'deleted', deleted_at = NOW(), updated_at = NOW() "
             "WHERE id = :id AND tenant_id = :tid AND channel = 'wechat' AND user_id = :uid "
@@ -3060,7 +4129,64 @@ class MemoryStore(
         )
         if not rows:
             raise MemoryItemConflictError("member memory etag conflict")
-        await self._delete_memory_vector_for_item_safe(int(item_id))
+        await _exec(
+            "UPDATE plugin_memory_fact SET status = 'invalidated', "
+            "invalid_at = COALESCE(invalid_at, NOW()), updated_at = NOW() "
+            "WHERE memory_item_id = :item_id",
+            {"item_id": int(item_id)},
+        )
+        deleted_episode_ids: list[int] = []
+        archived_episode_ids: list[int] = []
+        for episode in episode_rows:
+            episode_id = _safe_int(episode.get("id"), 0)
+            if episode_id <= 0:
+                continue
+            remaining_ids = sorted(
+                _coerce_int_set(
+                    _safe_json_loads(
+                        episode.get("memory_item_ids_json"),
+                        [],
+                    )
+                )
+                - {int(item_id)}
+            )
+            if remaining_ids:
+                await _exec(
+                    "UPDATE plugin_memory_episode SET status = 'archived', "
+                    "title = '', summary = '', "
+                    "memory_item_ids_json = :memory_item_ids_json, "
+                    "updated_at = NOW() WHERE id = :id",
+                    {
+                        "id": episode_id,
+                        "memory_item_ids_json": _to_json(remaining_ids),
+                    },
+                )
+                archived_episode_ids.append(episode_id)
+            else:
+                await _exec(
+                    "DELETE FROM plugin_memory_episode WHERE id = :id",
+                    {"id": episode_id},
+                )
+                deleted_episode_ids.append(episode_id)
+        await self._delete_memory_and_graph_vectors_for_item(int(item_id))
+        for episode_id in sorted(
+            set(archived_episode_ids + deleted_episode_ids)
+        ):
+            try:
+                await self.vector_index.delete_episode(
+                    episode_id,
+                    force=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "memory.member_delete_episode_vector_failed",
+                    episode_id=episode_id,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+        await self._refresh_legacy_cache_for_item_scope(
+            {**full_item, "status": "deleted", "deleted_at": datetime.now(UTC)}
+        )
         return True
 
     @staticmethod
@@ -3163,8 +4289,15 @@ class MemoryStore(
         source_trace_id: str = "",
         original_text: str = "",
     ) -> dict[str, Any] | None:
-        original_text = _sanitize_db_text(original_text)
-        content = _normalize_line(_sanitize_db_text(content))[:500]
+        raw_original_text = _sanitize_db_text(original_text)
+        raw_content = _sanitize_db_text(content)
+        detected_sensitivity = (
+            "normal"
+            if source_type == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE
+            else _detect_sensitivity(raw_content)
+        )
+        original_text = _redact_memory_storage_text(raw_original_text)
+        content = _normalize_line(_redact_memory_storage_text(raw_content))[:500]
         if not content:
             return None
         scope_type = scope_type if scope_type in {"identity", "session"} else "identity"
@@ -3184,11 +4317,6 @@ class MemoryStore(
             else "auto"
         )
         status = status if status in MEMORY_ITEM_STATUSES else "active"
-        detected_sensitivity = (
-            "normal"
-            if source_type == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE
-            else _detect_sensitivity(content)
-        )
         if detected_sensitivity != "normal":
             sensitivity = detected_sensitivity
         else:
@@ -3232,6 +4360,114 @@ class MemoryStore(
             status = "pending"
         normalized_key = normalized_key or _normalize_key(content)
         value_payload = value_json if value_json is not None else {}
+        evidence_event_ids = _memory_evidence_event_ids(
+            value_payload,
+            source_event_id=source_event_id,
+        )
+        evidence_rows = (
+            await _exec(
+                "SELECT id, source_member_id, source_message_id "
+                "FROM plugin_memory_event WHERE id = ANY(:event_ids) "
+                "ORDER BY id ASC",
+                {"event_ids": evidence_event_ids},
+            )
+            if evidence_event_ids
+            else []
+        )
+        found_event_ids = _coerce_int_set(row.get("id") for row in evidence_rows)
+        # A stale extractor must not recreate a projection after its source
+        # event was erased for consent, exact deletion, or retention.
+        if evidence_event_ids and found_event_ids != set(evidence_event_ids):
+            logger.info(
+                "memory.projection_missing_source_event",
+                missing_event_ids=sorted(set(evidence_event_ids) - found_event_ids)[:20],
+            )
+            return None
+        evidence_members = sorted(
+            {
+                str(row.get("source_member_id") or "").strip()
+                for row in evidence_rows
+                if str(row.get("source_member_id") or "").strip()
+            }
+        )
+        if channel == "wechat" and evidence_members:
+            if _ACTIVE_MUTATION_CONNECTION.get() is None:
+                async with self._mutation_transaction():
+                    return await self._insert_or_touch_memory_item(
+                        tenant_id=tenant_id,
+                        channel=channel,
+                        source_key=source_key,
+                        user_id=user_id,
+                        session_id=session_id,
+                        scope_type=scope_type,
+                        source_type=source_type,
+                        memory_type=memory_type,
+                        content=content,
+                        value_json=value_payload,
+                        normalized_key=normalized_key,
+                        confidence=confidence,
+                        status=status,
+                        pinned=pinned,
+                        priority=priority,
+                        sensitivity=sensitivity,
+                        origin_session_kind=origin_session_kind,
+                        audience_scope=audience_scope,
+                        allowed_session_ids=allowed_session_ids,
+                        sensitivity_category=sensitivity_category,
+                        expires_at=expires_at,
+                        source_kind=source_kind,
+                        source_event_id=source_event_id,
+                        source_trace_id=source_trace_id,
+                        original_text=original_text,
+                    )
+            for evidence_member in evidence_members:
+                await self._lock_member_memory_mutation(
+                    tenant_id=tenant_id,
+                    user_id=evidence_member,
+                )
+                if await self._member_memory_write_blocked(
+                    tenant_id=tenant_id,
+                    user_id=evidence_member,
+                ):
+                    logger.info(
+                        "memory.projection_suppressed_by_source_member_control",
+                        tenant_id=tenant_id,
+                        source_member_id=evidence_member,
+                    )
+                    return None
+        source_evidence = _memory_source_evidence(evidence_rows)
+        if source_event_id is not None:
+            tombstones = await _exec(
+                "SELECT id FROM plugin_memory_item "
+                "WHERE tenant_id = :tid AND channel = :channel "
+                "AND source_key = :source_key AND user_id = :uid "
+                "AND scope_type = :scope_type AND session_id = :sid "
+                "AND normalized_key = :normalized_key "
+                "AND deleted_at IS NOT NULL "
+                "AND (source_event_id = :source_event_id "
+                "OR source_evidence_json @> CAST(:source_evidence AS JSONB)) "
+                "ORDER BY id DESC LIMIT 1",
+                {
+                    "tid": tenant_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "uid": user_id,
+                    "scope_type": scope_type,
+                    "sid": session_id,
+                    "normalized_key": normalized_key,
+                    "source_event_id": int(source_event_id),
+                    "source_evidence": _to_json(
+                        [{"source_event_id": int(source_event_id)}]
+                    ),
+                },
+            )
+            if tombstones:
+                logger.info(
+                    "memory.source_projection_blocked_by_tombstone",
+                    source_event_id=int(source_event_id),
+                    normalized_key=normalized_key,
+                )
+                return None
 
         existing = await _exec(
             "SELECT id, audience_scope, origin_session_kind, allowed_session_ids, "
@@ -3293,6 +4529,11 @@ class MemoryStore(
                 "pinned = pinned OR :pinned, priority = GREATEST(priority, :priority), "
                 "sensitivity = :sensitivity, sensitivity_category = :sensitivity_category, "
                 "expires_at = :expires_at, "
+                "source_evidence_json = ("
+                "SELECT COALESCE(jsonb_agg(DISTINCT evidence), '[]'::jsonb) "
+                "FROM jsonb_array_elements("
+                "COALESCE(plugin_memory_item.source_evidence_json, '[]'::jsonb) "
+                "|| CAST(:source_evidence AS JSONB)) AS evidence), "
                 "source_event_id = COALESCE(source_event_id, :source_event_id), "
                 "source_trace_id = COALESCE(NULLIF(source_trace_id, ''), :source_trace_id), "
                 "original_text = COALESCE(NULLIF(original_text, ''), :original_text), "
@@ -3310,6 +4551,7 @@ class MemoryStore(
                     "sensitivity": sensitivity,
                     "sensitivity_category": sensitivity_category,
                     "expires_at": effective_expiry,
+                    "source_evidence": _to_json(source_evidence),
                     "source_event_id": source_event_id,
                     "source_trace_id": source_trace_id or "",
                     "original_text": _memory_item_original_text_for_source(
@@ -3334,19 +4576,21 @@ class MemoryStore(
             "(tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, content, value_json, normalized_key, confidence, status, pinned, "
             "priority, sensitivity, audience_scope, origin_session_kind, allowed_session_ids, "
-            "source_kind, sensitivity_category, expires_at, "
+            "source_kind, sensitivity_category, expires_at, source_evidence_json, "
             "source_event_id, source_trace_id, original_text, "
             "occurrence_count, first_seen_at, last_seen_at, created_at, updated_at) "
             "VALUES (:tid, :channel, :source_key, :uid, :sid, :scope_type, :source_type, "
             ":memory_type, :content, :value_json, :normalized_key, :confidence, :status, :pinned, "
             ":priority, :sensitivity, :audience_scope, :origin_session_kind, "
             "CAST(:allowed_session_ids AS JSONB), :source_kind, :sensitivity_category, :expires_at, "
+            "CAST(:source_evidence AS JSONB), "
             ":source_event_id, :source_trace_id, :original_text, "
             "1, NOW(), NOW(), NOW(), NOW()) ON CONFLICT DO NOTHING "
             "RETURNING id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, content, value_json, normalized_key, confidence, status, pinned, priority, "
             "sensitivity, audience_scope, origin_session_kind, allowed_session_ids, source_kind, "
-            "sensitivity_category, expires_at, source_event_id, source_trace_id, original_text, occurrence_count, "
+            "sensitivity_category, expires_at, source_evidence_json, source_event_id, "
+            "source_trace_id, original_text, occurrence_count, "
             "first_seen_at, last_seen_at, created_at, updated_at, deleted_at",
             {
                 "tid": tenant_id,
@@ -3371,6 +4615,7 @@ class MemoryStore(
                 "source_kind": source_kind,
                 "sensitivity_category": sensitivity_category,
                 "expires_at": audience_contract["expires_at"],
+                "source_evidence": _to_json(source_evidence),
                 "source_event_id": source_event_id,
                 "source_trace_id": source_trace_id or "",
                 "original_text": _memory_item_original_text_for_source(
@@ -3382,7 +4627,10 @@ class MemoryStore(
         )
         rows = [row for row in rows if _looks_like_memory_item_row(row)]
         if rows:
-            return self._finalize_memory_item(rows[0])
+            item = self._finalize_memory_item(rows[0])
+            if not item.get("source_evidence"):
+                item["source_evidence"] = source_evidence
+            return item
 
         # A concurrent insert or the dedupe index's allowed-session hash may
         # have won the race. Re-read and compare the full audience contract;
@@ -3460,6 +4708,9 @@ class MemoryStore(
         payload["sensitivity_category"] = str(
             payload.get("sensitivity_category") or payload.get("sensitivity") or "normal"
         )
+        payload["source_evidence"] = _memory_source_evidence_from_value(
+            payload.get("source_evidence_json")
+        )
         payload["expires_at"] = _coerce_datetime(payload.get("expires_at"))
         return payload
 
@@ -3513,11 +4764,27 @@ class MemoryStore(
                 }
         return items
 
-    async def _sync_memory_vector_for_item_safe(self, item: dict[str, Any] | None) -> None:
-        if not item or not self.vector_index.is_enabled:
+    async def _sync_memory_vector_for_item_safe(
+        self,
+        item: dict[str, Any] | None,
+        *,
+        force: bool = False,
+        scope_execution_allowed: ScopeExecutionAllowed | None = None,
+    ) -> None:
+        available = self.vector_index.is_available if force else self.vector_index.is_enabled
+        if not item or not available:
+            return
+        deferred = _DEFERRED_MEMORY_VECTOR_ITEMS.get()
+        item_id = _safe_int(item.get("id"), 0)
+        if deferred is not None and item_id > 0 and not force:
+            deferred[item_id] = dict(item)
             return
         try:
-            await self.vector_index.upsert_item(item)
+            await self.vector_index.upsert_item(
+                item,
+                force=force,
+                scope_execution_allowed=scope_execution_allowed,
+            )
         except Exception as exc:
             logger.warning(
                 "memory.vector_sync_failed",
@@ -3627,7 +4894,8 @@ class MemoryStore(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, content, value_json, normalized_key, confidence, status, pinned, priority, "
             "sensitivity, audience_scope, origin_session_kind, allowed_session_ids, source_kind, "
-            "sensitivity_category, expires_at, source_event_id, source_trace_id, original_text, occurrence_count, "
+            "sensitivity_category, expires_at, source_evidence_json, source_event_id, "
+            "source_trace_id, original_text, occurrence_count, "
             "first_seen_at, last_seen_at, created_at, updated_at, deleted_at "
             "FROM plugin_memory_item WHERE id = ANY(:memory_item_ids)",
             {"memory_item_ids": ids},
@@ -3711,20 +4979,37 @@ class MemoryStore(
             {"event_ids": ids},
         )
 
-    async def _sync_graph_vectors_for_memory_item_safe(self, item: dict[str, Any]) -> None:
+    async def _sync_graph_vectors_for_memory_item_safe(
+        self,
+        item: dict[str, Any],
+        *,
+        scope_execution_allowed: ScopeExecutionAllowed | None = None,
+    ) -> None:
         if not self.vector_index.is_enabled or item.get("id") is None:
             return
         item_id = int(item["id"])
+        deferred = _DEFERRED_MEMORY_VECTOR_ITEMS.get()
+        if deferred is not None:
+            deferred[item_id] = dict(item)
+            return
         try:
             fact = await self._get_graph_fact_for_memory_item(item_id)
             if fact:
-                await self.vector_index.upsert_fact(fact, backing_item=item)
+                await self.vector_index.upsert_fact(
+                    fact,
+                    backing_item=item,
+                    scope_execution_allowed=scope_execution_allowed,
+                )
             episode = await self._get_graph_episode_for_memory_item(item_id, item=item)
             if episode:
                 backing_items = await self._get_memory_items_by_ids(
                     episode.get("memory_item_ids") or []
                 )
-                await self.vector_index.upsert_episode(episode, backing_items=backing_items)
+                await self.vector_index.upsert_episode(
+                    episode,
+                    backing_items=backing_items,
+                    scope_execution_allowed=scope_execution_allowed,
+                )
         except Exception as exc:
             logger.warning(
                 "memory.graph_vector_sync_failed",
@@ -3732,6 +5017,297 @@ class MemoryStore(
                 error_type=exc.__class__.__name__,
                 error=_truncate_error(exc),
             )
+
+    async def _memory_graph_vector_publication_state(
+        self,
+        object_type: Literal["fact", "episode"],
+        object_id: int,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any]:
+        active_conn = _ACTIVE_MUTATION_CONNECTION.get()
+        dialect = (
+            str(active_conn.dialect.name or "").lower()
+            if active_conn is not None
+            else ""
+        )
+        lock_clause = (
+            (
+                " FOR UPDATE OF fact"
+                if object_type == "fact"
+                else " FOR UPDATE"
+            )
+            if for_update and active_conn is not None and dialect != "sqlite"
+            else ""
+        )
+        if object_type == "fact":
+            rows = await _exec(
+                "SELECT fact.id, fact.tenant_id, fact.channel, fact.source_key, "
+                "fact.user_id, fact.subject_entity_id, subject.name AS subject_name, "
+                "subject.normalized_name AS subject_normalized_name, fact.predicate, "
+                "fact.object_entity_id, object_entity.name AS object_name, "
+                "object_entity.normalized_name AS object_normalized_name, "
+                "fact.object_value, fact.memory_item_id, fact.source_event_id, "
+                "fact.confidence, fact.status, fact.valid_at, fact.invalid_at, "
+                "fact.created_at, fact.updated_at "
+                "FROM plugin_memory_fact fact "
+                "LEFT JOIN plugin_memory_entity subject "
+                "ON subject.id = fact.subject_entity_id "
+                "LEFT JOIN plugin_memory_entity object_entity "
+                "ON object_entity.id = fact.object_entity_id "
+                "WHERE fact.id = :object_id"
+                f"{lock_clause}",
+                {"object_id": int(object_id)},
+            )
+            row = dict(rows[0]) if rows else None
+            memory_item_ids = _coerce_int_set(
+                [row.get("memory_item_id")] if row else []
+            )
+            event_ids = _coerce_int_set(
+                [row.get("source_event_id")] if row else []
+            )
+        else:
+            rows = await _exec(
+                "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+                "title, summary, event_ids_json, memory_item_ids_json, "
+                "importance, status, created_at, updated_at "
+                "FROM plugin_memory_episode WHERE id = :object_id"
+                f"{lock_clause}",
+                {"object_id": int(object_id)},
+            )
+            row = _finalize_graph_episode(rows[0]) if rows else None
+            memory_item_ids = _coerce_int_set(
+                row.get("memory_item_ids") if row else []
+            )
+            event_ids = _coerce_int_set(row.get("event_ids") if row else [])
+
+        backing_items = await self._get_memory_items_by_ids(memory_item_ids)
+        event_rows = (
+            await _exec(
+                "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+                "source_member_id, expires_at, created_at "
+                "FROM plugin_memory_event WHERE id = ANY(:event_ids)",
+                {"event_ids": sorted(event_ids)},
+            )
+            if event_ids
+            else []
+        )
+        members: set[str] = set()
+        if row:
+            row_user_id = str(row.get("user_id") or "").strip()
+            if row_user_id and row_user_id != GROUP_HISTORY_USER_ID_SCOPE:
+                members.add(row_user_id)
+        for item in backing_items:
+            members.update(self._memory_vector_payload_member_ids(item))
+        members.update(
+            str(event.get("source_member_id") or "").strip()
+            for event in event_rows
+            if str(event.get("source_member_id") or "").strip()
+        )
+        return {
+            "row": row,
+            "backing_items": backing_items,
+            "event_rows": event_rows,
+            "memory_item_ids": memory_item_ids,
+            "event_ids": event_ids,
+            "members": members,
+        }
+
+    async def _publish_current_memory_graph_vector(
+        self,
+        object_type: Literal["fact", "episode"],
+        object_id: int,
+        *,
+        fallback_row: dict[str, Any] | None = None,
+        scope_execution_allowed: ScopeExecutionAllowed | None = None,
+    ) -> str:
+        """Publish one current graph point under expiry/member erase fences."""
+
+        if object_type not in {"fact", "episode"}:
+            raise ValueError(f"unsupported memory graph object type: {object_type}")
+        object_id = int(object_id)
+        if object_id <= 0 or not self.vector_index.is_enabled:
+            return "skipped"
+        if _ACTIVE_MUTATION_CONNECTION.get() is not None:
+            raise RuntimeError(
+                "current memory graph vector publication requires a committed transaction"
+            )
+
+        initial = await self._memory_graph_vector_publication_state(
+            object_type,
+            object_id,
+        )
+        expected_members = set(initial["members"])
+        expected_members.update(
+            self._memory_vector_payload_member_ids(fallback_row)
+        )
+        fallback_user_id = str((fallback_row or {}).get("user_id") or "").strip()
+        if fallback_user_id and fallback_user_id != GROUP_HISTORY_USER_ID_SCOPE:
+            expected_members.add(fallback_user_id)
+        scope = initial.get("row") or fallback_row or {}
+
+        for attempt in range(4):
+            retry_members: set[str] = set()
+            async with get_engine().begin() as conn:
+                token = _ACTIVE_MUTATION_CONNECTION.set(conn)
+                try:
+                    await self._lock_governance_expiry()
+                    tenant_id = str(scope.get("tenant_id") or "").strip()
+                    for member_id in sorted(expected_members):
+                        await self._lock_member_memory_mutation(
+                            tenant_id=tenant_id,
+                            user_id=member_id,
+                        )
+                    current_state = (
+                        await self._memory_graph_vector_publication_state(
+                            object_type,
+                            object_id,
+                            for_update=True,
+                        )
+                    )
+                    retry_members = (
+                        set(current_state["members"]) - expected_members
+                    )
+                    if retry_members:
+                        raise _MemoryVectorPublicationRetry
+
+                    row = current_state["row"]
+                    backing_items = current_state["backing_items"]
+                    event_rows = current_state["event_rows"]
+                    event_ids = current_state["event_ids"]
+                    current_members = (
+                        set(current_state["members"]) or expected_members
+                    )
+                    current_scope = row or scope
+                    channel = str(
+                        current_scope.get("channel") or ""
+                    ).strip().lower()
+                    tenant_id = str(
+                        current_scope.get("tenant_id") or tenant_id
+                    ).strip()
+                    blocked = False
+                    if channel == "wechat":
+                        for member_id in sorted(current_members):
+                            if await self._member_memory_write_blocked(
+                                tenant_id=tenant_id,
+                                user_id=member_id,
+                            ):
+                                blocked = True
+                                break
+
+                    now = datetime.now(UTC).replace(tzinfo=None)
+                    missing_event = bool(event_ids) and {
+                        int(event.get("id") or 0) for event in event_rows
+                    } != event_ids
+                    expired_event = any(
+                        (
+                            (expires_at := _coerce_datetime(
+                                event.get("expires_at")
+                            ))
+                            is not None
+                            and expires_at <= now
+                        )
+                        for event in event_rows
+                    )
+                    missing_backing = bool(
+                        current_state["memory_item_ids"]
+                    ) and {
+                        int(item.get("id") or 0) for item in backing_items
+                    } != current_state["memory_item_ids"]
+                    invalid_backing = any(
+                        item.get("deleted_at") is not None
+                        or str(item.get("status") or "") != "active"
+                        or str(
+                            item.get("sensitivity_category")
+                            or item.get("sensitivity")
+                            or "normal"
+                        )
+                        != "normal"
+                        or (
+                            (expires_at := _coerce_datetime(
+                                item.get("expires_at")
+                            ))
+                            is not None
+                            and expires_at <= now
+                        )
+                        for item in backing_items
+                    )
+                    group_without_evidence = (
+                        row is not None
+                        and str(row.get("user_id") or "")
+                        == GROUP_HISTORY_USER_ID_SCOPE
+                        and not current_members
+                    )
+                    invalid = (
+                        row is None
+                        or blocked
+                        or missing_event
+                        or expired_event
+                        or missing_backing
+                        or invalid_backing
+                        or group_without_evidence
+                    )
+                    if invalid:
+                        try:
+                            if object_type == "fact":
+                                await self.vector_index.delete_fact(
+                                    object_id,
+                                    force=True,
+                                )
+                            else:
+                                await self.vector_index.delete_episode(
+                                    object_id,
+                                    force=True,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "memory.graph_vector_fenced_delete_failed",
+                                object_type=object_type,
+                                object_id=object_id,
+                                error_type=exc.__class__.__name__,
+                                error=_truncate_error(exc),
+                            )
+                        return "deleted"
+
+                    try:
+                        if object_type == "fact":
+                            backing_item = (
+                                backing_items[0] if backing_items else None
+                            )
+                            return await self.vector_index.upsert_fact(
+                                row,
+                                backing_item=backing_item,
+                                scope_execution_allowed=scope_execution_allowed,
+                            )
+                        return await self.vector_index.upsert_episode(
+                            row,
+                            backing_items=backing_items,
+                            scope_execution_allowed=scope_execution_allowed,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "memory.graph_vector_fenced_publish_failed",
+                            object_type=object_type,
+                            object_id=object_id,
+                            error_type=exc.__class__.__name__,
+                            error=_truncate_error(exc),
+                        )
+                        return "error"
+                except _MemoryVectorPublicationRetry:
+                    pass
+                finally:
+                    _ACTIVE_MUTATION_CONNECTION.reset(token)
+            expected_members.update(retry_members)
+            if attempt == 3:
+                break
+
+        logger.warning(
+            "memory.graph_vector_publication_member_set_unstable",
+            object_type=object_type,
+            object_id=object_id,
+            member_count=len(expected_members),
+        )
+        return "deferred"
 
     async def _get_or_create_graph_entity(
         self,
@@ -4310,7 +5886,8 @@ class MemoryStore(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, content, value_json, normalized_key, confidence, status, pinned, priority, "
             "sensitivity, audience_scope, origin_session_kind, allowed_session_ids, source_kind, "
-            "sensitivity_category, expires_at, source_event_id, source_trace_id, original_text, occurrence_count, "
+            "sensitivity_category, expires_at, source_evidence_json, source_event_id, "
+            "source_trace_id, original_text, occurrence_count, "
             "first_seen_at, last_seen_at, created_at, updated_at, deleted_at "
             f"FROM plugin_memory_item WHERE id = :id{lock_clause}",
             {"id": item_id},
@@ -4766,6 +6343,38 @@ class MemoryStore(
         }
 
     async def create_memory_item(self, **kwargs: Any) -> dict[str, Any] | None:
+        channel = str(kwargs.get("channel") or "").strip().lower()
+        tenant_id = str(kwargs.get("tenant_id") or "").strip()
+        user_id = str(kwargs.get("user_id") or "").strip()
+        member_owned = (
+            bool(tenant_id)
+            and bool(user_id)
+            and user_id != GROUP_HISTORY_USER_ID_SCOPE
+        )
+        if member_owned and _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.create_memory_item(**kwargs)
+        if member_owned:
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            # The advisory lock fences full erasure for every provider.  The
+            # social tenant-member control is currently a WeChat-only policy
+            # surface and must not be applied to unrelated channel identities.
+            if channel == "wechat" and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            ):
+                logger.info(
+                    "memory.create_suppressed_by_member_control",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+                raise MemoryMutationError(
+                    "member_memory_write_blocked",
+                    status_code=409,
+                )
         item = await self._insert_or_touch_memory_item(**kwargs)
         if item:
             await self._refresh_legacy_cache_for_item_scope(item)
@@ -4856,7 +6465,7 @@ class MemoryStore(
                 is not True
             ):
                 raise RuntimeError("memory plugin runtime disabled for profile enrichment")
-        item = await self._insert_or_touch_memory_item(
+        item = await self.create_memory_item(
             tenant_id=tenant_id,
             channel=channel,
             source_key=source_key,
@@ -5026,6 +6635,39 @@ class MemoryStore(
         current = await self.get_memory_item(item_id)
         if not current or current.get("deleted_at"):
             return None
+        current_channel = str(current.get("channel") or "").strip().lower()
+        tenant_id = str(current.get("tenant_id") or "").strip()
+        user_id = str(current.get("user_id") or "").strip()
+        member_owned = (
+            bool(tenant_id)
+            and bool(user_id)
+            and user_id != GROUP_HISTORY_USER_ID_SCOPE
+        )
+        if member_owned and _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.update_memory_item(item_id, **updates)
+        if member_owned:
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            if current_channel == "wechat" and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            ):
+                logger.info(
+                    "memory.update_suppressed_by_member_control",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    item_id=item_id,
+                )
+                raise MemoryMutationError(
+                    "member_memory_write_blocked",
+                    status_code=409,
+                )
+            current = await self.get_memory_item(item_id, for_update=True)
+            if not current or current.get("deleted_at"):
+                return None
         allowed = {
             "content",
             "value_json",
@@ -5040,9 +6682,15 @@ class MemoryStore(
         assignments: list[str] = []
         params: dict[str, Any] = {"id": item_id}
         if "content" in updates:
-            updates["content"] = _normalize_line(str(updates.get("content") or ""))[:500]
+            updates["content"] = _normalize_line(
+                _redact_memory_storage_text(updates.get("content"))
+            )[:500]
             updates["normalized_key"] = _normalize_key(str(updates["content"]))
             allowed.add("normalized_key")
+        if "original_text" in updates:
+            updates["original_text"] = _redact_memory_storage_text(
+                updates.get("original_text")
+            )[:2000]
         for key, value in updates.items():
             if key not in allowed:
                 continue
@@ -5126,9 +6774,6 @@ class MemoryStore(
         superseded_by_item_id: int | None = None,
         supersedes_item_id: int | None = None,
     ) -> dict[str, Any] | None:
-        current = await self.get_memory_item(item_id)
-        if not current or current.get("deleted_at"):
-            return None
         normalized_action = str(action or "").strip().lower()
         if normalized_action not in MEMORY_ACCEPTANCE_REVIEW_ACTIONS:
             raise ValueError(f"unsupported acceptance review action: {normalized_action}")
@@ -5138,6 +6783,33 @@ class MemoryStore(
         supersedes_id = _safe_int(supersedes_item_id, 0) if supersedes_item_id is not None else 0
         if superseded_by_id == item_id or supersedes_id == item_id:
             raise ValueError("memory item cannot supersede itself")
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.review_memory_item_acceptance(
+                    item_id,
+                    action=normalized_action,
+                    review_reason=review_reason,
+                    reviewed_by=reviewed_by,
+                    superseded_by_item_id=superseded_by_item_id,
+                    supersedes_item_id=supersedes_item_id,
+                )
+
+        locked_items: dict[int, dict[str, Any] | None] = {}
+        lock_ids = sorted(
+            {
+                candidate
+                for candidate in (int(item_id), superseded_by_id, supersedes_id)
+                if candidate > 0
+            }
+        )
+        for lock_id in lock_ids:
+            locked_items[lock_id] = await self.get_memory_item(
+                lock_id,
+                for_update=True,
+            )
+        current = locked_items.get(int(item_id))
+        if not current or current.get("deleted_at"):
+            return None
 
         value = current.get("value") if isinstance(current.get("value"), dict) else {}
         next_value = dict(value or {})
@@ -5229,7 +6901,7 @@ class MemoryStore(
                 supersedes_item_id=supersedes_id if supersedes_id > 0 else None,
             )
         if normalized_action == "supersede" and supersedes_id > 0 and updated:
-            counterpart = await self.get_memory_item(supersedes_id)
+            counterpart = locked_items.get(supersedes_id)
             if (
                 counterpart
                 and not counterpart.get("deleted_at")
@@ -5356,18 +7028,22 @@ class MemoryStore(
         current = await self.get_memory_item(item_id)
         if not current:
             return None
-        if not allow_pinned and _memory_item_requires_delete_confirmation(current):
-            raise MemoryItemProtectedError([item_id])
-        await _exec(
-            "UPDATE plugin_memory_item SET status = 'deleted', deleted_at = NOW(), updated_at = NOW() "
-            "WHERE id = :id AND deleted_at IS NULL",
-            {"id": item_id},
+        result = await self.forget_memory_items(
+            tenant_id=str(current.get("tenant_id") or ""),
+            channel=str(current.get("channel") or ""),
+            source_key=str(current.get("source_key") or "*"),
+            user_id=str(current.get("user_id") or ""),
+            item_id=int(item_id),
+            session_id=str(current.get("session_id") or ""),
+            scope_type=str(current.get("scope_type") or "") or None,
+            allow_pinned=allow_pinned,
+            limit=1,
         )
-        deleted = await self.get_memory_item(item_id)
-        await self._refresh_legacy_cache_for_item_scope(current)
-        await self._sync_memory_graph_for_item_safe(deleted)
-        await self._delete_memory_vector_for_item_safe(item_id)
-        return deleted
+        return (
+            await self.get_memory_item(item_id)
+            if int(result.get("count") or 0) > 0
+            else None
+        )
 
     async def forget_memory_items(
         self,
@@ -5385,6 +7061,20 @@ class MemoryStore(
     ) -> dict[str, Any]:
         if item_id is None and not _normalize_line(query):
             return {"ids": [], "count": 0}
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.forget_memory_items(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    item_id=item_id,
+                    query=query,
+                    session_id=session_id,
+                    scope_type=scope_type,
+                    allow_pinned=allow_pinned,
+                    limit=limit,
+                )
         candidates: list[dict[str, Any]]
         if item_id is not None:
             item = await self.get_memory_item(item_id)
@@ -5432,6 +7122,55 @@ class MemoryStore(
                     item for item in candidates if str(item.get("scope_type") or "") == scope_type
                 ]
 
+        member_ids: set[str] = set()
+        if user_id and user_id != GROUP_HISTORY_USER_ID_SCOPE:
+            member_ids.add(str(user_id))
+        else:
+            for candidate in candidates:
+                candidate_id = _safe_int(candidate.get("id"), 0)
+                if candidate_id <= 0:
+                    continue
+                _state, source_members = (
+                    await self._memory_vector_publication_state(
+                        candidate_id,
+                    )
+                )
+                member_ids.update(source_members)
+        for member_id in sorted(member_ids):
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=member_id,
+            )
+
+        locked_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            candidate_id = _safe_int(candidate.get("id"), 0)
+            if candidate_id <= 0:
+                continue
+            locked = await self.get_memory_item(
+                candidate_id,
+                for_update=True,
+            )
+            if (
+                locked
+                and locked.get("deleted_at") is None
+                and str(locked.get("status") or "") != "deleted"
+                and _memory_item_matches_scope(
+                    locked,
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                and (
+                    not scope_type
+                    or str(locked.get("scope_type") or "") == scope_type
+                )
+            ):
+                locked_candidates.append(locked)
+        candidates = locked_candidates
+
         protected_ids = [
             int(item["id"])
             for item in candidates
@@ -5446,6 +7185,12 @@ class MemoryStore(
             candidate_id = item.get("id")
             if candidate_id is None:
                 continue
+            episode_rows = await _exec(
+                "SELECT id, memory_item_ids_json FROM plugin_memory_episode "
+                "WHERE memory_item_ids_json @> CAST(:item_ids AS JSONB) "
+                "ORDER BY id ASC",
+                {"item_ids": _to_json([int(candidate_id)])},
+            )
             rows = await _exec(
                 "UPDATE plugin_memory_item SET status = 'deleted', deleted_at = NOW(), updated_at = NOW() "
                 "WHERE id = :id AND tenant_id = :tid AND channel = :channel AND source_key = :source_key "
@@ -5463,9 +7208,59 @@ class MemoryStore(
             if not rows:
                 continue
             affected_ids.append(int(candidate_id))
-            deleted_item = await self.get_memory_item(int(candidate_id))
-            await self._sync_memory_graph_for_item_safe(deleted_item)
-            await self._delete_memory_vector_for_item_safe(candidate_id)
+            await _exec(
+                "UPDATE plugin_memory_fact SET status = 'invalidated', "
+                "invalid_at = COALESCE(invalid_at, NOW()), updated_at = NOW() "
+                "WHERE memory_item_id = :item_id",
+                {"item_id": int(candidate_id)},
+            )
+            affected_episode_ids: list[int] = []
+            for episode in episode_rows:
+                episode_id = _safe_int(episode.get("id"), 0)
+                if episode_id <= 0:
+                    continue
+                remaining_ids = sorted(
+                    _coerce_int_set(
+                        _safe_json_loads(
+                            episode.get("memory_item_ids_json"),
+                            [],
+                        )
+                    )
+                    - {int(candidate_id)}
+                )
+                if remaining_ids:
+                    await _exec(
+                        "UPDATE plugin_memory_episode SET status = 'archived', "
+                        "title = '', summary = '', "
+                        "memory_item_ids_json = :memory_item_ids_json, "
+                        "updated_at = NOW() WHERE id = :id",
+                        {
+                            "id": episode_id,
+                            "memory_item_ids_json": _to_json(remaining_ids),
+                        },
+                    )
+                else:
+                    await _exec(
+                        "DELETE FROM plugin_memory_episode WHERE id = :id",
+                        {"id": episode_id},
+                    )
+                affected_episode_ids.append(episode_id)
+            await self._delete_memory_and_graph_vectors_for_item(
+                int(candidate_id)
+            )
+            for episode_id in sorted(set(affected_episode_ids)):
+                try:
+                    await self.vector_index.delete_episode(
+                        episode_id,
+                        force=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "memory.forget_episode_vector_failed",
+                        episode_id=episode_id,
+                        error_type=exc.__class__.__name__,
+                        error=_truncate_error(exc),
+                    )
             scope_key = (
                 str(item.get("tenant_id") or ""),
                 str(item.get("channel") or ""),
@@ -5480,6 +7275,173 @@ class MemoryStore(
             await self._refresh_legacy_cache_for_item_scope(item)
         return {"ids": affected_ids, "count": len(affected_ids)}
 
+    async def _consented_group_event_rows(
+        self,
+        *,
+        tenant_id: str,
+        rows: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Filter historical group events through the current write policy."""
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        allowed: list[dict[str, Any]] = []
+        blocked: dict[str, bool] = {}
+        for row in rows:
+            member_id = str(row.get("source_member_id") or "").strip()
+            session_id = str(row.get("session_id") or "").strip()
+            if not member_id or not session_id:
+                continue
+            if member_id not in blocked:
+                blocked[member_id] = await self._member_memory_write_blocked(
+                    tenant_id=tenant_id,
+                    user_id=member_id,
+                )
+            if blocked[member_id]:
+                continue
+            policy = await self._group_backfill_member_policy(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=member_id,
+                user_text=row.get("user_text"),
+                assistant_text=row.get("assistant_text"),
+                event_created_at=row.get("created_at"),
+            )
+            if policy is None:
+                continue
+            created_at = _coerce_datetime(row.get("created_at"))
+            expires_at = _coerce_datetime(row.get("expires_at"))
+            policy_expiry = (
+                created_at + timedelta(days=int(policy.retention_days))
+                if created_at is not None
+                else None
+            )
+            effective_expiry = min(
+                [
+                    value
+                    for value in (expires_at, policy_expiry)
+                    if value is not None
+                ],
+                default=None,
+            )
+            if effective_expiry is None or effective_expiry > now:
+                allowed.append(row)
+        return allowed
+
+    async def _rebuild_group_session_profiles(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: Iterable[str],
+        event_rows: Iterable[dict[str, Any]],
+    ) -> int:
+        """Replace affected group caches from surviving, consented events."""
+
+        sessions = sorted(
+            {
+                str(value or "").strip()
+                for value in session_ids
+                if str(value or "").strip()
+            }
+        )
+        if not sessions:
+            return 0
+        await _exec(
+            "DELETE FROM plugin_memory_session_profile "
+            "WHERE tenant_id = :tid AND channel = 'wechat' "
+            "AND user_id = :group_uid AND session_id = ANY(:session_ids)",
+            {
+                "tid": tenant_id,
+                "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                "session_ids": sessions,
+            },
+        )
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in event_rows:
+            session_id = str(row.get("session_id") or "").strip()
+            if session_id not in sessions:
+                continue
+            source_key = str(row.get("source_key") or "*").strip() or "*"
+            grouped.setdefault((source_key, session_id), []).append(row)
+
+        rebuilt = 0
+        for (source_key, session_id), rows in sorted(grouped.items()):
+            state: dict[str, Any] = {
+                "recent_turns": [],
+                "open_items": [],
+                "decisions": [],
+                "session_summary": "",
+                "summary_version": SESSION_STATE_VERSION,
+            }
+            ordered_rows = sorted(
+                rows,
+                key=lambda row: (
+                    _coerce_datetime(row.get("created_at"))
+                    or datetime.min,
+                    _safe_int(row.get("id"), 0),
+                ),
+            )
+            for row in ordered_rows:
+                created_at = _coerce_datetime(row.get("created_at"))
+                state = {
+                    **state,
+                    **_update_session_state(
+                        state,
+                        session_id=session_id,
+                        user_text=str(row.get("user_text") or ""),
+                        assistant_text=str(row.get("assistant_text") or ""),
+                        created_at=(
+                            created_at.isoformat()
+                            if created_at is not None
+                            else datetime.now(UTC).replace(tzinfo=None).isoformat()
+                        ),
+                    ),
+                }
+            recent_turns = list(state.get("recent_turns") or [])
+            await _exec(
+                "INSERT INTO plugin_memory_session_profile "
+                "(tenant_id, channel, source_key, session_id, user_id, "
+                "short_term_memory, manual_notes, short_term_items_json, "
+                "session_summary, open_items_json, decisions_json, recent_turns_json, "
+                "last_compacted_at, summary_version, message_count, imported_message_count, "
+                "last_seen_at, updated_at) "
+                "VALUES (:tid, 'wechat', :source_key, :sid, :group_uid, "
+                ":short_term, '', :short_items, :session_summary, :open_items, "
+                ":decisions, :recent_turns, :last_compacted_at, :summary_version, "
+                ":message_count, :message_count, NOW(), NOW()) "
+                "ON CONFLICT (tenant_id, channel, source_key, session_id, user_id) "
+                "DO UPDATE SET short_term_memory = EXCLUDED.short_term_memory, "
+                "manual_notes = EXCLUDED.manual_notes, "
+                "short_term_items_json = EXCLUDED.short_term_items_json, "
+                "session_summary = EXCLUDED.session_summary, "
+                "open_items_json = EXCLUDED.open_items_json, "
+                "decisions_json = EXCLUDED.decisions_json, "
+                "recent_turns_json = EXCLUDED.recent_turns_json, "
+                "last_compacted_at = EXCLUDED.last_compacted_at, "
+                "summary_version = EXCLUDED.summary_version, "
+                "message_count = EXCLUDED.message_count, "
+                "imported_message_count = EXCLUDED.imported_message_count, "
+                "last_seen_at = NOW(), updated_at = NOW()",
+                {
+                    "tid": tenant_id,
+                    "source_key": source_key,
+                    "sid": session_id,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "short_term": _build_short_term_summary(recent_turns),
+                    "short_items": _to_json(recent_turns),
+                    "session_summary": str(state.get("session_summary") or ""),
+                    "open_items": _to_json(state.get("open_items") or []),
+                    "decisions": _to_json(state.get("decisions") or []),
+                    "recent_turns": _to_json(recent_turns),
+                    "last_compacted_at": state.get("last_compacted_at"),
+                    "summary_version": int(
+                        state.get("summary_version") or SESSION_STATE_VERSION
+                    ),
+                    "message_count": len(ordered_rows),
+                },
+            )
+            rebuilt += 1
+        return rebuilt
+
     async def forget_member(
         self,
         *,
@@ -5487,53 +7449,328 @@ class MemoryStore(
         session_id: str,
         user_id: str,
         idempotency_key: str,
+        channel: str | None = None,
     ) -> int:
-        """Physically erase every WeChat memory for one tenant/member.
+        """Compatibility adapter for social feedback consumers."""
+
+        result = await self.forget_member_detailed(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            channel=channel,
+        )
+        if result.get("complete") is not True:
+            residual = result.get("residual_by_table")
+            residual_tables = (
+                [
+                    str(table_name)
+                    for table_name, value in residual.items()
+                    if value
+                ]
+                if isinstance(residual, dict)
+                else []
+            )
+            raise MemoryErasureIncompleteError(
+                count=int(result.get("count") or 0),
+                residual_tables=residual_tables,
+            )
+        return int(result.get("count") or 0)
+
+    async def forget_member_detailed(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        idempotency_key: str,
+        channel: str | None = None,
+    ) -> dict[str, Any]:
+        """Physically erase one tenant/member's memory in the selected channel.
 
         The durable social control is committed before this compensation is
         invoked.  Database content and every known vector projection must be
         gone before the handler may report completion.  Save and erase share
         a member-scoped transaction lock, preventing an in-flight save from
-        recreating memory after the final scan.
+        recreating memory after the final scan. Group provenance compensation
+        is WeChat-specific; direct rows use the provider-neutral channel scope.
         """
 
         _ = session_id, idempotency_key
         tenant = str(tenant_id or "").strip()
         member = str(user_id or "").strip()
+        memory_channel = str(channel or "wechat").strip().lower() or "wechat"
         if not tenant or not member:
             raise ValueError("tenant_id and user_id are required")
         if _ACTIVE_MUTATION_CONNECTION.get() is None:
             async with self._mutation_transaction():
-                return await self.forget_member(
+                return await self.forget_member_detailed(
                     tenant_id=tenant,
                     session_id=session_id,
                     user_id=member,
                     idempotency_key=idempotency_key,
+                    channel=memory_channel,
                 )
 
         await self._lock_member_memory_mutation(
             tenant_id=tenant,
             user_id=member,
         )
-        scope = {"tid": tenant, "uid": member}
+        scope = {
+            "tid": tenant,
+            "uid": member,
+            "memory_channel": memory_channel,
+        }
+        group_event_rows = await _exec(
+            "SELECT id, source_key, session_id, source_message_id "
+            "FROM plugin_memory_event "
+            "WHERE tenant_id = :tid AND channel = 'wechat' "
+            "AND user_id = :group_uid AND source_member_id = :uid "
+            "ORDER BY id ASC",
+            {
+                **scope,
+                "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+            },
+        ) if memory_channel == "wechat" else []
+        group_event_ids = _coerce_int_set(row.get("id") for row in group_event_rows)
+        group_sessions = sorted(
+            {
+                str(row.get("session_id") or "").strip()
+                for row in group_event_rows
+                if str(row.get("session_id") or "").strip()
+            }
+        )
+        group_source_keys = sorted(
+            {
+                str(row.get("source_key") or "*").strip() or "*"
+                for row in group_event_rows
+            }
+        )
+        remaining_group_event_rows = await _exec(
+            "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+            "user_text, assistant_text, source_member_id, source_message_id, "
+            "expires_at, created_at "
+            "FROM plugin_memory_event "
+            "WHERE tenant_id = :tid AND channel = 'wechat' "
+            "AND user_id = :group_uid AND NOT (id = ANY(:event_ids)) "
+            "ORDER BY created_at ASC, id ASC",
+            {
+                "tid": tenant,
+                "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                "event_ids": sorted(group_event_ids) or [0],
+            },
+        ) if memory_channel == "wechat" else []
+        consented_group_event_rows = (
+            await self._consented_group_event_rows(
+                tenant_id=tenant,
+                rows=remaining_group_event_rows,
+            )
+            if memory_channel == "wechat"
+            else []
+        )
+        consented_group_event_ids = _coerce_int_set(
+            row.get("id") for row in consented_group_event_rows
+        )
+        group_item_rows = await _exec(
+            "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+            "scope_type, source_type, memory_type, content, value_json, "
+            "normalized_key, confidence, status, pinned, priority, sensitivity, "
+            "audience_scope, origin_session_kind, allowed_session_ids, source_kind, "
+            "sensitivity_category, expires_at, source_evidence_json, source_event_id, "
+            "source_trace_id, original_text, occurrence_count, first_seen_at, "
+            "last_seen_at, created_at, updated_at, deleted_at "
+            "FROM plugin_memory_item "
+            "WHERE tenant_id = :tid AND channel = 'wechat' "
+            "AND user_id = :group_uid AND deleted_at IS NULL "
+            "ORDER BY id ASC",
+            {"tid": tenant, "group_uid": GROUP_HISTORY_USER_ID_SCOPE},
+        ) if memory_channel == "wechat" else []
+        group_items_to_delete: list[dict[str, Any]] = []
+        group_items_to_rebuild: list[dict[str, Any]] = []
+        impacted_group_item_ids: set[int] = set()
+        for row in group_item_rows:
+            item_id = _safe_int(row.get("id"), 0)
+            if item_id <= 0:
+                continue
+            value = _safe_json_loads(row.get("value_json"), {})
+            evidence = _memory_source_evidence_from_value(
+                row.get("source_evidence_json")
+            )
+            impacted_evidence = [
+                item
+                for item in evidence
+                if str(item.get("source_member_id") or "") == member
+                or _safe_int(item.get("source_event_id"), 0) in group_event_ids
+            ]
+            mentions_member = any(
+                _memory_payload_mentions_member(candidate, member)
+                for candidate in (
+                    row.get("content"),
+                    row.get("original_text"),
+                    value,
+                )
+            )
+            direct_event_hit = (
+                _safe_int(row.get("source_event_id"), 0) in group_event_ids
+            )
+            if not impacted_evidence and not mentions_member and not direct_event_hit:
+                continue
+            impacted_group_item_ids.add(item_id)
+            remaining_evidence = [
+                item for item in evidence if item not in impacted_evidence
+            ]
+            remaining_event_ids = _coerce_int_set(
+                item.get("source_event_id") for item in remaining_evidence
+            )
+            if mentions_member or not remaining_event_ids:
+                group_items_to_delete.append(row)
+                continue
+            group_items_to_rebuild.append(
+                {
+                    **row,
+                    "value": _remove_event_evidence_from_value(
+                        value,
+                        group_event_ids,
+                    ),
+                    "source_evidence": remaining_evidence,
+                    "source_event_id": min(remaining_event_ids),
+                }
+            )
+        group_source_keys = sorted(
+            set(group_source_keys)
+            | {
+                str(row.get("source_key") or "*").strip() or "*"
+                for row in group_items_to_delete + group_items_to_rebuild
+            }
+        )
+
         item_rows = await _exec(
             "SELECT id FROM plugin_memory_item "
-            "WHERE tenant_id = :tid AND channel = 'wechat' AND user_id = :uid "
+            "WHERE tenant_id = :tid AND channel = :memory_channel AND user_id = :uid "
             "ORDER BY id ASC",
             scope,
         )
         fact_rows = await _exec(
             "SELECT id FROM plugin_memory_fact "
-            "WHERE tenant_id = :tid AND channel = 'wechat' AND user_id = :uid "
+            "WHERE tenant_id = :tid AND channel = :memory_channel AND user_id = :uid "
             "ORDER BY id ASC",
             scope,
         )
         episode_rows = await _exec(
             "SELECT id FROM plugin_memory_episode "
-            "WHERE tenant_id = :tid AND channel = 'wechat' AND user_id = :uid "
+            "WHERE tenant_id = :tid AND channel = :memory_channel AND user_id = :uid "
             "ORDER BY id ASC",
             scope,
         )
+        group_fact_rows: list[dict[str, Any]] = []
+        if impacted_group_item_ids or group_event_ids:
+            group_fact_rows = await _exec(
+                "SELECT id, memory_item_id, source_event_id "
+                "FROM plugin_memory_fact "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid "
+                "AND (memory_item_id = ANY(:item_ids) "
+                "OR source_event_id = ANY(:event_ids)) "
+                "ORDER BY id ASC",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "item_ids": sorted(impacted_group_item_ids) or [0],
+                    "event_ids": sorted(group_event_ids) or [0],
+                },
+            )
+        group_episode_rows: list[dict[str, Any]] = []
+        if impacted_group_item_ids or group_event_ids:
+            candidate_episodes = await _exec(
+                "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
+                "event_ids_json, memory_item_ids_json, title, summary, importance, "
+                "status, created_at, updated_at "
+                "FROM plugin_memory_episode "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid ORDER BY id ASC",
+                {"tid": tenant, "group_uid": GROUP_HISTORY_USER_ID_SCOPE},
+            )
+            for row in candidate_episodes:
+                episode_event_ids = _coerce_int_set(
+                    _safe_json_loads(row.get("event_ids_json"), [])
+                )
+                episode_item_ids = _coerce_int_set(
+                    _safe_json_loads(row.get("memory_item_ids_json"), [])
+                )
+                if (
+                    episode_event_ids.intersection(group_event_ids)
+                    or episode_item_ids.intersection(impacted_group_item_ids)
+                    or _memory_payload_mentions_member(row.get("title"), member)
+                    or _memory_payload_mentions_member(row.get("summary"), member)
+                ):
+                    group_episode_rows.append(row)
+
+        group_delete_item_id_set = _coerce_int_set(
+            row.get("id") for row in group_items_to_delete
+        )
+        rebuilt_group_items_by_id = {
+            int(row["id"]): row for row in group_items_to_rebuild
+        }
+        consented_group_item_ids: set[int] = set()
+        for row in group_item_rows:
+            item_id = _safe_int(row.get("id"), 0)
+            if item_id <= 0 or item_id in group_delete_item_id_set:
+                continue
+            rebuilt = rebuilt_group_items_by_id.get(item_id)
+            value = (
+                rebuilt.get("value")
+                if rebuilt is not None
+                else _safe_json_loads(row.get("value_json"), {})
+            )
+            evidence = (
+                rebuilt.get("source_evidence")
+                if rebuilt is not None
+                else _memory_source_evidence_from_value(
+                    row.get("source_evidence_json")
+                )
+            )
+            evidence_ids = set(
+                _memory_evidence_event_ids(
+                    value,
+                    source_event_id=(
+                        rebuilt.get("source_event_id")
+                        if rebuilt is not None
+                        else row.get("source_event_id")
+                    ),
+                )
+            )
+            evidence_ids.update(
+                _coerce_int_set(
+                    item.get("source_event_id") for item in evidence
+                )
+            )
+            evidence_ids.difference_update(group_event_ids)
+            if evidence_ids and evidence_ids.issubset(consented_group_event_ids):
+                consented_group_item_ids.add(item_id)
+
+        group_episodes_to_delete: list[dict[str, Any]] = []
+        group_episodes_to_rebuild: list[dict[str, Any]] = []
+        for row in group_episode_rows:
+            remaining_event_ids = sorted(
+                _coerce_int_set(
+                    _safe_json_loads(row.get("event_ids_json"), [])
+                ).intersection(consented_group_event_ids)
+            )
+            remaining_item_ids = sorted(
+                _coerce_int_set(
+                    _safe_json_loads(row.get("memory_item_ids_json"), [])
+                ).intersection(consented_group_item_ids)
+            )
+            if remaining_event_ids or remaining_item_ids:
+                group_episodes_to_rebuild.append(
+                    {
+                        **row,
+                        "remaining_event_ids": remaining_event_ids,
+                        "remaining_item_ids": remaining_item_ids,
+                    }
+                )
+            else:
+                group_episodes_to_delete.append(row)
 
         # Vector deletion is strict for privacy compensation.  A disabled
         # indexing feature may still have residue from an earlier deployment,
@@ -5544,10 +7781,237 @@ class MemoryStore(
             await self.vector_index.delete_fact(row.get("id"), force=True)
         for row in episode_rows:
             await self.vector_index.delete_episode(row.get("id"), force=True)
+        for row in group_items_to_delete:
+            await self.vector_index.delete_item(row.get("id"), force=True)
+        for row in group_items_to_rebuild:
+            await self.vector_index.delete_item(row.get("id"), force=True)
+        for row in group_fact_rows:
+            await self.vector_index.delete_fact(row.get("id"), force=True)
+        for row in group_episode_rows:
+            await self.vector_index.delete_episode(row.get("id"), force=True)
+
+        group_fact_ids = sorted(
+            _coerce_int_set(row.get("id") for row in group_fact_rows)
+        )
+        group_episode_ids = sorted(
+            _coerce_int_set(row.get("id") for row in group_episodes_to_delete)
+        )
+        group_delete_item_ids = sorted(
+            _coerce_int_set(row.get("id") for row in group_items_to_delete)
+        )
+        if group_fact_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_fact "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND id = ANY(:ids)",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "ids": group_fact_ids,
+                },
+            )
+        if group_episode_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_episode "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND id = ANY(:ids)",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "ids": group_episode_ids,
+                },
+            )
+        if group_delete_item_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_acceptance_audit "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND item_id = ANY(:ids)",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "ids": group_delete_item_ids,
+                },
+            )
+            await _exec(
+                "DELETE FROM plugin_memory_item "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND id = ANY(:ids)",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "ids": group_delete_item_ids,
+                },
+            )
+        rebuilt_items: list[dict[str, Any]] = []
+        for row in group_items_to_rebuild:
+            item_id = int(row["id"])
+            source_evidence = row["source_evidence"]
+            await _exec(
+                "UPDATE plugin_memory_item SET value_json = :value_json, "
+                "source_evidence_json = CAST(:source_evidence AS JSONB), "
+                "source_event_id = :source_event_id, "
+                "occurrence_count = GREATEST(1, LEAST(occurrence_count, :evidence_count)), "
+                "updated_at = NOW() "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND id = :id",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "id": item_id,
+                    "value_json": _to_json(row["value"]),
+                    "source_evidence": _to_json(source_evidence),
+                    "source_event_id": row["source_event_id"],
+                    "evidence_count": len(source_evidence),
+                },
+            )
+            rebuilt = await self.get_memory_item(item_id)
+            if rebuilt:
+                rebuilt_items.append(rebuilt)
+        deleted_group_jobs = 0
+        deleted_group_events = 0
+        if group_event_ids:
+            deleted_group_job_rows = await _exec(
+                "DELETE FROM plugin_memory_extraction_job "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND source_event_id = ANY(:event_ids) RETURNING id",
+                {"tid": tenant, "event_ids": sorted(group_event_ids)},
+            )
+            deleted_group_jobs = len(deleted_group_job_rows)
+            deleted_group_event_rows = await _exec(
+                "DELETE FROM plugin_memory_event "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND source_member_id = :uid "
+                "AND id = ANY(:event_ids) RETURNING id",
+                {
+                    **scope,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "event_ids": sorted(group_event_ids),
+                },
+            )
+            deleted_group_events = max(
+                len(deleted_group_event_rows),
+                len(group_event_ids),
+            )
+        remaining_events_by_id = {
+            int(row["id"]): row
+            for row in consented_group_event_rows
+            if _safe_int(row.get("id"), 0) > 0
+        }
+        rebuilt_episode_ids: list[int] = []
+        for row in group_episodes_to_rebuild:
+            episode_id = int(row["id"])
+            remaining_item_ids = list(row["remaining_item_ids"])
+            remaining_event_ids = list(row["remaining_event_ids"])
+            backing_items = await self._get_memory_items_by_ids(
+                remaining_item_ids
+            )
+            summary_parts: list[str] = []
+            for item in backing_items:
+                content = _normalize_line(str(item.get("content") or ""))
+                if content and content not in summary_parts:
+                    summary_parts.append(content)
+            for event_id in remaining_event_ids:
+                event = remaining_events_by_id.get(event_id)
+                if event is None:
+                    continue
+                for text_value in (
+                    event.get("user_text"),
+                    event.get("assistant_text"),
+                ):
+                    content = _normalize_line(
+                        _redact_memory_storage_text(text_value)
+                    )
+                    if content and content not in summary_parts:
+                        summary_parts.append(content)
+            rebuilt_summary = "\n".join(summary_parts)[:4000]
+            if not rebuilt_summary:
+                rebuilt_summary = "Group memory rebuilt from retained evidence."
+            rebuilt_title = "Rebuilt group memory"
+            await _exec(
+                "UPDATE plugin_memory_episode SET title = :title, "
+                "summary = :summary, event_ids_json = :event_ids_json, "
+                "memory_item_ids_json = :item_ids_json, status = 'active', "
+                "updated_at = NOW() WHERE tenant_id = :tid "
+                "AND channel = 'wechat' AND user_id = :group_uid AND id = :id",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "id": episode_id,
+                    "title": rebuilt_title,
+                    "summary": rebuilt_summary,
+                    "event_ids_json": _to_json(remaining_event_ids),
+                    "item_ids_json": _to_json(remaining_item_ids),
+                },
+            )
+            rebuilt_episode = {
+                **row,
+                "title": rebuilt_title,
+                "summary": rebuilt_summary,
+                "event_ids": remaining_event_ids,
+                "memory_item_ids": remaining_item_ids,
+                "status": "active",
+            }
+            await self.vector_index.upsert_episode(
+                rebuilt_episode,
+                backing_items=backing_items,
+            )
+            rebuilt_episode_ids.append(episode_id)
+        rebuilt_group_profiles = await self._rebuild_group_session_profiles(
+            tenant_id=tenant,
+            session_ids=group_sessions,
+            event_rows=consented_group_event_rows,
+        )
+        if group_source_keys:
+            await _exec(
+                "DELETE FROM plugin_memory_identity_profile "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND source_key = ANY(:source_keys)",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "source_keys": group_source_keys,
+                },
+            )
+        if group_fact_ids:
+            await _exec(
+                "DELETE FROM plugin_memory_entity entity "
+                "WHERE entity.tenant_id = :tid AND entity.channel = 'wechat' "
+                "AND entity.user_id = :group_uid "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM plugin_memory_fact fact "
+                "WHERE fact.tenant_id = entity.tenant_id "
+                "AND fact.channel = entity.channel "
+                "AND fact.source_key = entity.source_key "
+                "AND fact.user_id = entity.user_id "
+                "AND (fact.subject_entity_id = entity.id "
+                "OR fact.object_entity_id = entity.id))",
+                {"tid": tenant, "group_uid": GROUP_HISTORY_USER_ID_SCOPE},
+            )
+        for rebuilt in rebuilt_items:
+            await self._sync_memory_graph_for_item_safe(rebuilt)
+            await self._sync_memory_vector_for_item_safe(rebuilt)
+        if group_source_keys:
+            surviving_group_scopes = await _exec(
+                "SELECT DISTINCT tenant_id, channel, source_key, user_id, "
+                "session_id, scope_type FROM plugin_memory_item "
+                "WHERE tenant_id = :tid AND channel = 'wechat' "
+                "AND user_id = :group_uid AND source_key = ANY(:source_keys) "
+                "AND deleted_at IS NULL AND status NOT IN ('deleted', 'invalidated')",
+                {
+                    "tid": tenant,
+                    "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                    "source_keys": group_source_keys,
+                },
+            )
+            for surviving_scope in surviving_group_scopes:
+                await self._refresh_legacy_cache_for_item_scope(
+                    surviving_scope
+                )
 
         # Delete content-bearing graph projections before their source rows.
         # Every statement repeats the tenant/channel/member scope; ids are
         # inventory for vector cleanup, never authorization.
+        direct_deleted_by_table: dict[str, int] = {}
         for table in (
             "plugin_memory_fact",
             "plugin_memory_episode",
@@ -5559,14 +8023,21 @@ class MemoryStore(
             "plugin_memory_identity_profile",
             "plugin_memory_session_profile",
         ):
-            await _exec(
+            deleted_rows = await _exec(
                 f"DELETE FROM {table} "
-                "WHERE tenant_id = :tid AND channel = 'wechat' AND user_id = :uid",
+                "WHERE tenant_id = :tid AND channel = :memory_channel "
+                "AND user_id = :uid "
+                "RETURNING 1 AS deleted",
                 scope,
             )
+            direct_deleted_by_table[table] = len(deleted_rows)
 
         # One-release cleanup for databases that still retain the pre-split
         # profile table.  Avoid referencing it when it no longer exists.
+        terminal_effect_intents_deleted = 0
+        effect_intents_deleted_by_status: dict[str, int] = {}
+        residual_effect_intents: dict[str, int] = {}
+        legacy_effect_rows_deleted = 0
         active_connection = _ACTIVE_MUTATION_CONNECTION.get()
         if (
             active_connection is not None
@@ -5576,12 +8047,154 @@ class MemoryStore(
                 "SELECT to_regclass('plugin_memory_profile') AS table_name"
             )
             if legacy_table and legacy_table[0].get("table_name"):
-                await _exec(
+                legacy_profile_rows = await _exec(
                     "DELETE FROM plugin_memory_profile "
-                    "WHERE tenant_id = :tid AND channel = 'wechat' AND user_id = :uid",
+                    "WHERE tenant_id = :tid AND channel = :memory_channel "
+                    "AND user_id = :uid "
+                    "RETURNING 1 AS deleted",
                     scope,
                 )
-        return len(item_rows)
+                direct_deleted_by_table["plugin_memory_profile"] = len(
+                    legacy_profile_rows
+                )
+            terminal_effect_rows = await _exec(
+                "DELETE FROM message_effect_intent "
+                "WHERE tenant_id = :tid AND owner = 'memory' "
+                "AND effect_type = 'save_memory' "
+                "AND status IN ('prepared', 'completed', 'failed') "
+                "AND COALESCE(payload->>'user_id', '') = :uid "
+                "AND COALESCE(payload->>'channel', '') = :memory_channel "
+                "RETURNING status",
+                scope,
+            )
+            terminal_effect_intents_deleted = len(terminal_effect_rows)
+            for row in terminal_effect_rows:
+                status = str(row.get("status") or "")
+                if status:
+                    effect_intents_deleted_by_status[status] = (
+                        effect_intents_deleted_by_status.get(status, 0) + 1
+                    )
+            residual_rows = await _exec(
+                "SELECT status, COUNT(*) AS count FROM message_effect_intent "
+                "WHERE tenant_id = :tid AND owner = 'memory' "
+                "AND effect_type = 'save_memory' "
+                "AND status = 'running' "
+                "AND COALESCE(payload->>'user_id', '') = :uid "
+                "AND COALESCE(payload->>'channel', '') = :memory_channel "
+                "GROUP BY status ORDER BY status",
+                scope,
+            )
+            residual_effect_intents = {
+                str(row.get("status") or ""): _safe_int(row.get("count"), 0)
+                for row in residual_rows
+                if str(row.get("status") or "")
+            }
+            legacy_effect_rows = await _exec(
+                "DELETE FROM flow_effect_log "
+                "WHERE tenant_id = :tid AND owner = 'memory' AND type = 'save_memory' "
+                "AND COALESCE(payload->>'user_id', '') = :uid "
+                "AND COALESCE(payload->>'channel', '') = :memory_channel "
+                "RETURNING 1 AS deleted",
+                scope,
+            )
+            legacy_effect_rows_deleted = len(legacy_effect_rows)
+
+        residual_content_rows = await _exec(
+            "SELECT table_name, row_count FROM ("
+            "SELECT 'plugin_memory_item' AS table_name, COUNT(*) AS row_count "
+            "FROM plugin_memory_item WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_event', COUNT(*) "
+            "FROM plugin_memory_event WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_fact', COUNT(*) "
+            "FROM plugin_memory_fact WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_episode', COUNT(*) "
+            "FROM plugin_memory_episode WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_entity', COUNT(*) "
+            "FROM plugin_memory_entity WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_identity_profile', COUNT(*) "
+            "FROM plugin_memory_identity_profile WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid "
+            "UNION ALL SELECT 'plugin_memory_session_profile', COUNT(*) "
+            "FROM plugin_memory_session_profile WHERE tenant_id = :tid "
+            "AND channel = :memory_channel AND user_id = :uid"
+            ") AS residual WHERE row_count > 0",
+            scope,
+        )
+        residual_content = {
+            str(row.get("table_name") or ""): _safe_int(
+                row.get("row_count"),
+                0,
+            )
+            for row in residual_content_rows
+            if str(row.get("table_name") or "")
+            and _safe_int(row.get("row_count"), 0) > 0
+        }
+        deleted_by_table = {
+            **direct_deleted_by_table,
+            "plugin_memory_group_item": len(group_delete_item_ids),
+            "plugin_memory_group_fact": len(group_fact_ids),
+            "plugin_memory_group_episode": len(group_episode_ids),
+            "plugin_memory_group_event": deleted_group_events,
+            "plugin_memory_group_extraction_job": deleted_group_jobs,
+            "message_effect_intent": terminal_effect_intents_deleted,
+            "flow_effect_log": legacy_effect_rows_deleted,
+        }
+        # The compatibility count includes durable rows removed plus group
+        # projections that were rebuilt.  This prevents a raw-event-only
+        # erasure from being misreported as a no-op.
+        count = (
+            sum(deleted_by_table.values())
+            + len(rebuilt_items)
+            + len(rebuilt_episode_ids)
+            + rebuilt_group_profiles
+        )
+        # Test doubles and older adapters may not return rows for DELETE
+        # ... RETURNING.  Inventoried direct/group rows are still authoritative.
+        count = max(
+            count,
+            len(item_rows)
+            + len(fact_rows)
+            + len(episode_rows)
+            + len(group_event_ids)
+            + len(impacted_group_item_ids)
+            + len(group_fact_ids)
+            + len(group_episode_rows),
+        )
+        result = {
+            "count": count,
+            "channel": memory_channel,
+            "complete": not residual_content and not residual_effect_intents,
+            "deleted_by_table": deleted_by_table,
+            "effect_intents_deleted_by_status": effect_intents_deleted_by_status,
+            "group_rebuilt": {
+                "items": len(rebuilt_items),
+                "episodes": len(rebuilt_episode_ids),
+                "session_profiles": rebuilt_group_profiles,
+            },
+            "residual_by_table": {
+                **residual_content,
+                "message_effect_intent": residual_effect_intents,
+            },
+        }
+        if residual_effect_intents:
+            logger.warning(
+                "memory.forget_member_residual_effect_intents",
+                tenant_id=tenant,
+                user_id=member,
+                residual_by_status=residual_effect_intents,
+            )
+        logger.info(
+            "memory.forget_member_completed",
+            tenant_id=tenant,
+            user_id=member,
+            **result,
+        )
+        return result
 
     async def resolve_member_fact_correction(
         self,
@@ -5915,22 +8528,83 @@ class MemoryStore(
         expires_at: datetime | str | None = None,
         source_kind: str = "conversation",
     ) -> dict[str, Any] | None:
-        original_text = _sanitize_db_text(original_text)
+        raw_original_text = _sanitize_db_text(original_text)
+        raw_content = _sanitize_db_text(action.get("content"))
+        detected_action_sensitivity = _detect_sensitivity(raw_content)
+        original_text = _redact_memory_storage_text(raw_original_text)
         op = str(action.get("op") or "add")
         if op == "ignore":
             return None
 
         normalized_key = str(action.get("normalized_key") or "").strip()
-        content = _normalize_line(_sanitize_db_text(action.get("content")))
+        content = _normalize_line(_redact_memory_storage_text(raw_content))
         if not normalized_key or not content:
             return None
+
+        source_event_rows = (
+            await _exec(
+                "SELECT id, source_member_id, source_message_id "
+                "FROM plugin_memory_event WHERE id = :source_event_id LIMIT 1",
+                {"source_event_id": int(source_event_id)},
+            )
+            if source_event_id is not None
+            else []
+        )
+        if source_event_id is not None and not source_event_rows:
+            logger.info(
+                "memory.projection_missing_source_event",
+                source_event_id=int(source_event_id),
+                user_id=user_id,
+            )
+            return None
+        evidence_members = sorted(
+            {
+                str(row.get("source_member_id") or "").strip()
+                for row in source_event_rows
+                if str(row.get("source_member_id") or "").strip()
+            }
+        )
+        if channel == "wechat" and evidence_members:
+            if _ACTIVE_MUTATION_CONNECTION.get() is None:
+                async with self._mutation_transaction():
+                    return await self._apply_structured_memory_action(
+                        tenant_id=tenant_id,
+                        channel=channel,
+                        source_key=source_key,
+                        user_id=user_id,
+                        action=action,
+                        source_event_id=source_event_id,
+                        source_trace_id=source_trace_id,
+                        original_text=original_text,
+                        source_type_override=source_type_override,
+                        scope_type=scope_type,
+                        session_id=session_id,
+                        origin_session_kind=origin_session_kind,
+                        audience_scope=audience_scope,
+                        allowed_session_ids=allowed_session_ids,
+                        sensitivity_category=sensitivity_category,
+                        expires_at=expires_at,
+                        source_kind=source_kind,
+                    )
+            for evidence_member in evidence_members:
+                await self._lock_member_memory_mutation(
+                    tenant_id=tenant_id,
+                    user_id=evidence_member,
+                )
+                if await self._member_memory_write_blocked(
+                    tenant_id=tenant_id,
+                    user_id=evidence_member,
+                ):
+                    return None
 
         source_type = source_type_override or str(action.get("source_type") or "auto")
         if source_type not in AUTO_SOURCE_TYPES:
             source_type = "auto"
         confidence = float(action.get("confidence") or 0.0)
-        sensitivity = str(action.get("sensitivity") or _detect_sensitivity(content)).strip().lower()
-        detected_sensitivity = _detect_sensitivity(content)
+        sensitivity = str(
+            action.get("sensitivity") or detected_action_sensitivity
+        ).strip().lower()
+        detected_sensitivity = detected_action_sensitivity
         if detected_sensitivity != "normal":
             sensitivity = detected_sensitivity
         elif sensitivity not in MEMORY_SENSITIVITY_CATEGORIES:
@@ -6090,6 +8764,11 @@ class MemoryStore(
                     session_id=session_id,
                 ):
                     continue
+                # LLM-supplied target ids must not bypass the same protection
+                # enforced for normalized-key conflicts. Only an explicit
+                # operator action may invalidate manual or pinned memories.
+                if target_item.get("source_type") == "manual" or target_item.get("pinned"):
+                    continue
                 await self._mark_memory_item_invalidated(
                     target_id,
                     reason=reason,
@@ -6140,6 +8819,11 @@ class MemoryStore(
                     "UPDATE plugin_memory_item SET content = :content, value_json = :value_json, "
                     "memory_type = :memory_type, confidence = GREATEST(confidence, :confidence), status = :status, "
                     "sensitivity = :sensitivity, sensitivity_category = :sensitivity_category, "
+                    "source_evidence_json = ("
+                    "SELECT COALESCE(jsonb_agg(DISTINCT evidence), '[]'::jsonb) "
+                    "FROM jsonb_array_elements("
+                    "COALESCE(plugin_memory_item.source_evidence_json, '[]'::jsonb) "
+                    "|| CAST(:source_evidence AS JSONB)) AS evidence), "
                     "source_event_id = COALESCE(source_event_id, :source_event_id), "
                     "source_trace_id = COALESCE(NULLIF(source_trace_id, ''), :source_trace_id), "
                     "original_text = COALESCE(NULLIF(original_text, ''), :original_text), "
@@ -6154,6 +8838,9 @@ class MemoryStore(
                         "status": status,
                         "sensitivity": sensitivity,
                         "sensitivity_category": sensitivity_category,
+                        "source_evidence": _to_json(
+                            _memory_source_evidence(source_event_rows)
+                        ),
                         "source_event_id": source_event_id,
                         "source_trace_id": source_trace_id or "",
                         "original_text": original_text or content,
@@ -6321,6 +9008,26 @@ class MemoryStore(
         user_id = str(profile.get("user_id") or "")
         if not tenant_id or not channel or not user_id:
             return
+        if user_id == GROUP_HISTORY_USER_ID_SCOPE:
+            # Aggregate legacy profile text has no per-member provenance and
+            # cannot be safely re-materialized after member consent changes.
+            return
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                await self._import_legacy_identity_items(profile)
+                return
+        await self._lock_member_memory_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if (
+            channel.strip().lower() == "wechat"
+            and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        ):
+            return
         inserted = False
         for line in _split_note_lines(str(profile.get("manual_notes") or "")):
             item = await self._insert_or_touch_memory_item(
@@ -6388,6 +9095,24 @@ class MemoryStore(
         user_id = str(profile.get("user_id") or "")
         session_id = str(profile.get("session_id") or "")
         if not tenant_id or not channel or not user_id or not session_id:
+            return
+        if user_id == GROUP_HISTORY_USER_ID_SCOPE:
+            return
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                await self._import_legacy_session_items(profile)
+                return
+        await self._lock_member_memory_mutation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if (
+            channel.strip().lower() == "wechat"
+            and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        ):
             return
         inserted = False
         for line in _split_note_lines(str(profile.get("manual_notes") or "")):
@@ -6680,16 +9405,85 @@ class MemoryStore(
         user_id: str,
         long_term_memory: str | None = None,
         manual_notes: str | None = None,
+        expected_version: str | None = None,
     ) -> dict[str, Any]:
-        current = await self.get_identity_profile(
-            tenant_id=tenant_id,
-            channel=channel,
-            source_key=source_key,
-            user_id=user_id,
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.upsert_identity_profile(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    long_term_memory=long_term_memory,
+                    manual_notes=manual_notes,
+                    expected_version=expected_version,
+                )
+        normalized_channel = str(channel or "").strip().lower()
+        member_owned = (
+            bool(str(tenant_id or "").strip())
+            and bool(str(user_id or "").strip())
+            and str(user_id or "").strip() != GROUP_HISTORY_USER_ID_SCOPE
         )
+        if member_owned:
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            if normalized_channel == "wechat" and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            ):
+                raise MemoryMutationError(
+                    "member_memory_write_blocked",
+                    status_code=409,
+                )
+        active_connection = _ACTIVE_MUTATION_CONNECTION.get()
+        dialect = (
+            str(active_connection.dialect.name or "").lower()
+            if active_connection is not None
+            else ""
+        )
+        lock_clause = " FOR UPDATE" if dialect != "sqlite" else ""
+        rows = await _exec(
+            "SELECT tenant_id, channel, source_key, user_id, long_term_memory, "
+            "manual_notes, long_term_items_json, message_count, imported_message_count, "
+            "last_session_id, last_seen_at, updated_at "
+            "FROM plugin_memory_identity_profile "
+            "WHERE tenant_id = :tid AND channel = :channel "
+            "AND source_key = :source_key AND user_id = :uid"
+            f"{lock_clause}",
+            {
+                "tid": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "uid": user_id,
+            },
+        )
+        current = (
+            _finalize_identity_profile(rows[0])
+            if rows
+            else _empty_identity_profile(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                user_id=user_id,
+            )
+        )
+        if expected_version is not None:
+            expected = _normalized_profile_version(expected_version)
+            actual = _normalized_profile_version(
+                rows[0].get("updated_at") if rows else ""
+            )
+            if expected != actual:
+                raise MemoryProfileConflictError(
+                    expected_version=expected,
+                    actual_version=actual,
+                )
         if manual_notes is not None:
+            manual_notes = _redact_memory_storage_text(manual_notes)
             current["manual_notes"] = manual_notes
         if long_term_memory is not None:
+            long_term_memory = _redact_memory_storage_text(long_term_memory)
             current["long_term_memory"] = long_term_memory
         else:
             current["long_term_items"], current["long_term_memory"] = _merge_long_term_items(
@@ -6812,17 +9606,89 @@ class MemoryStore(
         user_id: str,
         short_term_memory: str | None = None,
         manual_notes: str | None = None,
+        expected_version: str | None = None,
     ) -> dict[str, Any]:
-        current = await self.get_session_profile(
-            tenant_id=tenant_id,
-            channel=channel,
-            source_key=source_key,
-            session_id=session_id,
-            user_id=user_id,
+        if _ACTIVE_MUTATION_CONNECTION.get() is None:
+            async with self._mutation_transaction():
+                return await self.upsert_session_profile(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    user_id=user_id,
+                    short_term_memory=short_term_memory,
+                    manual_notes=manual_notes,
+                    expected_version=expected_version,
+                )
+        normalized_channel = str(channel or "").strip().lower()
+        member_owned = (
+            bool(str(tenant_id or "").strip())
+            and bool(str(user_id or "").strip())
+            and str(user_id or "").strip() != GROUP_HISTORY_USER_ID_SCOPE
         )
+        if member_owned:
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            if normalized_channel == "wechat" and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=user_id,
+            ):
+                raise MemoryMutationError(
+                    "member_memory_write_blocked",
+                    status_code=409,
+                )
+        active_connection = _ACTIVE_MUTATION_CONNECTION.get()
+        dialect = (
+            str(active_connection.dialect.name or "").lower()
+            if active_connection is not None
+            else ""
+        )
+        lock_clause = " FOR UPDATE" if dialect != "sqlite" else ""
+        rows = await _exec(
+            "SELECT tenant_id, channel, source_key, session_id, user_id, "
+            "short_term_memory, manual_notes, short_term_items_json, session_summary, "
+            "open_items_json, decisions_json, recent_turns_json, last_compacted_at, "
+            "summary_version, message_count, imported_message_count, last_seen_at, updated_at "
+            "FROM plugin_memory_session_profile "
+            "WHERE tenant_id = :tid AND channel = :channel "
+            "AND source_key = :source_key AND session_id = :sid AND user_id = :uid"
+            f"{lock_clause}",
+            {
+                "tid": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "sid": session_id,
+                "uid": user_id,
+            },
+        )
+        current = (
+            _finalize_session_profile(rows[0])
+            if rows
+            else _empty_session_profile(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                user_id=user_id,
+            )
+        )
+        if expected_version is not None:
+            expected = _normalized_profile_version(expected_version)
+            actual = _normalized_profile_version(
+                rows[0].get("updated_at") if rows else ""
+            )
+            if expected != actual:
+                raise MemoryProfileConflictError(
+                    expected_version=expected,
+                    actual_version=actual,
+                )
         if short_term_memory is not None:
+            short_term_memory = _redact_memory_storage_text(short_term_memory)
             current["short_term_memory"] = short_term_memory
         if manual_notes is not None:
+            manual_notes = _redact_memory_storage_text(manual_notes)
             current["manual_notes"] = manual_notes
 
         await _exec(
@@ -6944,6 +9810,7 @@ class MemoryStore(
         short_term_memory: str | None = None,
         long_term_memory: str | None = None,
         manual_notes: str | None = None,
+        expected_version: str | None = None,
     ) -> dict[str, Any]:
         _ = short_term_memory  # legacy field no longer stored at identity scope
         return await self.upsert_identity_profile(
@@ -6953,6 +9820,7 @@ class MemoryStore(
             user_id=user_id,
             long_term_memory=long_term_memory,
             manual_notes=manual_notes,
+            expected_version=expected_version,
         )
 
     async def remember_interaction(
@@ -6966,6 +9834,7 @@ class MemoryStore(
         user_text: str,
         assistant_text: str,
         trace_id: str = "",
+        source_message_id: str = "",
         identity_scope: bool = True,
         origin_session_kind: str = "private",
         audience_scope: str = "private",
@@ -6992,6 +9861,7 @@ class MemoryStore(
                     user_text=user_text,
                     assistant_text=assistant_text,
                     trace_id=trace_id,
+                    source_message_id=source_message_id,
                     identity_scope=identity_scope,
                     origin_session_kind=origin_session_kind,
                     audience_scope=audience_scope,
@@ -7029,9 +9899,68 @@ class MemoryStore(
                 "message_count": 0,
             }
 
-        user_text = _sanitize_db_text(user_text)
-        assistant_text = _sanitize_db_text(assistant_text)
+        user_text = _redact_memory_storage_text(user_text)
+        assistant_text = _redact_memory_storage_text(assistant_text)
         allowed_session_ids = _normalize_allowed_session_ids(allowed_session_ids)
+        event_key = _interaction_event_key(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            user_id=user_id,
+            session_id=session_id,
+            source_message_id=source_message_id,
+            trace_id=trace_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+        )
+        event_created_at = datetime.now(UTC).replace(tzinfo=None)
+        event_expiry = _memory_event_expiry(
+            self.settings,
+            created_at=event_created_at,
+            expires_at=expires_at,
+        )
+        event_rows = await _exec(
+            "INSERT INTO plugin_memory_event "
+            "(tenant_id, channel, source_key, user_id, session_id, user_text, assistant_text, "
+            "trace_id, event_key, source_member_id, source_message_id, expires_at, created_at) "
+            "VALUES (:tid, :channel, :source_key, :uid, :sid, :user_text, :assistant_text, "
+            ":trace, :event_key, :source_member_id, :source_message_id, :expires_at, :created_at) "
+            "ON CONFLICT (event_key) WHERE event_key IS NOT NULL "
+            "DO NOTHING RETURNING id",
+            {
+                "tid": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "uid": user_id,
+                "sid": session_id,
+                "user_text": user_text[:2000],
+                "assistant_text": assistant_text[:2000],
+                "trace": trace_id[:128],
+                "event_key": event_key,
+                "source_member_id": user_id[:128],
+                "source_message_id": (source_message_id or trace_id or event_key)[:256],
+                "expires_at": event_expiry,
+                "created_at": event_created_at,
+            },
+        )
+        if not event_rows:
+            logger.info(
+                "memory.remember_interaction_replayed",
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                event_key=event_key,
+            )
+            return await self.get_runtime_profile(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                user_id=user_id,
+                request_session_kind=origin_session_kind,
+            )
+        source_event_id = int(event_rows[0]["id"])
+
         identity = await self.get_identity_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -7086,24 +10015,6 @@ class MemoryStore(
             created_at=created_at,
         )
         deterministic_candidates = _extract_long_term_candidates(user_text)
-
-        event_rows = await _exec(
-            "INSERT INTO plugin_memory_event "
-            "(tenant_id, channel, source_key, user_id, session_id, user_text, assistant_text, trace_id) "
-            "VALUES (:tid, :channel, :source_key, :uid, :sid, :user_text, :assistant_text, :trace) "
-            "RETURNING id",
-            {
-                "tid": tenant_id,
-                "channel": channel,
-                "source_key": source_key,
-                "uid": user_id,
-                "sid": session_id,
-                "user_text": user_text[:2000],
-                "assistant_text": assistant_text[:2000],
-                "trace": trace_id,
-            },
-        )
-        source_event_id = int(event_rows[0]["id"]) if event_rows else None
 
         if identity_scope:
             await _exec(

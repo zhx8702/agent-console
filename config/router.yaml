@@ -21,24 +21,33 @@ rules:
     route: handoff
     reason: "persistent negative emotion after fallbacks"
 
+  - name: complaint_safe_default
+    when:
+      intent_coarse: complaint
+    route: llm
+    reason: "complaint handled conversationally; no automatic handoff"
+
   - name: faq_hit
     when:
-      faq_similarity_gte: 0.88
+      faq_matched: true
+      faq_verdict: clear
     route: faq
-    reason: "high FAQ similarity"
+    reason: "FAQ engine confirmed a clear match"
 
   - name: business_with_tools
     when:
       intent_coarse: business
+      tool_intent_matched: true
       tools_available: true
     route: agent
-    reason: "business intent with tools"
+    reason: "business tool intent with effective tools"
 
   - name: group_tools_query
     when:
+      tool_intent_matched: true
       tools_available: true
     route: agent
-    reason: "group query with tools"
+    reason: "tool intent with effective tools"
 
   - name: business_knowledge
     when:

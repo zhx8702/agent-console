@@ -447,11 +447,26 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
             "bot_normalized_content",
             "wxbot_normalized_content",
             "bot_wxid",
+            "sender_roles",
+            "sender_is_group_admin",
+            "sender_is_group_owner",
             "quote",
             "quote_text",
             "quote_image_path",
             "quote_image_url",
             "image_observation",
+            "file_raw_name",
+            "file_name",
+            "file_ext",
+            "file_size",
+            "file_md5",
+            "file_sha256",
+            "file_url",
+            "file_download_status",
+            "file_failure_reason",
+            "file_attachment",
+            "msg_type",
+            "media",
             "media_status",
             "occurred_at",
             "occurred_ts",
@@ -465,7 +480,11 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
                 session_name=str(metadata.get("session_name") or ""),
                 sender_wxid=str(metadata.get("sender_wxid") or event.user_id or ""),
                 sender_name=str(metadata.get("sender_name") or ""),
-                msg_type=str(getattr(event.message.type, "value", event.message.type) or "text"),
+                msg_type=str(
+                    metadata.get("msg_type")
+                    or getattr(event.message.type, "value", event.message.type)
+                    or "text"
+                ),
                 content=str(event.message.content or ""),
                 mentioned_me=bool(metadata.get("bot_mentioned") or metadata.get("mentioned_me")),
                 bot_addressed=bool(
@@ -543,8 +562,8 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
             return
 
         trace_id = new_trace_id()
-        msg_type = msg.get("msg_type", "text")
-        content = msg.get("msg_text", "")
+        msg_type = str(msg.get("msg_type") or "text").strip().lower()
+        content = str(msg.get("msg_text") or "")
         raw_occurred_at = str(msg.get("occurred_at") or msg.get("created_at") or "").strip()
 
         metadata: dict[str, Any] = {
@@ -552,6 +571,35 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
             "session_name": msg.get("session_name", ""),
             "sender_wxid": msg.get("sender_wxid", ""),
             "sender_name": msg.get("sender_name", ""),
+            "sender_roles": (
+                list(msg.get("sender_roles") or msg.get("roles") or [])
+                if isinstance(msg.get("sender_roles") or msg.get("roles"), list)
+                else [
+                    str(msg.get("sender_role") or msg.get("role") or msg.get("member_role") or "").strip()
+                ]
+                if str(msg.get("sender_role") or msg.get("role") or msg.get("member_role") or "").strip()
+                else []
+            ),
+            "sender_is_group_admin": bool(
+                msg.get("sender_is_group_admin")
+                or msg.get("is_group_admin")
+                or msg.get("group_admin")
+                or msg.get("is_admin")
+                or str(msg.get("sender_role") or msg.get("role") or msg.get("member_role") or "")
+                .strip()
+                .lower()
+                in {"admin", "group_admin", "owner"}
+            ),
+            "sender_is_group_owner": bool(
+                msg.get("sender_is_group_owner")
+                or msg.get("is_group_owner")
+                or msg.get("group_owner")
+                or msg.get("is_owner")
+                or str(msg.get("sender_role") or msg.get("role") or msg.get("member_role") or "")
+                .strip()
+                .lower()
+                == "owner"
+            ),
             "msg_svr_id": msg.get("msg_svr_id", ""),
             "mentioned_me": bool(msg.get("mentioned_me")),
             "at_wxids": list(msg.get("at_wxids") or []),
@@ -638,6 +686,24 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
                 "image_variants": metadata.get("image_variants") or {},
                 "failure_reason": str(msg.get("image_failure_reason") or ""),
             }
+        elif msg_type == "file":
+            raw_record = self._record(msg.get("raw"))
+            file_fields = self._file_fields(msg, raw_record, raw_record)
+            if not file_fields["media_status"]:
+                file_fields["media_status"] = "ready" if file_fields["file_url"] else "pending"
+            if not file_fields["file_download_status"]:
+                file_fields["file_download_status"] = file_fields["media_status"]
+            for key, value in file_fields.items():
+                metadata[key] = value
+            metadata["media"] = {
+                "type": "file",
+                "status": file_fields["media_status"],
+                **file_fields,
+            }
+            metadata["msg_type"] = "file"
+            metadata["file_attachment"] = self._file_attachment(metadata)
+            if not content:
+                content = self._file_placeholder(str(file_fields["file_name"]))
         self._apply_quote_metadata(metadata, msg.get("quote"))
         self._apply_image_observation_metadata(metadata, msg_type)
 
@@ -678,6 +744,9 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
             canonical_conversation_id=canonical_session_id,
             external_participant_id=external_participant_id,
             canonical_participant_id=canonical_user_id,
+            # Keep the historical placeholder message contract for downstream
+            # consumers.  The authoritative file attachment is carried in
+            # metadata and is consumed only by the file-intent/tool path.
             message=Message(type=MessageType.TEXT, content=content),
             trace_id=trace_id,
             metadata=metadata,

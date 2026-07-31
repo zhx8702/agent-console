@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -57,6 +58,9 @@ log = get_logger(__name__)
 _GROUP_MENTION_PREFIX_RE = re.compile(r"^\s*(?:@\S+[\s\u2005\u00a0]+)+")
 DEFAULT_TOOL_OWNER_GATE_TIMEOUT_SECONDS = 1.0
 MAX_TOOL_OWNER_GATE_TIMEOUT_SECONDS = 30.0
+MIN_CLEAR_TOOL_PRESELECTION_SCORE = 2
+MIN_CLEAR_TOOL_PRESELECTION_MARGIN = 2
+AMBIGUOUS_TOOL_PRESELECTION_TOP_K = 3
 
 ToolOwnerGate = Callable[[str, Session], Awaitable[bool]]
 
@@ -139,6 +143,24 @@ class AgentCapabilityEngine:
             self._tool_owner_gate_timeout_seconds = _bounded_tool_owner_gate_timeout(
                 timeout_seconds
             )
+
+    async def preview_availability(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        hints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the final tool exposure decision without invoking the LLM or a tool."""
+
+        tools, policy = await self._available_tools(session, hints, pre)
+        effective_tools = list(tools.keys())
+        return {
+            "effective_tool_count": len(effective_tools),
+            "policy_allowed": bool(policy.get("enabled", True)),
+            "denial_reason": str(policy.get("denial_reason") or ""),
+            "effective_tools": effective_tools,
+            "tool_preselection_verdict": str(policy.get("tool_preselection_verdict") or "LOW"),
+        }
 
     async def answer(
         self,
@@ -686,6 +708,25 @@ class AgentCapabilityEngine:
         return value
 
     @staticmethod
+    def _tool_result_for_audit(tool_name: str, result: Any) -> Any:
+        """Keep extracted file text out of durable tool-audit records."""
+
+        if tool_name != "inspect_current_file" or not isinstance(result, dict):
+            return result
+        value = dict(result)
+        raw_content = value.pop("content", None)
+        if isinstance(raw_content, str):
+            encoded = raw_content.encode("utf-8", errors="replace")
+            value.update(
+                {
+                    "content_redacted": True,
+                    "content_sha256": hashlib.sha256(encoded).hexdigest(),
+                    "content_chars": len(raw_content),
+                }
+            )
+        return value
+
+    @staticmethod
     def _sanitize_final_text(text: str) -> str:
         value = str(text or "").strip()
         if not value:
@@ -957,8 +998,6 @@ class AgentCapabilityEngine:
         hints: dict[str, Any] | None,
         pre: PreprocessedMessage | None = None,
     ) -> tuple[dict[str, _AgentTool], dict[str, Any]]:
-        if not self._is_group_session(session):
-            return {}, {}
         scope = normalize_agent_scope((hints or {}).get("agent_tool_scope"))
         scope_definitions = self._resolve_scope_definitions(scope)
         definitions = self._filter_definitions_for_session(
@@ -1160,14 +1199,29 @@ class AgentCapabilityEngine:
             )
             return tools, normalized_policy
 
-        highest = max(positive.values())
-        selected_names = [name for name, score in positive.items() if score == highest]
-        if highest >= 2 and len(selected_names) == 1:
+        tool_order = {name: index for index, name in enumerate(tools)}
+        ranked_names = sorted(positive, key=lambda name: (-positive[name], tool_order[name]))
+        highest = positive[ranked_names[0]]
+        top_names = [name for name in ranked_names if positive[name] == highest]
+        runner_up = positive[ranked_names[1]] if len(ranked_names) > 1 else 0
+        clear = (
+            highest >= MIN_CLEAR_TOOL_PRESELECTION_SCORE
+            and len(top_names) == 1
+            and highest - runner_up >= MIN_CLEAR_TOOL_PRESELECTION_MARGIN
+        )
+        if clear:
             verdict = "CLEAR"
-        elif len(selected_names) > 1:
+            selected_names = top_names
+        elif highest >= MIN_CLEAR_TOOL_PRESELECTION_SCORE:
             verdict = "AMBIGUOUS"
+            cutoff_index = min(AMBIGUOUS_TOOL_PRESELECTION_TOP_K, len(ranked_names)) - 1
+            cutoff_score = positive[ranked_names[cutoff_index]]
+            selected_names = [name for name in ranked_names if positive[name] >= cutoff_score]
         else:
+            # A weak substring/verb match is useful diagnostic evidence, but it
+            # is not enough to hide otherwise valid tools from the model.
             verdict = "INSUFFICIENT"
+            selected_names = list(tools.keys())
         selected = {name: tools[name] for name in selected_names}
         normalized_policy.update(
             {
@@ -1285,15 +1339,25 @@ class AgentCapabilityEngine:
         if allowed_channels and cls._session_channel(session) not in allowed_channels:
             return False
         allowed_session_kinds = cls._metadata_string_set(metadata, "session_kinds")
-        if allowed_session_kinds and cls._session_kind(session) not in allowed_session_kinds:
+        session_kind = cls._session_kind(session)
+        # Private tool access is explicit opt-in.  Legacy definitions without
+        # session metadata remain group-compatible, but can never become
+        # private tools merely because the blanket private guard was removed.
+        if session_kind == "private" and "private" not in allowed_session_kinds:
+            return False
+        if allowed_session_kinds and session_kind not in allowed_session_kinds:
             return False
         required_group_role = str(metadata.get("required_group_role") or "").strip().lower()
-        if required_group_role:
+        if required_group_role and session_kind == "group":
             requester_roles = cls._requester_group_roles(session)
             if required_group_role == "admin":
                 if not requester_roles.intersection({"admin", "owner", "group_admin"}):
                     return False
             elif required_group_role not in requester_roles:
+                return False
+        if bool(metadata.get("requires_group_file_send")) and session_kind == "group":
+            session_metadata = dict(getattr(session, "metadata", {}) or {})
+            if session_metadata.get("group_file_send_enabled") is not True:
                 return False
         return True
 
@@ -1385,7 +1449,7 @@ class AgentCapabilityEngine:
                     scope=scope,
                     tool_name=item.name,
                     tool_args=dict(item.arguments or {}),
-                    tool_result=item.result,
+                    tool_result=self._tool_result_for_audit(item.name, item.result),
                     tool_error=str(item.error or ""),
                     latency_ms=int(item.latency_ms or 0),
                     trace_id=str(get_trace_id() or ""),

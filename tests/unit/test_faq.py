@@ -466,6 +466,74 @@ async def test_faq_engine_rewrites_answer_when_style_or_memory_present() -> None
 
 
 @pytest.mark.asyncio
+async def test_faq_engine_rewrites_for_structured_relevant_memory_without_legacy_text() -> None:
+    vector = InMemoryVectorStore()
+    llm = _CapturingFAQProvider("会在审核通过后 7 个工作日内原路退回。")
+    repo = InMemoryFAQRepository()
+    store = FAQStore(repo, vector, llm, embed_model="fake")
+
+    await store.create(
+        tenant_id="demo",
+        question="退款多久到账？",
+        answer="退款会在审核通过后 7 个工作日内原路退回。",
+        variants=["退款多久", "退款时效"],
+    )
+
+    engine = FAQEngine(vector, llm, threshold=0.3, embed_model="fake")
+    session = make_session("demo")
+    session.variables["user_memory"] = {
+        "memory_items": {"identity": [], "session": []},
+        "relevant_memory_items": [
+            {
+                "source_type": "explicit_user",
+                "status": "active",
+                "confidence": 1.0,
+                "sensitivity": "normal",
+                "content": "用户希望回复简洁",
+            }
+        ],
+    }
+
+    result = await engine.answer(make_preprocessed("退款多久到账"), session)
+
+    assert result.metadata["rewritten"] is True
+    assert llm.last_request is not None
+    assert "用户希望回复简洁" in (llm.last_request.system or "")
+
+
+@pytest.mark.asyncio
+async def test_faq_engine_rewrites_for_active_persona_profile_without_prompt_text() -> None:
+    vector = InMemoryVectorStore()
+    llm = _CapturingFAQProvider("小海答：7 个工作日内原路退回。")
+    repo = InMemoryFAQRepository()
+    store = FAQStore(repo, vector, llm, embed_model="fake")
+
+    await store.create(
+        tenant_id="demo",
+        question="退款多久到账？",
+        answer="退款会在审核通过后 7 个工作日内原路退回。",
+        variants=["退款多久", "退款时效"],
+    )
+
+    engine = FAQEngine(vector, llm, threshold=0.3, embed_model="fake")
+    session = make_session("demo")
+    session.variables["persona_skill"] = ""
+    session.variables["persona_profile"] = {
+        "profile_id": "persona-1",
+        "name": "小海",
+    }
+
+    result = await engine.answer(make_preprocessed("退款多久到账"), session)
+
+    assert result.metadata["rewritten"] is True
+    assert llm.last_request is not None
+    assert (
+        "<active_persona_name>\n小海\n</active_persona_name>"
+        in (llm.last_request.system or "")
+    )
+
+
+@pytest.mark.asyncio
 async def test_faq_engine_rewrite_prompt_can_disable_customer_service_style() -> None:
     vector = InMemoryVectorStore()
     llm = _CapturingFAQProvider("可以，今晚能到。")
@@ -645,3 +713,60 @@ async def test_faq_lexical_match_rejects_short_or_negated_substrings() -> None:
 
     assert short_preview["matched"] is False
     assert negated_preview["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_faq_lexical_match_downgrades_distant_negation_in_zh_and_en() -> None:
+    vector = InMemoryVectorStore()
+    llm = FakeEmbeddingsProvider()
+    repo = InMemoryFAQRepository()
+    store = FAQStore(repo, vector, llm, embed_model="fake")
+    await store.create(
+        tenant_id="demo",
+        question="退款多久到账以及具体处理流程",
+        answer="7 个工作日。",
+    )
+    await store.create(
+        tenant_id="demo",
+        question="How long does a refund take and what is the process",
+        answer="Seven business days.",
+    )
+    engine = FAQEngine(
+        vector,
+        llm,
+        threshold=0.88,
+        embed_model="fake",
+        faq_store=store,
+    )
+
+    queries = [
+        "我并不是现在想问退款多久到账以及具体处理流程",
+        (
+            "I am definitely not currently asking about "
+            "how long does a refund take and what is the process"
+        ),
+    ]
+    for query in queries:
+        preview = await engine.preview_match(
+            make_preprocessed(query),
+            make_session("demo"),
+        )
+
+        assert preview["matched"] is False
+        assert preview["verdict"] != "CLEAR"
+
+    renewed_queries = [
+        "我不是问物流，而是想问退款多久到账以及具体处理流程",
+        (
+            "I am not asking about shipping, but I want to know "
+            "how long does a refund take and what is the process"
+        ),
+    ]
+    for query in renewed_queries:
+        preview = await engine.preview_match(
+            make_preprocessed(query),
+            make_session("demo"),
+        )
+
+        assert preview["matched"] is True
+        assert preview["verdict"] == "CLEAR"

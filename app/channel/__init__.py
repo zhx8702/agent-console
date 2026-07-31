@@ -27,6 +27,7 @@ from app.channel.identity import (
     canonical_session_namespace,
 )
 from app.channel.models import (
+    ChannelFile,
     ChannelMedia,
     ChannelSendOptions,
     ChannelSendResult,
@@ -54,6 +55,7 @@ __all__ = [
     "ChannelConnectionDocument",
     "ChannelConnectionStore",
     "ChannelConnectionUpdateRequest",
+    "ChannelFile",
     "ChannelMedia",
     "ChannelOutbound",
     "ChannelProbeResult",

@@ -4,6 +4,7 @@ import pytest
 
 from app.common.types import Channel, InboundEvent, Message, Session
 from app.orchestrator.pipeline import PipelineContext
+from app.plugin.hooks import HookPoint, HookRunner
 from plugins.persona_extract.hooks import PersonaSkillEnrichStep, PersonaSkillHook
 
 
@@ -13,9 +14,11 @@ class _FakePersonaStore:
         profile: dict | None,
         *,
         profile_session_id: str = "",
+        error: Exception | None = None,
     ) -> None:
         self._profile = profile
         self._profile_session_id = profile_session_id
+        self._error = error
         self.calls: list[dict[str, str]] = []
 
     async def resolve_profile(
@@ -34,6 +37,8 @@ class _FakePersonaStore:
                 "source_key": source_key,
             }
         )
+        if self._error is not None:
+            raise self._error
         if self._profile_session_id and session_id != self._profile_session_id:
             return None
         return self._profile
@@ -129,6 +134,97 @@ async def test_persona_skill_hook_uses_external_session_for_managed_channel() ->
     assert store.calls[0]["session_id"] == external_session_id
     assert session.variables["persona_skill"] == "使用小海的人格风格。"
     assert session.variables["persona_profile"]["skill_slug"] == "xiaohai"
+
+
+@pytest.mark.asyncio
+async def test_persona_skill_hook_treats_wxbot_admin_simulator_as_wxbot_only() -> None:
+    external_session_id = "00000000000@chatroom"
+    canonical_session_id = "cx1:c:managed@chatroom"
+    store = _FakePersonaStore(
+        {
+            "id": 3,
+            "profile_name": "wxbot-default",
+            "channel": "wechat",
+            "source_key": "wxbot",
+            "source_label": "微信机器人",
+            "prompt_text": "使用微信回复风格。",
+        },
+        profile_session_id=external_session_id,
+    )
+    event = InboundEvent(
+        message_id="m-admin-sim",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        connection_id="wechat-main",
+        user_id="cx1:p:admin-simulator",
+        session_id=canonical_session_id,
+        external_conversation_id=external_session_id,
+        canonical_conversation_id=canonical_session_id,
+        message=Message(content="模拟消息"),
+        metadata={
+            "source": "admin_console_simulator",
+            "profile_source_key": "wxbot",
+            "admin_simulation": True,
+        },
+    )
+    session = Session(
+        session_id=canonical_session_id,
+        tenant_id="demo",
+        user_id="cx1:p:admin-simulator",
+        channel=Channel.WECHAT,
+        external_conversation_id=external_session_id,
+        canonical_conversation_id=canonical_session_id,
+    )
+
+    await PersonaSkillHook(store).run(
+        PipelineContext(event=event, trace_id="trace-admin-sim", session=session)
+    )
+
+    assert store.calls == [
+        {
+            "tenant_id": "demo",
+            "session_id": external_session_id,
+            "channel": "wechat",
+            "source_key": "wxbot",
+        }
+    ]
+    assert session.variables["persona_skill"] == "使用微信回复风格。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel", "source"),
+    [
+        (Channel.WECHAT, "admin_faq_test"),
+        (Channel.WEB, "admin_console_simulator"),
+    ],
+)
+async def test_persona_skill_hook_does_not_alias_other_runtime_sources(
+    channel: Channel,
+    source: str,
+) -> None:
+    store = _FakePersonaStore(None)
+    event = InboundEvent(
+        message_id="m-other-source",
+        tenant_id="demo",
+        channel=channel,
+        user_id="u1",
+        session_id="s1",
+        message=Message(content="hello"),
+        metadata={"source": source},
+    )
+    session = Session(
+        session_id="s1",
+        tenant_id="demo",
+        user_id="u1",
+        channel=channel,
+    )
+
+    await PersonaSkillHook(store).run(
+        PipelineContext(event=event, trace_id="trace-other", session=session)
+    )
+
+    assert store.calls[0]["source_key"] == source
 
 
 @pytest.mark.asyncio
@@ -241,3 +337,41 @@ async def test_persona_skill_enrich_step_clears_signal_when_missing() -> None:
     assert "persona_skill" not in session.variables
     assert "persona_profile" not in session.variables
     assert ctx.signals["persona"]["skill"]["matched"] is False
+
+
+@pytest.mark.asyncio
+async def test_persona_skill_hook_query_failure_clears_stale_style_fail_open() -> None:
+    store = _FakePersonaStore(
+        None,
+        error=RuntimeError("profile database unavailable"),
+    )
+    hook = PersonaSkillHook(store)
+    runner = HookRunner()
+    runner.register(hook, owner="persona_extract")
+    event = InboundEvent(
+        message_id="m-query-failure",
+        tenant_id="demo",
+        channel=Channel.WEB,
+        user_id="u1",
+        session_id="s1",
+        message=Message(content="hello"),
+    )
+    session = Session(
+        session_id="s1",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WEB,
+        variables={
+            "persona_skill": "stale style",
+            "persona_profile": {"name": "stale"},
+            "durable_setting": "keep",
+        },
+    )
+    ctx = PipelineContext(event=event, trace_id="trace-query-failure", session=session)
+
+    await runner.run(HookPoint.BEFORE_CAPABILITY, ctx)
+
+    assert hook.error_policy == "fail_open"
+    assert "persona_skill" not in session.variables
+    assert "persona_profile" not in session.variables
+    assert session.variables["durable_setting"] == "keep"

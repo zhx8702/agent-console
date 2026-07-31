@@ -129,6 +129,17 @@ class Attachment(_ExternalInput):
     content: str | None = None
     mime: str | None = None
     size: int | None = None
+    # File metadata is kept separate from ``content``.  The latter may contain
+    # an image data URL, while a received wxbot file is an SDK URL that must be
+    # fetched through the trusted connector before it is inspected.
+    name: str | None = None
+    ext: str | None = None
+    path: str | None = None
+    md5: str | None = None
+    sha256: str | None = None
+    status: str | None = None
+    download_status: str | None = None
+    failure_reason: str | None = None
 
 
 class Message(_ExternalInput):

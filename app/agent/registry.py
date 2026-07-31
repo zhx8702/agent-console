@@ -170,6 +170,7 @@ class AgentToolRegistry:
                 "channels",
                 "session_kinds",
                 "required_group_role",
+                "requires_group_file_send",
             ):
                 if key in item.metadata:
                     row[key] = deepcopy(item.metadata[key])

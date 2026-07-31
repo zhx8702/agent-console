@@ -38,7 +38,7 @@ def test_report_delivery_ack_upgrade_is_linear_and_quarantines_legacy_rows(
 
     assert migration.revision == "0042_wxbot_report_delivery_ack"
     assert migration.down_revision == "0041_persona_job_queue"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 9
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]

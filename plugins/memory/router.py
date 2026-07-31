@@ -3,10 +3,11 @@ REST API for the user memory plugin.
 
 Mounted at ``/plugins/memory/`` by the plugin framework.
 """
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 
@@ -29,6 +30,7 @@ from plugins.memory.store import (
     MemoryItemConflictError,
     MemoryItemProtectedError,
     MemoryMutationError,
+    MemoryProfileConflictError,
     MemoryStore,
     memory_item_version,
 )
@@ -78,6 +80,12 @@ _SAFE_MEMORY_ITEM_FIELDS = {
     "pinned",
     "priority",
     "sensitivity",
+    "audience_scope",
+    "origin_session_kind",
+    "allowed_session_ids",
+    "source_kind",
+    "sensitivity_category",
+    "expires_at",
     "source_event_id",
     "source_trace_id",
     "occurrence_count",
@@ -238,6 +246,7 @@ class MemoryProfileUpsertRequest(StrictRequestModel):
     user_id: str
     long_term_memory: str | None = None
     manual_notes: str | None = None
+    expected_version: str | None = Field(default=None, max_length=128)
 
 
 class SessionMemoryProfileUpsertRequest(StrictRequestModel):
@@ -248,6 +257,7 @@ class SessionMemoryProfileUpsertRequest(StrictRequestModel):
     user_id: str
     short_term_memory: str | None = None
     manual_notes: str | None = None
+    expected_version: str | None = Field(default=None, max_length=128)
 
 
 class MemoryBackfillRequest(StrictRequestModel):
@@ -291,7 +301,9 @@ class MemoryAcceptanceLegacyBackfillRequest(StrictRequestModel):
     session_id: str | None = Field(default=None, min_length=1, max_length=256)
     scope_type: Literal["identity", "session"] | None = None
     source_type: Literal["manual", "auto", "explicit_user", "backfill"] | None = None
-    memory_type: Literal["preference", "constraint", "profile_fact", "note", "episodic"] | None = None
+    memory_type: Literal["preference", "constraint", "profile_fact", "note", "episodic"] | None = (
+        None
+    )
     status: Literal["active", "pending", "archived", "invalidated"] | None = None
     dry_run: bool = True
     max_items: int | None = Field(default=None, ge=1, le=10000)
@@ -343,6 +355,12 @@ class MemoryItemCreateRequest(StrictRequestModel):
     pinned: bool = True
     priority: int = Field(default=100, ge=0, le=1000)
     sensitivity: Literal["normal", "pii", "sensitive"] = "normal"
+    audience_scope: Literal["private", "session", "explicit"] | None = None
+    origin_session_kind: Literal["private", "group", "unknown"] | None = None
+    allowed_session_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_kind: Literal["conversation", "manual", "backfill", "graph", "profile"] = "manual"
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
+    expires_at: datetime | None = None
     source_trace_id: str = Field(default="", max_length=128)
     original_text: str = Field(default="", max_length=4000)
 
@@ -350,7 +368,9 @@ class MemoryItemCreateRequest(StrictRequestModel):
 class MemoryItemUpdateRequest(StrictRequestModel):
     content: str | None = Field(default=None, min_length=1, max_length=500)
     value_json: dict | list | str | int | float | bool | None = None
-    memory_type: Literal["preference", "constraint", "profile_fact", "note", "episodic"] | None = None
+    memory_type: Literal["preference", "constraint", "profile_fact", "note", "episodic"] | None = (
+        None
+    )
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     status: Literal["active", "pending", "archived", "invalidated"] | None = None
     pinned: bool | None = None
@@ -410,7 +430,11 @@ class MemoryDailyRelationshipExtractionRequest(StrictRequestModel):
     time_budget_seconds: int | None = None
 
     def extraction_controls(self) -> dict[str, int | bool]:
-        fields_set = self.model_fields_set if hasattr(self, "model_fields_set") else getattr(self, "__fields_set__", set())
+        fields_set = (
+            self.model_fields_set
+            if hasattr(self, "model_fields_set")
+            else getattr(self, "__fields_set__", set())
+        )
         new_fields = {"batch_limit", "max_jobs", "continuous", "time_budget_seconds"}
         has_new_fields = bool(new_fields.intersection(fields_set))
         if not has_new_fields and self.limit is not None:
@@ -505,6 +529,11 @@ class MemoryRememberRequest(MemoryControlScope):
     pinned: bool = True
     priority: int = 100
     sensitivity: str = "normal"
+    audience_scope: Literal["private", "session", "explicit"] | None = None
+    origin_session_kind: Literal["private", "group", "unknown"] | None = None
+    allowed_session_ids: list[str] = Field(default_factory=list, max_length=100)
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
+    expires_at: datetime | None = None
 
 
 class MemorySearchRequest(MemoryControlScope):
@@ -545,7 +574,9 @@ def _current_user_from_request(request: Request, body: MemoryControlScope) -> st
     )
 
 
-def _resolve_memory_target_user(request: Request, body: MemoryControlScope, store: MemoryStore) -> str:
+def _resolve_memory_target_user(
+    request: Request, body: MemoryControlScope, store: MemoryStore
+) -> str:
     current_user_id = _current_user_from_request(request, body)
     requested_user_id = str(body.user_id or "").strip()
     if requested_user_id:
@@ -632,9 +663,7 @@ def _current_user_for_read(
     if _is_admin_request(request, store):
         return requested_user_id, True
     current_user_id = (
-        request.headers.get("X-User-Id")
-        or request.headers.get("X-Actor-ID")
-        or ""
+        request.headers.get("X-User-Id") or request.headers.get("X-Actor-ID") or ""
     ).strip()
     requested = str(requested_user_id or "").strip()
     if requested:
@@ -649,7 +678,94 @@ def _current_user_for_read(
 def _body_updates(body: BaseModel, *, exclude: set[str]) -> dict[str, Any]:
     if hasattr(body, "model_dump"):
         return body.model_dump(exclude_none=True, exclude=exclude)
-    return body.dict(exclude_none=True, exclude=exclude)  # pragma: no cover - pydantic v1 compatibility
+    return body.dict(
+        exclude_none=True, exclude=exclude
+    )  # pragma: no cover - pydantic v1 compatibility
+
+
+def _is_group_memory_session(session_id: str) -> bool:
+    return str(session_id or "").strip().lower().endswith("@chatroom")
+
+
+def _manual_memory_write_fields(
+    body: MemoryItemCreateRequest | MemoryRememberRequest,
+    *,
+    allow_explicit_audience: bool,
+) -> dict[str, Any]:
+    session_id = str(body.session_id or "").strip()
+    requested_scope = str(body.scope_type or "identity").strip().lower()
+    if requested_scope not in {"identity", "session"}:
+        raise HTTPException(status_code=400, detail="scope_type must be identity or session")
+    if requested_scope == "session" and not session_id:
+        raise HTTPException(status_code=400, detail="session_id required for session memory")
+    if body.retention_days is not None and body.expires_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "memory_retention_conflict",
+                "message": "retention_days and expires_at are mutually exclusive",
+            },
+        )
+
+    allowed_session_ids = list(
+        dict.fromkeys(
+            normalized
+            for value in body.allowed_session_ids
+            if (normalized := str(value or "").strip())
+        )
+    )
+    expires_at = body.expires_at
+    if body.retention_days is not None:
+        expires_at = datetime.now(UTC) + timedelta(days=int(body.retention_days))
+
+    if _is_group_memory_session(session_id):
+        # A manual item created from a group management surface must be
+        # recallable in that same group and nowhere else. Do not accept a
+        # private/unknown default that would report success but fail retrieval.
+        return {
+            "session_id": session_id,
+            "scope_type": "session",
+            "origin_session_kind": "group",
+            "audience_scope": "session",
+            "allowed_session_ids": [session_id],
+            "source_kind": "manual",
+            "expires_at": expires_at,
+        }
+
+    audience_scope = str(body.audience_scope or "private").strip().lower()
+    origin_session_kind = str(body.origin_session_kind or "private").strip().lower()
+    if not allow_explicit_audience and (
+        audience_scope != "private" or origin_session_kind != "private" or allowed_session_ids
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "admin_required_for_audience_expansion"},
+        )
+    if audience_scope in {"session", "explicit"} and not allowed_session_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "allowed_session_ids_required"},
+        )
+    if audience_scope == "session" and (
+        origin_session_kind != "group"
+        or len(allowed_session_ids) != 1
+        or not _is_group_memory_session(allowed_session_ids[0])
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_session_audience_contract"},
+        )
+    if audience_scope == "private":
+        allowed_session_ids = []
+    return {
+        "session_id": session_id if requested_scope == "session" else "",
+        "scope_type": requested_scope,
+        "origin_session_kind": origin_session_kind,
+        "audience_scope": audience_scope,
+        "allowed_session_ids": allowed_session_ids,
+        "source_kind": "manual",
+        "expires_at": expires_at,
+    }
 
 
 _EXTRACTION_JOB_SAFE_FIELDS = {
@@ -676,6 +792,157 @@ def _safe_extraction_job_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: row.get(key) for key in _EXTRACTION_JOB_SAFE_FIELDS if key in row}
 
 
+_MEMORY_RUNTIME_SETTING_KEYS = (
+    "memory_llm_extraction_enabled",
+    "memory_llm_extraction_job_enabled",
+    "memory_llm_extraction_job_drain_enabled",
+    "memory_retrieval_enabled",
+    "memory_group_identity_memory_enabled",
+    "memory_hybrid_retrieval_enabled",
+    "memory_vector_index_enabled",
+    "memory_graph_retrieval_enabled",
+    "memory_graph_llm_extraction_enabled",
+    "memory_governance_auto_cleanup_enabled",
+)
+
+
+def _memory_runtime_config(settings: Any) -> dict[str, Any]:
+    return {key: getattr(settings, key, None) for key in _MEMORY_RUNTIME_SETTING_KEYS}
+
+
+def _parse_status_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _status_count(payload: dict[str, Any], key: str) -> int:
+    values = payload.get("status_counts") or payload.get("counts") or {}
+    if not isinstance(values, dict):
+        return 0
+    try:
+        return max(0, int(values.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _memory_management_diagnostics(
+    *,
+    config: dict[str, Any],
+    runtime_scope: dict[str, Any],
+    job_stats: dict[str, Any],
+    acceptance_stats: dict[str, Any],
+    items: list[dict[str, Any]],
+    session_id: str,
+) -> list[dict[str, str]]:
+    diagnostics: list[dict[str, str]] = []
+    if config.get("memory_retrieval_enabled") is False:
+        diagnostics.append(
+            {
+                "area": "recall",
+                "status": "blocked",
+                "code": "retrieval_disabled",
+                "message": "当前进程已关闭记忆召回，已保存记录不会进入回复上下文。",
+            }
+        )
+    if runtime_scope.get("status") == "disabled":
+        diagnostics.append(
+            {
+                "area": "recall_and_write",
+                "status": "blocked",
+                "code": "runtime_scope_disabled",
+                "message": "当前租户/会话的 memory 运行时开关未启用。",
+            }
+        )
+    if config.get("memory_llm_extraction_enabled") is False:
+        diagnostics.append(
+            {
+                "area": "write",
+                "status": "info",
+                "code": "automatic_extraction_disabled",
+                "message": "LLM 增强抽取已关闭；基础规则抽取和手工记忆仍可用。",
+            }
+        )
+    if (
+        config.get("memory_llm_extraction_enabled") is True
+        and config.get("memory_llm_extraction_job_enabled") is True
+        and config.get("memory_llm_extraction_job_drain_enabled") is False
+    ):
+        diagnostics.append(
+            {
+                "area": "write",
+                "status": "warning",
+                "code": "job_drain_disabled",
+                "message": "抽取任务可入队但消费开关关闭，任务可能持续停留在待处理状态。",
+            }
+        )
+    failed_jobs = _status_count(job_stats, "failed") + _status_count(job_stats, "dead")
+    if failed_jobs:
+        diagnostics.append(
+            {
+                "area": "write",
+                "status": "warning",
+                "code": "extraction_jobs_failed",
+                "message": f"当前筛选范围有 {failed_jobs} 个失败或终止的抽取任务。",
+            }
+        )
+    acceptance_counts = acceptance_stats.get("counts") or {}
+    needs_review = 0
+    if isinstance(acceptance_counts, dict):
+        for key in ("needs_review", "candidate", "missing_acceptance"):
+            try:
+                needs_review += max(0, int(acceptance_counts.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+    if needs_review:
+        diagnostics.append(
+            {
+                "area": "recall",
+                "status": "warning",
+                "code": "items_waiting_for_review",
+                "message": f"有 {needs_review} 条候选或旧版记忆尚未完成复核，可能不会参与正常召回。",
+            }
+        )
+    if _is_group_memory_session(session_id):
+        visible_group_items = [
+            item
+            for item in items
+            if str(item.get("origin_session_kind") or "") == "group"
+            and str(item.get("audience_scope") or "") == "session"
+            and session_id
+            in {str(value or "").strip() for value in (item.get("allowed_session_ids") or [])}
+        ]
+        if items and not visible_group_items:
+            diagnostics.append(
+                {
+                    "area": "recall",
+                    "status": "blocked",
+                    "code": "group_audience_mismatch",
+                    "message": "当前范围有记忆，但没有记录声明为当前群可见；请检查 audience/origin/allowed_session_ids。",
+                }
+            )
+    if not diagnostics:
+        diagnostics.append(
+            {
+                "area": "runtime",
+                "status": "ok",
+                "code": "no_obvious_blocker",
+                "message": "未发现配置、任务或可见性层面的明显阻断；可继续用检索调试检查查询匹配。",
+            }
+        )
+    return diagnostics
+
+
 def _extraction_job_filter_updates(body: MemoryExtractionJobMaintenanceRequest) -> dict[str, Any]:
     updates = _body_updates(body, exclude={"action", "actions", "dry_run", "limit"})
     filters: dict[str, Any] = {}
@@ -685,7 +952,9 @@ def _extraction_job_filter_updates(body: MemoryExtractionJobMaintenanceRequest) 
             if not status:
                 continue
             if status not in MEMORY_EXTRACTION_JOB_STATUSES:
-                raise HTTPException(status_code=400, detail=f"unsupported extraction job status: {status}")
+                raise HTTPException(
+                    status_code=400, detail=f"unsupported extraction job status: {status}"
+                )
             filters[key] = status
         elif isinstance(value, str):
             stripped = value.strip()
@@ -767,9 +1036,7 @@ def _require_admin_for_review_group_graph_statuses(
     acceptance_status: str | None,
 ) -> None:
     requested_acceptance = {
-        value.strip().lower()
-        for value in str(acceptance_status or "").split(",")
-        if value.strip()
+        value.strip().lower() for value in str(acceptance_status or "").split(",") if value.strip()
     }
     if requested_acceptance - _GROUP_GRAPH_PUBLIC_ACCEPTANCE_STATUSES:
         _require_admin_request(request, store)
@@ -857,8 +1124,12 @@ def build_memory_router(
         return {"items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_profile_row)}
 
     @router.get("/profiles/{tenant_id}/{channel}/{source_key}/{user_id:path}")
-    async def get_identity_profile(request: Request, tenant_id: str, channel: str, source_key: str, user_id: str):
-        _resolved_user_id, is_admin = _current_user_for_read(request, requested_user_id=user_id, store=store)
+    async def get_identity_profile(
+        request: Request, tenant_id: str, channel: str, source_key: str, user_id: str
+    ):
+        _resolved_user_id, is_admin = _current_user_for_read(
+            request, requested_user_id=user_id, store=store
+        )
         profile = await store.get_identity_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -870,14 +1141,28 @@ def build_memory_router(
     @router.post("/profiles")
     async def upsert_profile(request: Request, body: MemoryProfileUpsertRequest):
         _require_admin_request(request, store)
-        profile = await store.upsert_identity_profile(
-            tenant_id=body.tenant_id,
-            channel=body.channel,
-            source_key=body.source_key,
-            user_id=body.user_id,
-            long_term_memory=body.long_term_memory,
-            manual_notes=body.manual_notes,
-        )
+        try:
+            profile = await store.upsert_identity_profile(
+                tenant_id=body.tenant_id,
+                channel=body.channel,
+                source_key=body.source_key,
+                user_id=body.user_id,
+                long_term_memory=body.long_term_memory,
+                manual_notes=body.manual_notes,
+                expected_version=body.expected_version,
+            )
+        except MemoryProfileConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": exc.code,
+                    "message": "记忆档案已被其他操作更新，请刷新后重试。",
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                },
+            ) from exc
+        except Exception as exc:
+            _raise_mutation_error(exc)
         return profile
 
     @router.get("/session-profiles")
@@ -910,7 +1195,9 @@ def build_memory_router(
         session_id: str,
         user_id: str = Query(...),
     ):
-        _resolved_user_id, is_admin = _current_user_for_read(request, requested_user_id=user_id, store=store)
+        _resolved_user_id, is_admin = _current_user_for_read(
+            request, requested_user_id=user_id, store=store
+        )
         profile = await store.get_session_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -923,15 +1210,29 @@ def build_memory_router(
     @router.post("/session-profiles")
     async def upsert_session_profile(request: Request, body: SessionMemoryProfileUpsertRequest):
         _require_admin_request(request, store)
-        profile = await store.upsert_session_profile(
-            tenant_id=body.tenant_id,
-            channel=body.channel,
-            source_key=body.source_key,
-            session_id=body.session_id,
-            user_id=body.user_id,
-            short_term_memory=body.short_term_memory,
-            manual_notes=body.manual_notes,
-        )
+        try:
+            profile = await store.upsert_session_profile(
+                tenant_id=body.tenant_id,
+                channel=body.channel,
+                source_key=body.source_key,
+                session_id=body.session_id,
+                user_id=body.user_id,
+                short_term_memory=body.short_term_memory,
+                manual_notes=body.manual_notes,
+                expected_version=body.expected_version,
+            )
+        except MemoryProfileConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": exc.code,
+                    "message": "会话记忆档案已被其他操作更新，请刷新后重试。",
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                },
+            ) from exc
+        except Exception as exc:
+            _raise_mutation_error(exc)
         return profile
 
     @router.get("/runtime-profile/{tenant_id}/{channel}/{source_key}/{session_id:path}")
@@ -943,7 +1244,9 @@ def build_memory_router(
         session_id: str,
         user_id: str = Query(...),
     ):
-        _resolved_user_id, is_admin = _current_user_for_read(request, requested_user_id=user_id, store=store)
+        _resolved_user_id, is_admin = _current_user_for_read(
+            request, requested_user_id=user_id, store=store
+        )
         profile = await store.get_runtime_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -952,6 +1255,184 @@ def build_memory_router(
             user_id=user_id,
         )
         return _shape_read_payload(profile, is_admin=is_admin, safe_payload=_safe_profile_row)
+
+    @router.get("/management-status")
+    async def get_memory_management_status(
+        request: Request,
+        tenant_id: str = Query(..., min_length=1, max_length=64),
+        channel: str = Query(default="wechat", min_length=1, max_length=64),
+        source_key: str = Query(default="wxbot", min_length=1, max_length=128),
+        session_id: str = Query(default="", max_length=256),
+        user_id: str | None = Query(default=None, min_length=1, max_length=256),
+        recent_job_limit: int = Query(default=10, ge=1, le=50),
+    ):
+        _require_admin_request(request, store)
+        settings = getattr(store, "settings", None)
+        config = _memory_runtime_config(settings)
+        runtime_scope: dict[str, Any] = {
+            "required": runtime_gates_required,
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+            "status": "not_scoped" if not session_id else "unavailable",
+        }
+        if session_id and callable(scope_execution_allowed):
+            try:
+                runtime_scope["status"] = (
+                    "enabled"
+                    if await scope_execution_allowed(tenant_id, session_id) is True
+                    else "disabled"
+                )
+            except Exception:
+                runtime_scope["status"] = "unavailable"
+        elif session_id and not runtime_gates_required:
+            runtime_scope["status"] = "not_required"
+
+        job_filters = {
+            "tenant_id": tenant_id,
+            "channel": channel,
+            "source_key": source_key,
+            "user_id": user_id,
+            "session_id": session_id or None,
+        }
+        source_errors: list[str] = []
+        try:
+            recent_jobs = await store.list_llm_extraction_jobs(
+                **job_filters,
+                limit=recent_job_limit,
+            )
+        except Exception:
+            recent_jobs = []
+            source_errors.append("recent_jobs_unavailable")
+        try:
+            job_stats = await store.get_llm_extraction_job_status_counts(
+                **job_filters,
+                limit=100,
+            )
+        except Exception:
+            job_stats = {}
+            source_errors.append("job_stats_unavailable")
+        if not isinstance(job_stats, dict):
+            job_stats = {"counts": job_stats}
+        try:
+            acceptance_stats = await store.get_memory_acceptance_stats(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                user_id=user_id,
+                session_id=session_id or None,
+                scope_type="session" if session_id else None,
+                source_type=None,
+                memory_type=None,
+                status=None,
+                acceptance_status=None,
+                limit=5000,
+            )
+        except Exception:
+            acceptance_stats = {}
+            source_errors.append("acceptance_stats_unavailable")
+        try:
+            items = await store.list_memory_items(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                user_id=user_id,
+                session_id=session_id or None,
+                scope_type="session" if session_id else None,
+                include_deleted=False,
+                limit=500,
+            )
+        except Exception:
+            items = []
+            source_errors.append("memory_items_unavailable")
+
+        now = datetime.now(UTC)
+        expiring_soon = 0
+        expired = 0
+        group_visible = 0
+        for item in items:
+            expiry = _parse_status_datetime(item.get("expires_at"))
+            if expiry is not None:
+                if expiry <= now:
+                    expired += 1
+                elif expiry <= now + timedelta(days=7):
+                    expiring_soon += 1
+            allowed = item.get("allowed_session_ids")
+            allowed_values = (
+                [str(value or "").strip() for value in allowed]
+                if isinstance(allowed, (list, tuple, set))
+                else []
+            )
+            if (
+                session_id
+                and str(item.get("origin_session_kind") or "") == "group"
+                and str(item.get("audience_scope") or "") == "session"
+                and session_id in allowed_values
+            ):
+                group_visible += 1
+
+        diagnostics = _memory_management_diagnostics(
+            config=config,
+            runtime_scope=runtime_scope,
+            job_stats=job_stats,
+            acceptance_stats=acceptance_stats if isinstance(acceptance_stats, dict) else {},
+            items=items,
+            session_id=session_id,
+        )
+        diagnostics.extend(
+            {
+                "area": "observability",
+                "status": "warning",
+                "code": code,
+                "message": "部分管理状态暂时无法读取，请查看服务日志后重试。",
+            }
+            for code in source_errors
+        )
+        return {
+            "scope": {
+                "tenant_id": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "session_id": session_id,
+                "user_id": user_id or "",
+            },
+            "config": {
+                "values": config,
+                "source": "effective_process_settings",
+                "note": "这些值是当前服务进程的生效配置；租户/会话开关以 runtime_scope 为准。",
+            },
+            "runtime_scope": runtime_scope,
+            "jobs": {
+                "stats": job_stats,
+                "recent": [_safe_extraction_job_row(row) for row in recent_jobs],
+            },
+            "review": acceptance_stats,
+            "governance": {
+                "auto_cleanup_enabled": getattr(
+                    settings,
+                    "memory_governance_auto_cleanup_enabled",
+                    None,
+                ),
+                "needs_review_retention_days": getattr(
+                    settings,
+                    "memory_needs_review_retention_days",
+                    None,
+                ),
+                "rejected_retention_days": getattr(
+                    settings,
+                    "memory_rejected_retention_days",
+                    None,
+                ),
+                "auto_expire_days": getattr(settings, "memory_auto_expire_days", None),
+                "batch_size": getattr(settings, "memory_governance_batch_size", None),
+                "expired_items": expired,
+                "expiring_within_7_days": expiring_soon,
+            },
+            "visibility": {
+                "scanned_items": len(items),
+                "group_session_visible_items": group_visible,
+            },
+            "diagnostics": diagnostics,
+        }
 
     @router.get("/events")
     async def list_events(
@@ -1019,14 +1500,22 @@ def build_memory_router(
         if not isinstance(schema, dict):
             schema = {}
         schema["version"] = GROUP_GRAPH_SCHEMA_VERSION
-        schema["node_types"] = list(dict.fromkeys([
-            *[str(value) for value in schema.get("node_types", []) if value],
-            *GROUP_GRAPH_NODE_TYPES,
-        ]))
-        schema["edge_types"] = list(dict.fromkeys([
-            *[str(value) for value in schema.get("edge_types", []) if value],
-            *GROUP_GRAPH_EDGE_TYPES,
-        ]))
+        schema["node_types"] = list(
+            dict.fromkeys(
+                [
+                    *[str(value) for value in schema.get("node_types", []) if value],
+                    *GROUP_GRAPH_NODE_TYPES,
+                ]
+            )
+        )
+        schema["edge_types"] = list(
+            dict.fromkeys(
+                [
+                    *[str(value) for value in schema.get("edge_types", []) if value],
+                    *GROUP_GRAPH_EDGE_TYPES,
+                ]
+            )
+        )
         safe_payload["schema"] = schema
         filters = safe_payload.get("filters")
         if isinstance(filters, dict):
@@ -1170,7 +1659,9 @@ def build_memory_router(
         _require_admin_request(request, store)
         action = str(body.action or "").strip().lower()
         if action not in MEMORY_ACCEPTANCE_REVIEW_ACTIONS:
-            raise HTTPException(status_code=400, detail=f"unsupported acceptance review action: {action}")
+            raise HTTPException(
+                status_code=400, detail=f"unsupported acceptance review action: {action}"
+            )
         actor = (
             str(body.reviewed_by or "").strip()
             or request.headers.get("X-Actor-ID")
@@ -1246,7 +1737,10 @@ def build_memory_router(
             status=status,
             limit=limit,
         )
-        return {"items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_entity_row), "count": len(rows)}
+        return {
+            "items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_entity_row),
+            "count": len(rows),
+        }
 
     @router.get("/graph/facts")
     async def list_graph_facts(
@@ -1267,7 +1761,10 @@ def build_memory_router(
             status=status,
             limit=limit,
         )
-        return {"items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_fact_row), "count": len(rows)}
+        return {
+            "items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_fact_row),
+            "count": len(rows),
+        }
 
     @router.get("/graph/episodes")
     async def list_graph_episodes(
@@ -1290,7 +1787,10 @@ def build_memory_router(
             status=status,
             limit=limit,
         )
-        return {"items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_episode_row), "count": len(rows)}
+        return {
+            "items": _shape_read_rows(rows, is_admin=is_admin, safe_row=_safe_graph_episode_row),
+            "count": len(rows),
+        }
 
     @router.get("/graph/preview")
     async def preview_graph(
@@ -1309,6 +1809,7 @@ def build_memory_router(
             channel=channel,
             source_key=source_key,
             user_id=user_id,
+            session_id=session_id,
             status=status,
             limit=limit,
         )
@@ -1317,6 +1818,7 @@ def build_memory_router(
             channel=channel,
             source_key=source_key,
             user_id=user_id,
+            session_id=session_id,
             status=status,
             limit=limit,
         )
@@ -1339,7 +1841,9 @@ def build_memory_router(
                 "episodes": len(episodes),
             },
         }
-        return _shape_read_payload(payload, is_admin=is_admin, safe_payload=_safe_graph_preview_payload)
+        return _shape_read_payload(
+            payload, is_admin=is_admin, safe_payload=_safe_graph_preview_payload
+        )
 
     @router.get("/items")
     async def list_items(
@@ -1377,15 +1881,18 @@ def build_memory_router(
     ):
         _require_admin_request(request, store)
         actor = _admin_actor(request, body.created_by)
-        item = await store.create_profile_enrichment_candidate(
-            tenant_id=body.tenant_id,
-            channel=body.channel,
-            source_key=body.source_key,
-            session_id=body.session_id,
-            user_id=body.user_id,
-            report_payload=body.report_payload,
-            created_by=actor,
-        )
+        try:
+            item = await store.create_profile_enrichment_candidate(
+                tenant_id=body.tenant_id,
+                channel=body.channel,
+                source_key=body.source_key,
+                session_id=body.session_id,
+                user_id=body.user_id,
+                report_payload=body.report_payload,
+                created_by=actor,
+            )
+        except Exception as exc:
+            _raise_mutation_error(exc)
         if not item:
             raise HTTPException(400, "profile enrichment candidate content required")
         return item
@@ -1397,9 +1904,25 @@ def build_memory_router(
     ):
         _require_admin_request(request, store)
         if str(body.channel or "").strip().lower() != "wechat":
-            raise HTTPException(status_code=400, detail="profile report builder only supports channel=wechat")
+            raise HTTPException(
+                status_code=400, detail="profile report builder only supports channel=wechat"
+            )
         if str(body.source_key or "").strip().lower() != "wxbot":
-            raise HTTPException(status_code=400, detail="profile report builder only supports source_key=wxbot")
+            raise HTTPException(
+                status_code=400, detail="profile report builder only supports source_key=wxbot"
+            )
+        try:
+            if await store.member_memory_write_blocked(
+                tenant_id=body.tenant_id,
+                user_id=body.user_id,
+                channel=body.channel,
+            ):
+                raise MemoryMutationError(
+                    "member_memory_write_blocked",
+                    status_code=409,
+                )
+        except Exception as exc:
+            _raise_mutation_error(exc)
         if profile_report_builder is None:
             raise HTTPException(status_code=503, detail="profile report builder unavailable")
         if callable(combined_scope_execution_allowed):
@@ -1476,6 +1999,8 @@ def build_memory_router(
                 created_by=_admin_actor(request, body.created_by),
                 require_history_owner=True,
             )
+        except MemoryMutationError as exc:
+            _raise_mutation_error(exc)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         if not item:
@@ -1496,7 +2021,9 @@ def build_memory_router(
     ):
         _require_admin_request(request, store)
         if review_state and review_state not in PROFILE_ENRICHMENT_ACCEPTANCE_STATUSES:
-            raise HTTPException(status_code=400, detail=f"unsupported profile enrichment state: {review_state}")
+            raise HTTPException(
+                status_code=400, detail=f"unsupported profile enrichment state: {review_state}"
+            )
         rows = await store.list_profile_enrichment_candidates(
             tenant_id=tenant_id,
             channel=channel,
@@ -1529,7 +2056,9 @@ def build_memory_router(
         _require_admin_request(request, store)
         action = str(body.action or "").strip().lower()
         if action not in PROFILE_ENRICHMENT_REVIEW_ACTIONS:
-            raise HTTPException(status_code=400, detail=f"unsupported profile enrichment review action: {action}")
+            raise HTTPException(
+                status_code=400, detail=f"unsupported profile enrichment review action: {action}"
+            )
         actor, actor_kind, roles, trace_id = _mutation_actor_context(request)
         try:
             outcome = await store.review_profile_enrichment_candidate_idempotent(
@@ -1547,7 +2076,9 @@ def build_memory_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except MemoryItemConflictError as exc:
-            raise HTTPException(409, "profile enrichment candidate conflicts with an existing item") from exc
+            raise HTTPException(
+                409, "profile enrichment candidate conflicts with an existing item"
+            ) from exc
         except Exception as exc:
             _raise_mutation_error(exc)
         response.status_code = outcome.status_code
@@ -1626,9 +2157,13 @@ def build_memory_router(
         _require_admin_request(request, store)
         target_status = str(body.mark_missing_as or "").strip().lower()
         if target_status not in {"needs_review", "candidate"}:
-            raise HTTPException(status_code=400, detail="mark_missing_as must be needs_review or candidate")
+            raise HTTPException(
+                status_code=400, detail="mark_missing_as must be needs_review or candidate"
+            )
         if not body.dry_run and not body.max_items:
-            raise HTTPException(status_code=400, detail="non-dry-run acceptance backfill requires max_items")
+            raise HTTPException(
+                status_code=400, detail="non-dry-run acceptance backfill requires max_items"
+            )
         filters = _memory_acceptance_filters(
             tenant_id=body.tenant_id,
             channel=body.channel,
@@ -1668,6 +2203,7 @@ def build_memory_router(
 
     @router.get("/items/retrieve")
     async def retrieve_items(
+        request: Request,
         tenant_id: str = Query(...),
         channel: str = Query(...),
         source_key: str = Query(default="*"),
@@ -1677,7 +2213,10 @@ def build_memory_router(
         limit: int = Query(default=6, ge=1, le=20),
         debug: bool = Query(default=False),
     ):
-        if bool(getattr(getattr(store, "settings", None), "memory_hybrid_retrieval_enabled", False)) and hasattr(
+        _require_admin_request(request, store)
+        if bool(
+            getattr(getattr(store, "settings", None), "memory_hybrid_retrieval_enabled", False)
+        ) and hasattr(
             store,
             "retrieve_memory_hybrid",
         ):
@@ -1709,39 +2248,71 @@ def build_memory_router(
         return {"items": rows}
 
     @router.post("/remember")
-    async def remember_memory(body: MemoryRememberRequest, request: Request):
+    async def remember_memory(
+        body: MemoryRememberRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ):
         user_id = _resolve_memory_target_user(request, body, store)
-        scope_type = body.scope_type or "identity"
-        if scope_type == "session" and not body.session_id:
-            raise HTTPException(status_code=400, detail="session_id required for session memory")
-        item = await store.create_memory_item(
-            tenant_id=body.tenant_id,
-            channel=body.channel,
-            source_key=body.source_key,
-            user_id=user_id,
-            session_id=body.session_id if scope_type == "session" else "",
-            scope_type=scope_type,
-            source_type="manual",
-            memory_type=body.memory_type,
-            content=body.content,
-            value_json=body.value_json,
-            confidence=1.0,
-            status=body.status,
-            pinned=body.pinned,
-            priority=body.priority,
-            sensitivity=body.sensitivity,
-            source_trace_id="",
-            original_text="",
+        if _is_group_memory_session(body.session_id):
+            await _require_group_read_access(
+                request,
+                store,
+                group_membership_authorizer,
+                tenant_id=body.tenant_id,
+                session_id=body.session_id,
+            )
+        audience_fields = _manual_memory_write_fields(
+            body,
+            allow_explicit_audience=_is_admin_request(request, store),
         )
-        if not item:
-            raise HTTPException(400, "content required")
+        item_fields = {
+            "tenant_id": body.tenant_id,
+            "channel": body.channel,
+            "source_key": body.source_key,
+            "user_id": user_id,
+            "source_type": "manual",
+            "memory_type": body.memory_type,
+            "content": body.content,
+            "value_json": body.value_json,
+            "confidence": 1.0,
+            "status": body.status,
+            "pinned": body.pinned,
+            "priority": body.priority,
+            "sensitivity": body.sensitivity,
+            "source_trace_id": "",
+            "original_text": "",
+            **audience_fields,
+        }
+        actor, actor_kind, roles, trace_id = _mutation_actor_context(
+            request,
+            fallback_actor=user_id,
+        )
+        try:
+            outcome = await store.create_memory_item_idempotent(
+                item_fields=item_fields,
+                idempotency_key=_required_mutation_key(idempotency_key),
+                actor=actor,
+                actor_kind=actor_kind,
+                roles=roles,
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            _raise_mutation_error(exc)
+        response.status_code = outcome.status_code
+        if outcome.replayed:
+            response.headers["Idempotent-Replayed"] = "true"
+        item = outcome.response
         return {"ok": True, "ids": [item["id"]], "count": 1, "item": item}
 
     @router.post("/search")
     async def search_memory(body: MemorySearchRequest, request: Request):
         user_id = _resolve_memory_target_user(request, body, store)
         debug_payload: dict[str, Any] | None = None
-        if bool(getattr(getattr(store, "settings", None), "memory_hybrid_retrieval_enabled", False)) and hasattr(
+        if bool(
+            getattr(getattr(store, "settings", None), "memory_hybrid_retrieval_enabled", False)
+        ) and hasattr(
             store,
             "retrieve_memory_hybrid",
         ):
@@ -1852,6 +2423,7 @@ def build_memory_router(
 
     @router.get("/extraction-jobs")
     async def list_extraction_jobs(
+        request: Request,
         tenant_id: str | None = Query(default=None),
         channel: str | None = Query(default=None),
         source_key: str | None = Query(default=None),
@@ -1865,6 +2437,7 @@ def build_memory_router(
         updated_after: datetime | None = Query(default=None),  # noqa: B008
         limit: int = Query(default=50, ge=1, le=500),
     ):
+        _require_admin_request(request, store)
         rows = await store.list_llm_extraction_jobs(
             tenant_id=tenant_id,
             channel=channel,
@@ -1883,6 +2456,7 @@ def build_memory_router(
 
     @router.get("/extraction-jobs/stats")
     async def get_extraction_job_stats(
+        request: Request,
         tenant_id: str | None = Query(default=None),
         channel: str | None = Query(default=None),
         source_key: str | None = Query(default=None),
@@ -1896,6 +2470,7 @@ def build_memory_router(
         updated_after: datetime | None = Query(default=None),  # noqa: B008
         limit: int = Query(default=100, ge=1, le=100),
     ):
+        _require_admin_request(request, store)
         stats = await store.get_llm_extraction_job_status_counts(
             tenant_id=tenant_id,
             channel=channel,
@@ -1928,16 +2503,25 @@ def build_memory_router(
         allowed_actions = {"reset_stale", "retry", "mark_dead", "cleanup_smoke"}
         invalid_actions = [action for action in actions if action not in allowed_actions]
         if invalid_actions:
-            raise HTTPException(status_code=400, detail=f"unsupported maintenance action: {invalid_actions[0]}")
+            raise HTTPException(
+                status_code=400, detail=f"unsupported maintenance action: {invalid_actions[0]}"
+            )
 
         has_filters = _has_extraction_job_filters(body)
         if not body.dry_run and not has_filters:
-            raise HTTPException(status_code=400, detail="write maintenance requires at least one filter")
+            raise HTTPException(
+                status_code=400, detail="write maintenance requires at least one filter"
+            )
         for action in actions:
             if action != "reset_stale" and not has_filters:
-                raise HTTPException(status_code=400, detail=f"{action} requires at least one filter")
+                raise HTTPException(
+                    status_code=400, detail=f"{action} requires at least one filter"
+                )
             if action == "cleanup_smoke" and not body.dry_run and not _has_smoke_scope_filter(body):
-                raise HTTPException(status_code=400, detail="cleanup_smoke requires an explicit smoke/test scope filter")
+                raise HTTPException(
+                    status_code=400,
+                    detail="cleanup_smoke requires an explicit smoke/test scope filter",
+                )
 
         filters = _extraction_job_filter_updates(body)
         params = {
@@ -1971,7 +2555,16 @@ def build_memory_router(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ):
         _require_admin_request(request, store)
-        item_fields = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        if hasattr(body, "model_dump"):
+            item_fields = body.model_dump(exclude={"retention_days"})
+        else:  # pragma: no cover - pydantic v1 compatibility
+            item_fields = body.dict(exclude={"retention_days"})
+        item_fields.update(
+            _manual_memory_write_fields(
+                body,
+                allow_explicit_audience=True,
+            )
+        )
         actor, actor_kind, roles, trace_id = _mutation_actor_context(request)
         try:
             outcome = await store.create_memory_item_idempotent(
@@ -2058,7 +2651,9 @@ def build_memory_router(
         _require_admin_request(request, store)
         action = str(body.action or "").strip().lower()
         if action not in MEMORY_ACCEPTANCE_REVIEW_ACTIONS:
-            raise HTTPException(status_code=400, detail=f"unsupported acceptance review action: {action}")
+            raise HTTPException(
+                status_code=400, detail=f"unsupported acceptance review action: {action}"
+            )
         actor, actor_kind, roles, trace_id = _mutation_actor_context(request)
         try:
             outcome = await store.review_memory_item_acceptance_idempotent(

@@ -276,11 +276,17 @@ def _sync_wxbot_normalize_signal(ctx: PipelineContext) -> dict[str, object]:
 
 def _sync_wxbot_agent_scope_signal(ctx: PipelineContext) -> dict[str, object]:
     router_signals = ctx.extras.get("router_signals")
+    tool_intent_matched = (
+        bool(router_signals.get("tool_intent_matched"))
+        if isinstance(router_signals, dict)
+        else False
+    )
     tools_available = (
         bool(router_signals.get("tools_available")) if isinstance(router_signals, dict) else False
     )
     signal = {
         "tool_scope": str(ctx.extras.get("agent_tool_scope") or ""),
+        "tool_intent_matched": tool_intent_matched,
         "tools_available": tools_available,
         "map_progress_enqueued": bool(ctx.extras.get("wxbot_map_progress_enqueued")),
     }
@@ -288,6 +294,7 @@ def _sync_wxbot_agent_scope_signal(ctx: PipelineContext) -> dict[str, object]:
         **dict(ctx.signals.get("agent") or {}),
         **({"tool_scope": signal["tool_scope"]} if signal["tool_scope"] else {}),
     }
+    ctx.signals.setdefault("router", {})["tool_intent_matched"] = tool_intent_matched
     ctx.signals.setdefault("router", {})["tools_available"] = tools_available
     ctx.signals.setdefault("channel", {}).setdefault("wechat", {})["agent_scope"] = signal
     return signal
@@ -668,6 +675,10 @@ class WxbotUserBanGateStep:
 class WxbotAgentScopeEnrichStep:
     store: WxbotStore | None = None
     effect_handler_enabled: bool = False
+    social_policy_store: SocialPolicyStore | None = field(
+        default=None,
+        repr=False,
+    )
     kind: str = "plugin.wxbot.agent_scope_enrich"
     owner: str = "wxbot"
     name: str = "WeChat group agent scope enrich"
@@ -679,6 +690,7 @@ class WxbotAgentScopeEnrichStep:
         default_factory=lambda: {
             "effects.enqueue_channel_reply",
             "signals.agent.tool_scope",
+            "signals.router.tool_intent_matched",
             "signals.router.tools_available",
         }
     )
@@ -689,6 +701,7 @@ class WxbotAgentScopeEnrichStep:
         await WxbotAgentIntentHook(
             self.store,
             effect_handler_enabled=self.effect_handler_enabled,
+            social_policy_store=self.social_policy_store,
         ).run(ctx)
         signal = _sync_wxbot_agent_scope_signal(ctx)
         effects = _wxbot_map_progress_effects(ctx)

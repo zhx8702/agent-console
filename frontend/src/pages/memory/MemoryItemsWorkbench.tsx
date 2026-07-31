@@ -79,6 +79,7 @@ export function MemoryItemsWorkbench({
   const [newMemoryType, setNewMemoryType] = useState("note");
   const [newMemoryPinned, setNewMemoryPinned] = useState(true);
   const [newMemoryPriority, setNewMemoryPriority] = useState(100);
+  const [newMemoryRetentionDays, setNewMemoryRetentionDays] = useState("180");
   const [editMemoryContent, setEditMemoryContent] = useState("");
   const [editMemoryStatus, setEditMemoryStatus] = useState("active");
   const [editMemoryPinned, setEditMemoryPinned] = useState(true);
@@ -285,7 +286,7 @@ export function MemoryItemsWorkbench({
       setMemoryItemsOutput(formatJson({ error: "请先填写记忆内容" }));
       return;
     }
-    const intent = `memory:item:create:${config.tenantId}:${groupId}:${memberId}:${newMemoryContent.trim()}:${newMemoryType}`;
+    const intent = `memory:item:create:${config.tenantId}:${groupId}:${memberId}:${newMemoryContent.trim()}:${newMemoryType}:${newMemoryRetentionDays || "no-expiry"}`;
     try {
       const result = await apiRequest<MemoryItem>(config, "/plugins/memory/items", {
         auth: true,
@@ -303,6 +304,10 @@ export function MemoryItemsWorkbench({
             session_id: groupId,
             scope_type: "session",
             source_type: "manual",
+            source_kind: "manual",
+            origin_session_kind: "group",
+            audience_scope: "session",
+            allowed_session_ids: [groupId],
             memory_type: newMemoryType.trim() || "note",
             content: newMemoryContent.trim(),
             confidence: 1,
@@ -310,6 +315,9 @@ export function MemoryItemsWorkbench({
             pinned: newMemoryPinned,
             priority: newMemoryPriority,
             sensitivity: "normal",
+            retention_days: newMemoryRetentionDays
+              ? Math.max(1, Number(newMemoryRetentionDays) || 180)
+              : undefined,
           }),
         },
       });
@@ -715,6 +723,7 @@ export function MemoryItemsWorkbench({
               memoryType: newMemoryType,
               pinned: newMemoryPinned,
               priority: newMemoryPriority,
+              retentionDays: newMemoryRetentionDays,
             }}
             editDraft={{
               content: editMemoryContent,
@@ -736,6 +745,7 @@ export function MemoryItemsWorkbench({
             onNewMemoryTypeChange={setNewMemoryType}
             onNewPinnedChange={setNewMemoryPinned}
             onNewPriorityChange={setNewMemoryPriority}
+            onNewRetentionDaysChange={setNewMemoryRetentionDays}
             onEditContentChange={setEditMemoryContent}
             onEditStatusChange={setEditMemoryStatus}
             onEditMemoryTypeChange={setEditMemoryType}

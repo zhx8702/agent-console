@@ -187,6 +187,7 @@ export type ParticipationPolicyValues = {
   proactive_min_silence_seconds: number;
   mention_sender_strategy: "never" | "reply_or_ambiguous";
   prompt_context_retention_seconds: number;
+  file_send_enabled: boolean;
 };
 
 export type VoiceProfile = {
@@ -886,7 +887,10 @@ export async function getGroupGraphHistoryDates(config: ConsoleConfig, query: Gr
 }
 
 export async function getMemoryExtractionJobStats(config: ConsoleConfig, query: MemoryExtractionJobStatsQuery) {
-  return apiRequest<MemoryExtractionJobStatsResponse>(config, "/plugins/memory/extraction-jobs/stats", { query });
+  return apiRequest<MemoryExtractionJobStatsResponse>(config, "/plugins/memory/extraction-jobs/stats", {
+    auth: true,
+    query,
+  });
 }
 
 export async function getGroupGraphWindowStats(config: ConsoleConfig, query: GroupGraphWindowStatsQuery) {

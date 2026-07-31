@@ -116,6 +116,7 @@ const groupParticipationPolicy = {
     proactive_min_silence_seconds: 10800,
     mention_sender_strategy: "never" as const,
     prompt_context_retention_seconds: 3600,
+    file_send_enabled: false,
   },
   voice_profile: null,
   updated_by: "",

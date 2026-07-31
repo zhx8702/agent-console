@@ -6,13 +6,25 @@ from app.channel.models import configuration_session_id
 from app.common.types import channel_id_value
 from app.orchestrator.flow import StepResult
 from app.plugin.hooks import HookPoint, PipelineHook
-from plugins.persona_extract.store import PersonaExtractStore
+from plugins.persona_extract.store import (
+    PersonaExtractStore,
+    normalize_persona_runtime_source_key,
+)
+
+
+def _clear_persona_session_variables(ctx) -> None:
+    if ctx.session is None:
+        return
+    ctx.session.variables.pop("persona_skill", None)
+    ctx.session.variables.pop("persona_profile", None)
 
 
 class PersonaSkillHook(PipelineHook):
     name = "persona_extract.skill_injector"
     point = HookPoint.BEFORE_CAPABILITY
     priority = 40
+    timeout_seconds = 1.5
+    error_policy = "fail_open"
 
     def __init__(self, store: PersonaExtractStore) -> None:
         self._store = store
@@ -21,17 +33,22 @@ class PersonaSkillHook(PipelineHook):
         if ctx.session is None:
             return
 
-        source = str(ctx.event.metadata.get("source") or "*")
+        # These values are valid only for the current turn. Clear them before
+        # resolution so a failed query cannot reuse a previous turn's style.
+        _clear_persona_session_variables(ctx)
+        channel = channel_id_value(ctx.event.channel)
+        source = normalize_persona_runtime_source_key(
+            channel,
+            str(ctx.event.metadata.get("source") or "*"),
+        )
         profile = await self._store.resolve_profile(
             tenant_id=ctx.event.tenant_id,
             session_id=configuration_session_id(ctx.event, ctx.session),
-            channel=channel_id_value(ctx.event.channel),
+            channel=channel,
             source_key=source,
         )
 
         if not profile:
-            ctx.session.variables.pop("persona_skill", None)
-            ctx.session.variables.pop("persona_profile", None)
             return
 
         artifact = profile.get("artifact") if isinstance(profile.get("artifact"), dict) else {}

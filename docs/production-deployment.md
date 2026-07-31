@@ -183,6 +183,40 @@ readiness. See [`message-platform-deployment.md`](message-platform-deployment.md
 for Docker Desktop networking, secret references, legacy environment migration,
 and rollback.
 
+### Single-host companion deployment
+
+When Agent Console and the companion WeChat SDK run as separate Compose projects
+on the same Linux host, use the checked-in server deployment entry point:
+
+```bash
+AGENT_CONSOLE_ENV_FILE=.env.production bash scripts/deploy-server.sh
+```
+
+With `.env.production`, the script merges the base, production,
+`docker-compose.server.yml`, and optional host-specific override files in that
+order. An established host that keeps its production values in `.env` can
+instead run `AGENT_CONSOLE_ENV_FILE=.env bash scripts/deploy-server.sh`; that
+mode preserves an existing `docker-compose.override.yml` and does not introduce
+the production overlay unless `AGENT_CONSOLE_USE_PRODUCTION_OVERLAY=true` is set
+explicitly.
+Set `AGENT_CONSOLE_SITE_OVERRIDE_FILE=none` to disable automatic site-override
+loading, or point it at another host-owned override. Set
+`AGENT_CONSOLE_PROJECT_NAME` only when it matches the existing Compose project.
+
+The script refuses to deploy unless the final merged scheduler service is
+attached to the external `wxbot-sdk` network and that network exists, so a
+host-specific override cannot silently undo the requirement. After migrations
+and container replacement, it checks the scheduler's actual Docker networks and
+requests the SDK `/status` endpoint from inside the scheduler container. This
+is the supported server command; do not recreate an individual worker with an
+abbreviated Compose command.
+
+For outbound files, mount the same host directory into both projects at the same
+container path. The Agent Console defaults are
+`WXBOT_OUTBOUND_FILE_HOST_DIR=/opt/wxbot-shared/outbox` and
+`WXBOT_OUTBOUND_FILE_DIR=/data/wxbot-outbound`; the companion must allow the
+container path in `file_send_allowed_dirs`.
+
 ## 5. Rotate and recover
 
 - Rotate the admin bootstrap token after operator changes and invalidate active

@@ -53,6 +53,7 @@ const policyDocument: GroupParticipationPolicyDocument = {
     proactive_min_silence_seconds: 10800,
     mention_sender_strategy: "never",
     prompt_context_retention_seconds: 3600,
+    file_send_enabled: false,
   },
   voice_profile: {
     profile_id: "group-natural",
@@ -423,6 +424,9 @@ describe("GroupBehaviorPage", () => {
     renderPage();
 
     const groupSwitch = await screen.findByRole("checkbox", { name: /群开关/ });
+    const groupFileSwitch = screen.getByRole("checkbox", {
+      name: /^允许群文件发送/,
+    });
     const save = screen.getByRole("button", { name: "保存群策略" });
     expect(save).toBeDisabled();
 
@@ -432,6 +436,7 @@ describe("GroupBehaviorPage", () => {
     expect(results.violations).toEqual([]);
 
     await user.click(groupSwitch);
+    await user.click(groupFileSwitch);
     await user.selectOptions(
       screen.getByRole("combobox", { name: "群内 @发送者策略" }),
       "reply_or_ambiguous",
@@ -454,6 +459,7 @@ describe("GroupBehaviorPage", () => {
             policy: expect.objectContaining({
               mention_sender_strategy: "reply_or_ambiguous",
               prompt_context_retention_seconds: 7200,
+              file_send_enabled: true,
             }),
           }),
         }),

@@ -85,6 +85,10 @@ type MemoryItem = {
   session_id?: string;
   scope_type: string;
   source_type: string;
+  source_kind?: string;
+  audience_scope?: string;
+  origin_session_kind?: string;
+  allowed_session_ids?: string[];
   memory_type: string;
   content: string;
   status: string;
@@ -111,6 +115,7 @@ type MemoryItem = {
   sensitivity: string;
   occurrence_count: number;
   last_seen_at?: string | null;
+  expires_at?: string | null;
   updated_at?: string | null;
   deleted_at?: string | null;
 };
@@ -437,8 +442,21 @@ const MEMORY_SCOPE_TYPE_LABELS: Record<string, string> = {
 
 const MEMORY_SENSITIVITY_LABELS: Record<string, string> = {
   normal: "普通",
+  pii: "个人信息",
   private: "私密",
   sensitive: "敏感",
+};
+
+const MEMORY_AUDIENCE_SCOPE_LABELS: Record<string, string> = {
+  private: "仅本人",
+  session: "当前群会话",
+  explicit: "指定会话",
+};
+
+const MEMORY_ORIGIN_SESSION_KIND_LABELS: Record<string, string> = {
+  private: "私聊",
+  group: "群聊",
+  unknown: "未知来源",
 };
 
 const ACCEPTANCE_STATUS_LABELS: Record<string, string> = {
@@ -716,6 +734,14 @@ function memoryScopeTypeLabel(scopeType?: string) {
 
 function memorySensitivityLabel(sensitivity?: string) {
   return graphHumanLabel(sensitivity, MEMORY_SENSITIVITY_LABELS);
+}
+
+function memoryAudienceScopeLabel(audienceScope?: string) {
+  return graphHumanLabel(audienceScope, MEMORY_AUDIENCE_SCOPE_LABELS);
+}
+
+function memoryOriginSessionKindLabel(originSessionKind?: string) {
+  return graphHumanLabel(originSessionKind, MEMORY_ORIGIN_SESSION_KIND_LABELS);
 }
 
 function acceptanceStatusLabel(status?: string) {
@@ -1028,6 +1054,10 @@ function safeMemoryItemPayload(item?: MemoryItem | null) {
     session_id: item.session_id,
     scope_type: item.scope_type,
     source_type: item.source_type,
+    source_kind: item.source_kind,
+    audience_scope: item.audience_scope,
+    origin_session_kind: item.origin_session_kind,
+    allowed_session_ids: item.allowed_session_ids,
     memory_type: item.memory_type,
     status: item.status,
     acceptance_status: item.acceptance_status,
@@ -1036,6 +1066,7 @@ function safeMemoryItemPayload(item?: MemoryItem | null) {
     occurrence_count: item.occurrence_count,
     pinned: item.pinned,
     priority: item.priority,
+    expires_at: item.expires_at,
     updated_at: item.updated_at,
   };
 }
@@ -1260,6 +1291,8 @@ export {
   MEMORY_SOURCE_TYPE_LABELS,
   MEMORY_SCOPE_TYPE_LABELS,
   MEMORY_SENSITIVITY_LABELS,
+  MEMORY_AUDIENCE_SCOPE_LABELS,
+  MEMORY_ORIGIN_SESSION_KIND_LABELS,
   ACCEPTANCE_STATUS_LABELS,
   EXTRACTION_JOB_STATUS_LABELS,
   EXTRACTION_JOB_ID_PREVIEW_LIMIT,
@@ -1295,6 +1328,8 @@ export {
   memorySourceTypeLabel,
   memoryScopeTypeLabel,
   memorySensitivityLabel,
+  memoryAudienceScopeLabel,
+  memoryOriginSessionKindLabel,
   acceptanceStatusLabel,
   extractionJobStatusLabel,
   graphEntityLabel,

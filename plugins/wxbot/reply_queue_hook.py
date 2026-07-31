@@ -15,6 +15,10 @@ from plugins.wxbot.channel import (
     GroupParticipationPolicyReader,
     group_policy_delivery_contract,
 )
+from plugins.wxbot.group_file_policy import (
+    GroupFileSendDenied,
+    require_group_file_send_enabled,
+)
 from plugins.wxbot.hook_context import (
     _SOFT_REPLY_MAX_CHARS,
     _SOFT_REPLY_MAX_LINES,
@@ -263,6 +267,24 @@ class WxbotReplyQueueHook:
         messages = _collect_wxbot_messages(ctx.reply)
         if not messages:
             return
+        if is_group and any(item.get("msg_type") == "file" for item in messages):
+            try:
+                await require_group_file_send_enabled(
+                    self.social_policy_store,
+                    tenant_id=ctx.event.tenant_id,
+                    session_id=_event_policy_session_id(ctx),
+                )
+            except GroupFileSendDenied as exc:
+                ctx.extras["suppress_outbound"] = True
+                ctx.extras["skip_assistant_turn"] = True
+                ctx.extras["wxbot_file_send_denial_reason"] = exc.reason
+                logger.warning(
+                    "wxbot.reply_queue.group_file_send_suppressed",
+                    session_id=ctx.event.session_id,
+                    trace_id=ctx.trace_id,
+                    reason=exc.reason,
+                )
+                return
         participation_status = str(
             participation_state.get("status") if isinstance(participation_state, dict) else ""
         )
@@ -384,6 +406,13 @@ class WxbotReplyQueueHook:
             if item["msg_type"] == "image" and not item["image_path"] and not item.get("image_url"):
                 logger.warning(
                     "wxbot.reply_queue.skip_image_without_media_locator",
+                    session_id=ctx.event.session_id,
+                    trace_id=ctx.trace_id,
+                )
+                continue
+            if item["msg_type"] == "file" and not item.get("file_path"):
+                logger.warning(
+                    "wxbot.reply_queue.skip_file_without_sdk_path",
                     session_id=ctx.event.session_id,
                     trace_id=ctx.trace_id,
                 )
@@ -524,57 +553,75 @@ class WxbotReplyQueueHook:
                 delivery["segment_count"] = len(messages)
                 delivery["staggered"] = True
             if self.effect_only:
-                effect_items.append(
-                    {
-                        "tenant_id": ctx.event.tenant_id,
-                        "channel": "wechat",
-                        "adapter_id": ctx.event.adapter_id or "wechat-sdk",
-                        "connection_id": ctx.event.connection_id,
-                        "session_id": ctx.event.session_id,
-                        "external_conversation_id": (
-                            ctx.event.external_conversation_id or ctx.event.session_id
-                        ),
-                        "canonical_conversation_id": (
-                            ctx.event.canonical_conversation_id or ctx.event.session_id
-                        ),
-                        "session_name": session_name,
-                        "session_kind": session_kind,
-                        "user_id": ctx.event.user_id,
-                        "sender_name": sender_name,
-                        "sender_wxid": sender_wxid,
-                        "reply_to_msg_svr_id": reply_to_msg_svr_id,
-                        "body": {"type": item["msg_type"], "text": item["reply_text"]},
-                        "media": {
-                            "image_path": item["image_path"],
-                            "image_url": str(item.get("image_url") or ""),
-                        },
-                        "trace_id": ctx.trace_id,
-                        "mention_sender": mention_sender,
-                        "source_message": source_message,
-                        "delivery": delivery,
-                        "command_id": command_id,
+                effect_item: dict[str, object] = {
+                    "tenant_id": ctx.event.tenant_id,
+                    "channel": "wechat",
+                    "adapter_id": ctx.event.adapter_id or "wechat-sdk",
+                    "connection_id": ctx.event.connection_id,
+                    "session_id": ctx.event.session_id,
+                    "external_conversation_id": (
+                        ctx.event.external_conversation_id or ctx.event.session_id
+                    ),
+                    "canonical_conversation_id": (
+                        ctx.event.canonical_conversation_id or ctx.event.session_id
+                    ),
+                    "session_name": session_name,
+                    "session_kind": session_kind,
+                    "user_id": ctx.event.user_id,
+                    "sender_name": sender_name,
+                    "sender_wxid": sender_wxid,
+                    "reply_to_msg_svr_id": reply_to_msg_svr_id,
+                    "body": {"type": item["msg_type"], "text": item["reply_text"]},
+                    "media": {
+                        "image_path": item["image_path"],
+                        "image_url": str(item.get("image_url") or ""),
+                    },
+                    "trace_id": ctx.trace_id,
+                    "mention_sender": mention_sender,
+                    "source_message": source_message,
+                    "delivery": delivery,
+                    "command_id": command_id,
+                }
+                if item["msg_type"] == "file":
+                    effect_item["file"] = {
+                        "file_path": str(item.get("file_path") or ""),
+                        "file_name": str(item.get("file_name") or ""),
+                        "file_size": item.get("file_size"),
+                        "file_md5": str(item.get("file_md5") or ""),
+                        "file_sha256": str(item.get("file_sha256") or ""),
                     }
-                )
+                effect_items.append(effect_item)
             else:
-                try:
-                    await self.store.enqueue_reply(
-                        tenant_id=ctx.event.tenant_id,
-                        session_id=ctx.event.session_id,
-                        session_name=session_name,
-                        sender_name=sender_name,
-                        sender_wxid=sender_wxid,
-                        reply_text=item["reply_text"],
-                        trace_id=ctx.trace_id,
-                        msg_type=item["msg_type"],
-                        image_path=item["image_path"],
-                        image_url=str(item.get("image_url") or ""),
-                        mention_sender=mention_sender,
-                        reply_to_msg_svr_id=reply_to_msg_svr_id,
-                        session_kind=session_kind,
-                        source_message=source_message,
-                        delivery=delivery,
-                        command_id=command_id,
+                enqueue_kwargs: dict[str, object] = {
+                    "tenant_id": ctx.event.tenant_id,
+                    "session_id": ctx.event.session_id,
+                    "session_name": session_name,
+                    "sender_name": sender_name,
+                    "sender_wxid": sender_wxid,
+                    "reply_text": item["reply_text"],
+                    "trace_id": ctx.trace_id,
+                    "msg_type": item["msg_type"],
+                    "image_path": item["image_path"],
+                    "image_url": str(item.get("image_url") or ""),
+                    "mention_sender": mention_sender,
+                    "reply_to_msg_svr_id": reply_to_msg_svr_id,
+                    "session_kind": session_kind,
+                    "source_message": source_message,
+                    "delivery": delivery,
+                    "command_id": command_id,
+                }
+                if item["msg_type"] == "file":
+                    enqueue_kwargs.update(
+                        {
+                            "file_path": str(item.get("file_path") or ""),
+                            "file_name": str(item.get("file_name") or ""),
+                            "file_size": item.get("file_size"),
+                            "file_md5": str(item.get("file_md5") or ""),
+                            "file_sha256": str(item.get("file_sha256") or ""),
+                        }
                     )
+                try:
+                    await self.store.enqueue_reply(**enqueue_kwargs)
                 except GroupSpeechBudgetExceeded as exc:
                     if (
                         participation_status == ParticipationStatus.MUST_REPLY.value
@@ -589,22 +636,10 @@ class WxbotReplyQueueHook:
                         }
                         try:
                             await self.store.enqueue_reply(
-                                tenant_id=ctx.event.tenant_id,
-                                session_id=ctx.event.session_id,
-                                session_name=session_name,
-                                sender_name=sender_name,
-                                sender_wxid=sender_wxid,
-                                reply_text=item["reply_text"],
-                                trace_id=ctx.trace_id,
-                                msg_type=item["msg_type"],
-                                image_path=item["image_path"],
-                                image_url=str(item.get("image_url") or ""),
-                                mention_sender=mention_sender,
-                                reply_to_msg_svr_id=reply_to_msg_svr_id,
-                                session_kind=session_kind,
-                                source_message=source_message,
-                                delivery=deferred_delivery,
-                                command_id=command_id,
+                                **{
+                                    **enqueue_kwargs,
+                                    "delivery": deferred_delivery,
+                                }
                             )
                         except GroupSpeechBudgetExceeded as deferred_exc:
                             exc = deferred_exc

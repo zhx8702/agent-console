@@ -15,11 +15,12 @@ from app.common.wxbot_auth import wxbot_sdk_headers
 from plugins.memory import store as _store_runtime
 from plugins.memory.store import (
     GROUP_HISTORY_USER_ID_SCOPE,
-    SESSION_RECENT_TURN_LIMIT,
     SESSION_STATE_VERSION,
     _backfill_event_key,
     _build_short_term_summary,
+    _coerce_datetime,
     _decode_message_hex,
+    _detect_sensitivity,
     _extract_long_term_candidates,
     _format_history_timestamp,
     _group_history_user_scope,
@@ -27,10 +28,12 @@ from plugins.memory.store import (
     _history_sync_adapter_for_channel,
     _is_group_session_id,
     _looks_like_wechat_username,
+    _memory_event_expiry,
     _message_table_name,
     _normalize_line,
     _parse_group_body,
     _parse_history_target_date,
+    _redact_memory_storage_text,
     _sanitize_db_text,
     _to_json,
     _update_session_state,
@@ -51,6 +54,221 @@ async def safe_trusted_service_request(*args: Any, **kwargs: Any) -> httpx.Respo
 
 
 class MemoryBackfillStoreMixin:
+    async def _group_backfill_tenant_control_floor(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> tuple[bool, datetime | None]:
+        """Return whether a tenant opt-out/erase barrier exists and its re-opt-in."""
+
+        rows = await _exec(
+            "SELECT action, before_state_json, after_state_json, created_at "
+            "FROM audit_events WHERE tenant_id = :tid AND user_id = :uid "
+            "AND target_type = 'social_tenant_member_control' "
+            "ORDER BY created_at ASC, id ASC",
+            {
+                "tid": str(tenant_id or "").strip(),
+                "uid": str(user_id or "").strip(),
+            },
+        )
+        barrier_seen = False
+        latest_barrier: datetime | None = None
+        latest_reopt: datetime | None = None
+
+        def decoded(value: Any) -> dict[str, Any]:
+            if isinstance(value, str):
+                value = _store_runtime._safe_json_loads(value, {})
+            return value if isinstance(value, dict) else {}
+
+        def blocked(value: dict[str, Any]) -> bool:
+            control = value.get("control")
+            memory_opt_out = (
+                bool(control.get("memory_opt_out"))
+                if isinstance(control, dict)
+                else False
+            )
+            deletion_state = str(value.get("deletion_state") or "none")
+            return memory_opt_out or deletion_state in {
+                "requested",
+                "failed",
+            }
+
+        for row in rows:
+            created_at = _coerce_datetime(row.get("created_at"))
+            if created_at is None:
+                continue
+            action = str(row.get("action") or "")
+            before = decoded(row.get("before_state_json"))
+            after = decoded(row.get("after_state_json"))
+            if action == "tenant_member_memory_deletion.completed":
+                barrier_seen = True
+                latest_barrier = created_at
+                latest_reopt = None
+                continue
+            if action != "tenant_member_control.update":
+                continue
+            before_blocked = blocked(before)
+            after_blocked = blocked(after)
+            if after_blocked:
+                barrier_seen = True
+                latest_barrier = created_at
+                latest_reopt = None
+            elif before_blocked:
+                # A completed erasure remains a barrier, but an explicit
+                # update from opt-out/deleted to enabled starts a fresh
+                # non-retroactive consent period.
+                barrier_seen = True
+                latest_reopt = created_at
+        if not barrier_seen:
+            return False, None
+        if (
+            latest_reopt is None
+            or (
+                latest_barrier is not None
+                and latest_reopt <= latest_barrier
+            )
+        ):
+            return True, None
+        return True, latest_reopt
+
+    async def _group_backfill_consent_since(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        sensitive_required: bool,
+    ) -> datetime | None:
+        """Return the start of the current uninterrupted history-import consent.
+
+        There is no retroactive-consent field in ``MemberPrivacyValues``.
+        Therefore enabling memory today authorizes only history created from
+        that policy transition onward.  Invalid or missing history is a
+        fail-closed boundary.
+        """
+
+        rows = await _exec(
+            "SELECT snapshot_json, created_at FROM social_member_policy_history "
+            "WHERE tenant_id = :tid AND session_id = :sid AND user_id = :uid "
+            "ORDER BY version DESC, created_at DESC",
+            {
+                "tid": str(tenant_id or "").strip(),
+                "sid": str(session_id or "").strip(),
+                "uid": str(user_id or "").strip(),
+            },
+        )
+        consent_since: datetime | None = None
+        for row in rows:
+            snapshot = row.get("snapshot_json")
+            if isinstance(snapshot, str):
+                snapshot = _store_runtime._safe_json_loads(snapshot, {})
+            if not isinstance(snapshot, dict):
+                break
+            raw_policy = snapshot.get("policy")
+            if not isinstance(raw_policy, dict):
+                break
+            audience = str(raw_policy.get("audience_scope") or "private")
+            allowed_sessions = {
+                str(value)
+                for value in (raw_policy.get("allowed_session_ids") or [])
+            }
+            audience_allowed = audience == "session" or (
+                audience == "explicit" and session_id in allowed_sessions
+            )
+            enabled = bool(raw_policy.get("memory_enabled")) and audience_allowed
+            if sensitive_required:
+                enabled = enabled and bool(
+                    raw_policy.get("sensitive_memory_enabled")
+                )
+            created_at = _coerce_datetime(row.get("created_at"))
+            if not enabled or created_at is None:
+                break
+            consent_since = created_at
+        return consent_since
+
+    async def _group_backfill_member_policy(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        user_text: Any = "",
+        assistant_text: Any = "",
+        event_created_at: Any = None,
+    ) -> Any | None:
+        """Return an opt-in policy for this exact group/member, or deny.
+
+        History import is a durable write, so a missing/invalid control-plane
+        row is never treated as consent.  Capture authorization intentionally
+        does not depend on ``allow_group_recall``: that flag governs reads,
+        while ``memory_enabled`` plus the audience governs writes.
+        """
+
+        loader = getattr(self, "get_group_member_privacy_policy", None)
+        if not callable(loader):
+            return None
+        try:
+            policy = await loader(
+                tenant_id=str(tenant_id or "").strip(),
+                session_id=str(session_id or "").strip(),
+                user_id=str(user_id or "").strip(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        if not bool(getattr(policy, "memory_enabled", False)):
+            return None
+        audience = str(getattr(policy, "audience_scope", "private") or "private")
+        if audience == "session":
+            audience_allowed = True
+        elif audience == "explicit":
+            audience_allowed = str(session_id or "").strip() in {
+                str(value)
+                for value in (getattr(policy, "allowed_session_ids", None) or [])
+            }
+        else:
+            audience_allowed = False
+        if not audience_allowed:
+            return None
+        sensitivity_user_text = str(user_text or "")
+        member_prefix = f"{str(user_id or '').strip()}:"
+        if member_prefix != ":" and sensitivity_user_text.startswith(member_prefix):
+            sensitivity_user_text = sensitivity_user_text[len(member_prefix) :].lstrip()
+        sensitivity = _detect_sensitivity(
+            f"{sensitivity_user_text}\n{(assistant_text or '')!s}"
+        )
+        if sensitivity != "normal" and not bool(
+            getattr(policy, "sensitive_memory_enabled", False)
+        ):
+            return None
+        if event_created_at is not None:
+            consent_since = await self._group_backfill_consent_since(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                user_id=user_id,
+                sensitive_required=sensitivity != "normal",
+            )
+            created_at = _coerce_datetime(event_created_at)
+            if (
+                consent_since is None
+                or created_at is None
+                or created_at < consent_since
+            ):
+                return None
+            control_barrier, control_floor = (
+                await self._group_backfill_tenant_control_floor(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
+            )
+            if control_barrier and (
+                control_floor is None or created_at < control_floor
+            ):
+                return None
+        return policy
+
     def _require_legacy_wxbot_history_connection(
         self,
         *,
@@ -142,11 +360,71 @@ class MemoryBackfillStoreMixin:
             tenant_id=tenant_id,
             session_id=session_id,
         )
-        user_text = _sanitize_db_text(message.get("user_text"))
-        assistant_text = _sanitize_db_text(message.get("assistant_text"))
+        source_member_id = str(
+            message.get("source_member_id")
+            or message.get("sender_wxid")
+            or message.get("sender_id")
+            or (user_id if user_id != GROUP_HISTORY_USER_ID_SCOPE else "")
+        ).strip()[:128]
+        timestamp = message.get("ts") or message.get("created_at") or ""
+        created_at = _history_datetime(timestamp)
+        if (
+            channel == "wechat"
+            and user_id == GROUP_HISTORY_USER_ID_SCOPE
+            and not source_member_id
+        ):
+            return None, False
+        if (
+            source_member_id
+            and channel == "wechat"
+            and _store_runtime._ACTIVE_MUTATION_CONNECTION.get() is None
+        ):
+            async with self._mutation_transaction():
+                return await self._insert_backfill_event(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    message=message,
+                )
+        if source_member_id and channel == "wechat":
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=source_member_id,
+            )
+            if await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=source_member_id,
+            ):
+                return None, False
+            if user_id == GROUP_HISTORY_USER_ID_SCOPE:
+                policy = await self._group_backfill_member_policy(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    user_id=source_member_id,
+                    user_text=message.get("user_text"),
+                    assistant_text=message.get("assistant_text"),
+                    event_created_at=created_at,
+                )
+                if policy is None:
+                    return None, False
+            else:
+                policy = None
+        else:
+            policy = None
+
+        user_text = _redact_memory_storage_text(message.get("user_text"))
+        assistant_text = _redact_memory_storage_text(message.get("assistant_text"))
         if not _normalize_line(user_text):
             return None, False
-        timestamp = message.get("ts") or message.get("created_at") or ""
+        source_message_id = str(
+            message.get("source_message_id")
+            or message.get("message_id")
+            or message.get("rowid")
+            or ""
+        ).strip()
+        if source_message_id:
+            source_message_id = f"{session_id}:{source_message_id}"[:256]
         event_key = _backfill_event_key(
             tenant_id=tenant_id,
             channel=channel,
@@ -155,17 +433,36 @@ class MemoryBackfillStoreMixin:
             session_id=session_id,
             timestamp=timestamp,
             user_text=user_text,
+            source_member_id=source_member_id,
+            source_message_id=source_message_id,
         )
-        created_at = _history_datetime(timestamp)
+        if not source_message_id:
+            source_message_id = event_key[:256]
+        policy_expiry = (
+            created_at + timedelta(days=int(policy.retention_days))
+            if policy is not None
+            else None
+        )
+        explicit_expiry = _coerce_datetime(message.get("expires_at"))
+        if policy_expiry is not None and explicit_expiry is not None:
+            requested_expiry = min(policy_expiry, explicit_expiry)
+        else:
+            requested_expiry = policy_expiry or explicit_expiry
+        event_expiry = _memory_event_expiry(
+            self.settings,
+            created_at=created_at,
+            expires_at=requested_expiry,
+        )
         rows = await _exec(
             "INSERT INTO plugin_memory_event "
             "(tenant_id, channel, source_key, user_id, session_id, user_text, assistant_text, "
-            "trace_id, event_key, created_at) "
+            "trace_id, event_key, source_member_id, source_message_id, expires_at, created_at) "
             "VALUES (:tid, :channel, :source_key, :uid, :sid, :user_text, :assistant_text, "
-            ":trace, :event_key, :created_at) "
+            ":trace, :event_key, :source_member_id, :source_message_id, :expires_at, :created_at) "
             "ON CONFLICT DO NOTHING "
             "RETURNING id, tenant_id, channel, source_key, user_id, session_id, "
-            "user_text, assistant_text, trace_id, event_key, created_at",
+            "user_text, assistant_text, trace_id, event_key, source_member_id, "
+            "source_message_id, expires_at, created_at",
             {
                 "tid": tenant_id,
                 "channel": channel,
@@ -176,6 +473,9 @@ class MemoryBackfillStoreMixin:
                 "assistant_text": assistant_text[:2000],
                 "trace": event_key[:128],
                 "event_key": event_key,
+                "source_member_id": source_member_id,
+                "source_message_id": source_message_id,
+                "expires_at": event_expiry,
                 "created_at": created_at,
             },
         )
@@ -183,7 +483,8 @@ class MemoryBackfillStoreMixin:
             return rows[0], True
         existing = await _exec(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
-            "user_text, assistant_text, trace_id, event_key, created_at "
+            "user_text, assistant_text, trace_id, event_key, source_member_id, "
+            "source_message_id, expires_at, created_at "
             "FROM plugin_memory_event WHERE event_key = :event_key LIMIT 1",
             {"event_key": event_key},
         )
@@ -351,9 +652,15 @@ class MemoryBackfillStoreMixin:
             if not username:
                 continue
             metadata_by_username[username] = {
-                "remark": _normalize_line(_sanitize_db_text(row.get("remark")))[:80],
-                "nick_name": _normalize_line(_sanitize_db_text(row.get("nick_name")))[:80],
-                "alias": _normalize_line(_sanitize_db_text(row.get("alias")))[:80],
+                "remark": _normalize_line(
+                    _redact_memory_storage_text(row.get("remark"))
+                )[:80],
+                "nick_name": _normalize_line(
+                    _redact_memory_storage_text(row.get("nick_name"))
+                )[:80],
+                "alias": _normalize_line(
+                    _redact_memory_storage_text(row.get("alias"))
+                )[:80],
             }
         return metadata_by_username
 
@@ -430,9 +737,18 @@ class MemoryBackfillStoreMixin:
                     "assistant_text": "",
                     "created_at": _format_history_timestamp(row.get("create_time")),
                     "ts": int(row.get("create_time") or 0),
+                    "source_message_id": str(row.get("rowid") or ""),
                 }
                 if is_group:
-                    message.update({"sender_id": sender_wxid, "sender_wxid": sender_wxid})
+                    message.update(
+                        {
+                            "sender_id": sender_wxid,
+                            "sender_wxid": sender_wxid,
+                            "source_member_id": sender_wxid,
+                        }
+                    )
+                elif sender_wxid:
+                    message["source_member_id"] = sender_wxid
                 messages.append(message)
             if len(messages) > history_limit:
                 del messages[:-history_limit]
@@ -499,7 +815,7 @@ class MemoryBackfillStoreMixin:
                     session_id=session_id,
                     database="message",
                     sql=(
-                        f"SELECT create_time, real_sender_id, local_type, "
+                        f"SELECT rowid AS rowid, create_time, real_sender_id, local_type, "
                         f"hex(message_content) AS message_content_hex, "
                         f"WCDB_CT_message_content AS compression_type "
                         f"FROM [{table}] "
@@ -612,6 +928,94 @@ class MemoryBackfillStoreMixin:
             "items": rows,
         }
 
+    async def _live_group_backfill_messages(
+        self,
+        *,
+        tenant_id: str,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep only still-present evidence from members who permit memory."""
+
+        by_event_id: dict[int, dict[str, Any]] = {}
+        for message in messages:
+            event = message.get("source_event")
+            if not isinstance(event, dict):
+                continue
+            try:
+                event_id = int(event.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if event_id > 0:
+                by_event_id[event_id] = message
+        if not by_event_id:
+            return []
+        rows = await _exec(
+            "SELECT id, source_member_id, session_id, user_text, assistant_text, "
+            "created_at, expires_at FROM plugin_memory_event "
+            "WHERE id = ANY(:event_ids) ORDER BY id ASC",
+            {"event_ids": sorted(by_event_id)},
+        )
+        allowed_ids: set[int] = set()
+        for member_id in sorted(
+            {
+                str(row.get("source_member_id") or "").strip()
+                for row in rows
+                if str(row.get("source_member_id") or "").strip()
+            }
+        ):
+            await self._lock_member_memory_mutation(
+                tenant_id=tenant_id,
+                user_id=member_id,
+            )
+        blocked_members: set[str] = set()
+        for member_id in {
+            str(row.get("source_member_id") or "").strip() for row in rows
+        }:
+            if member_id and await self._member_memory_write_blocked(
+                tenant_id=tenant_id,
+                user_id=member_id,
+            ):
+                blocked_members.add(member_id)
+        now = datetime.now(UTC).replace(tzinfo=None)
+        for row in rows:
+            event_id = int(row.get("id") or 0)
+            member_id = str(row.get("source_member_id") or "").strip()
+            event_session_id = str(row.get("session_id") or "").strip()
+            if event_id <= 0 or not member_id or member_id in blocked_members:
+                continue
+            policy = await self._group_backfill_member_policy(
+                tenant_id=tenant_id,
+                session_id=event_session_id,
+                user_id=member_id,
+                user_text=row.get("user_text"),
+                assistant_text=row.get("assistant_text"),
+                event_created_at=row.get("created_at"),
+            )
+            if policy is None:
+                continue
+            created_at = _coerce_datetime(row.get("created_at"))
+            expires_at = _coerce_datetime(row.get("expires_at"))
+            policy_expiry = (
+                created_at + timedelta(days=int(policy.retention_days))
+                if created_at is not None
+                else None
+            )
+            effective_expiry = min(
+                [
+                    value
+                    for value in (expires_at, policy_expiry)
+                    if value is not None
+                ],
+                default=None,
+            )
+            if effective_expiry is None or effective_expiry > now:
+                allowed_ids.add(event_id)
+        return [
+            message
+            for event_id, message in by_event_id.items()
+            if event_id in allowed_ids
+        ]
+
     async def _apply_backfill_session_messages(
         self,
         *,
@@ -623,10 +1027,33 @@ class MemoryBackfillStoreMixin:
         messages: list[dict[str, Any]],
         imported_count: int | None = None,
     ) -> dict[str, Any]:
+        if (
+            user_id == GROUP_HISTORY_USER_ID_SCOPE
+            and _store_runtime._ACTIVE_MUTATION_CONNECTION.get() is None
+        ):
+            async with self._mutation_transaction():
+                return await self._apply_backfill_session_messages(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    user_id=user_id,
+                    messages=messages,
+                    imported_count=imported_count,
+                )
         await self._require_history_runtime_scope(
             tenant_id=tenant_id,
             session_id=session_id,
         )
+        if user_id == GROUP_HISTORY_USER_ID_SCOPE:
+            messages = await self._live_group_backfill_messages(
+                tenant_id=tenant_id,
+                messages=messages,
+            )
+            imported_count = min(
+                len(messages),
+                len(messages) if imported_count is None else max(0, int(imported_count or 0)),
+            )
         current = await self.get_session_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -652,7 +1079,11 @@ class MemoryBackfillStoreMixin:
             ]
             short_term_memory = _build_short_term_summary(short_items)
         session_state = dict(current)
-        for item in messages[-SESSION_RECENT_TURN_LIMIT:]:
+        # Only newly inserted/idempotency-filtered events reach this method.
+        # Feed the whole accepted batch chronologically so evicted turns enter
+        # the rolling compaction instead of being discarded before the state
+        # machine can summarize them.
+        for item in messages:
             session_state = {
                 **session_state,
                 **_update_session_state(
@@ -738,10 +1169,33 @@ class MemoryBackfillStoreMixin:
         messages: list[dict[str, Any]],
         imported_count: int | None = None,
     ) -> dict[str, Any]:
+        if (
+            user_id == GROUP_HISTORY_USER_ID_SCOPE
+            and _store_runtime._ACTIVE_MUTATION_CONNECTION.get() is None
+        ):
+            async with self._mutation_transaction():
+                return await self._apply_backfill_identity_messages(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    last_session_id=last_session_id,
+                    messages=messages,
+                    imported_count=imported_count,
+                )
         await self._require_history_runtime_scope(
             tenant_id=tenant_id,
             session_id=last_session_id,
         )
+        if user_id == GROUP_HISTORY_USER_ID_SCOPE:
+            messages = await self._live_group_backfill_messages(
+                tenant_id=tenant_id,
+                messages=messages,
+            )
+            imported_count = min(
+                len(messages),
+                len(messages) if imported_count is None else max(0, int(imported_count or 0)),
+            )
         current = await self.get_identity_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -864,6 +1318,23 @@ class MemoryBackfillStoreMixin:
         enqueue_llm_jobs: bool = False,
         target_date: str | None = None,
     ) -> dict[str, Any]:
+        if _store_runtime._ACTIVE_MUTATION_CONNECTION.get() is None:
+            # Event, deterministic projections, extraction jobs and both
+            # profile caches are one retryable unit.  Otherwise an event-only
+            # commit would make the next run treat the message as a duplicate
+            # and permanently skip its missing derived state.
+            async with self._mutation_transaction():
+                return await self._backfill_from_sdk_scoped(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    user_id=user_id,
+                    session_ids=session_ids,
+                    days_limit=days_limit,
+                    max_messages_per_session=max_messages_per_session,
+                    enqueue_llm_jobs=enqueue_llm_jobs,
+                    target_date=target_date,
+                )
         history_adapter = _history_sync_adapter_for_channel(channel, self)
         cleaned_sessions = [
             str(item or "").strip() for item in session_ids if str(item or "").strip()
@@ -987,8 +1458,10 @@ class MemoryBackfillStoreMixin:
                 # generated identifiers. Preserve the already-sanitized source
                 # message as the contract fallback instead of silently
                 # skipping deterministic extraction.
-                event_user_text = str(event.get("user_text") or message.get("user_text") or "")
-                event_assistant_text = str(
+                event_user_text = _redact_memory_storage_text(
+                    event.get("user_text") or message.get("user_text") or ""
+                )
+                event_assistant_text = _redact_memory_storage_text(
                     event.get("assistant_text") or message.get("assistant_text") or ""
                 )
                 enriched_message = {
@@ -999,6 +1472,11 @@ class MemoryBackfillStoreMixin:
                 }
                 inserted_session_messages.append(enriched_message)
                 imported_messages.append(enriched_message)
+                message_audience_kwargs = {
+                    **audience_kwargs,
+                    "sensitivity_category": _detect_sensitivity(event_user_text),
+                    "expires_at": event.get("expires_at"),
+                }
 
                 for candidate in _extract_long_term_candidates(event_user_text):
                     await self._require_history_runtime_scope(
@@ -1015,7 +1493,7 @@ class MemoryBackfillStoreMixin:
                         source_trace_id=str(event.get("trace_id") or "backfill"),
                         original_text=event_user_text,
                         source_type_override="backfill",
-                        **audience_kwargs,
+                        **message_audience_kwargs,
                     )
                     if item is not None:
                         if int(item.get("occurrence_count") or 1) <= 1:
@@ -1041,7 +1519,7 @@ class MemoryBackfillStoreMixin:
                         session_id=session_id,
                         trace_id=str(event.get("trace_id") or ""),
                         source_event_id=int(event["id"]) if event.get("id") is not None else None,
-                        **audience_kwargs,
+                        **message_audience_kwargs,
                     )
                     if job is not None:
                         stats["jobs_enqueued"] += 1

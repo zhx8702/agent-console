@@ -12,6 +12,19 @@ from plugins.memory.store import MemoryStore, _semantic_key
 from plugins.memory.structured_extractor import MemoryStructuredExtractor
 
 
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    """Keep storage unit tests inside an injected non-Postgres transaction."""
+
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+
 class _LLM:
     def __init__(
         self, content: str | None = None, *, exc: Exception | None = None, delay: float = 0.0
@@ -332,6 +345,24 @@ async def test_acceptance_metadata_keeps_joke_pending(monkeypatch: pytest.Monkey
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         nonlocal inserted
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             return []
         if (
@@ -409,6 +440,24 @@ async def test_acceptance_metadata_auto_accepts_clear_preference(
     store = MemoryStore(_settings(), llm_service=_LLM())
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             return []
         if (
@@ -1657,6 +1706,24 @@ async def test_llm_update_does_not_overwrite_manual_or_pinned(
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params))
+        if "FROM plugin_memory_event WHERE id = :source_event_id" in sql:
+            event_id = int((params or {})["source_event_id"])
+            return [
+                {
+                    "id": event_id,
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+            ]
+        if "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql:
+            return [
+                {
+                    "id": int(event_id),
+                    "source_member_id": "",
+                    "source_message_id": f"event-{event_id}",
+                }
+                for event_id in (params or {}).get("event_ids", [])
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             return []
         if (

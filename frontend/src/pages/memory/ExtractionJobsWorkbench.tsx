@@ -117,6 +117,7 @@ export function ExtractionJobsWorkbench({
         config,
         "/plugins/memory/extraction-jobs/stats",
         {
+          auth: true,
           query: {
             ...extractionJobFilters,
             limit: extractionJobApiLimit,
@@ -210,6 +211,7 @@ export function ExtractionJobsWorkbench({
           config,
           "/plugins/memory/extraction-jobs/stats",
           {
+            auth: true,
             query: {
               ...extractionJobFilters,
               limit: extractionJobApiLimit,

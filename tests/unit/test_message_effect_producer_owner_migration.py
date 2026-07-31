@@ -35,8 +35,8 @@ def test_message_effect_producer_owner_upgrade_is_linear_and_backfilled(
 
     assert migration.revision == "0034_message_effect_producer_owner"
     assert migration.down_revision == "0033_wxbot_event_connection_scope"
-    assert RUNTIME_SCHEMA_REVISION == "0044_persona_profile_catalog"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
+    assert RUNTIME_SCHEMA_REVISION == "0046_memory_event_provenance_expiry"
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 9
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [RUNTIME_SCHEMA_REVISION]
     assert (

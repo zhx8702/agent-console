@@ -64,9 +64,7 @@ def apply_event_scope_to_session(session: Session, event: InboundEvent) -> Sessi
     session.adapter_id = event.adapter_id
     session.connection_id = event.connection_id
     session.conversation_id = event.conversation_id or event.session_id
-    session.external_conversation_id = (
-        event.external_conversation_id or event.session_id
-    )
+    session.external_conversation_id = event.external_conversation_id or event.session_id
     session.canonical_conversation_id = (
         event.canonical_conversation_id or event.conversation_id or event.session_id
     )
@@ -171,13 +169,9 @@ class ChannelTarget:
             tenant_id=str(getattr(session, "tenant_id", "") or ""),
             channel=_channel_value(getattr(session, "channel", "")),
             session_id=session_id,
-            adapter_id=str(
-                getattr(session, "adapter_id", "") or metadata.get("adapter_id") or ""
-            ),
+            adapter_id=str(getattr(session, "adapter_id", "") or metadata.get("adapter_id") or ""),
             connection_id=str(
-                getattr(session, "connection_id", "")
-                or metadata.get("connection_id")
-                or ""
+                getattr(session, "connection_id", "") or metadata.get("connection_id") or ""
             ),
             external_conversation_id=str(
                 getattr(session, "external_conversation_id", "")
@@ -226,6 +220,21 @@ class ChannelTarget:
 class ChannelMedia:
     image_path: str = ""
     image_url: str = ""
+
+
+@dataclass(frozen=True)
+class ChannelFile:
+    """A file already present on the outbound provider's local filesystem.
+
+    ``file_size`` intentionally distinguishes an omitted assertion (``None``)
+    from an explicit zero-byte file (``0``).
+    """
+
+    file_path: str
+    file_name: str = ""
+    file_size: int | None = None
+    file_md5: str = ""
+    file_sha256: str = ""
 
 
 @dataclass(frozen=True)

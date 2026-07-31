@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any
 
 from app.common.types import OutboundReply, ReplySegment
 from plugins.wxbot.hook_context import _GROUP_SEGMENT_STAGGER_SECONDS
 
 
-def _segment_to_queue_payload(segment: ReplySegment) -> dict[str, str] | None:
+def _is_absolute_file_path(value: str) -> bool:
+    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def _optional_file_size(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        raise ValueError("file_size must be a non-negative integer")
+    size = int(value)
+    if size < 0:
+        raise ValueError("file_size must be a non-negative integer")
+    return size
+
+
+def _valid_digest(value: str, length: int) -> bool:
+    return not value or (
+        len(value) == length and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _segment_to_queue_payload(segment: ReplySegment) -> dict[str, Any] | None:
     metadata = segment.metadata or {}
     msg_type = (
         str(metadata.get("wxbot_msg_type") or metadata.get("msg_type") or "text").strip().lower()
@@ -25,6 +48,35 @@ def _segment_to_queue_payload(segment: ReplySegment) -> dict[str, str] | None:
             "image_url": image_url,
         }
 
+    if msg_type == "file":
+        file_path = str(metadata.get("file_path") or "").strip()
+        file_url = str(metadata.get("file_url") or "").strip()
+        file_md5 = str(metadata.get("file_md5") or "").strip().lower()
+        file_sha256 = str(metadata.get("file_sha256") or "").strip().lower()
+        try:
+            file_size = _optional_file_size(metadata.get("file_size"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            not file_path
+            or file_url
+            or not _is_absolute_file_path(file_path)
+            or not _valid_digest(file_md5, 32)
+            or not _valid_digest(file_sha256, 64)
+        ):
+            return None
+        return {
+            "msg_type": "file",
+            "reply_text": reply_text,
+            "image_path": "",
+            "image_url": "",
+            "file_path": file_path,
+            "file_name": str(metadata.get("file_name") or "").strip(),
+            "file_size": file_size,
+            "file_md5": file_md5,
+            "file_sha256": file_sha256,
+        }
+
     if not reply_text.strip():
         return None
     return {
@@ -35,7 +87,7 @@ def _segment_to_queue_payload(segment: ReplySegment) -> dict[str, str] | None:
     }
 
 
-def _collect_wxbot_messages(reply: OutboundReply) -> list[dict[str, str]]:
+def _collect_wxbot_messages(reply: OutboundReply) -> list[dict[str, Any]]:
     if reply.segments:
         items = [
             payload
@@ -56,7 +108,7 @@ def _collect_wxbot_messages(reply: OutboundReply) -> list[dict[str, str]]:
     return []
 
 
-def _group_text_stats(messages: list[dict[str, str]]) -> tuple[int, int]:
+def _group_text_stats(messages: list[dict[str, Any]]) -> tuple[int, int]:
     text = "\n".join(
         str(item.get("reply_text") or "").strip()
         for item in messages

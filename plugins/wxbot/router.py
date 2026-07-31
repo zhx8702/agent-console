@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -28,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import Field, field_validator
 from sqlalchemy import or_, select
+from starlette.responses import StreamingResponse
 
 from app.admin.audit import set_admin_audit_context
 from app.admin.auth_router import authenticate_admin_request
@@ -37,7 +40,7 @@ from app.agent.store import AgentStore
 from app.bus.base import MessagePublishIdempotencyConflict
 from app.common.logging import get_logger
 from app.common.request_models import StrictRequestModel
-from app.common.safe_url import configure_http_client, safe_get
+from app.common.safe_url import configure_http_client, normalize_origin, safe_get
 from app.common.types import (
     Channel,
     InboundEvent,
@@ -46,7 +49,10 @@ from app.common.types import (
     channel_id_value,
 )
 from app.common.wxbot_auth import wxbot_sdk_headers
-from app.egress.safe_http import safe_trusted_service_request
+from app.egress.safe_http import (
+    safe_trusted_service_request,
+    safe_trusted_service_stream,
+)
 from app.infra.db import get_session_factory
 from app.infra.redis_client import get_redis
 from app.models.session import SessionRow, TurnRow
@@ -55,6 +61,11 @@ from plugins.repeater.store import (
     RepeaterStore,
 )
 from plugins.wxbot.bridge import read_bridge_runtime_status
+from plugins.wxbot.group_file_policy import (
+    GroupFilePolicyReader,
+    GroupFileSendDenied,
+    require_group_file_send_enabled,
+)
 from plugins.wxbot.media_ids import (
     InvalidMediaID,
     MediaLocator,
@@ -85,6 +96,16 @@ _HANDOFF_HINT_KEYWORDS = ("转人工", "人工客服", "真人")
 _REPORT_MAX_CHARS_PER_CHUNK = 12_000
 _ADMIN_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 _ADMIN_IMAGE_MAX_PIXELS = 40_000_000
+_ADMIN_FILE_DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_ADMIN_FILE_CONTENT_TYPES = (
+    "application/",
+    "audio/",
+    "font/",
+    "image/",
+    "model/",
+    "text/",
+    "video/",
+)
 _RASTER_MEDIA_TYPES = {
     "image/bmp",
     "image/gif",
@@ -278,6 +299,11 @@ class WxbotSendRequest(StrictRequestModel):
     text: str = Field(default="", max_length=20_000)
     msg_type: str = "text"
     media_id: str = Field(default="", max_length=4096)
+    file_path: str = Field(default="", max_length=4096)
+    file_name: str = Field(default="", max_length=512)
+    file_size: int | None = Field(default=None, ge=0)
+    file_md5: str = Field(default="", max_length=32)
+    file_sha256: str = Field(default="", max_length=64)
     source_message: dict[str, Any] = Field(default_factory=dict)
     delivery: dict[str, Any] = Field(default_factory=dict)
 
@@ -999,6 +1025,8 @@ def _mutation_audit_summary(
 def _validate_send_payload(payload: dict[str, Any], *, image_error_field: str) -> None:
     msg_type = str(payload.get("msg_type") or payload.get("type") or "text").strip().lower()
     text = str(payload.get("text") or payload.get("reply_text") or "")
+    if msg_type not in {"text", "image", "file"}:
+        raise HTTPException(400, "msg_type must be text, image, or file")
     if payload.get("image_path") or payload.get("image_url"):
         raise HTTPException(400, "server media paths and URLs are not accepted")
     media_id = str(payload.get("media_id") or "").strip()
@@ -1006,6 +1034,52 @@ def _validate_send_payload(payload: dict[str, Any], *, image_error_field: str) -
         raise HTTPException(400, f"{image_error_field} required for image messages")
     if msg_type == "text" and not text.strip():
         raise HTTPException(400, "text required for text messages")
+    file_fields_present = any(
+        payload.get(key) is not None and payload.get(key) != ""
+        for key in ("file_path", "file_name", "file_size", "file_md5", "file_sha256", "file_url")
+    )
+    if msg_type != "file" and file_fields_present:
+        raise HTTPException(400, "file fields are accepted only for file messages")
+    if msg_type != "file":
+        return
+    if media_id:
+        raise HTTPException(400, "media_id is not accepted for file messages")
+    if str(payload.get("file_url") or "").strip():
+        raise HTTPException(400, "file_url is not supported for outbound file messages")
+    file_path = str(payload.get("file_path") or "").strip()
+    if not file_path:
+        raise HTTPException(400, "file_path required for file messages")
+    if "\x00" in file_path or not (
+        PurePosixPath(file_path).is_absolute() or PureWindowsPath(file_path).is_absolute()
+    ):
+        raise HTTPException(400, "file_path must be absolute on the SDK host")
+    if ".." in file_path.replace("\\", "/").split("/"):
+        raise HTTPException(400, "file_path must not contain traversal segments")
+    file_name = str(payload.get("file_name") or "").strip()
+    if file_name and (
+        "\x00" in file_name
+        or "/" in file_name
+        or "\\" in file_name
+        or file_name in {".", ".."}
+    ):
+        raise HTTPException(400, "file_name must be a basename")
+    declared_size = payload.get("file_size")
+    if declared_size is not None and declared_size != "":
+        if isinstance(declared_size, bool):
+            raise HTTPException(400, "file_size must be a non-negative integer")
+        try:
+            normalized_size = int(declared_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "file_size must be a non-negative integer") from exc
+        if normalized_size < 0 or str(declared_size).strip() != str(normalized_size):
+            raise HTTPException(400, "file_size must be a non-negative integer")
+        payload["file_size"] = normalized_size
+    file_md5 = str(payload.get("file_md5") or "").strip()
+    if file_md5 and not re.fullmatch(r"[A-Fa-f0-9]{32}", file_md5):
+        raise HTTPException(400, "file_md5 must be a 32-character hexadecimal digest")
+    file_sha256 = str(payload.get("file_sha256") or "").strip()
+    if file_sha256 and not re.fullmatch(r"[A-Fa-f0-9]{64}", file_sha256):
+        raise HTTPException(400, "file_sha256 must be a 64-character hexadecimal digest")
 
 
 def _normalize_target_session_state(body: WxbotSessionStateUpdateRequest) -> SessionState:
@@ -1295,13 +1369,34 @@ async def _require_verified_group(
     return _client_safe_media_payload(dict(target), store, tenant_id=tenant_id)
 
 
+async def _require_group_file_send(
+    policy_reader: GroupFilePolicyReader | None,
+    *,
+    tenant_id: str,
+    session_id: str,
+) -> None:
+    try:
+        await require_group_file_send_enabled(
+            policy_reader,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+    except GroupFileSendDenied as exc:
+        status_code = 503 if exc.reason == "group_file_policy_unavailable" else 403
+        raise HTTPException(status_code, exc.reason) from exc
+
+
 def _resolve_send_media(
     payload: dict[str, Any],
     store: WxbotStore,
     *,
     tenant_id: str,
 ) -> None:
-    if str(payload.get("msg_type") or payload.get("type") or "text").lower() != "image":
+    msg_type = str(payload.get("msg_type") or payload.get("type") or "text").lower()
+    if msg_type != "file":
+        for key in ("file_path", "file_name", "file_size", "file_md5", "file_sha256"):
+            payload.pop(key, None)
+    if msg_type != "image":
         payload.pop("media_id", None)
         return
     try:
@@ -1316,25 +1411,48 @@ def _resolve_send_media(
     payload[target_key] = locator.value
 
 
-_CLIENT_MEDIA_LOCATORS = {
-    "image_path": "media_id",
-    "image_url": "media_id",
-    "media_path": "media_id",
-    "media_url": "media_id",
-    "image_preview_path": "preview_media_id",
-    "image_preview_url": "preview_media_id",
-    "preview_path": "preview_media_id",
-    "preview_url": "preview_media_id",
-    "image_thumbnail_path": "thumbnail_media_id",
-    "image_thumbnail_url": "thumbnail_media_id",
-    "thumbnail_path": "thumbnail_media_id",
-    "thumbnail_url": "thumbnail_media_id",
-    "thumb_url": "thumbnail_media_id",
-    "quote_image_path": "quote_media_id",
-    "quote_image_url": "quote_media_id",
-    "quote_image_preview_url": "quote_preview_media_id",
-    "quote_image_thumbnail_url": "quote_thumbnail_media_id",
+_CLIENT_MEDIA_LOCATORS: dict[str, tuple[str, Literal["image", "file"]]] = {
+    "image_path": ("media_id", "image"),
+    "image_url": ("media_id", "image"),
+    "media_path": ("media_id", "image"),
+    "media_url": ("media_id", "image"),
+    "image_preview_path": ("preview_media_id", "image"),
+    "image_preview_url": ("preview_media_id", "image"),
+    "preview_path": ("preview_media_id", "image"),
+    "preview_url": ("preview_media_id", "image"),
+    "image_thumbnail_path": ("thumbnail_media_id", "image"),
+    "image_thumbnail_url": ("thumbnail_media_id", "image"),
+    "thumbnail_path": ("thumbnail_media_id", "image"),
+    "thumbnail_url": ("thumbnail_media_id", "image"),
+    "thumb_url": ("thumbnail_media_id", "image"),
+    "quote_image_path": ("quote_media_id", "image"),
+    "quote_image_url": ("quote_media_id", "image"),
+    "quote_image_preview_url": ("quote_preview_media_id", "image"),
+    "quote_image_thumbnail_url": ("quote_thumbnail_media_id", "image"),
+    "file_path": ("file_media_id", "file"),
+    "file_url": ("file_media_id", "file"),
 }
+
+
+def _client_media_locator(
+    raw_value: str,
+    *,
+    resource_type: Literal["image", "file"],
+) -> str:
+    locator = str(raw_value or "").strip()
+    if resource_type == "image":
+        if locator.startswith(("/images/", "images/")):
+            return locator.split("images/", 1)[1]
+        return locator
+    parsed = urlsplit(locator)
+    if parsed.scheme.lower() in {"http", "https"}:
+        return locator
+    normalized_path = parsed.path.replace("\\", "/")
+    if normalized_path.startswith("/files/"):
+        return normalized_path[len("/files/") :]
+    if normalized_path.startswith("files/"):
+        return normalized_path[len("files/") :]
+    raise InvalidMediaID("invalid sdk file path")
 
 
 def _client_safe_media_payload(value: Any, store: WxbotStore, *, tenant_id: str) -> Any:
@@ -1343,20 +1461,31 @@ def _client_safe_media_payload(value: Any, store: WxbotStore, *, tenant_id: str)
     if not isinstance(value, dict):
         return value
     safe: dict[str, Any] = {}
+    resource_hint = str(
+        value.get("type") or value.get("media_type") or value.get("msg_type") or ""
+    ).strip().lower()
     for raw_key, raw_value in value.items():
         key = str(raw_key)
-        media_key = _CLIENT_MEDIA_LOCATORS.get(key.lower())
-        if media_key and isinstance(raw_value, str) and raw_value.strip():
-            locator = raw_value.strip()
-            if locator.startswith(("/images/", "images/")):
-                locator = locator.split("images/", 1)[1]
+        media_spec = _CLIENT_MEDIA_LOCATORS.get(key.lower())
+        if (
+            key.lower() in {"media_path", "media_url"}
+            and resource_hint == "file"
+        ):
+            media_spec = ("file_media_id", "file")
+        if media_spec and isinstance(raw_value, str) and raw_value.strip():
+            media_key, resource_type = media_spec
             try:
+                locator = _client_media_locator(
+                    raw_value,
+                    resource_type=resource_type,
+                )
                 safe.setdefault(
                     media_key,
                     issue_media_id(
                         locator,
                         store.settings,
                         tenant_id=tenant_id,
+                        resource_type=resource_type,
                     ),
                 )
             except InvalidMediaID:
@@ -1464,6 +1593,110 @@ async def _sdk_admin_image(store: WxbotStore, locator: MediaLocator) -> Response
             "Cache-Control": "private, max-age=300",
             "X-Content-Type-Options": "nosniff",
         },
+    )
+
+
+def _sdk_file_request_path(store: WxbotStore, locator: MediaLocator) -> str:
+    if locator.resource_type != "file":
+        raise HTTPException(400, "media id is not a file")
+    if locator.kind == "sdk_path":
+        return f"/files/{quote(locator.value, safe='/-_.()@')}"
+    base_url = str(
+        getattr(store.settings, "wxbot_sdk_url", "http://127.0.0.1:5080") or ""
+    ).rstrip("/")
+    parsed = urlsplit(locator.value)
+    if normalize_origin(locator.value) != normalize_origin(base_url):
+        raise HTTPException(400, "file media URL must use the configured wxbot SDK")
+    decoded_path = parsed.path
+    for _ in range(3):
+        next_path = unquote(decoded_path)
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    if (
+        not decoded_path.startswith("/files/")
+        or ".." in decoded_path.replace("\\", "/").split("/")
+        or parsed.fragment
+    ):
+        raise HTTPException(400, "invalid wxbot file media URL")
+    return parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
+
+async def _sdk_admin_file(store: WxbotStore, locator: MediaLocator) -> StreamingResponse:
+    base_url = str(
+        getattr(store.settings, "wxbot_sdk_url", "http://127.0.0.1:5080") or ""
+    ).rstrip("/")
+    request_path = _sdk_file_request_path(store, locator)
+    max_bytes = int(
+        getattr(
+            store.settings,
+            "wxbot_file_download_max_bytes",
+            _ADMIN_FILE_DEFAULT_MAX_BYTES,
+        )
+        or _ADMIN_FILE_DEFAULT_MAX_BYTES
+    )
+    client = httpx.AsyncClient(timeout=None, trust_env=False, follow_redirects=False)
+    stream_context = safe_trusted_service_stream(
+        client,
+        base_url,
+        request_path,
+        headers={
+            "Accept": "*/*",
+            **wxbot_sdk_headers(store.settings),
+        },
+        timeout_seconds=300.0,
+        max_response_bytes=max_bytes,
+        allowed_response_content_types=_ADMIN_FILE_CONTENT_TYPES,
+    )
+    try:
+        upstream = await stream_context.__aenter__()
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(502, "wxbot file service unavailable") from exc
+    if upstream.status_code == 404:
+        await stream_context.__aexit__(None, None, None)
+        await client.aclose()
+        raise HTTPException(404, "wxbot file not found")
+    if upstream.status_code < 200 or upstream.status_code >= 300:
+        await stream_context.__aexit__(None, None, None)
+        await client.aclose()
+        raise HTTPException(502, "wxbot file service returned an error")
+
+    content_type = (
+        str(upstream.headers.get("content-type") or "application/octet-stream")
+        .split(";", 1)[0]
+        .strip()
+        or "application/octet-stream"
+    )
+    content_disposition = str(upstream.headers.get("content-disposition") or "").strip()
+    if (
+        not content_disposition.lower().startswith("attachment")
+        or "\r" in content_disposition
+        or "\n" in content_disposition
+    ):
+        content_disposition = "attachment"
+    response_headers = {
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": content_disposition,
+        "X-Content-Type-Options": "nosniff",
+    }
+    declared_length = str(upstream.headers.get("content-length") or "").strip()
+    if declared_length.isdigit():
+        response_headers["Content-Length"] = declared_length
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+
+    return StreamingResponse(
+        body(),
+        status_code=upstream.status_code,
+        media_type=content_type,
+        headers=response_headers,
     )
 
 
@@ -1583,6 +1816,9 @@ def build_wxbot_router(
     owners_scope_execution_allowed: WxbotOwnersScopeExecutionAllowed | None = None,
 ) -> APIRouter:
     router = APIRouter()
+    social_policy_store = (
+        getattr(container, "social_policy_store", None) if container is not None else None
+    )
     repeater_store = getattr(container, "repeater_store", None) or RepeaterStore(store.settings)
     report_service = report_service or WxbotReportService(
         store,
@@ -1626,7 +1862,20 @@ def build_wxbot_router(
             raise HTTPException(400, str(exc)) from exc
         if not principal.allows_tenant(locator.tenant_id):
             raise HTTPException(403, "tenant access denied")
+        if locator.resource_type != "image":
+            raise HTTPException(400, "media id is not an image")
         return await _sdk_admin_image(store, locator)
+
+    @router.get("/admin/files/{media_id}")
+    async def get_admin_file(media_id: str, request: Request) -> Response:
+        principal = _require_admin(store, request)
+        try:
+            locator = resolve_media_id(media_id, store.settings)
+        except InvalidMediaID as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not principal.allows_tenant(locator.tenant_id):
+            raise HTTPException(403, "tenant access denied")
+        return await _sdk_admin_file(store, locator)
 
     @router.get("/admin/reply-queue/messages")
     async def list_reply_queue_messages(
@@ -2020,6 +2269,7 @@ def build_wxbot_router(
             message=Message(content=body.message),
             metadata={
                 "source": "admin_console_simulator",
+                "profile_source_key": "wxbot",
                 "session_kind": "group",
                 "session_name": str(target.get("session_name") or normalized_session_id),
                 "sender_name": "模拟群成员",
@@ -2721,6 +2971,10 @@ def build_wxbot_router(
         _validate_send_payload(payload, image_error_field="media_id")
         _resolve_send_media(payload, store, tenant_id=tenant_id)
         session_id = str(payload.get("session_id") or "").strip()
+        group_file_send = bool(
+            session_id.endswith("@chatroom")
+            and str(payload.get("msg_type") or "text").strip().lower() == "file"
+        )
         if session_id.endswith("@chatroom"):
             await _require_verified_group(
                 store,
@@ -2730,6 +2984,12 @@ def build_wxbot_router(
             )
 
         async def effect() -> _AdminEffectOutcome:
+            if group_file_send:
+                await _require_group_file_send(
+                    social_policy_store,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
             await _require_wxbot_scope_execution(
                 scope_execution_allowed,
                 tenant_id=tenant_id,
@@ -2803,6 +3063,18 @@ def build_wxbot_router(
             )
 
         async def effect() -> _AdminEffectOutcome:
+            if (
+                session_id.endswith("@chatroom")
+                and str(content.get("msg_type") or content.get("type") or "text")
+                .strip()
+                .lower()
+                == "file"
+            ):
+                await _require_group_file_send(
+                    social_policy_store,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
             await _require_wxbot_scope_execution(
                 scope_execution_allowed,
                 tenant_id=tenant_id,
@@ -2853,6 +3125,7 @@ def build_wxbot_router(
             raise HTTPException(400, "messages array required")
         tenant_ids: set[str] = set()
         group_session_ids: set[str] = set()
+        group_file_session_ids: set[str] = set()
         scope_targets: set[tuple[str, str]] = set()
         for message in messages:
             content = message.get("content")
@@ -2875,6 +3148,13 @@ def build_wxbot_router(
             scope_targets.add((tenant_id, session_id))
             if session_id.endswith("@chatroom"):
                 group_session_ids.add(session_id)
+                if (
+                    str(content.get("msg_type") or content.get("type") or "text")
+                    .strip()
+                    .lower()
+                    == "file"
+                ):
+                    group_file_session_ids.add(session_id)
         if len(tenant_ids) != 1:
             raise HTTPException(400, "batch messages must use one tenant")
         response_tenant = next(iter(tenant_ids))
@@ -2888,6 +3168,12 @@ def build_wxbot_router(
         request_payload = {"messages": messages}
 
         async def effect() -> _AdminEffectOutcome:
+            for group_file_session_id in sorted(group_file_session_ids):
+                await _require_group_file_send(
+                    social_policy_store,
+                    tenant_id=response_tenant,
+                    session_id=group_file_session_id,
+                )
             await _require_wxbot_scope_targets(
                 scope_execution_allowed,
                 scope_targets,
@@ -2945,6 +3231,7 @@ def build_wxbot_router(
             raise HTTPException(400, "messages array required")
         tenant_ids: set[str] = set()
         group_session_ids: set[str] = set()
+        group_file_session_ids: set[str] = set()
         scope_targets: set[tuple[str, str]] = set()
         for message in messages:
             tenant_id = str(
@@ -2963,6 +3250,13 @@ def build_wxbot_router(
             scope_targets.add((tenant_id, session_id))
             if session_id.endswith("@chatroom"):
                 group_session_ids.add(session_id)
+                if (
+                    str(message.get("msg_type") or message.get("type") or "text")
+                    .strip()
+                    .lower()
+                    == "file"
+                ):
+                    group_file_session_ids.add(session_id)
         if len(tenant_ids) != 1:
             raise HTTPException(400, "batch messages must use one tenant")
         response_tenant = next(iter(tenant_ids))
@@ -2976,6 +3270,12 @@ def build_wxbot_router(
         request_payload = {"messages": messages}
 
         async def effect() -> _AdminEffectOutcome:
+            for group_file_session_id in sorted(group_file_session_ids):
+                await _require_group_file_send(
+                    social_policy_store,
+                    tenant_id=response_tenant,
+                    session_id=group_file_session_id,
+                )
             await _require_wxbot_scope_targets(
                 scope_execution_allowed,
                 scope_targets,

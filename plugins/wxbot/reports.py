@@ -1203,7 +1203,7 @@ class WxbotReportService:
             }
 
         sdk_status = str(sdk_row.get("status") or "").strip().lower()
-        if sdk_status in {"pending", "running"}:
+        if sdk_status in {"pending", "running", "sending"}:
             await self._store.touch_report_delivery_check(
                 int(job_id),
                 delivery_attempt=delivery_attempt,

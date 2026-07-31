@@ -13,8 +13,29 @@ from app.plugin.state import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_override(
+    loader: _ComposeLoader,
+    node: yaml.Node,
+) -> object:
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    return loader.construct_scalar(node)
+
+
+_ComposeLoader.add_constructor("!override", _construct_override)
+
+
 def _compose(name: str) -> dict[str, object]:
-    payload = yaml.safe_load((ROOT / name).read_text(encoding="utf-8"))
+    payload = yaml.load(
+        (ROOT / name).read_text(encoding="utf-8"),
+        Loader=_ComposeLoader,
+    )
     assert isinstance(payload, dict)
     return payload
 
@@ -25,7 +46,15 @@ def test_core_compose_profile_has_no_wxbot_worker_or_secret_injection() -> None:
     assert isinstance(core_env, dict)
     assert {
         str(name) for name in core_env if str(name).startswith("WXBOT_")
-    } == {"WXBOT_DAILY_REPORT_FOOTER", "WXBOT_SDK_URL"}
+    } == {
+        "WXBOT_DAILY_REPORT_FOOTER",
+        "WXBOT_FILE_DOWNLOAD_MAX_BYTES",
+        "WXBOT_OUTBOUND_FILE_CLEANUP_GRACE_SECONDS",
+        "WXBOT_OUTBOUND_FILE_DIR",
+        "WXBOT_OUTBOUND_FILE_MAX_BYTES",
+        "WXBOT_OUTBOUND_FILE_RETENTION_SECONDS",
+        "WXBOT_SDK_URL",
+    }
     assert core_env["CHANNEL_CONNECTION_ID"] == "${COMPOSE_CHANNEL_CONNECTION_ID:-}"
     assert core_env["READINESS_REQUIRED_WORKER_ROLES"] == (
         "${COMPOSE_READINESS_REQUIRED_WORKER_ROLES:-inbound,outbound,scheduler}"
@@ -105,6 +134,37 @@ def test_production_core_contract_does_not_require_wechat() -> None:
         "ANTHROPIC_API_KEY",
     ):
         assert unrelated_secret not in bridge["environment"]
+
+
+def test_server_deployment_keeps_scheduler_on_sdk_network() -> None:
+    server = _compose("docker-compose.server.yml")
+    services = server["services"]
+    assert isinstance(services, dict)
+
+    for service_name in (
+        "api",
+        "inbound-worker",
+        "outbound-worker",
+        "scheduler",
+        "wxbot-bridge-worker",
+    ):
+        assert services[service_name]["networks"] == ["default", "wxbot-sdk"]
+
+    sdk_network = server["networks"]["wxbot-sdk"]
+    assert sdk_network["external"] is True
+    assert sdk_network["name"] == (
+        "${COMPOSE_WXBOT_DOCKER_NETWORK:-wx-bot-linux-xfce_default}"
+    )
+
+    deploy_script = (ROOT / "scripts" / "deploy-server.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "-f docker-compose.server.yml" in deploy_script
+    assert deploy_script.index("COMPOSE+=(-f docker-compose.server.yml)") < (
+        deploy_script.index('SITE_OVERRIDE="${AGENT_CONSOLE_SITE_OVERRIDE_FILE')
+    )
+    assert "merged scheduler config is missing wxbot-sdk" in deploy_script
+    assert "scheduler -> wxbot SDK" in deploy_script
 
 
 def test_builtin_wxbot_is_only_a_protected_compatibility_adapter() -> None:

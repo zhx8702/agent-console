@@ -9,9 +9,14 @@ from app.channel import (
     ChannelSendResult,
     ChannelTarget,
 )
+from app.channel.models import ChannelFile
 from app.social.contracts import GroupParticipationPolicyDocument
 from app.social.rollout import resolve_humanization_features
 from app.social.speech_ledger import GroupSpeechBudgetExceeded
+from plugins.wxbot.group_file_policy import (
+    GroupFileSendDenied,
+    require_group_file_send_enabled,
+)
 from plugins.wxbot.store import WxbotStore
 
 _GROUP_DELIVERY_CONTRACT_FIELDS = (
@@ -133,9 +138,7 @@ class WxbotChannelOutbound:
     ) -> dict[str, Any]:
         """Snapshot the policy fence before a source-bound async task starts."""
 
-        if not (
-            target.session_kind == "group" or target.session_id.endswith("@chatroom")
-        ):
+        if not (target.session_kind == "group" or target.session_id.endswith("@chatroom")):
             return {}
         source_id = str(source_message_id or "").strip()
         if not source_id:
@@ -171,6 +174,11 @@ class WxbotChannelOutbound:
                 msg_type="text",
                 image_path="",
                 image_url="",
+                file_path="",
+                file_name="",
+                file_size=None,
+                file_md5="",
+                file_sha256="",
                 options=options,
             )
         except GroupSpeechBudgetExceeded as exc:
@@ -207,6 +215,11 @@ class WxbotChannelOutbound:
                 msg_type="image",
                 image_path=media.image_path,
                 image_url=media.image_url,
+                file_path="",
+                file_name="",
+                file_size=None,
+                file_md5="",
+                file_sha256="",
                 options=options,
             )
         except GroupSpeechBudgetExceeded as exc:
@@ -229,6 +242,52 @@ class WxbotChannelOutbound:
             metadata={"reply_queue_id": reply_id},
         )
 
+    async def send_file(
+        self,
+        target: ChannelTarget,
+        file: ChannelFile,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult:
+        options = options or ChannelSendOptions()
+        try:
+            reply_id = await self._enqueue(
+                target,
+                reply_text="",
+                msg_type="file",
+                image_path="",
+                image_url="",
+                file_path=file.file_path,
+                file_name=file.file_name,
+                file_size=file.file_size,
+                file_md5=file.file_md5,
+                file_sha256=file.file_sha256,
+                options=options,
+            )
+        except GroupSpeechBudgetExceeded as exc:
+            return ChannelSendResult(
+                provider="wxbot",
+                metadata={
+                    "suppressed": True,
+                    "reason": exc.reason,
+                    "output_kind": exc.output_kind,
+                },
+            )
+        except WxbotGroupDeliverySuppressed as exc:
+            return ChannelSendResult(
+                provider="wxbot",
+                metadata={"suppressed": True, "reason": exc.reason},
+            )
+        except GroupFileSendDenied as exc:
+            return ChannelSendResult(
+                provider="wxbot",
+                metadata={"suppressed": True, "reason": exc.reason},
+            )
+        return ChannelSendResult(
+            message_id=str(reply_id),
+            provider="wxbot",
+            metadata={"reply_queue_id": reply_id},
+        )
+
     async def _enqueue(
         self,
         target: ChannelTarget,
@@ -237,9 +296,24 @@ class WxbotChannelOutbound:
         msg_type: str,
         image_path: str,
         image_url: str,
+        file_path: str,
+        file_name: str,
+        file_size: int | None,
+        file_md5: str,
+        file_sha256: str,
         options: ChannelSendOptions,
     ) -> int:
         await self._require_connection_enabled(target)
+        if msg_type == "file" and (
+            target.session_kind == "group"
+            or target.session_id.endswith("@chatroom")
+            or (target.external_conversation_id or "").endswith("@chatroom")
+        ):
+            await require_group_file_send_enabled(
+                self._social_policy_store,
+                tenant_id=target.tenant_id,
+                session_id=target.external_conversation_id or target.session_id,
+            )
         mention_sender = options.mention_sender
         if mention_sender is None:
             mention_sender = False
@@ -251,12 +325,8 @@ class WxbotChannelOutbound:
             "connection_id": target.connection_id,
             "tenant_id": target.tenant_id,
             "session_id": target.session_id,
-            "external_conversation_id": (
-                target.external_conversation_id or target.session_id
-            ),
-            "canonical_conversation_id": (
-                target.canonical_conversation_id or target.session_id
-            ),
+            "external_conversation_id": (target.external_conversation_id or target.session_id),
+            "canonical_conversation_id": (target.canonical_conversation_id or target.session_id),
             "session_name": target.session_name,
             "session_kind": target.session_kind,
             "sender_name": target.sender_name,
@@ -282,27 +352,35 @@ class WxbotChannelOutbound:
             or str(delivery.get("command_id") or "")
             or str(delivery.get("idempotency_key") or "")
         )
-        return cast(
-            int,
-            await self._store.enqueue_reply(
-                tenant_id=target.tenant_id,
-                session_id=target.session_id,
-                session_name=target.session_name,
-                sender_name=target.sender_name,
-                sender_wxid=target.sender_id,
-                reply_text=reply_text,
-                trace_id=options.trace_id,
-                msg_type=msg_type,
-                image_path=image_path,
-                image_url=image_url,
-                mention_sender=bool(mention_sender),
-                reply_to_msg_svr_id=reply_to_message_id,
-                session_kind=target.session_kind,
-                source_message=options.source_message,
-                delivery=delivery,
-                command_id=command_id,
-            ),
-        )
+        enqueue_payload: dict[str, Any] = {
+            "tenant_id": target.tenant_id,
+            "session_id": target.session_id,
+            "session_name": target.session_name,
+            "sender_name": target.sender_name,
+            "sender_wxid": target.sender_id,
+            "reply_text": reply_text,
+            "trace_id": options.trace_id,
+            "msg_type": msg_type,
+            "image_path": image_path,
+            "image_url": image_url,
+            "mention_sender": bool(mention_sender),
+            "reply_to_msg_svr_id": reply_to_message_id,
+            "session_kind": target.session_kind,
+            "source_message": options.source_message,
+            "delivery": delivery,
+            "command_id": command_id,
+        }
+        if msg_type == "file":
+            enqueue_payload.update(
+                {
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "file_md5": file_md5,
+                    "file_sha256": file_sha256,
+                }
+            )
+        return cast(int, await self._store.enqueue_reply(**enqueue_payload))
 
     async def _require_connection_enabled(self, target: ChannelTarget) -> None:
         """Fail closed before enqueueing for a managed connection.
@@ -352,8 +430,7 @@ class WxbotChannelOutbound:
         if not status:
             status = (
                 "must_reply"
-                if response_kind in {"tool_progress", "tool_result"}
-                or speech_class == "obligation"
+                if response_kind in {"tool_progress", "tool_result"} or speech_class == "obligation"
                 else "may_reply"
             )
         if status not in _GROUP_REVALIDATED_STATUSES:
@@ -370,9 +447,7 @@ class WxbotChannelOutbound:
         if self._social_policy_store is None:
             raise RuntimeError("wxbot_group_delivery_policy_store_required")
         if not complete_contract:
-            raise RuntimeError(
-                "wxbot_group_delivery_request_contract_required"
-            )
+            raise RuntimeError("wxbot_group_delivery_request_contract_required")
 
         document = await self._social_policy_store.get_group_policy(
             target.tenant_id,
@@ -388,22 +463,14 @@ class WxbotChannelOutbound:
             try:
                 queued_version = int(captured_version)
             except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "wxbot_group_delivery_policy_version_invalid"
-                ) from exc
+                raise RuntimeError("wxbot_group_delivery_policy_version_invalid") from exc
             if queued_version != int(current["participation_policy_version"]):
-                raise WxbotGroupDeliverySuppressed(
-                    "participation_policy_version_changed"
-                )
+                raise WxbotGroupDeliverySuppressed("participation_policy_version_changed")
         captured_revalidation = prepared.get("send_revalidation_enabled")
         if not isinstance(captured_revalidation, bool):
-            raise RuntimeError(
-                "wxbot_group_delivery_send_revalidation_enabled_invalid"
-            )
+            raise RuntimeError("wxbot_group_delivery_send_revalidation_enabled_invalid")
         if captured_revalidation != bool(current["send_revalidation_enabled"]):
-            raise RuntimeError(
-                "wxbot_group_delivery_send_revalidation_policy_mismatch"
-            )
+            raise RuntimeError("wxbot_group_delivery_send_revalidation_policy_mismatch")
         for key, value in current.items():
             prepared.setdefault(key, value)
         if not _has_complete_group_delivery_contract(prepared):
@@ -447,8 +514,7 @@ def _is_source_bound_group_delivery(
     if _group_source_message_id(target, options=options, delivery=delivery):
         return True
     return bool(
-        str(delivery.get("response_kind") or "").strip()
-        in {"tool_progress", "tool_result"}
+        str(delivery.get("response_kind") or "").strip() in {"tool_progress", "tool_result"}
         or any(key in delivery for key in _GROUP_DELIVERY_CONTRACT_FIELDS)
     )
 

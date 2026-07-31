@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.common.types import (
+    CapabilityResult,
     Channel,
     InboundEvent,
     Message,
     OutboundReply,
     PreprocessedMessage,
     ReplySegment,
+    RouteType,
     Session,
 )
 from app.orchestrator.effect_handlers import (
@@ -24,6 +29,7 @@ from app.orchestrator.pipeline import PipelineContext
 from app.social.contracts import MemberPrivacyValues
 from plugins.memory.hooks import (
     MemoryContextHook,
+    MemoryControlHook,
     MemoryLoadStep,
     MemoryPersistenceHook,
     MemorySaveStep,
@@ -417,6 +423,112 @@ class _FakeMemoryStore:
         }
 
 
+def _save_ctx(
+    *,
+    user_text: str = "我要看物流",
+    assistant_text: str = "物流今天会继续更新",
+    channel: Channel = Channel.DISCORD,
+    extras: dict | None = None,
+    result_metadata: dict | None = None,
+) -> PipelineContext:
+    source = "wxbot" if channel == Channel.WECHAT else channel.value
+    user_id = "wxid_member_b" if channel == Channel.WECHAT else "discord-user-b"
+    session_id = user_id if channel == Channel.WECHAT else "discord-channel-2"
+    event = InboundEvent(
+        message_id="m-save-guard",
+        tenant_id="demo",
+        channel=channel,
+        user_id=user_id,
+        session_id=session_id,
+        message=Message(content=user_text),
+        metadata={"source": source},
+        trace_id="trace-save-guard",
+    )
+    session = Session(
+        session_id=session_id,
+        tenant_id="demo",
+        user_id=user_id,
+        channel=channel,
+    )
+    reply = OutboundReply(
+        tenant_id="demo",
+        channel=channel,
+        user_id=user_id,
+        session_id=session_id,
+        segments=[ReplySegment(content=assistant_text)] if assistant_text else [],
+    )
+    result = (
+        CapabilityResult(
+            route=RouteType.LLM,
+            reply_text=assistant_text,
+            metadata=result_metadata,
+        )
+        if result_metadata is not None
+        else None
+    )
+    return PipelineContext(
+        event=event,
+        trace_id=event.trace_id,
+        session=session,
+        pre=PreprocessedMessage(original_text=user_text, cleaned_text=user_text),
+        result=result,
+        reply=reply,
+        extras=dict(extras or {}),
+    )
+
+
+def test_memory_legacy_hook_error_policies_keep_context_and_save_fail_open() -> None:
+    store = _FakeMemoryStore()
+
+    assert MemoryContextHook(store).error_policy == "fail_open"
+    assert MemoryPersistenceHook(store).error_policy == "fail_open"
+    assert MemoryControlHook(store).error_policy == "fail_closed"
+
+
+@pytest.mark.asyncio
+async def test_private_memory_context_load_stops_after_member_opt_out() -> None:
+    store = _FakeMemoryStore()
+    store._member_memory_write_blocked = AsyncMock(return_value=True)
+    ctx = _save_ctx(channel=Channel.WECHAT)
+    assert ctx.session is not None
+    ctx.session.variables["user_memory"] = {"manual_notes": "stale"}
+
+    await MemoryContextHook(store).run(ctx)
+
+    store._member_memory_write_blocked.assert_awaited_once_with(
+        tenant_id="demo",
+        user_id="wxid_member_b",
+    )
+    assert "user_memory" not in ctx.session.variables
+    assert ctx.signals["memory"]["member_recall_blocked"] is True
+    assert ctx.signals["memory"]["member_recall_block_reason"] == "member_control_blocked"
+
+
+@pytest.mark.asyncio
+async def test_memory_context_clears_previous_turn_before_fail_open_load() -> None:
+    store = _FakeMemoryStore()
+
+    async def fail_profile_load(**kwargs):
+        del kwargs
+        raise RuntimeError("memory database unavailable")
+
+    store.get_runtime_profile = fail_profile_load
+    ctx = _save_ctx()
+    ctx.extras["user_memory_profile"] = {"stale": True}
+    ctx.extras["group_memory_profile"] = {"stale": True}
+    assert ctx.session is not None
+    ctx.session.variables["user_memory"] = {"stale": True}
+    ctx.session.variables["group_memory"] = {"stale": True}
+
+    with pytest.raises(RuntimeError, match="memory database unavailable"):
+        await MemoryContextHook(store).run(ctx)
+
+    assert "user_memory_profile" not in ctx.extras
+    assert "group_memory_profile" not in ctx.extras
+    assert "user_memory" not in ctx.session.variables
+    assert "group_memory" not in ctx.session.variables
+
+
 @pytest.mark.asyncio
 async def test_memory_context_hook_uses_event_user_id_for_group_member_scope() -> None:
     store = _FakeMemoryStore()
@@ -679,9 +791,10 @@ async def test_memory_context_hook_uses_hybrid_once_when_enabled() -> None:
             "limit": 5,
             "fact_top_k": 2,
             "episode_top_k": 1,
-            "budget_chars": 400,
-            "include_graph": True,
-            "request_session_kind": "group",
+                "budget_chars": 400,
+                "include_graph": True,
+                "debug": True,
+                "request_session_kind": "group",
         },
         {
             "tenant_id": "demo",
@@ -693,9 +806,10 @@ async def test_memory_context_hook_uses_hybrid_once_when_enabled() -> None:
             "limit": 5,
             "fact_top_k": 2,
             "episode_top_k": 1,
-            "budget_chars": 400,
-            "include_graph": True,
-            "request_session_kind": "group",
+                "budget_chars": 400,
+                "include_graph": True,
+                "debug": True,
+                "request_session_kind": "group",
         },
     ]
     assert session.variables["user_memory"]["relevant_memory_items"][0]["id"] == 7
@@ -771,8 +885,133 @@ async def test_memory_load_step_sets_memory_signal() -> None:
             "request_session_kind": "private",
         }
     ]
-    assert ctx.signals["memory"]["user_profile"]["user_id"] == "discord-user-a"
+    assert ctx.signals["memory"]["user_profile"]["loaded"] is True
+    assert "user_id" not in ctx.signals["memory"]["user_profile"]
+    assert ctx.signals["memory"]["user_profile"]["selected_item_ids"] == [7]
+    runtime = ctx.signals["memory"]["runtime"]
+    assert runtime["scope"] == {
+        "session_kind": "private",
+        "source_scope": "legacy_source",
+        "legacy_or_ambiguous": False,
+    }
+    assert runtime["load"]["status"] == "loaded"
+    assert runtime["load"]["loaded_scopes"] == ["member"]
+    assert runtime["load"]["candidate_count"] == 1
+    assert runtime["load"]["selected_count"] == 1
+    assert runtime["load"]["selected_item_ids"] == [7]
+    serialized_signal = json.dumps(ctx.signals["memory"], ensure_ascii=False)
+    for forbidden in (
+        "discord-user-a",
+        "用户最近问了退货进度",
+        "VIP 客户",
+        "用户正在查物流",
+    ):
+        assert forbidden not in serialized_signal
     assert session.variables["user_memory"]["user_id"] == "discord-user-a"
+
+
+@pytest.mark.asyncio
+async def test_memory_context_loads_member_and_group_concurrently() -> None:
+    store = _FakeMemoryStore()
+    original_get_runtime_profile = store.get_runtime_profile
+    started_user_ids: list[str] = []
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_get_runtime_profile(**kwargs):
+        started_user_ids.append(str(kwargs["user_id"]))
+        if len(started_user_ids) >= 2:
+            both_started.set()
+        await release.wait()
+        return await original_get_runtime_profile(**kwargs)
+
+    store.get_runtime_profile = gated_get_runtime_profile  # type: ignore[method-assign]
+    event = InboundEvent(
+        message_id="m-concurrent-load",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="wxid_member_b",
+        session_id="group-1@chatroom",
+        message=Message(content="查一下物流"),
+        metadata={"source": "wxbot"},
+    )
+    session = Session(
+        session_id="group-1@chatroom",
+        tenant_id="demo",
+        user_id="group-1@chatroom",
+        channel=Channel.WECHAT,
+    )
+    ctx = PipelineContext(event=event, trace_id="trace-concurrent-load", session=session)
+    load_task = asyncio.create_task(
+        MemoryContextHook(store, load_timeout_seconds=1.0).run(ctx)
+    )
+
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+    finally:
+        release.set()
+    await load_task
+
+    assert set(started_user_ids) == {"wxid_member_b", GROUP_HISTORY_USER_ID_SCOPE}
+    runtime_load = ctx.signals["memory"]["runtime"]["load"]
+    assert runtime_load["status"] == "loaded"
+    assert runtime_load["loaded_scopes"] == ["group", "member"]
+    assert set(runtime_load["selected_item_ids"]) == {7, 17}
+
+
+@pytest.mark.asyncio
+async def test_memory_context_total_timeout_clears_stale_projection_and_reports_safely() -> None:
+    store = _FakeMemoryStore()
+
+    async def slow_get_runtime_profile(**kwargs):
+        del kwargs
+        await asyncio.sleep(5)
+        return {}
+
+    store.get_runtime_profile = slow_get_runtime_profile  # type: ignore[method-assign]
+    ctx = _save_ctx()
+    assert ctx.session is not None
+    ctx.extras["user_memory_profile"] = {"short_term_memory": "stale secret"}
+    ctx.session.variables["user_memory"] = {"short_term_memory": "stale secret"}
+
+    with pytest.raises(TimeoutError):
+        await MemoryContextHook(store, load_timeout_seconds=0.05).run(ctx)
+
+    assert "user_memory_profile" not in ctx.extras
+    assert "user_memory" not in ctx.session.variables
+    runtime_load = ctx.signals["memory"]["runtime"]["load"]
+    assert runtime_load["status"] == "error"
+    assert runtime_load["reason"] == "timeout"
+    assert runtime_load["error_type"] == "timeout_error"
+    assert "stale secret" not in json.dumps(ctx.signals["memory"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_keeps_profile_after_vector_timeout_sql_fallback() -> None:
+    store = _FakeMemoryStore()
+    original_retrieve = store.retrieve_memory_items
+    vector_timed_out = False
+
+    async def vector_timeout_then_sql(**kwargs):
+        nonlocal vector_timed_out
+        try:
+            await asyncio.wait_for(asyncio.sleep(5), timeout=1.3)
+        except TimeoutError:
+            vector_timed_out = True
+        return await original_retrieve(**kwargs)
+
+    store.retrieve_memory_items = vector_timeout_then_sql  # type: ignore[method-assign]
+    ctx = _save_ctx()
+
+    await MemoryContextHook(store).run(ctx)
+
+    assert vector_timed_out is True
+    assert ctx.session is not None
+    assert ctx.session.variables["user_memory"]["relevant_memory_items"][0]["id"] == 7
+    assert ctx.signals["memory"]["runtime"]["load"]["status"] == "loaded"
+    assert MemoryContextHook(store).load_timeout_seconds == 3.0
+    assert MemoryContextHook(store).timeout_seconds == 3.5
+    assert MemoryLoadStep(store).timeout_seconds == 3.5
 
 
 @pytest.mark.asyncio
@@ -852,6 +1091,7 @@ async def test_memory_persistence_hook_persists_reply_by_event_user_id() -> None
         "user_text": "我要看物流",
         "assistant_text": "物流今天会继续更新",
         "trace_id": "trace-2",
+        "source_message_id": "m-2",
         "origin_session_kind": "group",
         "audience_scope": "session",
         "allowed_session_ids": ["group-2@chatroom"],
@@ -893,6 +1133,39 @@ async def test_memory_persistence_hook_persists_reply_by_event_user_id() -> None
     assert session.variables["user_memory"]["memory_items"]["session"][0]["content"] == (
         "用户刚刚要求看物流"
     )
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "success",
+        "reason": "saved",
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_persistence_error_signal_does_not_include_exception_or_turn_body() -> None:
+    store = _FakeMemoryStore()
+    store.remember_interaction = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("failed near 13800138000 and secret turn body")
+    )
+    ctx = _save_ctx(
+        user_text="secret turn body 13800138000",
+        assistant_text="private assistant body",
+    )
+
+    await MemoryPersistenceHook(store).run(ctx)
+
+    runtime_save = ctx.signals["memory"]["runtime"]["save"]
+    assert runtime_save == {
+        "status": "error",
+        "reason": "persistence_failed",
+        "error_type": "runtimeerror",
+    }
+    serialized_signal = json.dumps(ctx.signals["memory"], ensure_ascii=False)
+    for forbidden in (
+        "13800138000",
+        "secret turn body",
+        "private assistant body",
+        "failed near",
+    ):
+        assert forbidden not in serialized_signal
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1327,163 @@ async def test_memory_persistence_skips_observation_only_group_message() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extras", "reason"),
+    [
+        ({"suppress_outbound": True}, "suppress_outbound"),
+        ({"skip_assistant_turn": True}, "skip_assistant_turn"),
+    ],
+)
+async def test_memory_persistence_skips_unsent_reply_flags(
+    extras: dict,
+    reason: str,
+) -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(extras=extras)
+
+    await MemoryPersistenceHook(store).run(ctx)
+
+    assert store.remember_calls == []
+    assert ctx.signals["memory"]["save_suppressed"] is True
+    assert ctx.signals["memory"]["save_suppression_reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_memory_persistence_masks_restored_pii_before_store_write() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(
+        user_text="我的手机号是 13800138000",
+        assistant_text="我会发到 customer@example.com",
+    )
+
+    await MemoryPersistenceHook(store).run(ctx)
+
+    assert len(store.remember_calls) == 1
+    call = store.remember_calls[0]
+    assert call["user_text"] == "我的手机号是 <PII:phone:1>"
+    assert call["assistant_text"] == "我会发到 <PII:email:1>"
+    assert "13800138000" not in repr(call)
+    assert "customer@example.com" not in repr(call)
+    assert ctx.signals["memory"]["persistence_pii_masked"] == {
+        "user": 1,
+        "assistant": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_save_step_skips_result_suppressed_reply() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(
+        result_metadata={
+            "suppress_final_reply": True,
+            "skip_assistant_turn": True,
+        }
+    )
+
+    result = await MemorySaveStep(store, effect_handler_enabled=True).run(ctx)
+
+    assert result.reason == "not_saved"
+    assert result.effects == []
+    assert store.remember_calls == []
+    assert ctx.signals["memory"]["save_suppression_reason"] == "skip_assistant_turn"
+
+
+@pytest.mark.asyncio
+async def test_memory_save_step_masks_pii_in_effect_payload() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(
+        user_text="手机号 13800138000",
+        assistant_text="邮箱 customer@example.com",
+    )
+
+    result = await MemorySaveStep(store, effect_handler_enabled=True).run(ctx)
+
+    assert result.reason == "effect_pending"
+    assert len(result.effects) == 1
+    payload = result.effects[0].payload
+    assert payload["user_text"] == "手机号 <PII:phone:1>"
+    assert payload["assistant_text"] == "邮箱 <PII:email:1>"
+    assert payload["source_message_id"] == "m-save-guard"
+    assert "13800138000" not in repr(payload)
+    assert "customer@example.com" not in repr(payload)
+    assert store.remember_calls == []
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "pending",
+        "reason": "effect_pending",
+    }
+    assert "13800138000" not in json.dumps(ctx.signals["memory"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_memory_runtime_marks_canonical_connection_scope_without_leaking_ids() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(channel=Channel.WECHAT)
+    ctx.event.metadata.pop("source", None)
+    ctx.event.connection_id = "conn-secret-123"
+    ctx.event.canonical_participant_id = "wxbot:conn-secret-123:member"
+    ctx.event.canonical_conversation_id = "wxbot:conn-secret-123:conversation"
+
+    result = await MemorySaveStep(store, effect_handler_enabled=True).run(ctx)
+
+    assert result.reason == "effect_pending"
+    assert ctx.signals["memory"]["runtime"]["scope"] == {
+        "session_kind": "private",
+        "source_scope": "canonical_connection_scoped",
+        "legacy_or_ambiguous": False,
+    }
+    serialized_signal = json.dumps(ctx.signals["memory"], ensure_ascii=False)
+    assert "conn-secret-123" not in serialized_signal
+    assert "wxbot:conn-secret-123" not in serialized_signal
+
+
+@pytest.mark.asyncio
+async def test_memory_runtime_marks_noncanonical_missing_source_as_legacy_wildcard() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx()
+    ctx.event.metadata.pop("source", None)
+
+    result = await MemorySaveStep(store, effect_handler_enabled=True).run(ctx)
+
+    assert result.reason == "effect_pending"
+    assert ctx.signals["memory"]["runtime"]["scope"] == {
+        "session_kind": "private",
+        "source_scope": "legacy_wildcard",
+        "legacy_or_ambiguous": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_memory_save_step_keeps_successfully_queued_wxbot_reply() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(
+        channel=Channel.WECHAT,
+        extras={
+            "suppress_outbound": True,
+            "wxbot_reply_queued_count": 1,
+        },
+    )
+
+    result = await MemorySaveStep(store).run(ctx)
+
+    assert result.reason == "saved"
+    assert len(store.remember_calls) == 1
+    assert "save_suppressed" not in ctx.signals.get("memory", {})
+
+
+@pytest.mark.asyncio
+async def test_memory_save_step_skips_empty_assistant_reply() -> None:
+    store = _FakeMemoryStore()
+    ctx = _save_ctx(assistant_text="")
+
+    result = await MemorySaveStep(store).run(ctx)
+
+    assert result.reason == "not_saved"
+    assert result.effects == []
+    assert store.remember_calls == []
+    assert ctx.signals["memory"]["save_suppression_reason"] == "empty_assistant_reply"
+
+
+@pytest.mark.asyncio
 async def test_memory_save_step_persists_reply_and_updates_signal() -> None:
     store = _FakeMemoryStore()
     step = MemorySaveStep(store)
@@ -1096,7 +1526,7 @@ async def test_memory_save_step_persists_reply_and_updates_signal() -> None:
     assert result.effects[0].type == "save_memory"
     assert result.effects[0].owner == "memory"
     assert result.effects[0].idempotency_key == (
-        "memory:save:demo:discord:discord:discord-channel-2:discord-user-b:trace-2"
+        "memory:save:demo:discord:discord:discord-channel-2:discord-user-b:m-2"
     )
     assert result.effects[0].payload["message_count"] == 4
     assert store.remember_calls == [
@@ -1109,6 +1539,7 @@ async def test_memory_save_step_persists_reply_and_updates_signal() -> None:
             "user_text": "我要看物流",
             "assistant_text": "物流今天会继续更新",
             "trace_id": "trace-2",
+            "source_message_id": "m-2",
             "origin_session_kind": "private",
             "audience_scope": "private",
             "allowed_session_ids": [],
@@ -1118,6 +1549,10 @@ async def test_memory_save_step_persists_reply_and_updates_signal() -> None:
         }
     ]
     assert ctx.signals["memory"]["user_profile"]["message_count"] == 4
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "success",
+        "reason": "saved",
+    }
     assert session.variables["user_memory"]["user_id"] == "discord-user-b"
 
 
@@ -1172,6 +1607,7 @@ async def test_memory_save_step_effect_handler_opt_in_only_emits_effect() -> Non
         "user_text": "我要看物流",
         "assistant_text": "物流今天会继续更新",
         "trace_id": "trace-3",
+        "source_message_id": "m-3",
         "origin_session_kind": "private",
         "audience_scope": "private",
         "allowed_session_ids": [],
@@ -1183,7 +1619,10 @@ async def test_memory_save_step_effect_handler_opt_in_only_emits_effect() -> Non
         "session_message_count": 0,
     }
     assert store.remember_calls == []
-    assert "memory" not in ctx.signals
+    assert ctx.signals["memory"]["runtime"]["save"] == {
+        "status": "pending",
+        "reason": "effect_pending",
+    }
 
 
 @pytest.mark.asyncio
@@ -1240,6 +1679,7 @@ async def test_memory_save_effect_handler_persists_and_updates_signal() -> None:
         "user_text": "我要看物流",
         "assistant_text": "物流今天会继续更新",
         "trace_id": "trace-4",
+        "source_message_id": "m-4",
         "origin_session_kind": "group",
         "audience_scope": "session",
         "allowed_session_ids": ["group-4@chatroom"],

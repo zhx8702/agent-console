@@ -135,6 +135,13 @@ def test_wechat_group_ban_gate_runs_before_repeater() -> None:
     assert step_ids.index("wxbot_user_ban_gate") < step_ids.index("repeater")
 
 
+def test_wechat_memory_save_runs_after_final_outbound_policy() -> None:
+    step_ids = [step.id for step in build_default_wechat_group_flow_specs()]
+
+    assert step_ids.index("wxbot_outbound_policy") < step_ids.index("memory_save")
+    assert step_ids.index("memory_save") < step_ids.index("commit")
+
+
 def test_builtin_flow_resolver_uses_group_channel_flow_for_discord_group() -> None:
     result = resolve_builtin_flow(
         FlowResolveRequest(

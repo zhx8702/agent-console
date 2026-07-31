@@ -13,6 +13,7 @@ from datetime import date, datetime
 from typing import Any, Protocol
 
 from app.channel import (
+    ChannelFile,
     ChannelMedia,
     ChannelOutbound,
     ChannelRegistry,
@@ -35,6 +36,7 @@ from app.orchestrator.owner_gate import (
     owner_gate_failure_is_retryable,
 )
 from app.orchestrator.pipeline import PipelineContext
+from plugins.memory.observability import build_safe_memory_profile_signal
 
 EFFECT_HANDLER_STATUS_HANDLER_ERROR = "handler_error"
 EFFECT_HANDLER_STATUS_NO_HANDLER = "no_handler"
@@ -184,6 +186,23 @@ def effect_handler_opt_in_enabled(
     )
 
 
+def _set_memory_save_runtime_signal(
+    ctx: PipelineContext,
+    *,
+    status: str,
+    reason: str,
+    error_type: str = "",
+) -> None:
+    runtime = ctx.signals.setdefault("memory", {}).setdefault("runtime", {})
+    save = runtime.setdefault("save", {})
+    save["status"] = status
+    save["reason"] = reason
+    if error_type:
+        save["error_type"] = error_type.lower()[:64]
+    else:
+        save.pop("error_type", None)
+
+
 @dataclass
 class MemorySaveEffectHandler:
     """Persist ``memory:save_memory`` effects through the memory store."""
@@ -215,41 +234,65 @@ class MemorySaveEffectHandler:
             assistant_text = str(ctx.reply.primary_text or "").strip()
 
         if not user_text:
+            _set_memory_save_runtime_signal(
+                ctx,
+                status="skipped",
+                reason="empty_user_text",
+            )
             return
 
-        remember_kwargs = {
-            "tenant_id": tenant_id,
-            "channel": channel,
-            "source_key": source_key,
-            "user_id": user_id,
-            "session_id": session_id,
-            "user_text": user_text,
-            "assistant_text": assistant_text,
-            "trace_id": trace_id,
-            "origin_session_kind": str(payload.get("origin_session_kind") or "unknown"),
-            "audience_scope": str(payload.get("audience_scope") or "private"),
-            "allowed_session_ids": list(payload.get("allowed_session_ids") or []),
-            "sensitivity_category": str(payload.get("sensitivity_category") or "normal"),
-            "expires_at": payload.get("expires_at"),
-            "source_kind": str(payload.get("source_kind") or "conversation"),
-        }
-        if payload.get("identity_scope") is False:
-            remember_kwargs["identity_scope"] = False
-        profile = await self.store.remember_interaction(**remember_kwargs)
-        if not isinstance(profile, dict):
-            profile = {}
-        if not bool(payload.get("identity_scope", True)):
-            profile = _session_only_memory_profile(profile, session_id=session_id)
-        ctx.extras["user_memory_profile"] = profile
-        ctx.signals.setdefault("memory", {})["user_profile"] = dict(profile)
-        if ctx.session is not None:
-            ctx.session.variables["user_memory"] = _memory_session_payload(
-                user_id=user_id,
-                channel=channel,
-                source_key=source_key,
-                session_id=session_id,
-                profile=profile,
+        try:
+            remember_kwargs = {
+                "tenant_id": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "user_id": user_id,
+                "session_id": session_id,
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+                "trace_id": trace_id,
+                "source_message_id": str(
+                    payload.get("source_message_id") or ctx.event.message_id or ""
+                ),
+                "origin_session_kind": str(payload.get("origin_session_kind") or "unknown"),
+                "audience_scope": str(payload.get("audience_scope") or "private"),
+                "allowed_session_ids": list(payload.get("allowed_session_ids") or []),
+                "sensitivity_category": str(payload.get("sensitivity_category") or "normal"),
+                "expires_at": payload.get("expires_at"),
+                "source_kind": str(payload.get("source_kind") or "conversation"),
+            }
+            if payload.get("identity_scope") is False:
+                remember_kwargs["identity_scope"] = False
+            profile = await self.store.remember_interaction(**remember_kwargs)
+            if not isinstance(profile, dict):
+                profile = {}
+            if not bool(payload.get("identity_scope", True)):
+                profile = _session_only_memory_profile(profile, session_id=session_id)
+            ctx.extras["user_memory_profile"] = profile
+            ctx.signals.setdefault("memory", {})["user_profile"] = (
+                build_safe_memory_profile_signal(profile)
             )
+            if ctx.session is not None:
+                ctx.session.variables["user_memory"] = _memory_session_payload(
+                    user_id=user_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    profile=profile,
+                )
+        except Exception as exc:
+            _set_memory_save_runtime_signal(
+                ctx,
+                status="error",
+                reason="persistence_failed",
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        _set_memory_save_runtime_signal(
+            ctx,
+            status="success",
+            reason="saved",
+        )
 
 
 @dataclass
@@ -337,16 +380,26 @@ class ChannelReplyEffectHandler:
 
         target = _channel_target_from_effect(payload, ctx, default_channel=self.default_channel)
         body = _reply_effect_body(payload)
+        file = _reply_effect_file(payload)
         media = _reply_effect_media(payload)
         options = _channel_send_options_from_effect(payload, ctx, effect)
         outbound = await self._gated_outbound(target, ctx)
 
-        if body:
+        if file is not None:
+            result = await outbound.send_file(target, file, options)
+        elif body:
             result = await outbound.send_text(target, body, options)
         elif media is not None:
             result = await outbound.send_image(target, media, options)
         else:
-            raise ValueError("channel reply effect missing text body or supported media")
+            raise ValueError("channel reply effect missing text body or supported media/file")
+
+        if (
+            file is not None
+            and bool(dict(payload.get("delivery") or {}).get("must_deliver_file"))
+            and bool(result.metadata.get("suppressed"))
+        ):
+            raise RuntimeError("channel_file_delivery_suppressed")
 
         ctx.signals.setdefault("effects", {}).setdefault("channel_replies", []).append(
             {
@@ -937,6 +990,47 @@ def _reply_effect_media(payload: dict[str, Any]) -> ChannelMedia | None:
     if not image_path and not image_url:
         return None
     return ChannelMedia(image_path=image_path, image_url=image_url)
+
+
+def _reply_effect_file(payload: dict[str, Any]) -> ChannelFile | None:
+    file_payload = payload.get("file")
+    if not isinstance(file_payload, dict):
+        file_payload = {}
+    file_path = _first_non_empty(
+        file_payload.get("file_path"),
+        payload.get("file_path"),
+    )
+    if not file_path:
+        return None
+    file_size_value = file_payload.get("file_size", payload.get("file_size"))
+    file_size: int | None = None
+    if file_size_value not in (None, ""):
+        if isinstance(file_size_value, bool):
+            raise ValueError("channel reply file_size must be a non-negative integer")
+        try:
+            file_size = int(file_size_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "channel reply file_size must be a non-negative integer"
+            ) from exc
+        if file_size < 0:
+            raise ValueError("channel reply file_size must be a non-negative integer")
+    return ChannelFile(
+        file_path=file_path,
+        file_name=_first_non_empty(
+            file_payload.get("file_name"),
+            payload.get("file_name"),
+        ),
+        file_size=file_size,
+        file_md5=_first_non_empty(
+            file_payload.get("file_md5"),
+            payload.get("file_md5"),
+        ),
+        file_sha256=_first_non_empty(
+            file_payload.get("file_sha256"),
+            payload.get("file_sha256"),
+        ),
+    )
 
 
 def _first_non_empty(*values: object) -> str:

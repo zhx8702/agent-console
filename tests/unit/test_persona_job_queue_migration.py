@@ -33,8 +33,8 @@ def test_persona_job_queue_upgrade_is_linear_and_fenced(monkeypatch) -> None:
 
     assert migration.revision == "0041_persona_job_queue"
     assert migration.down_revision == "0039_channel_connection_activity"
-    assert RUNTIME_SCHEMA_REVISION == "0044_persona_profile_catalog"
-    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 7
+    assert RUNTIME_SCHEMA_REVISION == "0046_memory_event_provenance_expiry"
+    assert RUNTIME_SCHEMA_COMPATIBILITY_LEVEL == 9
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]

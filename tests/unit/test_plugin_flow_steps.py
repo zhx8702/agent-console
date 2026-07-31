@@ -65,6 +65,8 @@ def test_flow_step_catalog_separates_channel_specific_steps() -> None:
 
     assert "plugin.commands.dispatch" in generic_kinds
     assert "plugin.memory.load" in generic_kinds
+    memory_load = next(step for step in steps if step.kind == "plugin.memory.load")
+    assert memory_load.timeout_seconds == 3.5
     assert "plugin.wxbot.reply_policy" in wxbot_kinds
     assert "plugin.wxbot.outbound_policy" in wxbot_kinds
     assert not any(kind.startswith("plugin.wxbot.") for kind in generic_kinds)

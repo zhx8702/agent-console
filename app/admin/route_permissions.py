@@ -293,6 +293,7 @@ READ GET /plugins/memory/items
 READ GET /plugins/memory/items/acceptance-legacy-audit
 READ GET /plugins/memory/items/acceptance-stats
 READ GET /plugins/memory/items/retrieve
+READ GET /plugins/memory/management-status
 READ GET /plugins/memory/profile-enrichment/candidates
 READ GET /plugins/memory/profile-enrichment/candidates/{candidate_id}
 READ GET /plugins/memory/profiles
@@ -319,6 +320,7 @@ READ GET /plugins/wxbot/admin/agent-tools/audit
 READ GET /plugins/wxbot/admin/agent-tools/catalog
 READ GET /plugins/wxbot/admin/agent-tools/policy/{tenant_id}/{session_id:path}
 READ GET /plugins/wxbot/admin/event-subscriptions
+READ GET /plugins/wxbot/admin/files/{media_id}
 READ GET /plugins/wxbot/admin/group-members/settings/{session_id:path}
 READ GET /plugins/wxbot/admin/images/{media_id}
 READ GET /plugins/wxbot/admin/media-ready-events

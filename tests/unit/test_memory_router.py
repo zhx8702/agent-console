@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 
+from app.admin.authorization import AdminRole, Principal, build_admin_authorization_dependency
 from app.admin.mutation_ledger import MutationIdempotencyConflictError, MutationOutcome
+from app.common.config import Settings
 from plugins.memory.router import build_memory_router
+from plugins.memory.store import MemoryMutationError, MemoryProfileConflictError
 
 
 class _FakeStore:
@@ -41,7 +46,22 @@ class _FakeStore:
             (),
             {
                 "admin_bearer_token": "admin_token",
+                "admin_principal_tokens_json": "",
                 "wxbot_default_tenant_id": "demo",
+                "memory_llm_extraction_enabled": False,
+                "memory_llm_extraction_job_enabled": True,
+                "memory_llm_extraction_job_drain_enabled": False,
+                "memory_retrieval_enabled": True,
+                "memory_group_identity_memory_enabled": False,
+                "memory_hybrid_retrieval_enabled": False,
+                "memory_vector_index_enabled": False,
+                "memory_graph_retrieval_enabled": False,
+                "memory_graph_llm_extraction_enabled": False,
+                "memory_governance_auto_cleanup_enabled": True,
+                "memory_needs_review_retention_days": 30,
+                "memory_rejected_retention_days": 7,
+                "memory_auto_expire_days": 180,
+                "memory_governance_batch_size": 500,
             },
         )()
 
@@ -668,6 +688,9 @@ class _FakeStore:
             },
         }
 
+    async def member_memory_write_blocked(self, **_kwargs):
+        return False
+
     async def list_profile_enrichment_candidates(self, **kwargs):
         self.profile_candidate_list_calls.append(kwargs)
         return [{
@@ -874,6 +897,20 @@ class _SessionScopedControlStore:
         return None
 
 
+class _ProfileConflictStore(_FakeStore):
+    async def upsert_identity_profile(self, **kwargs):
+        raise MemoryProfileConflictError(
+            expected_version=str(kwargs.get("expected_version") or ""),
+            actual_version="2026-07-30T10:00:00+00:00",
+        )
+
+    async def upsert_session_profile(self, **kwargs):
+        raise MemoryProfileConflictError(
+            expected_version=str(kwargs.get("expected_version") or ""),
+            actual_version="2026-07-30T11:00:00+00:00",
+        )
+
+
 @pytest.mark.asyncio
 async def test_memory_router_supports_layered_memory_endpoints() -> None:
     app = FastAPI()
@@ -984,10 +1021,12 @@ async def test_memory_router_supports_layered_memory_endpoints() -> None:
             },
         )
         jobs_resp = await client.get(
-            "/extraction-jobs?tenant_id=demo&channel=wechat&source_key=wxbot&user_id=wxid_a&status=pending"
+            "/extraction-jobs?tenant_id=demo&channel=wechat&source_key=wxbot&user_id=wxid_a&status=pending",
+            headers=admin_headers,
         )
         job_stats_resp = await client.get(
-            "/extraction-jobs/stats?tenant_id=demo&channel=wechat&source_key=wxbot&user_id=wxid_a"
+            "/extraction-jobs/stats?tenant_id=demo&channel=wechat&source_key=wxbot&user_id=wxid_a",
+            headers=admin_headers,
         )
         graph_entities_resp = await client.get(
             "/graph/entities?tenant_id=demo&channel=wechat&source_key=wxbot&user_id=wxid_a",
@@ -1221,7 +1260,7 @@ async def test_memory_router_p2a_scoped_control_endpoints() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         remember_resp = await client.post(
             "/remember",
-            headers={"X-User-Id": "wxid_a"},
+            headers={"X-User-Id": "wxid_a", "Idempotency-Key": "remember-item-4"},
             json={
                 "tenant_id": "demo",
                 "channel": "wechat",
@@ -1298,6 +1337,398 @@ async def test_memory_router_p2a_scoped_control_endpoints() -> None:
     assert store.updated_item[1]["user_id"] == "wxid_a"
     assert store.updated_item[1]["content"] == "高价值客户"
     assert cross_user_resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_manual_memory_creation_enforces_group_audience_and_retention_contract() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_memory_router(store))
+    admin_headers = {
+        "Authorization": "Bearer admin_token",
+        "Idempotency-Key": "group-memory-create",
+    }
+    started_at = datetime.now(UTC)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        group_resp = await client.post(
+            "/items",
+            headers=admin_headers,
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "user_id": "wxid_a",
+                "session_id": "group-1@chatroom",
+                "scope_type": "identity",
+                "source_type": "manual",
+                "memory_type": "note",
+                "content": "群内物流偏好",
+                "audience_scope": "private",
+                "origin_session_kind": "private",
+                "allowed_session_ids": [],
+                "retention_days": 90,
+            },
+        )
+        group_saved = dict(store.saved_item or {})
+        private_resp = await client.post(
+            "/items",
+            headers={
+                "Authorization": "Bearer admin_token",
+                "Idempotency-Key": "private-memory-create",
+            },
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "user_id": "wxid_a",
+                "source_type": "manual",
+                "memory_type": "note",
+                "content": "私聊偏好",
+            },
+        )
+        private_saved = dict(store.saved_item or {})
+        retention_conflict_resp = await client.post(
+            "/items",
+            headers={
+                "Authorization": "Bearer admin_token",
+                "Idempotency-Key": "retention-conflict",
+            },
+            json={
+                "tenant_id": "demo",
+                "user_id": "wxid_a",
+                "content": "冲突保留策略",
+                "retention_days": 30,
+                "expires_at": "2026-12-31T00:00:00Z",
+            },
+        )
+
+    assert group_resp.status_code == 200
+    assert group_saved["scope_type"] == "session"
+    assert group_saved["session_id"] == "group-1@chatroom"
+    assert group_saved["origin_session_kind"] == "group"
+    assert group_saved["audience_scope"] == "session"
+    assert group_saved["allowed_session_ids"] == ["group-1@chatroom"]
+    assert group_saved["source_kind"] == "manual"
+    expires_at = group_saved["expires_at"]
+    assert isinstance(expires_at, datetime)
+    assert started_at + timedelta(days=89) < expires_at < started_at + timedelta(days=91)
+
+    assert private_resp.status_code == 200
+    assert private_saved["scope_type"] == "identity"
+    assert private_saved["session_id"] == ""
+    assert private_saved["origin_session_kind"] == "private"
+    assert private_saved["audience_scope"] == "private"
+    assert private_saved["allowed_session_ids"] == []
+    assert private_saved["expires_at"] is None
+
+    assert retention_conflict_resp.status_code == 400
+    assert retention_conflict_resp.json()["detail"]["code"] == "memory_retention_conflict"
+
+
+@pytest.mark.asyncio
+async def test_remember_requires_idempotency_and_group_writes_are_recallable_in_that_group() -> None:
+    async def group_member(_tenant_id: str, _session_id: str, _user_id: str) -> bool:
+        return True
+
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(
+        build_memory_router(store, group_membership_authorizer=group_member)
+    )
+    body = {
+        "tenant_id": "demo",
+        "channel": "wechat",
+        "source_key": "wxbot",
+        "session_id": "group-1@chatroom",
+        "content": "只在当前群召回",
+        "memory_type": "note",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing_key_resp = await client.post(
+            "/remember",
+            headers={"X-User-Id": "wxid_a"},
+            json=body,
+        )
+        remember_resp = await client.post(
+            "/remember",
+            headers={
+                "X-User-Id": "wxid_a",
+                "Idempotency-Key": "remember-group-item",
+            },
+            json=body,
+        )
+
+    assert missing_key_resp.status_code == 428
+    assert remember_resp.status_code == 200
+    assert remember_resp.json()["count"] == 1
+    assert store.saved_item is not None
+    assert store.saved_item["scope_type"] == "session"
+    assert store.saved_item["origin_session_kind"] == "group"
+    assert store.saved_item["audience_scope"] == "session"
+    assert store.saved_item["allowed_session_ids"] == ["group-1@chatroom"]
+
+
+@pytest.mark.asyncio
+async def test_memory_management_status_is_admin_only_and_explains_runtime_blockers() -> None:
+    async def scope_disabled(_tenant_id: str, _session_id: str) -> bool:
+        return False
+
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(
+        build_memory_router(store, scope_execution_allowed=scope_disabled)
+    )
+    params = {
+        "tenant_id": "demo",
+        "channel": "wechat",
+        "source_key": "wxbot",
+        "session_id": "group-1@chatroom",
+        "user_id": "wxid_a",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthenticated_resp = await client.get("/management-status", params=params)
+        invalid_bearer_resp = await client.get(
+            "/management-status",
+            params=params,
+            headers={"Authorization": "Bearer not-an-admin"},
+        )
+        admin_resp = await client.get(
+            "/management-status",
+            params=params,
+            headers={"Authorization": "Bearer admin_token"},
+        )
+
+    assert unauthenticated_resp.status_code == 401
+    assert invalid_bearer_resp.status_code == 403
+    assert admin_resp.status_code == 200
+    payload = admin_resp.json()
+    assert payload["config"]["source"] == "effective_process_settings"
+    assert payload["config"]["values"]["memory_retrieval_enabled"] is True
+    assert payload["runtime_scope"]["status"] == "disabled"
+    assert payload["jobs"]["stats"]["status_counts"]["failed"] == 4
+    assert "last_error" not in payload["jobs"]["recent"][0]
+    assert "result_json" not in payload["jobs"]["recent"][0]
+    assert payload["governance"]["auto_expire_days"] == 180
+    diagnostic_codes = {item["code"] for item in payload["diagnostics"]}
+    assert {
+        "runtime_scope_disabled",
+        "automatic_extraction_disabled",
+        "extraction_jobs_failed",
+        "items_waiting_for_review",
+        "group_audience_mismatch",
+    }.issubset(diagnostic_codes)
+    assert "job_drain_disabled" not in diagnostic_codes
+
+
+@pytest.mark.asyncio
+async def test_sensitive_retrieval_and_job_reads_reject_missing_or_invalid_admin_auth() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_memory_router(store))
+    retrieve_params = {
+        "tenant_id": "demo",
+        "channel": "wechat",
+        "source_key": "wxbot",
+        "user_id": "wxid_a",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        retrieve_unauthenticated = await client.get(
+            "/items/retrieve",
+            params=retrieve_params,
+        )
+        retrieve_invalid_bearer = await client.get(
+            "/items/retrieve",
+            params=retrieve_params,
+            headers={"Authorization": "Bearer invalid"},
+        )
+        retrieve_admin = await client.get(
+            "/items/retrieve",
+            params=retrieve_params,
+            headers={"Authorization": "Bearer admin_token"},
+        )
+        jobs_unauthenticated = await client.get("/extraction-jobs")
+        stats_invalid_bearer = await client.get(
+            "/extraction-jobs/stats",
+            headers={"Authorization": "Bearer invalid"},
+        )
+
+    assert retrieve_unauthenticated.status_code == 401
+    assert retrieve_invalid_bearer.status_code == 403
+    assert retrieve_admin.status_code == 200
+    assert retrieve_admin.json()["items"][0]["content"] == "重点客户"
+    assert jobs_unauthenticated.status_code == 401
+    assert stats_invalid_bearer.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_retrieval_mount_guard_rejects_cross_tenant_scope() -> None:
+    settings = Settings(
+        app_env="test",
+        admin_bearer_token="admin_token",
+        outbound_hmac_secret="test-secret",
+        tenant_demo_secret="test-tenant-secret",
+    )
+    principal = Principal(
+        subject="tenant-admin",
+        roles=(AdminRole.TENANT_ADMIN.value,),
+        tenant_ids=("demo",),
+        auth_kind="test",
+    )
+
+    async def authenticate() -> Principal:
+        return principal
+
+    store = _FakeStore()
+    store.settings = settings
+    guard = build_admin_authorization_dependency(
+        settings,
+        authentication_dependency=authenticate,
+    )
+    app = FastAPI()
+    mounted = APIRouter(
+        prefix="/plugins/memory",
+        dependencies=[Depends(guard)],
+    )
+    mounted.include_router(build_memory_router(store))
+    app.include_router(mounted)
+    params = {
+        "channel": "wechat",
+        "source_key": "wxbot",
+        "user_id": "wxid_a",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        allowed_resp = await client.get(
+            "/plugins/memory/items/retrieve",
+            params={"tenant_id": "demo", **params},
+            headers={"Authorization": "Bearer admin_token"},
+        )
+        cross_tenant_resp = await client.get(
+            "/plugins/memory/items/retrieve",
+            params={"tenant_id": "other", **params},
+            headers={"Authorization": "Bearer admin_token"},
+        )
+
+    assert allowed_resp.status_code == 200
+    assert cross_tenant_resp.status_code == 403
+    assert cross_tenant_resp.json()["detail"] == "tenant_scope_forbidden"
+
+
+@pytest.mark.asyncio
+async def test_profile_expected_version_is_forwarded_and_conflicts_return_actionable_409() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_memory_router(store))
+    admin_headers = {"Authorization": "Bearer admin_token"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        saved_resp = await client.post(
+            "/profiles",
+            headers=admin_headers,
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "user_id": "wxid_a",
+                "manual_notes": "新备注",
+                "expected_version": "2026-07-30T09:00:00+00:00",
+            },
+        )
+
+    assert saved_resp.status_code == 200
+    assert store.saved_identity is not None
+    assert store.saved_identity["expected_version"] == "2026-07-30T09:00:00+00:00"
+
+    conflict_app = FastAPI()
+    conflict_app.include_router(build_memory_router(_ProfileConflictStore()))
+    conflict_transport = httpx.ASGITransport(app=conflict_app)
+    async with httpx.AsyncClient(
+        transport=conflict_transport,
+        base_url="http://test",
+    ) as client:
+        identity_conflict = await client.post(
+            "/profiles",
+            headers=admin_headers,
+            json={
+                "tenant_id": "demo",
+                "user_id": "wxid_a",
+                "manual_notes": "过期页面写入",
+                "expected_version": "2026-07-30T08:00:00+00:00",
+            },
+        )
+        session_conflict = await client.post(
+            "/session-profiles",
+            headers=admin_headers,
+            json={
+                "tenant_id": "demo",
+                "session_id": "group-1@chatroom",
+                "user_id": "wxid_a",
+                "manual_notes": "过期页面写入",
+                "expected_version": "2026-07-30T08:30:00+00:00",
+            },
+        )
+
+    assert identity_conflict.status_code == 409
+    assert identity_conflict.json()["detail"]["code"] == "memory_profile_version_conflict"
+    assert identity_conflict.json()["detail"]["actual_version"] == "2026-07-30T10:00:00+00:00"
+    assert session_conflict.status_code == 409
+    assert session_conflict.json()["detail"]["code"] == "memory_profile_version_conflict"
+    assert session_conflict.json()["detail"]["actual_version"] == "2026-07-30T11:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_profile_upserts_map_member_memory_write_block_to_stable_409() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+
+    async def raise_member_write_blocked(**_kwargs):
+        raise MemoryMutationError("member_memory_write_blocked", status_code=409)
+
+    store.upsert_identity_profile = raise_member_write_blocked
+    store.upsert_session_profile = raise_member_write_blocked
+    app.include_router(build_memory_router(store))
+
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": "Bearer admin_token"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        identity_resp = await client.post(
+            "/profiles",
+            headers=headers,
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "user_id": "wxid_a",
+                "manual_notes": "must not be saved",
+            },
+        )
+        session_resp = await client.post(
+            "/session-profiles",
+            headers=headers,
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": "group-1@chatroom",
+                "user_id": "wxid_a",
+                "manual_notes": "must not be saved",
+            },
+        )
+
+    assert identity_resp.status_code == 409
+    assert identity_resp.json() == {"detail": "member_memory_write_blocked"}
+    assert session_resp.status_code == 409
+    assert session_resp.json() == {"detail": "member_memory_write_blocked"}
 
 
 @pytest.mark.asyncio
@@ -1599,6 +2030,7 @@ async def test_memory_router_extraction_job_filters_and_stats_are_safe() -> None
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         jobs_resp = await client.get(
             "/extraction-jobs",
+            headers={"Authorization": "Bearer admin_token"},
             params={
                 "tenant_id": "demo",
                 "channel": "wechat",
@@ -1614,6 +2046,7 @@ async def test_memory_router_extraction_job_filters_and_stats_are_safe() -> None
         )
         stats_resp = await client.get(
             "/extraction-jobs/stats",
+            headers={"Authorization": "Bearer admin_token"},
             params={
                 "tenant_id": "demo",
                 "channel": "wechat",
@@ -1900,6 +2333,49 @@ async def test_memory_backfill_maps_idempotency_conflict_to_409() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_item_idempotent_mutations_map_member_write_block_to_stable_409() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+
+    async def raise_member_write_blocked(*_args, **_kwargs):
+        raise MemoryMutationError("member_memory_write_blocked", status_code=409)
+
+    store.create_memory_item_idempotent = raise_member_write_blocked
+    store.update_memory_item_idempotent = raise_member_write_blocked
+    app.include_router(build_memory_router(store), prefix="/plugins/memory")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/plugins/memory/items",
+            headers={
+                "Authorization": "Bearer admin_token",
+                "Idempotency-Key": "blocked-create-item",
+            },
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "user_id": "wxid_member",
+                "content": "must not be saved",
+            },
+        )
+        update_resp = await client.patch(
+            "/plugins/memory/items/20?tenant_id=demo",
+            headers={
+                "Authorization": "Bearer admin_token",
+                "Idempotency-Key": "blocked-update-item",
+            },
+            json={"content": "must not be saved"},
+        )
+
+    assert create_resp.status_code == 409
+    assert create_resp.json() == {"detail": "member_memory_write_blocked"}
+    assert update_resp.status_code == 409
+    assert update_resp.json() == {"detail": "member_memory_write_blocked"}
+
+
+@pytest.mark.asyncio
 async def test_memory_router_profile_enrichment_candidate_crud_requires_admin() -> None:
     app = FastAPI()
     store = _FakeStore()
@@ -1970,6 +2446,47 @@ async def test_memory_router_profile_enrichment_candidate_crud_requires_admin() 
 
 
 @pytest.mark.asyncio
+async def test_profile_enrichment_mutations_map_member_write_block_to_stable_409() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+
+    async def raise_member_write_blocked(*_args, **_kwargs):
+        raise MemoryMutationError("member_memory_write_blocked", status_code=409)
+
+    store.create_profile_enrichment_candidate = raise_member_write_blocked
+    store.review_profile_enrichment_candidate_idempotent = raise_member_write_blocked
+    app.include_router(build_memory_router(store), prefix="/plugins/memory")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_resp = await client.post(
+            "/plugins/memory/profile-enrichment/candidates",
+            headers={"Authorization": "Bearer admin_token"},
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": "group-1@chatroom",
+                "user_id": "wxid_member",
+                "report_payload": {"profile": {"summary": "must not be saved"}},
+            },
+        )
+        review_resp = await client.post(
+            "/plugins/memory/profile-enrichment/candidates/20/review?tenant_id=demo",
+            headers={
+                "Authorization": "Bearer admin_token",
+                "Idempotency-Key": "blocked-profile-review",
+            },
+            json={"action": "accept"},
+        )
+
+    assert create_resp.status_code == 409
+    assert create_resp.json() == {"detail": "member_memory_write_blocked"}
+    assert review_resp.status_code == 409
+    assert review_resp.json() == {"detail": "member_memory_write_blocked"}
+
+
+@pytest.mark.asyncio
 async def test_memory_router_profile_enrichment_from_report_generates_and_saves_candidate() -> None:
     app = FastAPI()
     store = _FakeStore()
@@ -2037,6 +2554,96 @@ async def test_memory_router_profile_enrichment_from_report_generates_and_saves_
     }]
     assert store.profile_candidate_create_calls[0]["created_by"] == "admin-test"
     assert store.profile_candidate_create_calls[0]["report_payload"]["review"]["state"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_profile_enrichment_from_report_blocks_before_report_builder() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    preflight_calls: list[dict[str, object]] = []
+    builder_calls = 0
+
+    async def member_memory_write_blocked(**kwargs):
+        preflight_calls.append(kwargs)
+        return True
+
+    async def build_report(_session, _arguments):
+        nonlocal builder_calls
+        builder_calls += 1
+        return {"profile": {"summary": "must not be built"}}
+
+    store.member_memory_write_blocked = member_memory_write_blocked
+    app.include_router(
+        build_memory_router(store, profile_report_builder=build_report),
+        prefix="/plugins/memory",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/plugins/memory/profile-enrichment/candidates/from-report",
+            headers={"Authorization": "Bearer admin_token"},
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": "group-1@chatroom",
+                "user_id": "wxid_member",
+                "query": "Synthetic Member",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "member_memory_write_blocked"}
+    assert preflight_calls == [
+        {
+            "tenant_id": "demo",
+            "user_id": "wxid_member",
+            "channel": "wechat",
+        }
+    ]
+    assert builder_calls == 0
+    assert store.profile_candidate_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_profile_enrichment_from_report_maps_post_builder_write_race_to_409() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    builder_calls = 0
+
+    async def build_report(_session, _arguments):
+        nonlocal builder_calls
+        builder_calls += 1
+        return {"profile": {"summary": "candidate"}}
+
+    async def raise_member_write_blocked(**_kwargs):
+        raise MemoryMutationError("member_memory_write_blocked", status_code=409)
+
+    store.create_profile_enrichment_candidate = raise_member_write_blocked
+    app.include_router(
+        build_memory_router(store, profile_report_builder=build_report),
+        prefix="/plugins/memory",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/plugins/memory/profile-enrichment/candidates/from-report",
+            headers={"Authorization": "Bearer admin_token"},
+            json={
+                "tenant_id": "demo",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": "group-1@chatroom",
+                "user_id": "wxid_member",
+                "query": "Synthetic Member",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "member_memory_write_blocked"}
+    assert builder_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2466,7 +3073,10 @@ async def test_memory_router_extraction_job_admin_paths_with_plugin_prefix_are_r
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        stats_resp = await client.get("/plugins/memory/extraction-jobs/stats")
+        stats_resp = await client.get(
+            "/plugins/memory/extraction-jobs/stats",
+            headers={"Authorization": "Bearer admin_token"},
+        )
         maintenance_forbidden_resp = await client.post(
             "/plugins/memory/extraction-jobs/maintenance",
             json={"action": "retry", "tenant_id": "demo"},

@@ -100,6 +100,19 @@ _TRANSIENT_LLM_ERROR_MARKERS = (
 HistoryScopeGate = Callable[[str, str], Awaitable[bool]]
 
 
+def normalize_persona_runtime_source_key(channel: str, source_key: str) -> str:
+    """Map only the wxbot admin simulator onto the real wxbot profile scope."""
+
+    normalized_channel = str(channel or "").strip().lower()
+    normalized_source = str(source_key or "").strip() or "*"
+    if (
+        normalized_channel == "wechat"
+        and normalized_source == "admin_console_simulator"
+    ):
+        return "wxbot"
+    return normalized_source
+
+
 def _is_transient_llm_error(exc: BaseException) -> bool:
     if isinstance(exc, TimeoutError):
         return True
@@ -1815,6 +1828,7 @@ class PersonaExtractStore:
         channel: str,
         source_key: str,
     ) -> dict | None:
+        source_key = normalize_persona_runtime_source_key(channel, source_key)
         rows = await _exec(
             "SELECT * FROM plugin_persona_profiles "
             "WHERE tenant_id = :tid AND session_id = :sid AND enabled = TRUE "

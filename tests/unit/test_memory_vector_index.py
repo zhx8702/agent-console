@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -136,6 +137,16 @@ class _SearchFailingVectorStore(_FakeQdrantVectorStore):
     async def search(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         _ = args, kwargs
         raise RuntimeError("qdrant search unavailable")
+
+
+class _RecordingEmbeddingsProvider(FakeEmbeddingsProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[str] = []
+
+    async def embed(self, request):  # type: ignore[no-untyped-def]
+        self.texts.extend(str(text) for text in request.texts)
+        return await super().embed(request)
 
 
 @pytest.mark.asyncio
@@ -354,13 +365,32 @@ async def test_memory_vector_smoke_rebuild_dry_run_and_search_hit(
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         assert "status = 'active'" in sql
         assert "sensitivity = 'normal'" in sql
+        assert "sensitivity_category = 'normal'" in sql
         assert "deleted_at IS NULL" in sql
         assert params is not None
         if "ORDER BY updated_at DESC, id DESC LIMIT :lim" in sql:
+            assert "expires_at IS NULL" in sql
+            assert "expires_at > NOW()" in sql
             assert params["lim"] == 1
         return [_row(id=7, content="用户喜欢 Adidas")]
 
+    async def publish_current(
+        item_id: int,
+        *,
+        fallback_item: dict[str, Any] | None = None,
+        force: bool = False,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert item_id == 7
+        assert fallback_item is not None
+        return await store.vector_index.upsert_item(
+            fallback_item,
+            force=force,
+            scope_execution_allowed=scope_execution_allowed,
+        )
+
     monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_publish_current_memory_vectors", publish_current)
 
     dry_run = await store.rebuild_memory_item_vector_index(
         tenant_id="demo",
@@ -391,6 +421,279 @@ async def test_memory_vector_smoke_rebuild_dry_run_and_search_hit(
     assert search["ok"] is True
     assert search["behavior"] == "vector_hit"
     assert search["vector_ids"] == [7]
+
+
+@pytest.mark.asyncio
+async def test_memory_vector_rebuild_session_scope_never_embeds_other_groups_or_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RecordingEmbeddingsProvider()
+    store = MemoryStore(
+        _settings(memory_vector_index_enabled=False),
+        llm_service=provider,
+        vector_store=_FakeQdrantVectorStore(),
+    )
+    scope_checks: list[tuple[str, str]] = []
+
+    async def scope_gate(tenant_id: str, session_id: str) -> bool:
+        scope_checks.append((tenant_id, session_id))
+        return (tenant_id, session_id) == ("demo", "group-a@chatroom")
+
+    store.runtime_scope_gates_required = True
+    store.scope_execution_allowed = scope_gate
+    rows = [
+        _row(
+            id=71,
+            session_id="group-a@chatroom",
+            scope_type="session",
+            content="GROUP-A-ALLOWED",
+        ),
+        _row(
+            id=72,
+            session_id="group-b@chatroom",
+            scope_type="session",
+            content="GROUP-B-MUST-NOT-EMBED",
+        ),
+        _row(
+            id=73,
+            session_id="",
+            scope_type="identity",
+            content="IDENTITY-MUST-NOT-EMBED",
+        ),
+    ]
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        assert "FROM plugin_memory_item" in sql
+        assert "scope_type = 'session'" in sql
+        assert "session_id = :sid" in sql
+        assert params is not None
+        assert params["sid"] == "group-a@chatroom"
+        return [
+            row
+            for row in rows
+            if row["scope_type"] == "session" and row["session_id"] == params["sid"]
+        ]
+
+    async def publish_current(
+        item_id: int,
+        *,
+        fallback_item: dict[str, Any] | None = None,
+        force: bool = False,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert fallback_item is not None
+        assert int(fallback_item["id"]) == item_id
+        return await store.vector_index.upsert_item(
+            fallback_item,
+            force=force,
+            scope_execution_allowed=scope_execution_allowed,
+        )
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_publish_current_memory_vectors", publish_current)
+
+    result = await store.rebuild_memory_item_vector_index(
+        tenant_id="demo",
+        session_id="group-a@chatroom",
+        limit=20,
+        dry_run=False,
+        force=True,
+    )
+
+    assert result["scanned"] == 1
+    assert result["indexed"] == 1
+    assert provider.texts == ["GROUP-A-ALLOWED"]
+    assert scope_checks
+    assert set(scope_checks) == {("demo", "group-a@chatroom")}
+
+
+@pytest.mark.asyncio
+async def test_memory_vector_rebuild_erase_first_never_bypasses_safe_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RecordingEmbeddingsProvider()
+    vector = InMemoryVectorStore()
+    store = MemoryStore(
+        _settings(),
+        llm_service=provider,
+        vector_store=vector,
+    )
+    publication_started = asyncio.Event()
+    erase_committed = asyncio.Event()
+    publish_calls: list[dict[str, Any]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        assert "FROM plugin_memory_item" in sql
+        assert params is not None
+        return [_row(id=77, content="MUST-NOT-BE-REPUBLISHED")]
+
+    async def publish_current(
+        item_id: int,
+        *,
+        fallback_item: dict[str, Any] | None = None,
+        force: bool = False,
+        scope_execution_allowed=None,
+    ) -> str:
+        publish_calls.append(
+            {
+                "item_id": item_id,
+                "fallback_item": fallback_item,
+                "force": force,
+                "scope_execution_allowed": scope_execution_allowed,
+            }
+        )
+        publication_started.set()
+        await erase_committed.wait()
+        # The reusable store publisher re-read the committed DB state under
+        # the member fence and observed that forget had already removed it.
+        return "deleted"
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_publish_current_memory_vectors", publish_current)
+
+    rebuild = asyncio.create_task(
+        store.rebuild_memory_item_vector_index(
+            tenant_id="demo",
+            limit=1,
+            dry_run=False,
+        )
+    )
+    await asyncio.wait_for(publication_started.wait(), timeout=1)
+    erase_committed.set()
+    result = await rebuild
+
+    assert result["scanned"] == 1
+    assert result["indexed"] == 0
+    assert result["deleted"] == 1
+    assert result["errors"] == 0
+    assert [call["item_id"] for call in publish_calls] == [77]
+    assert provider.texts == []
+    assert vector._collections == {}
+
+
+@pytest.mark.asyncio
+async def test_memory_vector_rebuild_publish_first_is_removed_by_later_forget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vector = InMemoryVectorStore()
+    store = MemoryStore(
+        _settings(),
+        llm_service=FakeEmbeddingsProvider(),
+        vector_store=vector,
+    )
+    member_fence = asyncio.Lock()
+    published = asyncio.Event()
+    release_publication = asyncio.Event()
+    erased = asyncio.Event()
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        assert "FROM plugin_memory_item" in sql
+        assert params is not None
+        return [_row(id=78, content="publish-before-forget")]
+
+    async def publish_current(
+        item_id: int,
+        *,
+        fallback_item: dict[str, Any] | None = None,
+        force: bool = False,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert item_id == 78
+        assert fallback_item is not None
+        async with member_fence:
+            status = await store.vector_index.upsert_item(
+                fallback_item,
+                force=force,
+                scope_execution_allowed=scope_execution_allowed,
+            )
+            assert status == "indexed"
+            published.set()
+            await release_publication.wait()
+        return "published"
+
+    async def forget_after_publication() -> None:
+        async with member_fence:
+            await store.vector_index.delete_item(78, force=True)
+            erased.set()
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_publish_current_memory_vectors", publish_current)
+
+    rebuild = asyncio.create_task(
+        store.rebuild_memory_item_vector_index(
+            tenant_id="demo",
+            limit=1,
+            dry_run=False,
+        )
+    )
+    await asyncio.wait_for(published.wait(), timeout=1)
+    forget = asyncio.create_task(forget_after_publication())
+    await asyncio.sleep(0)
+    assert erased.is_set() is False
+
+    release_publication.set()
+    result, _ = await asyncio.gather(rebuild, forget)
+
+    assert result["indexed"] == 1
+    assert erased.is_set() is True
+    query_vector = await store.vector_index._embed(
+        tenant_id="demo",
+        text="publish-before-forget",
+        trace_id="verify-forget",
+    )
+    assert (
+        await vector.search(
+            "test_memory_items",
+            query_vector,
+            top_k=3,
+            filter_={"tenant_id": "demo", "item_id": "78"},
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_vector_smoke_forwards_only_explicit_session_as_rebuild_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(
+        _settings(memory_vector_index_enabled=False),
+        llm_service=FakeEmbeddingsProvider(),
+        vector_store=_FakeQdrantVectorStore(),
+    )
+    rebuild_calls: list[dict[str, Any]] = []
+
+    async def fake_preflight(**_kwargs: Any) -> dict[str, Any]:
+        return {"safe_to_enable": True, "reasons": []}
+
+    async def fake_rebuild(**kwargs: Any) -> dict[str, Any]:
+        rebuild_calls.append(kwargs)
+        return {"errors": 0}
+
+    async def fake_search(**_kwargs: Any) -> dict[str, Any]:
+        return {"ok": False, "skipped": True, "vector_error": ""}
+
+    monkeypatch.setattr(store.vector_index, "smoke_enable_preflight", fake_preflight)
+    monkeypatch.setattr(store, "rebuild_memory_item_vector_index", fake_rebuild)
+    monkeypatch.setattr(store, "smoke_memory_item_vector_search", fake_search)
+
+    await store.smoke_memory_vector_enable(
+        tenant_id="demo",
+        channel="wechat",
+        user_id="wxid_a",
+        session_id="group-a@chatroom",
+        dry_run=False,
+    )
+    await store.smoke_memory_vector_enable(
+        tenant_id="demo",
+        channel="wechat",
+        user_id="wxid_a",
+        session_id="",
+        dry_run=False,
+    )
+
+    assert rebuild_calls[0]["session_id"] == "group-a@chatroom"
+    assert rebuild_calls[1]["session_id"] is None
 
 
 @pytest.mark.asyncio
@@ -981,7 +1284,35 @@ async def test_memory_graph_vector_rebuild_idempotent(monkeypatch: pytest.Monkey
             return [item]
         return []
 
+    async def publish_graph(
+        object_type: str,
+        object_id: int,
+        *,
+        fallback_row: dict[str, Any] | None = None,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert fallback_row is not None
+        assert int(fallback_row["id"]) == object_id
+        backing_item = store._finalize_memory_item(item)
+        if object_type == "fact":
+            return await store.vector_index.upsert_fact(
+                fallback_row,
+                backing_item=backing_item,
+                scope_execution_allowed=scope_execution_allowed,
+            )
+        assert object_type == "episode"
+        return await store.vector_index.upsert_episode(
+            fallback_row,
+            backing_items=[backing_item],
+            scope_execution_allowed=scope_execution_allowed,
+        )
+
     monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(
+        store,
+        "_publish_current_memory_graph_vector",
+        publish_graph,
+    )
 
     first = await store.rebuild_memory_graph_vector_index(tenant_id="demo")
     second = await store.rebuild_memory_graph_vector_index(tenant_id="demo")
@@ -1004,6 +1335,77 @@ async def test_memory_graph_vector_rebuild_idempotent(monkeypatch: pytest.Monkey
 
     assert [hit.id for hit in fact_hits] == ["memory_fact:101"]
     assert [hit.id for hit in episode_hits] == ["memory_episode:201"]
+
+
+@pytest.mark.asyncio
+async def test_memory_graph_vector_rebuild_erase_first_uses_exact_safe_publishers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _RecordingEmbeddingsProvider()
+    vector = InMemoryVectorStore()
+    store = MemoryStore(
+        _settings(),
+        llm_service=provider,
+        vector_store=vector,
+    )
+    item = _row(id=7, session_id="group-1", scope_type="session")
+    episode_row = {
+        **_episode(id=201),
+        "event_ids_json": "[88]",
+        "memory_item_ids_json": "[7]",
+    }
+    publication_started = asyncio.Event()
+    erase_committed = asyncio.Event()
+    calls: list[tuple[str, int]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_fact fact" in sql:
+            return [_fact(id=101)]
+        if "FROM plugin_memory_episode" in sql:
+            return [episode_row]
+        if "FROM plugin_memory_item" in sql:
+            return [item]
+        return []
+
+    async def publish_graph(
+        object_type: str,
+        object_id: int,
+        *,
+        fallback_row: dict[str, Any] | None = None,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert fallback_row is not None
+        assert scope_execution_allowed is None
+        calls.append((object_type, object_id))
+        publication_started.set()
+        await erase_committed.wait()
+        # The exact graph publisher re-read the fact/episode and backing
+        # evidence under the member fence after forget committed.
+        return "deleted"
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(
+        store,
+        "_publish_current_memory_graph_vector",
+        publish_graph,
+    )
+
+    rebuild = asyncio.create_task(
+        store.rebuild_memory_graph_vector_index(
+            tenant_id="demo",
+            limit=1,
+        )
+    )
+    await asyncio.wait_for(publication_started.wait(), timeout=1)
+    erase_committed.set()
+    result = await rebuild
+
+    assert result["scanned"] == 2
+    assert result["indexed"] == 0
+    assert result["deleted"] == 2
+    assert calls == [("fact", 101), ("episode", 201)]
+    assert provider.texts == []
+    assert vector._collections == {}
 
 
 @pytest.mark.asyncio
@@ -1035,7 +1437,35 @@ async def test_memory_graph_vector_rebuild_filters_stale_rows_before_limit(
             return [item]
         return []
 
+    async def publish_graph(
+        object_type: str,
+        object_id: int,
+        *,
+        fallback_row: dict[str, Any] | None = None,
+        scope_execution_allowed=None,
+    ) -> str:
+        assert fallback_row is not None
+        assert int(fallback_row["id"]) == object_id
+        backing_item = store._finalize_memory_item(item)
+        if object_type == "fact":
+            return await store.vector_index.upsert_fact(
+                fallback_row,
+                backing_item=backing_item,
+                scope_execution_allowed=scope_execution_allowed,
+            )
+        assert object_type == "episode"
+        return await store.vector_index.upsert_episode(
+            fallback_row,
+            backing_items=[backing_item],
+            scope_execution_allowed=scope_execution_allowed,
+        )
+
     monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(
+        store,
+        "_publish_current_memory_graph_vector",
+        publish_graph,
+    )
 
     result = await store.rebuild_memory_graph_vector_index(tenant_id="demo", limit=1)
 
@@ -1049,15 +1479,17 @@ async def test_memory_vector_delete_on_soft_delete(monkeypatch: pytest.MonkeyPat
     store = MemoryStore(_settings(), llm_service=FakeEmbeddingsProvider(), vector_store=vector)
     active = store._finalize_memory_item(_row(id=8))
     deleted = store._finalize_memory_item(_row(id=8, status="deleted", deleted_at="now"))
-    select_count = 0
+    row_deleted = False
 
     await store._sync_memory_vector_for_item_safe(active)
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
-        nonlocal select_count
+        nonlocal row_deleted
         if sql.startswith("SELECT id, tenant_id"):
-            select_count += 1
-            return [active if select_count == 1 else deleted]
+            return [deleted if row_deleted else active]
+        if sql.startswith("UPDATE plugin_memory_item SET status = 'deleted'"):
+            row_deleted = True
+            return [{"id": 8}]
         return []
 
     async def noop(_item: dict) -> None:
@@ -1067,7 +1499,13 @@ async def test_memory_vector_delete_on_soft_delete(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(store, "_refresh_legacy_cache_for_item_scope", noop)
     monkeypatch.setattr(store, "_sync_memory_graph_for_item_safe", noop)
 
-    result = await store.soft_delete_memory_item(8, allow_pinned=True)
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        result = await store.soft_delete_memory_item(8, allow_pinned=True)
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
 
     assert result is not None
     hits = await vector.search(

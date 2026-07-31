@@ -93,6 +93,11 @@ class _FakeStore:
         msg_type: str = "text",
         image_path: str = "",
         image_url: str = "",
+        file_path: str = "",
+        file_name: str = "",
+        file_size: int | None = None,
+        file_md5: str = "",
+        file_sha256: str = "",
         sender_wxid: str = "",
         reply_to_msg_svr_id: str = "",
         session_kind: str = "",
@@ -114,6 +119,11 @@ class _FakeStore:
                 "msg_type": msg_type,
                 "image_path": image_path,
                 "image_url": image_url,
+                "file_path": file_path,
+                "file_name": file_name,
+                "file_size": file_size,
+                "file_md5": file_md5,
+                "file_sha256": file_sha256,
                 "session_kind": session_kind,
                 "source_message": source_message or {},
                 "delivery": delivery or {},
@@ -979,6 +989,19 @@ async def test_wxbot_reply_effect_path_matches_legacy_queue_payload() -> None:
                 content="",
                 metadata={"wxbot_msg_type": "image", "image_path": "images/demo.png"},
             ),
+            ReplySegment(
+                type=ReplyType.TEXT,
+                content="",
+                metadata={
+                    "wxbot_msg_type": "file",
+                    "file_path": r"E:\wxbot-share\report.pdf",
+                    "file_name": "report.pdf",
+                    "file_size": 0,
+                    "file_sha256": (
+                        "1d3c43633f2b30c61186f81bb9d635327d0485094d65619745c0bf44f42996ae"
+                    ),
+                },
+            ),
         ],
         trace_id="trace-1",
     )
@@ -1040,16 +1063,25 @@ async def test_wxbot_reply_effect_path_matches_legacy_queue_payload() -> None:
         "msg_type",
         "image_path",
         "image_url",
+        "file_path",
+        "file_name",
+        "file_size",
+        "file_md5",
+        "file_sha256",
         "session_kind",
         "command_id",
     ]
-    assert len(effect_result.effects) == 2
-    assert len(direct_store.calls) == len(effect_store.calls) == 2
+    assert len(effect_result.effects) == 3
+    assert len(direct_store.calls) == len(effect_store.calls) == 3
     assert [{key: call[key] for key in comparable_keys} for call in effect_store.calls] == [
         {key: call[key] for key in comparable_keys} for call in direct_store.calls
     ]
     assert effect_store.calls[0]["delivery"] == direct_store.calls[0]["delivery"]
     assert effect_store.calls[1]["delivery"] == direct_store.calls[1]["delivery"]
+    assert effect_store.calls[2]["delivery"] == direct_store.calls[2]["delivery"]
+    assert effect_store.calls[2]["msg_type"] == "file"
+    assert effect_store.calls[2]["file_path"] == r"E:\wxbot-share\report.pdf"
+    assert effect_store.calls[2]["file_size"] == 0
 
 
 @pytest.mark.asyncio
@@ -2971,6 +3003,59 @@ async def test_wxbot_agent_intent_hook_enqueues_map_generation_progress() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected_scope"),
+    [
+        ("不要生成长沙旅游地图", None),
+        ("不要生成地图，只查一下长沙景点地址", "group_personal_map"),
+    ],
+)
+async def test_wxbot_agent_intent_hook_never_enqueues_negated_map_generation(
+    text: str,
+    expected_scope: str | None,
+) -> None:
+    store = _FakeStore()
+    hook = WxbotAgentIntentHook(store)
+    session = Session(
+        session_id="wx-session-negated-map@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+    )
+    event = InboundEvent(
+        message_id=f"m-negated-map-{abs(hash(text))}",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="u1",
+        session_id=session.session_id,
+        message=Message(content=f"@zzz {text}"),
+        trace_id=f"trace-negated-map-{abs(hash(text))}",
+        metadata={
+            "mentioned_me": True,
+            "wxbot_normalized_content": text,
+            "msg_svr_id": f"msg-negated-map-{abs(hash(text))}",
+            "session_kind": "group",
+        },
+    )
+    pipeline_ctx = PipelineContext(
+        event=event,
+        trace_id=event.trace_id,
+        session=session,
+    )
+    pipeline_ctx.extras["wxbot_reply_policy"] = {
+        "participation_policy_version": 11,
+        "send_revalidation_enabled": True,
+    }
+
+    await hook.run(pipeline_ctx)
+
+    assert pipeline_ctx.extras.get("agent_tool_scope") == expected_scope
+    assert "wxbot_map_progress_enqueued" not in pipeline_ctx.extras
+    assert "suppress_outbound" not in pipeline_ctx.extras
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
 async def test_wxbot_reply_queue_retimes_completed_tool_result() -> None:
     store = _FakeStore()
     pipeline_ctx = _group_reply_policy_ctx("@bot 查一下插件状态")
@@ -3086,6 +3171,52 @@ async def test_wxbot_agent_scope_step_emits_map_progress_effect_when_opted_in() 
     assert effect.payload["delivery"]["source_message_id"] == ("m-agent-map-progress-effect-1")
     assert effect.payload["delivery"]["participation_policy_version"] == 12
     assert effect.payload["delivery"]["send_revalidation_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_wxbot_agent_scope_step_emits_no_effect_for_negated_map_generation() -> None:
+    store = _FakeStore()
+    step = WxbotAgentScopeEnrichStep(store, effect_handler_enabled=True)
+    text = "不要生成地图，只查一下长沙景点地址"
+    session = Session(
+        session_id="wx-session-negated-map-effect@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+    )
+    event = InboundEvent(
+        message_id="m-negated-map-effect",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="u1",
+        session_id=session.session_id,
+        message=Message(content=f"@zzz {text}"),
+        trace_id="trace-negated-map-effect",
+        metadata={
+            "mentioned_me": True,
+            "wxbot_normalized_content": text,
+            "msg_svr_id": "msg-negated-map-effect",
+            "session_kind": "group",
+        },
+    )
+    pipeline_ctx = PipelineContext(
+        event=event,
+        trace_id=event.trace_id,
+        session=session,
+    )
+    pipeline_ctx.extras["wxbot_reply_policy"] = {
+        "participation_policy_version": 12,
+        "send_revalidation_enabled": True,
+    }
+
+    result = await step.run(pipeline_ctx)
+
+    assert result.reason == "enriched"
+    assert pipeline_ctx.extras["agent_tool_scope"] == "group_personal_map"
+    assert "wxbot_map_progress_enqueued" not in pipeline_ctx.extras
+    assert "suppress_outbound" not in pipeline_ctx.extras
+    assert store.calls == []
+    assert result.effects == []
 
 
 @pytest.mark.asyncio

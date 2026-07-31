@@ -37,6 +37,7 @@ def test_media_id_round_trip_is_signed_tenant_scoped_and_expiring() -> None:
     )
     assert locator.kind == "sdk_path"
     assert locator.value == "images/hash-1/photo.png"
+    assert locator.resource_type == "image"
 
     with pytest.raises(InvalidMediaID, match="tenant mismatch"):
         resolve_media_id(token, _settings(), expected_tenant_id="tenant-2", now=120)
@@ -92,3 +93,24 @@ def test_media_id_keeps_the_development_only_legacy_key_fallback() -> None:
 
     token = issue_media_id("images/hash-1/photo.png", settings, tenant_id="tenant-1")
     assert resolve_media_id(token, settings, expected_tenant_id="tenant-1").kind == "sdk_path"
+
+
+def test_file_media_id_preserves_resource_type_and_tenant_scope() -> None:
+    token = issue_media_id(
+        "incoming/report.pdf",
+        _settings(),
+        tenant_id="tenant-1",
+        resource_type="file",
+        now=100,
+    )
+
+    locator = resolve_media_id(
+        token,
+        _settings(),
+        expected_tenant_id="tenant-1",
+        now=120,
+    )
+
+    assert locator.kind == "sdk_path"
+    assert locator.value == "incoming/report.pdf"
+    assert locator.resource_type == "file"

@@ -16,6 +16,7 @@ import { ExtractionJobsWorkbench } from "./ExtractionJobsWorkbench";
 import { IdentityProfilePanel } from "./IdentityProfilePanel";
 import { MemoryGraphWorkbench } from "./MemoryGraphWorkbench";
 import { MemoryItemsWorkbench } from "./MemoryItemsWorkbench";
+import { MemoryRuntimeStatusPanel } from "./MemoryRuntimeStatusPanel";
 import { ProfileEnrichmentWorkbench } from "./ProfileEnrichmentWorkbench";
 import {
   type WxbotSession,
@@ -70,9 +71,11 @@ export function MemoryWorkspace() {
   const [identityLongTermMemory, setIdentityLongTermMemory] = useState("");
   const [identityManualNotes, setIdentityManualNotes] = useState("");
   const [identityProfileBaseline, setIdentityProfileBaseline] = useState<string | null>(null);
+  const [identityProfileVersion, setIdentityProfileVersion] = useState<string | null>(null);
   const [sessionShortTermMemory, setSessionShortTermMemory] = useState("");
   const [sessionManualNotes, setSessionManualNotes] = useState("");
   const [sessionProfileBaseline, setSessionProfileBaseline] = useState<string | null>(null);
+  const [sessionProfileVersion, setSessionProfileVersion] = useState<string | null>(null);
   const [runtimeProfile, setRuntimeProfile] = useState<RuntimeProfile | null>(null);
   const [daysLimit, setDaysLimit] = useState(180);
   const [maxMessagesPerSession, setMaxMessagesPerSession] = useState(200);
@@ -184,6 +187,7 @@ export function MemoryWorkspace() {
     setIdentityLongTermMemory(profile.long_term_memory || "");
     setIdentityManualNotes(profile.manual_notes || "");
     setIdentityProfileBaseline(JSON.stringify([profile.long_term_memory || "", profile.manual_notes || ""]));
+    setIdentityProfileVersion(profile.updated_at || "");
     return true;
   }, [members]);
 
@@ -213,6 +217,7 @@ export function MemoryWorkspace() {
     setSessionShortTermMemory(profile.short_term_memory || "");
     setSessionManualNotes(profile.manual_notes || "");
     setSessionProfileBaseline(JSON.stringify([profile.short_term_memory || "", profile.manual_notes || ""]));
+    setSessionProfileVersion(profile.updated_at || "");
   }, [members, sessionId, verifiedGroupIds]);
 
   const applyRuntimeProfile = useCallback((profile: RuntimeProfile) => {
@@ -234,6 +239,12 @@ export function MemoryWorkspace() {
     setSessionManualNotes(profile.session_manual_notes || "");
     setIdentityProfileBaseline(JSON.stringify([profile.long_term_memory || "", profile.identity_manual_notes || ""]));
     setSessionProfileBaseline(JSON.stringify([profile.short_term_memory || "", profile.session_manual_notes || ""]));
+    if (profile.identity_profile) {
+      setIdentityProfileVersion(profile.identity_profile.updated_at || "");
+    }
+    if (profile.session_profile) {
+      setSessionProfileVersion(profile.session_profile.updated_at || "");
+    }
   }, [members, sessionId, verifiedGroupIds]);
 
   const updateBackfillSessionIds = useCallback((items: string[]) => {
@@ -478,6 +489,7 @@ export function MemoryWorkspace() {
             user_id: memberId,
             long_term_memory: identityLongTermMemory,
             manual_notes: identityManualNotes,
+            expected_version: identityProfileVersion ?? "",
           }),
         },
       });
@@ -510,6 +522,7 @@ export function MemoryWorkspace() {
             user_id: memberId,
             short_term_memory: sessionShortTermMemory,
             manual_notes: sessionManualNotes,
+            expected_version: sessionProfileVersion ?? "",
           }),
         },
       });
@@ -576,6 +589,8 @@ export function MemoryWorkspace() {
     setSelectedMemberWxid("");
     setIdentityProfileBaseline(null);
     setSessionProfileBaseline(null);
+    setIdentityProfileVersion(null);
+    setSessionProfileVersion(null);
   }, [config.sessionId, sessionId]);
 
   useEffect(() => {
@@ -909,6 +924,15 @@ export function MemoryWorkspace() {
         >
           {visitedWorkspaceTabs.has("maintenance") && (
             <div className="memory-maintenance-grid">
+              <MemoryRuntimeStatusPanel
+                sessionId={sessionId}
+                channel={channel}
+                sourceKey={sourceKey}
+                userId={userId}
+                selectedSessionIsGroup={selectedSessionIsGroup}
+                selectedMemberIsVerified={selectedMemberIsVerified}
+                onOutput={setExtractionJobOutput}
+              />
               <ExtractionJobsWorkbench
                 members={members}
                 sessionId={sessionId}

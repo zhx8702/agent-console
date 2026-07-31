@@ -39,6 +39,11 @@ export type ReplyQueueMessage = {
   reply_text?: string;
   msg_type?: string;
   media_id?: string;
+  file_media_id?: string;
+  file_name?: string;
+  file_size?: number | null;
+  file_md5?: string;
+  file_sha256?: string;
   source_message?: Record<string, unknown>;
   delivery?: Record<string, unknown>;
   participation_status?: string;

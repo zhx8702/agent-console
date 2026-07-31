@@ -85,6 +85,10 @@ class ParticipationPolicyValues(StrictContract):
     # it short and bounded so a group cannot accidentally turn its prompt into
     # an unbounded transcript.  Zero disables durable group context entirely.
     prompt_context_retention_seconds: Annotated[int, Field(ge=0, le=86_400)] = 3_600
+    # File delivery is a separate, fail-closed group capability.  It is not
+    # implied by participation being enabled and cannot be bypassed by a group
+    # administrator or an Agent tool allowlist.
+    file_send_enabled: bool = False
     rollout_stage: RolloutStage = "contextual"
     rollout_opt_in: bool = False
     proactive_rollout_percent: Annotated[int, Field(ge=0, le=100)] = 5
@@ -95,6 +99,7 @@ class ParticipationPolicyValues(StrictContract):
                 "rollout_stage",
                 "rollout_opt_in",
                 "proactive_rollout_percent",
+                "file_send_enabled",
             }
         )
         return ParticipationPolicy(enabled=enabled, **values)

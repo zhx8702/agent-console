@@ -1,11 +1,11 @@
-.PHONY: help install frontend-install venv up up-app up-wxbot down migrate dev-start dev-start-wxbot dev-stop dev-stop-wxbot dev-restart dev-status dev-health dev-logs run-api run-frontend run-inbound-worker run-outbound-worker run-scheduler-worker run-wxbot-bridge-worker run-worker smoke test lint fmt
+.PHONY: help install frontend-install venv up up-app up-wxbot down migrate deploy-server dev-start dev-start-wxbot dev-stop dev-stop-wxbot dev-restart dev-status dev-health dev-logs run-api run-frontend run-inbound-worker run-outbound-worker run-scheduler-worker run-wxbot-bridge-worker run-worker smoke test lint fmt
 
 PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
 help:
-	@echo "Targets: venv install frontend-install up up-app up-wxbot down migrate dev-start dev-start-wxbot dev-stop dev-stop-wxbot dev-restart dev-status dev-health dev-logs run-api run-frontend run-inbound-worker run-outbound-worker run-scheduler-worker run-wxbot-bridge-worker run-worker smoke test lint fmt"
+	@echo "Targets: venv install frontend-install up up-app up-wxbot down migrate deploy-server dev-start dev-start-wxbot dev-stop dev-stop-wxbot dev-restart dev-status dev-health dev-logs run-api run-frontend run-inbound-worker run-outbound-worker run-scheduler-worker run-wxbot-bridge-worker run-worker smoke test lint fmt"
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -31,6 +31,9 @@ down:
 
 migrate:
 	$(BIN)/alembic upgrade head
+
+deploy-server:
+	bash scripts/deploy-server.sh
 
 dev-start:
 	scripts/dev-stack.sh start

@@ -9,6 +9,7 @@ from app.agent.scopes import (
     GROUP_DRAW_GENERATION_SCOPE,
     GROUP_PERSONAL_MAP_SCOPE,
     GROUP_PLUGIN_STATUS_SCOPE,
+    MESSAGE_EXPORT_SCOPE,
 )
 from app.orchestrator.pipeline import PipelineContext
 from app.social import (
@@ -18,6 +19,7 @@ from app.social import (
     VoiceProfile,
 )
 from app.social.feedback import NaturalFeedbackAction, NaturalFeedbackResult
+from plugins.wxbot.file_intent import FileIntent, classify_file_intent
 
 _MENTION_PREFIX_RE = re.compile(r"^\s*(?:@\S+[\s\u2005\u00a0]+)+")
 
@@ -103,14 +105,79 @@ _AGENT_GROUP_DRAW_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-_AGENT_GROUP_MAP_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"(地图|高德|导航|路线|出行|行程|打卡|旅游|景点|餐厅|咖啡|商场|周边|附近|位置|地址|门牌|楼栋|在哪|哪里|怎么走|怎么去)"
-    ),
-    re.compile(
-        r"(帮我|给我|查一下|查查|找一下|找找|规划).*(路线|行程|地图|附近|周边|导航|景点|餐厅|咖啡|商场|位置|地址|门牌|楼栋|在哪|哪里)"
-    ),
-    re.compile(r"(从).{1,40}(到).{1,40}(怎么走|怎么去|路线|导航)"),
+_DRAW_SCOPE_CUE_RE = re.compile(
+    r"画(?:一张|个|幅|只|套|版|下)?|生图|出图|"
+    r"(?:生成|做|来)(?:一张|个|幅)?(?:图|图片|海报|头像|壁纸|插画)"
+)
+
+
+_MAP_GEO_CONTEXT_RE = re.compile(
+    r"(地图|高德|导航|路线|出行|行程|打卡|旅游|旅行|一日游|"
+    r"景点|餐厅|饭店|咖啡店|咖啡馆|商场|酒店|医院|公园|车站|机场|地铁站|"
+    r"周边|附近|地点|位置|地址|门牌|楼栋)"
+)
+
+
+_MAP_QUERY_OR_PLAN_RE = re.compile(
+    r"(查(?:一下|下|查)?|查询|搜(?:一下|下|索)?|找(?:一下|下|找)?|"
+    r"推荐|看(?:一下|下|看)?|定位|规划|安排|制定|生成|创建|做成|整理成|"
+    r"标记|带路|告诉我|给我(?:找|查|推荐|规划|生成)?|"
+    r"帮我(?:找|查|推荐|规划|安排|生成)?|怎么(?:走|去|到达))"
+)
+
+
+_MAP_INTERROGATIVE_RE = re.compile(
+    r"(在(?:哪里|哪儿|哪)|位于(?:哪里|哪儿|哪)|"
+    r"(?:哪里|哪儿)有|有(?:什么|哪些)|怎么(?:走|去|到达)|"
+    r"(?:地址|位置)是什么|多少公里|多远|哪个好)"
+)
+
+
+_MAP_ROUTE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"从.{1,40}到.{1,40}(怎么走|怎么去|路线|导航|要多久|多远)"),
+    re.compile(r".{1,40}(?:到|去).{1,40}(?:路线|导航|怎么走|怎么去)"),
+    re.compile(r"(?:导航|带路)(?:到|去|至).{1,40}"),
+)
+
+
+_MAP_NEARBY_SHORTHAND_RE = re.compile(
+    r"(?:附近|周边)(?:的)?(?:有)?"
+    r"(?:景点|餐厅|饭店|咖啡店|咖啡馆|商场|酒店|医院|公园|车站|机场|地铁站|"
+    r"有什么|有哪些|哪里)"
+)
+
+
+_MAP_LOCATION_SHORTHAND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:地址|具体位置|详细位置).{0,12}(?:精确到|具体到)?(?:门牌|门牌号|楼栋)"),
+    re.compile(r"^.{1,40}(?:地址|具体位置|详细位置|门牌|门牌号|楼栋)\s*[?？]?$"),
+    re.compile(r"^(?:地图|高德地图|导航|路线|附近|周边)\s*[?？]?$"),
+    re.compile(r"^.{1,16}(?:地图)\s*[?？]?$"),
+)
+
+
+_MAP_NAMED_PLACE_QUESTION_RE = re.compile(
+    r"^.{2,40}(?:在|位于)(?:哪里|哪儿|哪|何处)[?？呢呀啊]*$"
+)
+
+
+_MAP_PERSON_SUBJECT_RE = re.compile(
+    r"^(?:你|我|他|她|谁|我们|你们|他们|她们)(?:现在|目前|刚才)?(?:在|位于)"
+)
+
+
+_MAP_PERSON_LOCATION_QUESTION_RE = re.compile(
+    r"^(?:你|我|他|她|谁|我们|你们|他们|她们|"
+    r"小明|小红|小王|张三|李四|王五|赵六|"
+    r"@\S+|[\u3400-\u9fff]{1,4}(?:先生|女士|小姐|老师|同学|经理|老板|医生|师傅))"
+    r"(?:现在|目前|刚才)?"
+    r"(?:在(?:哪里|哪儿|哪)|的?(?:位置|地址)(?:是|在)?(?:什么|哪里|哪儿|哪)|"
+    r"的?(?:家|家里|住处)(?:在)?(?:哪里|哪儿|哪))"
+)
+
+
+_MAP_PRIVATE_LOCATION_RE = re.compile(
+    r"(?:家庭住址|家庭地址|住宅地址|居住地址|个人住址|住址|"
+    r"家住(?:哪里|哪儿|哪)|住在(?:哪里|哪儿|哪))"
 )
 
 
@@ -118,6 +185,73 @@ _EXPLICIT_MAP_GENERATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(生成|创建|做成|整理成|标记到).{0,8}(高德)?地图"),
     re.compile(r"(高德)?地图.{0,8}(二维码|分享)"),
     re.compile(r"(打卡地图|路线地图|地图二维码|生成二维码)"),
+)
+
+
+_MAP_SCOPE_CUE_RE = re.compile(
+    r"(?:查(?:一下|下|查)?|查询|搜(?:一下|下|索)?|找(?:一下|下|找)?|"
+    r"推荐|看(?:一下|下|看)?|定位|规划|安排|制定|生成|创建|做成|整理成|"
+    r"标记|带路|导航|告诉我|怎么(?:走|去|到达)|"
+    r"在(?:哪里|哪儿|哪)|位于(?:哪里|哪儿|哪)|"
+    r"(?:哪里|哪儿)有|有(?:什么|哪些)|(?:地址|位置)是什么|"
+    r"多少公里|多远|哪个好|附近|周边|地址|具体位置|详细位置|"
+    r"门牌|门牌号|楼栋|地图|路线)"
+)
+
+
+_MESSAGE_SUMMARY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(消息|聊天记录|群聊记录|私聊记录|消息记录|聊天内容|群消息|私聊消息|群里聊的)"
+        r".{0,24}(汇总|总结|整理|归纳|摘要)"
+    ),
+    re.compile(
+        r"(汇总|总结|整理|归纳|摘要).{0,24}"
+        r"(消息|聊天记录|群聊记录|私聊记录|消息记录|聊天内容|群消息|私聊消息|群里聊的)"
+    ),
+)
+
+
+_MESSAGE_FILE_DELIVERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(发送|发给|发我|发个|发一份|给我|导出|输出|生成|做成|整理成|保存成)"
+        r".{0,12}(文件|文档|txt|csv)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(文件|文档|txt|csv).{0,12}"
+        r"(发送|发给|发我|给我|给群里|给大家|导出|输出|生成|下载)",
+        re.IGNORECASE,
+    ),
+)
+
+
+_MESSAGE_SUMMARY_CUE_RE = re.compile(r"(?:汇总|总结|整理|归纳|摘要)")
+
+
+_MESSAGE_FILE_DELIVERY_CUE_RE = re.compile(
+    r"(?:发送|发给|发我|发个|发一份|给我|给群里|给大家|"
+    r"导出|输出|生成|做成|整理成|保存成|下载)"
+)
+
+
+_SCOPE_CLAUSE_BOUNDARY_RE = re.compile(
+    r"[,，。！？!?；;\n]|(?:但是|不过|然而|而是|改成|改为|转而)|"
+    r"\b(?:but|however|instead|rather)\b",
+    re.IGNORECASE,
+)
+
+
+_SCOPE_NEGATION_RE = re.compile(
+    r"(?:不要|别|无需|不用|不必|不需要|不想|禁止|切勿|避免)|"
+    r"不(?=生成|创建|画|查询|查|导出|输出|汇总|总结|发送|发)|"
+    r"(?<![A-Za-z])(?:do\s+not|don['’]?t|dont|no\s+need\s+to|"
+    r"needn['’]?t|without)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+_SCOPE_CANCEL_AFTER_RE = re.compile(
+    r"^\s*(?:就)?(?:算了(?:吧)?|不用了|不要了|取消(?:吧|了)?)"
 )
 
 
@@ -481,26 +615,126 @@ def _normalize_agent_scope_text(text: str) -> str:
     return re.sub(r"\s+", " ", value)
 
 
+def _scope_cue_is_negated(text: str, cue: re.Match[str]) -> bool:
+    clause_start = 0
+    for boundary in _SCOPE_CLAUSE_BOUNDARY_RE.finditer(text, 0, cue.start()):
+        clause_start = boundary.end()
+    cue_prefix = text[clause_start : cue.start()]
+    if (
+        _SCOPE_NEGATION_RE.search(cue_prefix)
+        or cue_prefix.rstrip().endswith(("不", "未"))
+    ):
+        return True
+
+    clause_end = len(text)
+    boundary_after = _SCOPE_CLAUSE_BOUNDARY_RE.search(text, cue.end())
+    if boundary_after is not None:
+        clause_end = boundary_after.start()
+    return bool(_SCOPE_CANCEL_AFTER_RE.match(text[cue.end() : clause_end]))
+
+
+def _patterns_have_affirmative_cue(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+    cue_pattern: re.Pattern[str],
+) -> bool:
+    for pattern in patterns:
+        for candidate in pattern.finditer(text):
+            for cue in cue_pattern.finditer(
+                text,
+                candidate.start(),
+                candidate.end(),
+            ):
+                if not _scope_cue_is_negated(text, cue):
+                    return True
+    return False
+
+
+def _message_export_requested(text: str) -> bool:
+    intent = classify_file_intent(_normalize_agent_scope_text(text))
+    return intent.operation == "export_history" and intent.delivery_required
+
+
+def _file_intent_requested(
+    text: str,
+    *,
+    has_attachment: bool = False,
+) -> FileIntent:
+    """Return the structured file decision used by the wxbot intent hook."""
+
+    return classify_file_intent(
+        _normalize_agent_scope_text(text),
+        has_attachment=has_attachment,
+    )
+
+
+def _map_scope_requested(text: str) -> bool:
+    value = _normalize_agent_scope_text(text)
+    if not value or value.startswith("/"):
+        return False
+    if (
+        _MAP_PERSON_LOCATION_QUESTION_RE.search(value)
+        or _MAP_PRIVATE_LOCATION_RE.search(value)
+    ):
+        return False
+    candidate = (
+        _explicit_map_generation_requested(value)
+        or any(pattern.search(value) for pattern in _MAP_ROUTE_PATTERNS)
+        or bool(_MAP_NEARBY_SHORTHAND_RE.search(value))
+        or any(
+            pattern.search(value)
+            for pattern in _MAP_LOCATION_SHORTHAND_PATTERNS
+        )
+        or (
+        _MAP_NAMED_PLACE_QUESTION_RE.search(value)
+        and not _MAP_PERSON_SUBJECT_RE.search(value)
+        )
+        or (
+            _MAP_GEO_CONTEXT_RE.search(value)
+            and (
+                _MAP_QUERY_OR_PLAN_RE.search(value)
+                or _MAP_INTERROGATIVE_RE.search(value)
+            )
+        )
+    )
+    if not candidate:
+        return False
+    return any(
+        not _scope_cue_is_negated(value, cue)
+        for cue in _MAP_SCOPE_CUE_RE.finditer(value)
+    )
+
+
 def _resolve_group_agent_scope(text: str) -> str | None:
     value = _normalize_agent_scope_text(text)
     if not value or value.startswith("/"):
         return None
-    if any(pattern.search(value) for pattern in _AGENT_GROUP_DRAW_PATTERNS):
+    if _message_export_requested(value):
+        return MESSAGE_EXPORT_SCOPE
+    if _patterns_have_affirmative_cue(
+        value,
+        _AGENT_GROUP_DRAW_PATTERNS,
+        _DRAW_SCOPE_CUE_RE,
+    ):
         return GROUP_DRAW_GENERATION_SCOPE
-    if any(pattern.search(value) for pattern in _AGENT_GROUP_MAP_PATTERNS):
-        return GROUP_PERSONAL_MAP_SCOPE
     if any(pattern.search(value) for pattern in _AGENT_GROUP_PLUGIN_STATUS_PATTERNS):
         return GROUP_PLUGIN_STATUS_SCOPE
     if any(pattern.search(value) for pattern in _AGENT_GROUP_INFO_PATTERNS):
         return DEFAULT_AGENT_SCOPE
+    if _map_scope_requested(value):
+        return GROUP_PERSONAL_MAP_SCOPE
     return None
 
 
 def _explicit_map_generation_requested(text: str) -> bool:
-    value = str(text or "")
+    value = _normalize_agent_scope_text(text)
     if not value:
         return False
-    return any(pattern.search(value) for pattern in _EXPLICIT_MAP_GENERATION_PATTERNS)
+    return _patterns_have_affirmative_cue(
+        value,
+        _EXPLICIT_MAP_GENERATION_PATTERNS,
+        _MAP_SCOPE_CUE_RE,
+    )
 
 
 def _sync_wxbot_reply_policy_signal(ctx: PipelineContext) -> dict[str, object]:

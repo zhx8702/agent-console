@@ -22,6 +22,7 @@ class MediaLocator:
     kind: Literal["sdk_path", "remote_url"]
     value: str
     expires_at: int
+    resource_type: Literal["image", "file"] = "image"
 
 
 def issue_media_id(
@@ -29,10 +30,13 @@ def issue_media_id(
     settings: Any,
     *,
     tenant_id: str,
+    resource_type: Literal["image", "file"] = "image",
     now: int | None = None,
     ttl_seconds: int = 7 * 24 * 60 * 60,
 ) -> str:
     tenant = _required(tenant_id, "tenant_id", max_length=64)
+    if resource_type not in {"image", "file"}:
+        raise InvalidMediaID("invalid media resource type")
     raw = str(locator or "").strip()
     if raw.lower().startswith(("http://", "https://")):
         kind: Literal["sdk_path", "remote_url"] = "remote_url"
@@ -45,6 +49,7 @@ def issue_media_id(
         "v": 1,
         "t": tenant,
         "k": kind,
+        "r": resource_type,
         "l": value,
         "e": issued_at + max(60, int(ttl_seconds)),
     }
@@ -92,6 +97,9 @@ def resolve_media_id(
         raise InvalidMediaID("media id expired")
     kind = str(payload.get("k") or "")
     value = str(payload.get("l") or "")
+    resource_type = str(payload.get("r") or "image")
+    if resource_type not in {"image", "file"}:
+        raise InvalidMediaID("invalid media resource type")
     if kind == "sdk_path":
         normalized = normalize_sdk_media_path(value)
     elif kind == "remote_url":
@@ -103,6 +111,7 @@ def resolve_media_id(
         kind=kind,  # type: ignore[arg-type]
         value=normalized,
         expires_at=expires_at,
+        resource_type=resource_type,  # type: ignore[arg-type]
     )
 
 

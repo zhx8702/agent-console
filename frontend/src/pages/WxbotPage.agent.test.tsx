@@ -198,4 +198,32 @@ describe("wxbot agent tool defaults", () => {
       expect(saveCall?.[2]?.body).toEqual({ enabled: true, allowed_tools: [] });
     });
   });
+
+  it("labels file scopes explicitly and points to the group file master switch", async () => {
+    const user = userEvent.setup();
+    const baseRequest = apiRequestMock.getMockImplementation();
+    expect(baseRequest).toBeDefined();
+    apiRequestMock.mockImplementation(async (...args) => {
+      const [, path] = args;
+      if (path.endsWith("/agent-tools/catalog")) {
+        return {
+          items: catalog,
+          scopes: ["group_info", "file_analysis", "message_export"],
+        };
+      }
+      return baseRequest!(...args);
+    });
+    renderAgentPage();
+
+    await screen.findByText("系统默认");
+    await user.selectOptions(screen.getByLabelText("工具作用域"), "file_analysis");
+
+    expect(await screen.findByRole("heading", { name: "群文件处理智能体" })).toBeInTheDocument();
+    expect(screen.getByText(/允许群文件发送.*总开关约束/)).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("工具作用域"), "message_export");
+    expect(
+      await screen.findByRole("heading", { name: "群消息文件导出智能体" }),
+    ).toBeInTheDocument();
+  });
 });

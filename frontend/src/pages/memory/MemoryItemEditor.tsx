@@ -6,6 +6,8 @@ import {
   formatConfidence,
   formatTimestamp,
   memoryItemStatusLabel,
+  memoryAudienceScopeLabel,
+  memoryOriginSessionKindLabel,
   memoryScopeTypeLabel,
   memorySensitivityLabel,
   memorySourceTypeLabel,
@@ -22,6 +24,7 @@ type NewMemoryDraft = {
   memoryType: string;
   pinned: boolean;
   priority: number;
+  retentionDays: string;
 };
 
 type EditMemoryDraft = {
@@ -48,6 +51,7 @@ type MemoryItemEditorProps = {
   onNewMemoryTypeChange: (value: string) => void;
   onNewPinnedChange: (value: boolean) => void;
   onNewPriorityChange: (value: number) => void;
+  onNewRetentionDaysChange: (value: string) => void;
   onEditContentChange: (value: string) => void;
   onEditStatusChange: (value: string) => void;
   onEditMemoryTypeChange: (value: string) => void;
@@ -80,6 +84,7 @@ export function MemoryItemEditor({
   onNewMemoryTypeChange,
   onNewPinnedChange,
   onNewPriorityChange,
+  onNewRetentionDaysChange,
   onEditContentChange,
   onEditStatusChange,
   onEditMemoryTypeChange,
@@ -97,6 +102,15 @@ export function MemoryItemEditor({
   onReviewSupersededBy,
   onReviewSupersedes,
 }: MemoryItemEditorProps) {
+  const groupAudienceMismatch = Boolean(
+    selectedItem?.session_id?.endsWith("@chatroom")
+      && (
+        selectedItem.origin_session_kind !== "group"
+        || selectedItem.audience_scope !== "session"
+        || !selectedItem.allowed_session_ids?.includes(selectedItem.session_id)
+      ),
+  );
+
   return (
     <div className="memory-item-editor-stack">
       <div className="memory-item-editor">
@@ -112,6 +126,17 @@ export function MemoryItemEditor({
           </div>
           <label className="field"><span>记忆类型</span><input value={newDraft.memoryType} onChange={(event) => onNewMemoryTypeChange(event.target.value)} /></label>
           <label className="field"><span>优先级</span><input type="number" value={newDraft.priority} onChange={(event) => onNewPriorityChange(Number(event.target.value) || 0)} /></label>
+          <label className="field">
+            <span>保留期限</span>
+            <select value={newDraft.retentionDays} onChange={(event) => onNewRetentionDaysChange(event.target.value)}>
+              <option value="30">30 天</option>
+              <option value="90">90 天</option>
+              <option value="180">180 天</option>
+              <option value="365">365 天</option>
+              <option value="">长期保留（无到期时间）</option>
+            </select>
+            <small>到期后不会参与正常召回，可由治理清理任务处理。</small>
+          </label>
           <label className="toggle-chip">
             <span><input type="checkbox" checked={newDraft.pinned} onChange={(event) => onNewPinnedChange(event.target.checked)} />置顶</span>
             <em>创建时固定标记为手工来源和生效状态。</em>
@@ -124,7 +149,7 @@ export function MemoryItemEditor({
             confirmLabel="确认创建"
             pendingLabel="正在创建…"
             disabled={!newDraft.content.trim()}
-            impact={<ul><li>范围：当前已验证群和成员</li><li>类型：{newDraft.memoryType || "备注"}</li><li>固定写入当前会话范围，并记录稳定幂等键。</li></ul>}
+            impact={<ul><li>范围：仅当前已验证群和成员</li><li>可见性：群聊来源 / 当前群会话可见</li><li>保留：{newDraft.retentionDays ? `${newDraft.retentionDays} 天` : "长期保留"}</li><li>类型：{newDraft.memoryType || "备注"}</li><li>固定写入当前会话范围，并记录稳定幂等键。</li></ul>}
             onConfirm={onCreate}
           />
         </div>
@@ -144,7 +169,7 @@ export function MemoryItemEditor({
           <label className="field">
             <span>敏感级别</span>
             <select value={editDraft.sensitivity} onChange={(event) => onEditSensitivityChange(event.target.value)} disabled={!selectedItem}>
-              {(["normal", "private", "sensitive"] as const).map((value) => <option value={value} key={value}>{memorySensitivityLabel(value)}</option>)}
+              {(["normal", "pii", "sensitive"] as const).map((value) => <option value={value} key={value}>{memorySensitivityLabel(value)}</option>)}
             </select>
           </label>
           <label className="field"><span>置信度</span><input type="number" min={0} max={1} step={0.01} value={editDraft.confidence} onChange={(event) => onEditConfidenceChange(event.target.value)} disabled={!selectedItem} /></label>
@@ -155,6 +180,11 @@ export function MemoryItemEditor({
           </label>
           {selectedItem && (
             <div className="memory-acceptance-detail span-2">
+              {groupAudienceMismatch && (
+                <div className="admin-notice admin-notice-warning" role="alert">
+                  这条群记忆的可见性元数据不完整，可能出现“保存成功但无法在当前群召回”。请重新创建或修复为 group / session，并把当前群加入 allowed_session_ids。
+                </div>
+              )}
               <div className="memory-acceptance-detail-head">
                 <div><span>采纳状态</span><strong>{acceptanceStatusLabel(acceptanceStatusOf(selectedItem))} {formatConfidence(selectedItem.acceptance_score)}</strong></div>
                 <span className="pill pill-feature">持久化管理员复核</span>
@@ -164,6 +194,10 @@ export function MemoryItemEditor({
                 <div><dt>抽取置信度</dt><dd>{formatConfidence(selectedItem.extraction_confidence)}</dd></div>
                 <div><dt>被哪条记忆取代</dt><dd>{supersededByItemIdOf(selectedItem) || "-"}</dd></div>
                 <div><dt>取代哪条记忆</dt><dd>{supersedesItemIdOf(selectedItem) || "-"}</dd></div>
+                <div><dt>来源会话</dt><dd>{selectedItem.origin_session_kind ? memoryOriginSessionKindLabel(selectedItem.origin_session_kind) : "未声明"}</dd></div>
+                <div><dt>可见范围</dt><dd>{selectedItem.audience_scope ? memoryAudienceScopeLabel(selectedItem.audience_scope) : "未声明"}</dd></div>
+                <div><dt>允许会话</dt><dd>{selectedItem.allowed_session_ids?.join(", ") || "-"}</dd></div>
+                <div><dt>到期时间</dt><dd>{selectedItem.expires_at ? formatTimestamp(selectedItem.expires_at) : "长期保留"}</dd></div>
                 <div><dt>判定信号</dt><dd>{acceptanceSignalRows.length ? acceptanceSignalRows.map(([key, value]) => `${key} ${formatConfidence(value)}`).join(", ") : "-"}</dd></div>
               </dl>
               {selectedItem.possible_conflicts && Number(selectedItem.possible_conflicts.count || 0) > 0 && (

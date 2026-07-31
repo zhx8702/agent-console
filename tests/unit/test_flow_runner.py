@@ -12,12 +12,14 @@ from app.common.types import (
     CapabilityResult,
     Channel,
     InboundEvent,
+    IntentCoarse,
     Message,
     OutboundReply,
     PreprocessedMessage,
     ReplySegment,
     ReplyType,
     Role,
+    RouteDecision,
     RouteType,
     Session,
     SessionState,
@@ -328,6 +330,70 @@ async def test_flow_runner_shadow_mode_traces_missing_executors() -> None:
     assert result.status == FLOW_RUN_COMPLETED
     assert result.steps[0].status == STEP_TRACE_SHADOW
     assert result.steps[0].reason == "shadow_noop"
+
+
+@pytest.mark.asyncio
+async def test_flow_runner_emits_bounded_decision_trace_without_message_text() -> None:
+    ctx = _ctx()
+    ctx.pre = PreprocessedMessage(
+        original_text="private user text",
+        cleaned_text="private user text",
+        intent_coarse=IntentCoarse.BUSINESS,
+    )
+    ctx.route = RouteDecision(
+        type=RouteType.AGENT,
+        confidence=0.91,
+        reason="tool_intent",
+        hints={
+            "rule": "tool_intent",
+            "confidence_basis": "tool_intent_and_effective_preflight",
+            "matched_conditions": ["tool_intent_matched", "tools_available"],
+            "raw_text": "must_not_persist",
+        },
+    )
+    ctx.signals["router"] = {
+        "tool_intent_matched": True,
+        "effective_tool_count": 2,
+        "tool_preflight_failed": False,
+        "raw_text": "must_not_persist",
+    }
+    ctx.result = CapabilityResult(
+        route=RouteType.AGENT,
+        reply_text="private assistant text",
+        metadata={
+            "tool_preselection_verdict": "AMBIGUOUS",
+            "tool_preselection_selected": ["search", "export"],
+        },
+    )
+
+    result = await FlowRunner(shadow=True).run(
+        _flow(_compiled_step("one", "plugin.test.one")),
+        ctx,
+    )
+
+    assert result.decision_trace == {
+        "intent": {"coarse": "business", "language": "zh", "sensitive": False},
+        "route": {
+            "type": "agent",
+            "confidence": 0.91,
+            "reason": "tool_intent",
+            "rule": "tool_intent",
+            "confidence_basis": "tool_intent_and_effective_preflight",
+            "matched_conditions": ["tool_intent_matched", "tools_available"],
+        },
+        "router_signals": {
+            "tool_intent_matched": True,
+            "effective_tool_count": 2,
+            "tool_preflight_failed": False,
+        },
+        "result": {
+            "route": "agent",
+            "tool_preselection_verdict": "AMBIGUOUS",
+            "tool_preselection_selected": ["search", "export"],
+        },
+    }
+    assert "private user text" not in repr(result.decision_trace)
+    assert "private assistant text" not in repr(result.decision_trace)
 
 
 @pytest.mark.asyncio
@@ -822,6 +888,47 @@ async def test_flow_runner_selective_effect_dispatch_accepts_matching_handler() 
     assert result.status == FLOW_RUN_COMPLETED
     assert len(handler.calls) == 1
     assert ctx.signals["effects"]["dispatches"][0]["status"] == EFFECT_STATUS_RECORDED
+
+
+@pytest.mark.asyncio
+async def test_flow_runner_clears_stale_persona_before_owner_gate_skip() -> None:
+    async def deny_persona(owner: str, _ctx: PipelineContext) -> bool:
+        return owner != "persona_extract"
+
+    persona_step = _Step()
+    ctx = _ctx()
+    ctx.session = Session(
+        session_id="s1",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WEB,
+        variables={
+            "persona_skill": "stale style",
+            "persona_profile": {"name": "stale"},
+            "durable_setting": "keep",
+        },
+    )
+
+    result = await FlowRunner(
+        {"plugin.persona_extract.skill_enrich": persona_step},
+        owner_gate=deny_persona,
+    ).run(
+        _flow(
+            _compiled_step(
+                "persona",
+                "plugin.persona_extract.skill_enrich",
+                owner="persona_extract",
+            )
+        ),
+        ctx,
+    )
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert result.steps[0].status == STEP_TRACE_OWNER_SKIPPED
+    assert persona_step.calls == 0
+    assert "persona_skill" not in ctx.session.variables
+    assert "persona_profile" not in ctx.session.variables
+    assert ctx.session.variables["durable_setting"] == "keep"
 
 
 @pytest.mark.asyncio

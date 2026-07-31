@@ -818,8 +818,8 @@ def build_default_wechat_group_flow_specs() -> list[FlowStepSpec]:
         FlowStepSpec(id="draw_postprocess", kind="plugin.draw.postprocess_result"),
         FlowStepSpec(id="output_safety", kind="core.output_safety"),
         FlowStepSpec(id="postprocess", kind="core.postprocess"),
-        FlowStepSpec(id="memory_save", kind="plugin.memory.save"),
         FlowStepSpec(id="wxbot_outbound_policy", kind="plugin.wxbot.outbound_policy"),
+        FlowStepSpec(id="memory_save", kind="plugin.memory.save"),
         FlowStepSpec(id="commit", kind="core.commit_turns_and_publish"),
     ]
 

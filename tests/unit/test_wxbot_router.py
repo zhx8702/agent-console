@@ -14,6 +14,11 @@ from PIL import Image
 from app.admin.authorization import AdminRole, Principal
 from app.agent.engine import AgentCapabilityEngine
 from app.agent.registry import AgentToolDefinition, AgentToolRegistry
+from app.social.contracts import (
+    GroupParticipationPolicyDocument,
+    KillSwitches,
+    ParticipationPolicyValues,
+)
 from plugins.repeater.store import RepeaterConfigMutation
 from plugins.wxbot import router as wxbot_router
 from plugins.wxbot.media_ids import issue_media_id
@@ -1314,6 +1319,25 @@ async def _allow_wxbot_scope(_tenant_id: str, _session_id: str) -> bool:
     return True
 
 
+class _FakeGroupFilePolicyStore:
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+
+    async def get_group_policy(
+        self,
+        tenant_id: str,
+        session_id: str,
+    ) -> GroupParticipationPolicyDocument:
+        return GroupParticipationPolicyDocument(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            version=1,
+            kill_switches=KillSwitches(),
+            effective_enabled=True,
+            policy=ParticipationPolicyValues(file_send_enabled=self.enabled),
+        )
+
+
 def _seed_completed_self_review_job(
     store: _FakeStore,
     *,
@@ -1369,7 +1393,10 @@ def _build_self_review_publish_client(
     return TestClient(app), store
 
 
-def _build_client() -> tuple[TestClient, _FakeStore, _FakeBridge, _FakeScheduler, _FakeAgentStore]:
+def _build_client(
+    *,
+    group_file_send_enabled: bool = False,
+) -> tuple[TestClient, _FakeStore, _FakeBridge, _FakeScheduler, _FakeAgentStore]:
     app = FastAPI()
     store = _FakeStore()
     bridge = _FakeBridge()
@@ -1415,7 +1442,13 @@ def _build_client() -> tuple[TestClient, _FakeStore, _FakeBridge, _FakeScheduler
         ),
         owner="draw",
     )
-    container = SimpleNamespace(llm_service=_FakeLlmService(), agent_tool_registry=registry)
+    container = SimpleNamespace(
+        llm_service=_FakeLlmService(),
+        agent_tool_registry=registry,
+        social_policy_store=_FakeGroupFilePolicyStore(
+            enabled=group_file_send_enabled,
+        ),
+    )
     report_service = wxbot_router.WxbotReportService(
         store,
         container,
@@ -1518,6 +1551,8 @@ def test_admin_inbound_simulator_uses_verified_roster_and_server_side_bus() -> N
     assert published["headers"]["tenant_id"] == "default"
     assert published["payload"]["session_id"] == "room@chatroom"
     assert published["payload"]["metadata"]["admin_simulation"] is True
+    assert published["payload"]["metadata"]["source"] == "admin_console_simulator"
+    assert published["payload"]["metadata"]["profile_source_key"] == "wxbot"
     assert unknown.status_code == 404
     assert missing_key.status_code == 400
 
@@ -2979,6 +3014,73 @@ def test_wxbot_router_admin_image_requires_auth_and_rejects_traversal() -> None:
     assert traversal.json()["detail"] == "invalid media id"
 
 
+def test_wxbot_router_admin_file_streams_authenticated_sdk_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, store, _, _, _ = _build_client()
+    requested_urls: list[str] = []
+    real_async_client = wxbot_router.httpx.AsyncClient
+
+    async def handler(request):
+        requested_urls.append(str(request.url))
+        return wxbot_router.httpx.Response(
+            200,
+            content=b"report-bytes",
+            headers={
+                "Content-Type": "application/pdf",
+                "Content-Disposition": 'attachment; filename="report.pdf"',
+            },
+            request=request,
+        )
+
+    def client_factory(**kwargs):
+        kwargs.pop("follow_redirects", None)
+        return real_async_client(
+            **kwargs,
+            transport=wxbot_router.httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(wxbot_router.httpx, "AsyncClient", client_factory)
+    media_id = issue_media_id(
+        "incoming/report.pdf",
+        store.settings,
+        tenant_id="default",
+        resource_type="file",
+    )
+
+    with client:
+        response = client.get(
+            f"/admin/files/{media_id}",
+            headers={"Authorization": "Bearer token"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"report-bytes"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"] == 'attachment; filename="report.pdf"'
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert requested_urls == ["http://127.0.0.1:5080/files/incoming/report.pdf"]
+
+
+def test_wxbot_router_rejects_file_media_id_on_image_route() -> None:
+    client, store, _, _, _ = _build_client()
+    media_id = issue_media_id(
+        "incoming/report.pdf",
+        store.settings,
+        tenant_id="default",
+        resource_type="file",
+    )
+
+    with client:
+        response = client.get(
+            f"/admin/images/{media_id}",
+            headers={"Authorization": "Bearer token"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "media id is not an image"
+
+
 def test_wxbot_admin_image_send_accepts_only_tenant_scoped_media_id() -> None:
     client, store, bridge, _, _ = _build_client()
     media_id = issue_media_id(
@@ -3028,6 +3130,225 @@ def test_wxbot_admin_image_send_accepts_only_tenant_scoped_media_id() -> None:
     assert legacy_path.status_code == 422
     assert tenant_mismatch.status_code == 400
     assert tenant_mismatch.json()["detail"] == "media id tenant mismatch"
+
+
+def test_wxbot_admin_file_send_forwards_sdk_local_file_contract() -> None:
+    client, _store, bridge, _, _ = _build_client()
+
+    with client:
+        response = client.post(
+            "/admin/send",
+            headers={
+                "Authorization": "Bearer token",
+                "Idempotency-Key": "file-send-1",
+            },
+            json={
+                "tenant_id": "default",
+                "session_id": "wx-1",
+                "msg_type": "file",
+                "file_path": "E:\\wxbot-share\\report.pdf",
+                "file_name": "report.pdf",
+                "file_size": 123,
+                "file_md5": "9e107d9d372bb6826bd81d3542a419d6",
+                "file_sha256": (
+                    "1d3c43633f2b30c61186f81bb9d635327d0485094d65619745c0bf44f42996ae"
+                ),
+            },
+        )
+
+    assert response.status_code == 200
+    assert bridge.calls[-1][1] == "/send"
+    payload = bridge.calls[-1][3]
+    assert payload is not None
+    assert payload["msg_type"] == "file"
+    assert payload["file_path"] == "E:\\wxbot-share\\report.pdf"
+    assert payload["file_name"] == "report.pdf"
+    assert payload["file_size"] == 123
+    assert payload["file_md5"] == "9e107d9d372bb6826bd81d3542a419d6"
+    assert payload["file_sha256"].startswith("1d3c4363")
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "sdk_path"),
+    [
+        (
+            "/admin/send",
+            {
+                "tenant_id": "default",
+                "session_id": "room@chatroom",
+                "msg_type": "file",
+                "file_path": "E:\\wxbot-share\\report.pdf",
+            },
+            "/send",
+        ),
+        (
+            "/admin/send/envelope",
+            {
+                "target": {
+                    "tenant_id": "default",
+                    "session_id": "room@chatroom",
+                },
+                "content": {
+                    "msg_type": "file",
+                    "file_path": "E:\\wxbot-share\\report.pdf",
+                },
+            },
+            "/send/envelope",
+        ),
+        (
+            "/admin/send/batch",
+            {
+                "messages": [
+                    {
+                        "tenant_id": "default",
+                        "session_id": "room@chatroom",
+                        "msg_type": "file",
+                        "file_path": "E:\\wxbot-share\\report.pdf",
+                    }
+                ]
+            },
+            "/send/batch",
+        ),
+        (
+            "/admin/send/envelope/batch",
+            {
+                "messages": [
+                    {
+                        "target": {
+                            "tenant_id": "default",
+                            "session_id": "room@chatroom",
+                        },
+                        "content": {
+                            "msg_type": "file",
+                            "file_path": "E:\\wxbot-share\\report.pdf",
+                        },
+                    }
+                ]
+            },
+            "/send/envelope/batch",
+        ),
+    ],
+)
+def test_wxbot_admin_cannot_bypass_disabled_group_file_switch(
+    path: str,
+    body: dict[str, object],
+    sdk_path: str,
+) -> None:
+    client, _store, bridge, _, _ = _build_client(group_file_send_enabled=False)
+
+    with client:
+        response = client.post(
+            path,
+            headers={
+                "Authorization": "Bearer token",
+                "Idempotency-Key": f"group-file-disabled:{sdk_path}",
+            },
+            json=body,
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "group_file_send_disabled"
+    assert all(
+        not (method == "POST" and called_path == sdk_path)
+        for method, called_path, _params, _json in bridge.calls
+    )
+
+
+def test_wxbot_admin_group_file_send_succeeds_after_explicit_enable() -> None:
+    client, _store, bridge, _, _ = _build_client(group_file_send_enabled=True)
+
+    with client:
+        response = client.post(
+            "/admin/send",
+            headers={
+                "Authorization": "Bearer token",
+                "Idempotency-Key": "group-file-enabled",
+            },
+            json={
+                "tenant_id": "default",
+                "session_id": "room@chatroom",
+                "msg_type": "file",
+                "file_path": "E:\\wxbot-share\\report.pdf",
+            },
+        )
+
+    assert response.status_code == 200
+    assert any(
+        method == "POST" and called_path == "/send"
+        for method, called_path, _params, _json in bridge.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        (
+            {"msg_type": "file", "file_path": "relative/report.pdf"},
+            "file_path must be absolute on the SDK host",
+        ),
+        (
+            {
+                "msg_type": "file",
+                "file_path": "/srv/wxbot/report.pdf",
+                "file_url": "https://example.com/report.pdf",
+            },
+            "file_url is not supported for outbound file messages",
+        ),
+        (
+            {
+                "msg_type": "file",
+                "file_path": "/srv/wxbot/report.pdf",
+                "file_sha256": "not-a-digest",
+            },
+            "file_sha256 must be a 64-character hexadecimal digest",
+        ),
+    ],
+)
+def test_wxbot_admin_file_send_rejects_unsafe_contract(
+    payload: dict[str, object],
+    detail: str,
+) -> None:
+    client, _store, bridge, _, _ = _build_client()
+
+    with client:
+        response = client.post(
+            "/admin/send/envelope",
+            headers={
+                "Authorization": "Bearer token",
+                "Idempotency-Key": f"file-invalid-{detail}",
+            },
+            json={
+                "target": {"tenant_id": "default", "session_id": "wx-1"},
+                "content": payload,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
+    assert all(call[1] != "/send/envelope" for call in bridge.calls)
+
+
+def test_client_safe_media_payload_signs_file_url_without_exposing_sdk_locator() -> None:
+    store = _FakeStore()
+
+    safe = wxbot_router._client_safe_media_payload(
+        {
+            "type": "file",
+            "file_name": "report.pdf",
+            "file_path": "E:\\wxbot-files\\incoming\\report.pdf",
+            "file_url": "/files/incoming/report.pdf?name=report.pdf",
+        },
+        store,
+        tenant_id="default",
+    )
+
+    assert safe["file_name"] == "report.pdf"
+    assert "file_path" not in safe
+    assert "file_url" not in safe
+    file_media_id = safe["file_media_id"]
+    locator = wxbot_router.resolve_media_id(file_media_id, store.settings)
+    assert locator.resource_type == "file"
+    assert locator.value == "incoming/report.pdf"
 
 
 class _FakeMessageStore:

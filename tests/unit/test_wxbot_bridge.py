@@ -2230,6 +2230,60 @@ async def test_sdk_bridge_send_one_reply_prefers_envelope_protocol() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sdk_bridge_cancels_group_file_when_switch_was_closed_after_enqueue() -> None:
+    store = _FakeStore()
+    cancelled: list[dict[str, object]] = []
+
+    async def cancel(reply_id: int, **kwargs: object) -> bool:
+        cancelled.append({"reply_id": reply_id, **kwargs})
+        return True
+
+    class _PolicyStore:
+        async def get_group_policy(
+            self,
+            tenant_id: str,
+            session_id: str,
+        ) -> GroupParticipationPolicyDocument:
+            return GroupParticipationPolicyDocument(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                version=3,
+                kill_switches=KillSwitches(),
+                effective_enabled=True,
+                policy=ParticipationPolicyValues(file_send_enabled=False),
+            )
+
+    store.cancel_claimed_reply = cancel  # type: ignore[attr-defined]
+    bridge, _ = _build_bridge(store, social_policy_store=_PolicyStore())
+    client = _FakeClient()
+    bridge._client = client
+
+    await bridge._send_one_reply(
+        {
+            "id": 91,
+            "claim_token": "claim-91",
+            "session_id": "room@chatroom",
+            "session_kind": "group",
+            "reply_text": "",
+            "msg_type": "file",
+            "file_path": r"E:\wxbot-share\report.pdf",
+        }
+    )
+
+    assert client.calls == []
+    assert store.sent_ids == []
+    assert cancelled == [
+        {
+            "reply_id": 91,
+            "tenant_id": "demo",
+            "connection_id": "",
+            "claim_token": "claim-91",
+            "reason": "group_file_send_disabled",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sdk_bridge_send_one_reply_falls_back_to_legacy_send() -> None:
     store = _FakeStore()
     bridge, _ = _build_bridge(store)

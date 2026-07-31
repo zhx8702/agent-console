@@ -190,6 +190,17 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.production.yml
           --profile app config --quiet
 
+      - name: Validate single-host server deployment contract
+        run: |
+          bash -n scripts/deploy-server.sh
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.production.yml \
+            -f docker-compose.server.yml \
+            --profile app \
+            --profile wxbot \
+            config --quiet
+
       - name: Enforce basic Compose security invariants
         run: |
           uv run --all-extras --frozen python -c '

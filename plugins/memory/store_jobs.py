@@ -6,11 +6,14 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from plugins.memory import store as _store_runtime
+from plugins.memory.graph_extractor import is_safe_graph_llm_context_item
 from plugins.memory.store import (
     _LLM_JOB_SCOPE_GROUP_KEYS,
     GRAPH_LLM_BACKING_SOURCE_TYPE,
+    GROUP_HISTORY_USER_ID_SCOPE,
     MEMORY_EXTRACTION_JOB_STATUSES,
     _clamp_int,
     _job_idempotency_key,
@@ -41,6 +44,10 @@ async def _exec(sql: str, params: dict | None = None) -> list[dict]:
 
 class _MemoryScopeExecutionDenied(RuntimeError):
     """Internal control-flow signal for a fail-closed execution gate."""
+
+
+class _MemoryJobClaimLost(RuntimeError):
+    """Internal signal raised before a stale extraction worker may write."""
 
 
 async def _require_memory_scope_execution(
@@ -75,6 +82,39 @@ async def _require_memory_scope_execution(
         raise _MemoryScopeExecutionDenied("scope execution denied")
 
 
+async def _require_memory_job_execution(
+    scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None,
+    claim_lease_renew: Callable[[], Awaitable[bool]] | None,
+    *,
+    tenant_id: str,
+    session_id: str,
+    job_id: int | None = None,
+) -> None:
+    await _require_memory_scope_execution(
+        scope_execution_allowed,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        job_id=job_id,
+    )
+    if job_id is None and claim_lease_renew is None:
+        return
+    if not callable(claim_lease_renew):
+        raise _MemoryJobClaimLost("job claim gate unavailable")
+    try:
+        current = await claim_lease_renew()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "memory.llm_job_claim_renew_failed",
+            job_id=job_id,
+            error_type=exc.__class__.__name__,
+        )
+        raise _MemoryJobClaimLost("job claim renewal failed") from exc
+    if current is not True:
+        raise _MemoryJobClaimLost("job claim is no longer current")
+
+
 async def _settle_under_repeated_cancellation(awaitable: Awaitable[Any]) -> Any:
     """Finish claim cleanup even if the caller is cancelled more than once."""
 
@@ -85,6 +125,90 @@ async def _settle_under_repeated_cancellation(awaitable: Awaitable[Any]) -> Any:
         except asyncio.CancelledError:
             continue
     return task.result()
+
+
+_LLM_JOB_LOCK_OWNER_MAX_LENGTH = 128
+_LLM_JOB_RESULT_CLAIM_TOKEN_KEY = "_claim_token"
+
+
+def _new_llm_job_claim_token(settings: Any, worker_id: str | None) -> tuple[str, str]:
+    """Return the display owner and a unique token stored in ``locked_by``.
+
+    ``locked_by`` predates explicit claim-token columns and is bounded to 128
+    characters.  Keeping the worker id as a prefix preserves operational
+    provenance while the UUID suffix fences every new claim from stale workers.
+    """
+
+    owner = str(worker_id or _worker_id(settings) or "worker").strip() or "worker"
+    nonce = uuid4().hex
+    owner_limit = _LLM_JOB_LOCK_OWNER_MAX_LENGTH - len(nonce) - 1
+    return owner, f"{owner[:owner_limit]}:{nonce}"
+
+
+def _llm_job_claim_token(
+    job: dict[str, Any],
+    *,
+    worker_id: str | None,
+    settings: Any,
+) -> str:
+    """Resolve the fencing token, retaining support for pre-token claims."""
+
+    token = str(job.get("claim_token") or job.get("locked_by") or "").strip()
+    if token:
+        return token[:_LLM_JOB_LOCK_OWNER_MAX_LENGTH]
+    # Rolling deployments can still hand us a row claimed by the legacy
+    # worker-id-only format.  New claims always include the UUID suffix.
+    return str(worker_id or _worker_id(settings) or "").strip()[:_LLM_JOB_LOCK_OWNER_MAX_LENGTH]
+
+
+def _llm_job_has_claim(job: dict[str, Any]) -> bool:
+    """Return whether the claimed row itself carries ownership evidence."""
+
+    return bool(str(job.get("claim_token") or job.get("locked_by") or "").strip())
+
+
+async def _llm_job_transition_result(
+    *,
+    job_id: int,
+    claim_token: str,
+    intended_status: str,
+    updated_rows: list[dict[str, Any]],
+) -> str:
+    """Resolve a fenced write as applied, idempotent replay, or stale."""
+
+    if updated_rows:
+        return intended_status
+    observed = await _llm_job_observed_result(job_id, claim_token=claim_token)
+    return intended_status if observed == intended_status else "stale"
+
+
+async def _llm_job_observed_result(job_id: int, *, claim_token: str) -> str:
+    """Return this claim's terminal state, otherwise report a stale claim."""
+
+    claim_token = str(claim_token or "").strip()
+    if not claim_token:
+        return "stale"
+    rows = await _exec(
+        "SELECT status, locked_by, result_json FROM plugin_memory_extraction_job "
+        "WHERE id = :id LIMIT 1",
+        {"id": job_id},
+    )
+    if rows:
+        current_status = str(rows[0].get("status") or "").strip().lower()
+        current_token = str(rows[0].get("locked_by") or "").strip()
+        result = _safe_json_loads(rows[0].get("result_json"), {})
+        completed_token = (
+            str(result.get(_LLM_JOB_RESULT_CLAIM_TOKEN_KEY) or "").strip()
+            if isinstance(result, dict)
+            else ""
+        )
+        if (
+            current_status in {"succeeded", "failed", "dead"}
+            and not current_token
+            and completed_token == claim_token
+        ):
+            return current_status
+    return "stale"
 
 
 class MemoryExtractionJobStoreMixin:
@@ -196,6 +320,7 @@ class MemoryExtractionJobStoreMixin:
         expires_at: datetime | str | None = None,
         source_kind: str = "conversation",
         scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None = None,
+        claim_lease_renew: Callable[[], Awaitable[bool]] | None = None,
         job_id: int | None = None,
     ) -> int:
         user_text = _sanitize_db_text(user_text)
@@ -219,8 +344,9 @@ class MemoryExtractionJobStoreMixin:
             fallback_to_deterministic=False,
             raise_on_failure=True,
         )
-        await _require_memory_scope_execution(
+        await _require_memory_job_execution(
             scope_execution_allowed,
+            claim_lease_renew,
             tenant_id=tenant_id,
             session_id=session_id,
             job_id=job_id,
@@ -229,8 +355,9 @@ class MemoryExtractionJobStoreMixin:
         for action in actions:
             if str(action.get("op") or "") == "ignore":
                 continue
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -253,8 +380,9 @@ class MemoryExtractionJobStoreMixin:
             )
             applied_count += 1 if item is not None else 0
         if applied_count:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -290,6 +418,7 @@ class MemoryExtractionJobStoreMixin:
         expires_at: datetime | str | None = None,
         source_kind: str = "conversation",
         scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None = None,
+        claim_lease_renew: Callable[[], Awaitable[bool]] | None = None,
         job_id: int | None = None,
     ) -> dict[str, int]:
         if not self.graph_extractor.config.enabled or self.graph_extractor.llm_service is None:
@@ -310,9 +439,11 @@ class MemoryExtractionJobStoreMixin:
             user_id=user_id,
             session_id="",
             scope_type="identity",
+            status="active",
             include_deleted=False,
             limit=20,
         )
+        existing_items = [item for item in existing_items if is_safe_graph_llm_context_item(item)]
         session_profile = await self.get_session_profile(
             tenant_id=tenant_id,
             channel=channel,
@@ -329,8 +460,9 @@ class MemoryExtractionJobStoreMixin:
             memory_items_summary=self.graph_extractor.summarize_memory_items(existing_items),
             raise_on_failure=False,
         )
-        await _require_memory_scope_execution(
+        await _require_memory_job_execution(
             scope_execution_allowed,
+            claim_lease_renew,
             tenant_id=tenant_id,
             session_id=session_id,
             job_id=job_id,
@@ -352,8 +484,9 @@ class MemoryExtractionJobStoreMixin:
             if str(entity.get("key") or "")
         }
         for entity in entities_by_key.values():
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -371,8 +504,9 @@ class MemoryExtractionJobStoreMixin:
             counts["entities"] += 1
 
         for invalidation in graph.get("invalidations") or []:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -396,8 +530,9 @@ class MemoryExtractionJobStoreMixin:
             counts["invalidations"] += applied
 
         for conflict in graph.get("conflicts") or []:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -427,8 +562,9 @@ class MemoryExtractionJobStoreMixin:
             invalidates_id = fact.get("invalidates_memory_item_id")
             invalidates_key = str(fact.get("invalidates_normalized_key") or "")
             if invalidates_id is not None or invalidates_key:
-                await _require_memory_scope_execution(
+                await _require_memory_job_execution(
                     scope_execution_allowed,
+                    claim_lease_renew,
                     tenant_id=tenant_id,
                     session_id=session_id,
                     job_id=job_id,
@@ -453,8 +589,9 @@ class MemoryExtractionJobStoreMixin:
                     expires_at=expires_at,
                     source_kind=source_kind,
                 )
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -479,8 +616,9 @@ class MemoryExtractionJobStoreMixin:
             if backing_item is None:
                 counts["skipped"] += 1
                 continue
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -498,8 +636,9 @@ class MemoryExtractionJobStoreMixin:
                 counts["facts"] += 1
 
         for episode in graph.get("episodes") or []:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -526,8 +665,9 @@ class MemoryExtractionJobStoreMixin:
                 counts["skipped"] += 1
 
         if counts["facts"] or counts["episodes"] or counts["invalidations"] or counts["conflicts"]:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                claim_lease_renew,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -724,7 +864,7 @@ class MemoryExtractionJobStoreMixin:
             60.0,
             minimum=1.0,
         )
-        owner = worker_id or _worker_id(self.settings)
+        owner, claim_token = _new_llm_job_claim_token(self.settings, worker_id)
         configured_allowlist = (
             scope_allowlist
             if scope_allowlist is not None
@@ -755,17 +895,24 @@ class MemoryExtractionJobStoreMixin:
             {
                 "limit": batch_size,
                 "lock_ttl": lock_ttl,
-                "locked_by": owner,
+                "locked_by": claim_token,
                 **allowlist_params,
             },
         )
         for job in rows:
+            row_token = str(job.get("locked_by") or claim_token)
+            job["locked_by"] = row_token
+            # Additive aliases let callers distinguish worker provenance from
+            # the token while preserving the historical locked_by field.
+            job["claim_token"] = row_token
+            job["worker_id"] = owner
             logger.info(
                 "memory.llm_job_claimed",
                 job_id=job.get("id"),
                 status=job.get("status"),
                 attempts=job.get("attempts"),
-                locked_by=owner,
+                worker_id=owner,
+                locked_by=claim_token,
             )
         return rows
 
@@ -844,7 +991,7 @@ class MemoryExtractionJobStoreMixin:
             60.0,
             minimum=1.0,
         )
-        owner = worker_id or _worker_id(self.settings)
+        owner, claim_token = _new_llm_job_claim_token(self.settings, worker_id)
         rows = await _exec(
             "WITH candidate AS ("
             "  SELECT job.id FROM plugin_memory_extraction_job job "
@@ -889,16 +1036,21 @@ class MemoryExtractionJobStoreMixin:
                 "end_at": end_at,
                 "limit": batch_size,
                 "lock_ttl": lock_ttl,
-                "locked_by": owner,
+                "locked_by": claim_token,
             },
         )
         for job in rows:
+            row_token = str(job.get("locked_by") or claim_token)
+            job["locked_by"] = row_token
+            job["claim_token"] = row_token
+            job["worker_id"] = owner
             logger.info(
                 "memory.llm_job_claimed_for_day",
                 job_id=job.get("id"),
                 status=job.get("status"),
                 attempts=job.get("attempts"),
-                locked_by=owner,
+                worker_id=owner,
+                locked_by=claim_token,
                 tenant_id=tenant_id,
                 channel=channel,
                 source_key=source_key,
@@ -948,7 +1100,7 @@ class MemoryExtractionJobStoreMixin:
                     worker_id=worker_id,
                     scope_execution_allowed=scope_execution_allowed,
                 )
-                if status == "deferred":
+                if status in {"deferred", "stale"}:
                     continue
                 result["claimed"] += 1
                 if status in result:
@@ -979,10 +1131,7 @@ class MemoryExtractionJobStoreMixin:
         if not jobs:
             return
         outcomes = await asyncio.gather(
-            *(
-                self.defer_llm_extraction_job(job, worker_id=worker_id)
-                for job in jobs
-            ),
+            *(self.defer_llm_extraction_job(job, worker_id=worker_id) for job in jobs),
             return_exceptions=True,
         )
         for job, outcome in zip(jobs, outcomes, strict=True):
@@ -1005,7 +1154,13 @@ class MemoryExtractionJobStoreMixin:
         job_id = int(job.get("id") or 0)
         if job_id <= 0:
             return False
-        owner = str(worker_id or job.get("locked_by") or _worker_id(self.settings))
+        claim_token = _llm_job_claim_token(
+            job,
+            worker_id=worker_id,
+            settings=self.settings,
+        )
+        if not claim_token:
+            return False
         rows = await _exec(
             "UPDATE plugin_memory_extraction_job SET "
             "status = 'pending', locked_until = NULL, locked_by = '', "
@@ -1015,11 +1170,112 @@ class MemoryExtractionJobStoreMixin:
             "RETURNING id",
             {
                 "id": job_id,
-                "locked_by": owner,
+                "locked_by": claim_token,
                 "defer_seconds": max(1.0, float(defer_seconds or 30.0)),
             },
         )
         return bool(rows)
+
+    async def renew_llm_extraction_job_lease(
+        self,
+        job: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        lease_seconds: float | None = None,
+    ) -> bool:
+        """Extend only the live lease represented by this job's claim token."""
+
+        job_id = int(job.get("id") or 0)
+        if job_id <= 0:
+            return False
+        claim_token = _llm_job_claim_token(
+            job,
+            worker_id=worker_id,
+            settings=self.settings,
+        )
+        if not claim_token:
+            return False
+        ttl = (
+            _settings_float(
+                self.settings,
+                "memory_llm_extraction_job_lock_ttl_seconds",
+                60.0,
+                minimum=1.0,
+            )
+            if lease_seconds is None
+            else max(1.0, float(lease_seconds))
+        )
+        rows = await _exec(
+            "UPDATE plugin_memory_extraction_job SET "
+            "locked_until = NOW() + (:lock_ttl * INTERVAL '1 second'), updated_at = NOW() "
+            "WHERE id = :id AND status = 'running' AND locked_by = :locked_by "
+            "AND locked_until > NOW() RETURNING id",
+            {
+                "id": job_id,
+                "locked_by": claim_token,
+                "lock_ttl": ttl,
+            },
+        )
+        return bool(rows)
+
+    async def _guard_llm_job_member_mutation(
+        self,
+        job: dict[str, Any],
+        *,
+        event_hint: dict[str, Any] | None,
+        scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None,
+        claim_lease_renew: Callable[[], Awaitable[bool]] | None,
+    ) -> dict[str, Any]:
+        """Linearize one job's LLM call and writes with member erasure.
+
+        The source event is read once before the transaction only to discover
+        the member behind a group-history job.  Nothing is sent to an LLM until
+        the transaction owns the same member advisory lock as ``forget_member``
+        and has revalidated the claim, source event, and durable opt-out state.
+        """
+
+        job_id = int(job.get("id") or 0)
+        tenant_id = str(job.get("tenant_id") or "").strip()
+        channel = str(job.get("channel") or "").strip().lower()
+        session_id = str(job.get("session_id") or "").strip()
+        job_user_id = str(job.get("user_id") or "").strip()
+        hinted_source_member_id = str((event_hint or {}).get("source_member_id") or "").strip()
+        member_id = (
+            hinted_source_member_id if job_user_id == GROUP_HISTORY_USER_ID_SCOPE else job_user_id
+        )
+        if not tenant_id or not member_id:
+            raise _MemoryJobClaimLost("job source member unavailable")
+
+        await self._lock_member_memory_mutation(
+            tenant_id=tenant_id,
+            user_id=member_id,
+        )
+        await _require_memory_job_execution(
+            scope_execution_allowed,
+            claim_lease_renew,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            job_id=job_id,
+        )
+        current_event = await self._get_memory_event_for_job(job)
+        if current_event is None:
+            raise _MemoryJobClaimLost("job source event no longer exists")
+        if job_user_id == GROUP_HISTORY_USER_ID_SCOPE:
+            current_source_member_id = str(current_event.get("source_member_id") or "").strip()
+            if current_source_member_id != member_id:
+                raise _MemoryJobClaimLost("job source member changed")
+        if channel == "wechat" and await self._member_memory_write_blocked(
+            tenant_id=tenant_id,
+            user_id=member_id,
+        ):
+            logger.info(
+                "memory.llm_job_suppressed_by_member_control",
+                job_id=job_id,
+                tenant_id=tenant_id,
+                source_member_id=member_id,
+            )
+            raise _MemoryJobClaimLost("member memory writes are blocked")
+        return current_event
 
     async def process_llm_extraction_job(
         self,
@@ -1029,10 +1285,61 @@ class MemoryExtractionJobStoreMixin:
         scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None = None,
     ) -> str:
         job_id = int(job["id"])
+        claim_token = _llm_job_claim_token(
+            job,
+            worker_id=worker_id,
+            settings=self.settings,
+        )
+        had_claim = _llm_job_has_claim(job)
+        if not had_claim or not claim_token:
+            logger.info(
+                "memory.llm_job_unclaimed_process_rejected",
+                job_id=job_id,
+            )
+            return "stale"
+
+        async def renew_claim() -> bool:
+            return await self.renew_llm_extraction_job_lease(
+                job,
+                worker_id=worker_id,
+            )
+
         tenant_id = str(job.get("tenant_id") or "")
         session_id = str(job.get("session_id") or "")
         if scope_execution_allowed is None:
             scope_execution_allowed = getattr(self, "scope_execution_allowed", None)
+        if _store_runtime._ACTIVE_MUTATION_CONNECTION.get() is None:
+            event_hint = await self._get_memory_event_for_job(job)
+            try:
+                async with self._mutation_transaction():
+                    await self._guard_llm_job_member_mutation(
+                        job,
+                        event_hint=event_hint,
+                        scope_execution_allowed=scope_execution_allowed,
+                        claim_lease_renew=renew_claim,
+                    )
+                    return await self.process_llm_extraction_job(
+                        job,
+                        worker_id=worker_id,
+                        scope_execution_allowed=scope_execution_allowed,
+                    )
+            except _MemoryJobClaimLost:
+                return await _llm_job_observed_result(
+                    job_id,
+                    claim_token=claim_token,
+                )
+            except _MemoryScopeExecutionDenied:
+                deferred = await self.defer_llm_extraction_job(
+                    job,
+                    worker_id=worker_id,
+                )
+                logger.info(
+                    "memory.llm_job_scope_deferred",
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
+                return "deferred" if deferred else "stale"
         attempts = int(job.get("attempts") or 0)
         next_attempt = attempts + 1
         max_attempts = int(job.get("max_attempts") or 1)
@@ -1068,8 +1375,9 @@ class MemoryExtractionJobStoreMixin:
             "source_kind": str(raw_audience.get("source_kind") or "conversation"),
         }
         try:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                renew_claim,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
@@ -1091,8 +1399,9 @@ class MemoryExtractionJobStoreMixin:
                 self.structured_extractor.config.enabled
                 and self.structured_extractor.llm_service is not None
             ):
-                await _require_memory_scope_execution(
+                await _require_memory_job_execution(
                     scope_execution_allowed,
+                    renew_claim,
                     tenant_id=tenant_id,
                     session_id=session_id,
                     job_id=job_id,
@@ -1113,6 +1422,7 @@ class MemoryExtractionJobStoreMixin:
                             else None
                         ),
                         scope_execution_allowed=scope_execution_allowed,
+                        claim_lease_renew=renew_claim,
                         job_id=job_id,
                         **audience_payload,
                     ),
@@ -1120,8 +1430,9 @@ class MemoryExtractionJobStoreMixin:
                 )
             if self.graph_extractor.config.enabled and self.graph_extractor.llm_service is not None:
                 try:
-                    await _require_memory_scope_execution(
+                    await _require_memory_job_execution(
                         scope_execution_allowed,
+                        renew_claim,
                         tenant_id=tenant_id,
                         session_id=session_id,
                         job_id=job_id,
@@ -1141,10 +1452,11 @@ class MemoryExtractionJobStoreMixin:
                             else None
                         ),
                         scope_execution_allowed=scope_execution_allowed,
+                        claim_lease_renew=renew_claim,
                         job_id=job_id,
                         **audience_payload,
                     )
-                except _MemoryScopeExecutionDenied:
+                except (_MemoryScopeExecutionDenied, _MemoryJobClaimLost):
                     raise
                 except Exception as exc:
                     graph_counts = {
@@ -1167,32 +1479,27 @@ class MemoryExtractionJobStoreMixin:
                 "graph": graph_counts,
                 "audience": audience_payload,
             }
-        except _MemoryScopeExecutionDenied:
-            await self.defer_llm_extraction_job(job, worker_id=worker_id)
+        except _MemoryJobClaimLost:
             logger.info(
-                "memory.llm_job_scope_deferred",
+                "memory.llm_job_stale_before_write",
                 job_id=job_id,
-                tenant_id=tenant_id,
-                session_id=session_id,
             )
-            return "deferred"
+            raise
+        except _MemoryScopeExecutionDenied:
+            raise
         except Exception as exc:
             try:
-                await _require_memory_scope_execution(
+                await _require_memory_job_execution(
                     scope_execution_allowed,
+                    renew_claim,
                     tenant_id=tenant_id,
                     session_id=session_id,
                     job_id=job_id,
                 )
+            except _MemoryJobClaimLost:
+                raise
             except _MemoryScopeExecutionDenied:
-                await self.defer_llm_extraction_job(job, worker_id=worker_id)
-                logger.info(
-                    "memory.llm_job_scope_deferred",
-                    job_id=job_id,
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                )
-                return "deferred"
+                raise
             is_dead = next_attempt >= max_attempts
             status = "dead" if is_dead else "failed"
             backoff_seconds = self._job_backoff_seconds(next_attempt)
@@ -1215,16 +1522,19 @@ class MemoryExtractionJobStoreMixin:
             }
             if error_type == "TimeoutError":
                 result_payload["timeout"] = True
-            await _exec(
+            result_payload[_LLM_JOB_RESULT_CLAIM_TOKEN_KEY] = claim_token
+            updated_rows = await _exec(
                 "UPDATE plugin_memory_extraction_job SET "
                 "status = CAST(:status AS VARCHAR), attempts = :attempts, "
                 "next_run_at = CASE WHEN CAST(:status AS VARCHAR) = 'dead' THEN next_run_at "
                 "                   ELSE NOW() + (:backoff_seconds * INTERVAL '1 second') END, "
                 "locked_until = NULL, locked_by = '', last_error = :last_error, "
                 "result_json = :result_json, updated_at = NOW() "
-                "WHERE id = :id",
+                "WHERE id = :id AND status = 'running' AND locked_by = :locked_by "
+                "RETURNING id, status",
                 {
                     "id": job_id,
+                    "locked_by": claim_token,
                     "status": status,
                     "attempts": next_attempt,
                     "backoff_seconds": backoff_seconds,
@@ -1232,6 +1542,20 @@ class MemoryExtractionJobStoreMixin:
                     "result_json": _to_json(result_payload),
                 },
             )
+            transition_result = await _llm_job_transition_result(
+                job_id=job_id,
+                claim_token=claim_token,
+                intended_status=status,
+                updated_rows=updated_rows,
+            )
+            if transition_result == "stale":
+                logger.info(
+                    "memory.llm_job_stale_failure_ignored",
+                    job_id=job_id,
+                    attempted_status=status,
+                    attempts=next_attempt,
+                )
+                raise _MemoryJobClaimLost("job failure terminal claim lost") from exc
             logger.warning(
                 "memory.llm_job_failed",
                 job_id=job_id,
@@ -1243,27 +1567,44 @@ class MemoryExtractionJobStoreMixin:
             return status
 
         try:
-            await _require_memory_scope_execution(
+            await _require_memory_job_execution(
                 scope_execution_allowed,
+                renew_claim,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 job_id=job_id,
             )
+        except _MemoryJobClaimLost:
+            raise
         except _MemoryScopeExecutionDenied:
-            await self.defer_llm_extraction_job(job, worker_id=worker_id)
-            logger.info(
-                "memory.llm_job_scope_deferred",
-                job_id=job_id,
-                tenant_id=tenant_id,
-                session_id=session_id,
-            )
-            return "deferred"
-        await _exec(
+            raise
+        result_payload[_LLM_JOB_RESULT_CLAIM_TOKEN_KEY] = claim_token
+        updated_rows = await _exec(
             "UPDATE plugin_memory_extraction_job SET "
             "status = 'succeeded', attempts = :attempts, locked_until = NULL, locked_by = '', "
-            "last_error = '', result_json = :result_json, updated_at = NOW() WHERE id = :id",
-            {"id": job_id, "attempts": next_attempt, "result_json": _to_json(result_payload)},
+            "last_error = '', result_json = :result_json, updated_at = NOW() "
+            "WHERE id = :id AND status = 'running' AND locked_by = :locked_by "
+            "RETURNING id, status",
+            {
+                "id": job_id,
+                "locked_by": claim_token,
+                "attempts": next_attempt,
+                "result_json": _to_json(result_payload),
+            },
         )
+        transition_result = await _llm_job_transition_result(
+            job_id=job_id,
+            claim_token=claim_token,
+            intended_status="succeeded",
+            updated_rows=updated_rows,
+        )
+        if transition_result == "stale":
+            logger.info(
+                "memory.llm_job_stale_success_ignored",
+                job_id=job_id,
+                attempts=next_attempt,
+            )
+            raise _MemoryJobClaimLost("job success terminal claim lost")
         logger.info(
             "memory.llm_job_succeeded",
             job_id=job_id,
@@ -1279,14 +1620,25 @@ class MemoryExtractionJobStoreMixin:
         if source_event_id is not None:
             rows = await _exec(
                 "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
-                "user_text, assistant_text, trace_id, event_key, created_at "
-                "FROM plugin_memory_event WHERE id = :id",
-                {"id": int(source_event_id)},
+                "user_text, assistant_text, trace_id, event_key, source_member_id, "
+                "source_message_id, expires_at, created_at "
+                "FROM plugin_memory_event WHERE id = :id "
+                "AND tenant_id = :tid AND channel = :channel "
+                "AND source_key = :source_key AND user_id = :uid AND session_id = :sid",
+                {
+                    "id": int(source_event_id),
+                    "tid": str(job.get("tenant_id") or ""),
+                    "channel": str(job.get("channel") or ""),
+                    "source_key": str(job.get("source_key") or "*"),
+                    "uid": str(job.get("user_id") or ""),
+                    "sid": str(job.get("session_id") or ""),
+                },
             )
         else:
             rows = await _exec(
                 "SELECT id, tenant_id, channel, source_key, user_id, session_id, "
-                "user_text, assistant_text, trace_id, event_key, created_at "
+                "user_text, assistant_text, trace_id, event_key, source_member_id, "
+                "source_message_id, expires_at, created_at "
                 "FROM plugin_memory_event "
                 "WHERE tenant_id = :tid AND channel = :channel AND source_key = :source_key "
                 "AND user_id = :uid AND session_id = :sid AND trace_id = :trace "
@@ -1592,44 +1944,57 @@ class MemoryExtractionJobStoreMixin:
                 "SELECT id FROM plugin_memory_extraction_job "
                 f"{where} ORDER BY updated_at ASC, created_at ASC LIMIT :limit"
             )
+            claimed_candidate_sql = (
+                "SELECT id, locked_by FROM plugin_memory_extraction_job "
+                f"{where} ORDER BY updated_at ASC, created_at ASC LIMIT :limit "
+                "FOR UPDATE SKIP LOCKED"
+            )
             if dry_run:
                 rows = await _exec(candidate_sql, params)
             elif action == "cleanup_smoke":
                 rows = await _exec(
                     "WITH candidate AS ("
-                    f"{candidate_sql}"
+                    f"{claimed_candidate_sql}"
                     ") DELETE FROM plugin_memory_extraction_job job "
-                    "USING candidate WHERE job.id = candidate.id RETURNING job.id",
+                    "USING candidate WHERE job.id = candidate.id "
+                    "AND COALESCE(job.locked_by, '') = COALESCE(candidate.locked_by, '') "
+                    "RETURNING job.id",
                     params,
                 )
             elif action == "reset_stale":
                 rows = await _exec(
                     "WITH candidate AS ("
-                    f"{candidate_sql}"
+                    f"{claimed_candidate_sql}"
                     ") UPDATE plugin_memory_extraction_job job SET "
                     "status = 'pending', locked_until = NULL, locked_by = '', last_error = '', "
                     "result_json = :result_json, updated_at = NOW() "
-                    "FROM candidate WHERE job.id = candidate.id RETURNING job.id",
+                    "FROM candidate WHERE job.id = candidate.id "
+                    "AND COALESCE(job.locked_by, '') = COALESCE(candidate.locked_by, '') "
+                    "RETURNING job.id",
                     {**params, "result_json": result_json},
                 )
             elif action == "retry":
                 rows = await _exec(
                     "WITH candidate AS ("
-                    f"{candidate_sql}"
+                    f"{claimed_candidate_sql}"
                     ") UPDATE plugin_memory_extraction_job job SET "
                     "status = 'pending', attempts = 0, next_run_at = NOW(), locked_until = NULL, "
                     "locked_by = '', last_error = '', result_json = :result_json, updated_at = NOW() "
-                    "FROM candidate WHERE job.id = candidate.id RETURNING job.id",
+                    "FROM candidate WHERE job.id = candidate.id "
+                    "AND COALESCE(job.locked_by, '') = COALESCE(candidate.locked_by, '') "
+                    "RETURNING job.id",
                     {**params, "result_json": result_json},
                 )
             else:
                 rows = await _exec(
                     "WITH candidate AS ("
-                    f"{candidate_sql}"
+                    f"{claimed_candidate_sql}"
                     ") UPDATE plugin_memory_extraction_job job SET "
                     "status = 'dead', locked_until = NULL, locked_by = '', "
                     "last_error = :last_error, result_json = :result_json, updated_at = NOW() "
-                    "FROM candidate WHERE job.id = candidate.id RETURNING job.id",
+                    "FROM candidate WHERE job.id = candidate.id "
+                    "AND COALESCE(job.locked_by, '') = COALESCE(candidate.locked_by, '') "
+                    "RETURNING job.id",
                     {
                         **params,
                         "last_error": "admin maintenance marked job dead",

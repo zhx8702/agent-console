@@ -6,7 +6,9 @@ compatibility path that can be expanded behind tests.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
 from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
@@ -52,6 +54,12 @@ from app.postprocessing.response_guards import apply_response_guards
 
 logger = get_logger(__name__)
 
+_CONSECUTIVE_FALLBACKS_KEY = "consecutive_fallbacks"
+_SUCCESSFUL_ANSWER_ROUTES = frozenset(
+    {RouteType.FAQ, RouteType.RAG, RouteType.AGENT, RouteType.LLM}
+)
+_FAQ_VERDICTS = frozenset({"CLEAR", "AMBIGUOUS", "INSUFFICIENT", "LOW"})
+
 
 def _canned_text(name: str, fallback: str) -> str:
     try:
@@ -92,6 +100,122 @@ def _degradation_text(reason: str = "") -> str:
 
 def _handoff_pending() -> str:
     return _canned_text("HANDOFF_PENDING", "Transferring you to a human agent.")
+
+
+def _is_group_session(session: Any) -> bool:
+    kind = str((session.metadata or {}).get("session_kind") or "").strip().lower()
+    return kind in {"group", "chatroom", "channel", "guild"} or str(
+        session.session_id or ""
+    ).endswith("@chatroom")
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric < 0:
+        return None
+    return int(numeric)
+
+
+def _finite_similarity(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    score = float(value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        return None
+    return score
+
+
+def _inject_persisted_fallback_count(
+    router_signals: dict[str, Any],
+    session: Any,
+) -> None:
+    if _is_group_session(session):
+        # Group sessions are shared by multiple actors; never let a shared
+        # counter trigger group-wide automatic escalation.
+        router_signals.pop(_CONSECUTIVE_FALLBACKS_KEY, None)
+        return
+    persisted = _non_negative_int(
+        (session.variables or {}).get(_CONSECUTIVE_FALLBACKS_KEY)
+    )
+    router_signals[_CONSECUTIVE_FALLBACKS_KEY] = persisted or 0
+
+
+def _update_persisted_fallback_count(
+    session: Any,
+    result: CapabilityResult,
+) -> bool:
+    if _is_group_session(session):
+        return False
+    variables = session.variables
+    current = _non_negative_int(variables.get(_CONSECUTIVE_FALLBACKS_KEY)) or 0
+    fallback_reason = str(
+        result.metadata.get("fallback_reason")
+        or result.metadata.get("degradation_reason")
+        or ""
+    ).strip()
+    if fallback_reason:
+        updated = min(current + 1, 1000)
+    elif result.route in _SUCCESSFUL_ANSWER_ROUTES and result.reply_text.strip():
+        updated = 0
+    else:
+        return False
+    changed = variables.get(_CONSECUTIVE_FALLBACKS_KEY) != updated
+    variables[_CONSECUTIVE_FALLBACKS_KEY] = updated
+    return changed
+
+
+def _assistant_turn_metadata(
+    ctx: PipelineContext,
+    result: CapabilityResult,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"route": result.route.value}
+    if ctx.pre is not None and ctx.pre.intent_coarse is not None:
+        metadata["intent_coarse"] = ctx.pre.intent_coarse.value
+    if ctx.route is not None:
+        metadata["route_confidence"] = float(ctx.route.confidence)
+        rule = ctx.route.hints.get("rule") if isinstance(ctx.route.hints, dict) else None
+        if isinstance(rule, str) and rule.strip():
+            metadata["route_rule"] = rule.strip()
+
+    fallback_from = result.metadata.get("fallback_from")
+    fallback_reason = (
+        result.metadata.get("fallback_reason")
+        or result.metadata.get("degradation_reason")
+    )
+    if fallback_from:
+        metadata["fallback_from"] = str(fallback_from)
+    elif fallback_reason and ctx.route is not None:
+        metadata["fallback_from"] = ctx.route.type.value
+    if fallback_reason:
+        metadata["fallback_reason"] = str(fallback_reason)
+    return metadata
+
+
+def _tool_intent_matched(router_signals: dict[str, Any]) -> bool:
+    if "tool_intent_matched" in router_signals:
+        return router_signals.get("tool_intent_matched") is True
+    return router_signals.get("tools_available") is True
+
+
+def _merge_faq_preview_signals(
+    router_signals: dict[str, Any],
+    faq_preview: dict[str, Any],
+) -> None:
+    matched = faq_preview.get("matched")
+    if type(matched) is bool:
+        router_signals["faq_matched"] = matched
+    score = _finite_similarity(faq_preview.get("score"))
+    if score is not None:
+        router_signals["faq_similarity"] = score
+    verdict = faq_preview.get("verdict")
+    if isinstance(verdict, str) and verdict.strip().upper() in _FAQ_VERDICTS:
+        router_signals["faq_verdict"] = verdict.strip().upper()
+    if faq_preview.get("scope"):
+        router_signals["faq_scope"] = faq_preview.get("scope")
+    if faq_preview.get("faq_id"):
+        router_signals["faq_id"] = faq_preview.get("faq_id")
 
 
 @dataclass
@@ -326,6 +450,7 @@ class RouteStep(_BaseCoreStep):
         if ctx.session is None or ctx.pre is None:
             raise RuntimeError("session_and_pre_required")
         router_signals = dict(ctx.signals.get("router") or {})
+        _inject_persisted_fallback_count(router_signals, ctx.session)
         faq_preview: dict[str, Any] | None = None
         faq_engine = self.deps.capabilities.get(RouteType.FAQ)
         if (
@@ -340,13 +465,7 @@ class RouteStep(_BaseCoreStep):
                     {"trace_id": ctx.event.trace_id},
                 )
                 faq_preview = dict(preview)
-                score = float(faq_preview.get("score", 0.0) or 0.0)
-                router_signals["faq_similarity"] = score
-                for key in ("scope", "faq_id", "verdict"):
-                    if faq_preview.get(key):
-                        router_signals[
-                            f"faq_{key}" if key != "scope" else "faq_scope"
-                        ] = faq_preview.get(key)
+                _merge_faq_preview_signals(router_signals, faq_preview)
             except Exception as exc:
                 router_signals["faq_preview_failed"] = True
                 router_signals["faq_preview_error_class"] = exc.__class__.__name__
@@ -356,13 +475,74 @@ class RouteStep(_BaseCoreStep):
                     trace_id=ctx.event.trace_id,
                     error=str(exc),
                 )
+
+        agent_tool_scope = ctx.signals.get("agent", {}).get("tool_scope")
+        if not agent_tool_scope:
+            agent_tool_scope = ctx.extras.get("agent_tool_scope")
+        if _tool_intent_matched(router_signals):
+            router_signals.setdefault("tool_intent_matched", True)
+            agent_engine = self.deps.capabilities.get(RouteType.AGENT)
+            preview_availability = getattr(
+                agent_engine,
+                "preview_availability",
+                None,
+            )
+            if callable(preview_availability):
+                try:
+                    availability = await preview_availability(
+                        ctx.pre,
+                        ctx.session,
+                        {
+                            "trace_id": ctx.event.trace_id,
+                            "agent_tool_scope": agent_tool_scope,
+                            "tool_scope": agent_tool_scope,
+                            "request_metadata": dict(ctx.event.metadata or {}),
+                        },
+                    )
+                    if not isinstance(availability, dict):
+                        raise TypeError("tool availability preview must be a mapping")
+                    effective_count = _non_negative_int(
+                        availability.get("effective_tool_count")
+                    )
+                    if effective_count is None:
+                        raise ValueError(
+                            "tool availability preview has invalid effective_tool_count"
+                        )
+                    router_signals["effective_tool_count"] = effective_count
+                    router_signals["tools_available"] = effective_count > 0
+                    policy_allowed = availability.get("policy_allowed")
+                    if type(policy_allowed) is bool:
+                        router_signals["policy_allowed"] = policy_allowed
+                    denial_reason = availability.get("denial_reason")
+                    if isinstance(denial_reason, str) and denial_reason.strip():
+                        router_signals["tool_denial_reason"] = denial_reason.strip()
+                except Exception as exc:
+                    # Availability is an authorization boundary. If its
+                    # preflight cannot produce a valid result, do not route as
+                    # though tools were usable merely because intent matched.
+                    router_signals["tools_available"] = False
+                    router_signals["effective_tool_count"] = 0
+                    router_signals["policy_allowed"] = False
+                    router_signals["tool_denial_reason"] = "preflight_failed"
+                    router_signals["tool_preflight_failed"] = True
+                    router_signals["tool_preflight_error_class"] = (
+                        exc.__class__.__name__
+                    )
+                    logger.warning(
+                        "router.tool_preflight_failed",
+                        session_id=ctx.session.session_id,
+                        trace_id=ctx.event.trace_id,
+                        error=str(exc),
+                    )
+            elif type(router_signals.get("tools_available")) is not bool:
+                # Older Agent engines did not expose a preflight. Preserve the
+                # former intent-match behavior until all deployments upgrade.
+                router_signals["tools_available"] = True
+
         ctx.signals["router"] = router_signals
         route = await self.deps.router.decide(ctx.pre, ctx.session, signals=router_signals)
         if faq_preview is not None and isinstance(route.hints, dict):
             route.hints.setdefault("faq_preview", faq_preview)
-        agent_tool_scope = ctx.signals.get("agent", {}).get("tool_scope")
-        if not agent_tool_scope:
-            agent_tool_scope = ctx.extras.get("agent_tool_scope")
         if agent_tool_scope and isinstance(route.hints, dict):
             route.hints.setdefault("agent_tool_scope", agent_tool_scope)
         ctx.route = route
@@ -567,6 +747,7 @@ class CommitTurnsAndPublishStep(_BaseCoreStep):
             return _suppress_denied_result(ctx, result_decision)
         append_assistant_turn = not bool(ctx.extras.get("skip_assistant_turn"))
         publish_outbound = not bool(ctx.extras.get("suppress_outbound"))
+        fallback_count_changed = _update_persisted_fallback_count(session, result)
         append_assistant_turn_as_effect = append_assistant_turn and (
             self.deps.effect_handlers_enabled
             or effect_handler_opt_in_enabled(
@@ -601,7 +782,7 @@ class CommitTurnsAndPublishStep(_BaseCoreStep):
             tool_calls=list(result.tool_calls),
             citations=list(result.citations),
             trace_id=ctx.event.trace_id,
-            metadata={"route": result.route.value},
+            metadata=_assistant_turn_metadata(ctx, result),
         )
         if append_assistant_turn:
             if not append_assistant_turn_as_effect:
@@ -615,6 +796,14 @@ class CommitTurnsAndPublishStep(_BaseCoreStep):
                 await self.deps.session_manager.append_turn(session, assistant_turn)
         if state_transition and not state_transition_as_effect:
             await self.deps.session_manager.set_state(session, SessionState.CHATTING)
+        if (
+            fallback_count_changed
+            and not append_assistant_turn
+            and not state_transition
+        ):
+            save = getattr(self.deps.session_manager, "save", None)
+            if callable(save):
+                await save(session)
         if publish_outbound and not publish_outbound_as_effect:
             publish_decision = await _evaluate_result_owner_execution(
                 self.deps,

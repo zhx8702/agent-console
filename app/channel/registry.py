@@ -4,28 +4,38 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeAlias
 
-from app.channel.models import ChannelMedia, ChannelSendOptions, ChannelSendResult, ChannelTarget
+from app.channel.models import (
+    ChannelFile,
+    ChannelMedia,
+    ChannelSendOptions,
+    ChannelSendResult,
+    ChannelTarget,
+)
 
 
 class ChannelOutbound(Protocol):
-    async def get_session_policy(self, target: ChannelTarget) -> dict:
-        ...
+    async def get_session_policy(self, target: ChannelTarget) -> dict: ...
 
     async def send_text(
         self,
         target: ChannelTarget,
         text: str,
         options: ChannelSendOptions | None = None,
-    ) -> ChannelSendResult:
-        ...
+    ) -> ChannelSendResult: ...
 
     async def send_image(
         self,
         target: ChannelTarget,
         media: ChannelMedia,
         options: ChannelSendOptions | None = None,
-    ) -> ChannelSendResult:
-        ...
+    ) -> ChannelSendResult: ...
+
+    async def send_file(
+        self,
+        target: ChannelTarget,
+        file: ChannelFile,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult: ...
 
 
 ChannelOwnerGate: TypeAlias = Callable[[str, ChannelTarget], Awaitable[bool]]
@@ -80,6 +90,15 @@ class _GatedChannelOutbound:
     ) -> ChannelSendResult:
         await self._require_execution(target)
         return await self._provider.send_image(target, media, options)
+
+    async def send_file(
+        self,
+        target: ChannelTarget,
+        file: ChannelFile,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult:
+        await self._require_execution(target)
+        return await self._provider.send_file(target, file, options)
 
     async def capture_group_delivery_contract(
         self,
@@ -351,9 +370,7 @@ class ChannelRegistry:
         )
         if provider is None:
             scope = f" tenant={tenant_id} connection={connection_id}" if connection_id else ""
-            raise RuntimeError(
-                f"channel outbound provider not registered: {channel}{scope}"
-            )
+            raise RuntimeError(f"channel outbound provider not registered: {channel}{scope}")
         return provider
 
     def require_outbound_for_target(self, target: ChannelTarget) -> ChannelOutbound:

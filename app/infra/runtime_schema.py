@@ -6,11 +6,10 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0044_persona_profile_catalog"
+RUNTIME_SCHEMA_REVISION = "0046_memory_event_provenance_expiry"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
-# 0044 changes persona profile identity from one row per runtime scope to a
-# catalog of saved skills with one active row per scope.
-RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 7
+# 0046 adds durable memory-event provenance, evidence, and physical expiry.
+RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
 
 # Tables historically created by application/plugin startup code.  They are
 # now owned by Alembic and verified as one contract so a partially migrated
@@ -204,6 +203,11 @@ RUNTIME_SCHEMA_INDEXES = frozenset(
         "ix_audit_events_scope_created",
         "ix_audit_events_trace",
         "ix_memory_item_audience_expiry",
+        "ix_memory_event_member_evidence",
+        "ix_memory_event_source_message",
+        "ix_memory_event_expiry",
+        "ix_memory_item_expiry_physical",
+        "ix_memory_item_source_evidence",
         "uq_social_group_speech_observed_message",
     }
 )
@@ -225,6 +229,11 @@ RUNTIME_SCHEMA_COLUMN_CONTRACTS = (
     ("plugin_wxbot_session_policy", "reply_cooldown_seconds", True),
     ("plugin_wxbot_session_policy", "coalesce_window_ms", True),
     ("plugin_wxbot_session_policy", "adaptive_cooldown_enabled", True),
+    ("plugin_wxbot_reply_queue", "file_path", False),
+    ("plugin_wxbot_reply_queue", "file_name", False),
+    ("plugin_wxbot_reply_queue", "file_size", True),
+    ("plugin_wxbot_reply_queue", "file_md5", False),
+    ("plugin_wxbot_reply_queue", "file_sha256", False),
     ("plugin_persona_jobs", "run_attempt", False),
     ("plugin_persona_jobs", "status", False),
     ("plugin_persona_jobs", "claim_owner", False),
@@ -233,12 +242,34 @@ RUNTIME_SCHEMA_COLUMN_CONTRACTS = (
     ("plugin_persona_jobs", "input_messages_json", False),
     ("plugin_persona_jobs", "total_chunks", False),
     ("plugin_persona_jobs", "completed_chunks", False),
+    ("plugin_memory_event", "source_member_id", False),
+    ("plugin_memory_event", "source_message_id", False),
+    ("plugin_memory_event", "expires_at", True),
+    ("plugin_memory_item", "source_evidence_json", False),
 )
 
 # Index names alone are insufficient: an operator could recreate a same-name
 # index with the wrong keys or without its partial predicate and still pass a
 # name-only readiness probe.
 RUNTIME_SCHEMA_INDEX_CONTRACTS = (
+    (
+        "ux_memory_event_key",
+        "plugin_memory_event",
+        ("event_key",),
+        "event_key IS NOT NULL",
+    ),
+    (
+        "ix_memory_event_expiry",
+        "plugin_memory_event",
+        ("expires_at", "id"),
+        "expires_at IS NOT NULL",
+    ),
+    (
+        "ix_memory_item_expiry_physical",
+        "plugin_memory_item",
+        ("expires_at", "id"),
+        "expires_at IS NOT NULL",
+    ),
     (
         "ux_persona_profiles_active_scope",
         "plugin_persona_profiles",

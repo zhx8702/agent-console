@@ -20,10 +20,12 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from numbers import Real
 from typing import Any
 
 from opentelemetry import trace
@@ -75,7 +77,10 @@ from app.orchestrator.ports import (
     SafetyPort,
     SessionPort,
 )
-from app.orchestrator.runner import FlowRunResult
+from app.orchestrator.runner import (
+    FlowRunResult,
+    clear_turn_scoped_persona_variables,
+)
 from app.plugin.hooks import HookAbort, HookPoint, HookRunner
 from app.postprocessing.response_guards import apply_response_guards
 from app.reliability.message_store import (
@@ -86,6 +91,12 @@ from app.reliability.message_store import (
 
 logger = get_logger(__name__)
 tracer = trace.get_tracer("orchestrator")
+
+_CONSECUTIVE_FALLBACKS_KEY = "consecutive_fallbacks"
+_SUCCESSFUL_ANSWER_ROUTES = frozenset(
+    {RouteType.FAQ, RouteType.RAG, RouteType.AGENT, RouteType.LLM}
+)
+_FAQ_VERDICTS = frozenset({"CLEAR", "AMBIGUOUS", "INSUFFICIENT", "LOW"})
 
 
 def _canned() -> Any:
@@ -121,6 +132,120 @@ def _canned() -> Any:
                 return "The system service is unavailable. Please try again shortly."
 
         return _Fallback()
+
+
+def _is_group_session(session: Session) -> bool:
+    kind = str((session.metadata or {}).get("session_kind") or "").strip().lower()
+    return kind in {"group", "chatroom", "channel", "guild"} or str(
+        session.session_id or ""
+    ).endswith("@chatroom")
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric < 0:
+        return None
+    return int(numeric)
+
+
+def _finite_similarity(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    score = float(value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        return None
+    return score
+
+
+def _inject_persisted_fallback_count(
+    router_signals: dict[str, Any],
+    session: Session,
+) -> None:
+    if _is_group_session(session):
+        router_signals.pop(_CONSECUTIVE_FALLBACKS_KEY, None)
+        return
+    persisted = _non_negative_int(
+        (session.variables or {}).get(_CONSECUTIVE_FALLBACKS_KEY)
+    )
+    router_signals[_CONSECUTIVE_FALLBACKS_KEY] = persisted or 0
+
+
+def _update_persisted_fallback_count(
+    session: Session,
+    result: CapabilityResult,
+) -> bool:
+    if _is_group_session(session):
+        return False
+    variables = session.variables
+    current = _non_negative_int(variables.get(_CONSECUTIVE_FALLBACKS_KEY)) or 0
+    fallback_reason = str(
+        result.metadata.get("fallback_reason")
+        or result.metadata.get("degradation_reason")
+        or ""
+    ).strip()
+    if fallback_reason:
+        updated = min(current + 1, 1000)
+    elif result.route in _SUCCESSFUL_ANSWER_ROUTES and result.reply_text.strip():
+        updated = 0
+    else:
+        return False
+    changed = variables.get(_CONSECUTIVE_FALLBACKS_KEY) != updated
+    variables[_CONSECUTIVE_FALLBACKS_KEY] = updated
+    return changed
+
+
+def _assistant_turn_metadata(
+    ctx: PipelineContext,
+    result: CapabilityResult,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"route": result.route.value}
+    if ctx.pre is not None and ctx.pre.intent_coarse is not None:
+        metadata["intent_coarse"] = ctx.pre.intent_coarse.value
+    if ctx.route is not None:
+        metadata["route_confidence"] = float(ctx.route.confidence)
+        rule = ctx.route.hints.get("rule") if isinstance(ctx.route.hints, dict) else None
+        if isinstance(rule, str) and rule.strip():
+            metadata["route_rule"] = rule.strip()
+
+    fallback_from = result.metadata.get("fallback_from")
+    fallback_reason = (
+        result.metadata.get("fallback_reason")
+        or result.metadata.get("degradation_reason")
+    )
+    if fallback_from:
+        metadata["fallback_from"] = str(fallback_from)
+    elif fallback_reason and ctx.route is not None:
+        metadata["fallback_from"] = ctx.route.type.value
+    if fallback_reason:
+        metadata["fallback_reason"] = str(fallback_reason)
+    return metadata
+
+
+def _tool_intent_matched(router_signals: dict[str, Any]) -> bool:
+    if "tool_intent_matched" in router_signals:
+        return router_signals.get("tool_intent_matched") is True
+    return router_signals.get("tools_available") is True
+
+
+def _merge_faq_preview_signals(
+    router_signals: dict[str, Any],
+    faq_preview: dict[str, Any],
+) -> None:
+    matched = faq_preview.get("matched")
+    if type(matched) is bool:
+        router_signals["faq_matched"] = matched
+    score = _finite_similarity(faq_preview.get("score"))
+    if score is not None:
+        router_signals["faq_similarity"] = score
+    verdict = faq_preview.get("verdict")
+    if isinstance(verdict, str) and verdict.strip().upper() in _FAQ_VERDICTS:
+        router_signals["faq_verdict"] = verdict.strip().upper()
+    if faq_preview.get("scope"):
+        router_signals["faq_scope"] = faq_preview.get("scope")
+    if faq_preview.get("faq_id"):
+        router_signals["faq_id"] = faq_preview.get("faq_id")
 
 
 class DialogOrchestrator:
@@ -466,6 +591,7 @@ class DialogOrchestrator:
                     channel=event.channel,
                 )
                 apply_event_scope_to_session(session, event)
+                clear_turn_scoped_persona_variables(session)
             ctx.session = session
 
             # 2. Preprocess
@@ -550,6 +676,7 @@ class DialogOrchestrator:
                     if isinstance(ctx.extras.get("router_signals"), dict)
                     else {}
                 )
+                _inject_persisted_fallback_count(router_signals, session)
                 faq_preview: dict[str, Any] | None = None
                 faq_engine = self.capabilities.get(RouteType.FAQ)
                 if isinstance(faq_engine, FaqPreviewCapabilityPort):
@@ -560,21 +687,89 @@ class DialogOrchestrator:
                             {"trace_id": event.trace_id},
                         )
                         faq_preview = dict(preview)
-                        score = float(preview.get("score", 0.0) or 0.0)
-                        router_signals["faq_similarity"] = score
-                        if preview.get("scope"):
-                            router_signals["faq_scope"] = preview.get("scope")
-                        if preview.get("faq_id"):
-                            router_signals["faq_id"] = preview.get("faq_id")
-                        if preview.get("verdict"):
-                            router_signals["faq_verdict"] = preview.get("verdict")
+                        _merge_faq_preview_signals(
+                            router_signals,
+                            faq_preview,
+                        )
                     except Exception as exc:
+                        router_signals["faq_preview_failed"] = True
+                        router_signals["faq_preview_error_class"] = (
+                            exc.__class__.__name__
+                        )
                         logger.warning(
                             "router.faq_preview_failed",
                             session_id=session.session_id,
                             trace_id=event.trace_id,
                             error=str(exc),
                         )
+
+                agent_tool_scope = ctx.extras.get("agent_tool_scope")
+                if _tool_intent_matched(router_signals):
+                    router_signals.setdefault("tool_intent_matched", True)
+                    agent_engine = self.capabilities.get(RouteType.AGENT)
+                    preview_availability = getattr(
+                        agent_engine,
+                        "preview_availability",
+                        None,
+                    )
+                    if callable(preview_availability):
+                        try:
+                            availability = await preview_availability(
+                                pre,
+                                session,
+                                {
+                                    "trace_id": event.trace_id,
+                                    "agent_tool_scope": agent_tool_scope,
+                                    "tool_scope": agent_tool_scope,
+                                    "request_metadata": dict(event.metadata or {}),
+                                },
+                            )
+                            if not isinstance(availability, dict):
+                                raise TypeError(
+                                    "tool availability preview must be a mapping"
+                                )
+                            effective_count = _non_negative_int(
+                                availability.get("effective_tool_count")
+                            )
+                            if effective_count is None:
+                                raise ValueError(
+                                    "tool availability preview has invalid "
+                                    "effective_tool_count"
+                                )
+                            router_signals["effective_tool_count"] = effective_count
+                            router_signals["tools_available"] = effective_count > 0
+                            policy_allowed = availability.get("policy_allowed")
+                            if type(policy_allowed) is bool:
+                                router_signals["policy_allowed"] = policy_allowed
+                            denial_reason = availability.get("denial_reason")
+                            if (
+                                isinstance(denial_reason, str)
+                                and denial_reason.strip()
+                            ):
+                                router_signals["tool_denial_reason"] = (
+                                    denial_reason.strip()
+                                )
+                        except Exception as exc:
+                            # Availability is an authorization boundary. Match
+                            # the flow runtime: an invalid preflight cannot
+                            # inherit a stale optimistic compatibility signal.
+                            router_signals["tools_available"] = False
+                            router_signals["effective_tool_count"] = 0
+                            router_signals["policy_allowed"] = False
+                            router_signals["tool_denial_reason"] = "preflight_failed"
+                            router_signals["tool_preflight_failed"] = True
+                            router_signals["tool_preflight_error_class"] = (
+                                exc.__class__.__name__
+                            )
+                            logger.warning(
+                                "router.tool_preflight_failed",
+                                session_id=session.session_id,
+                                trace_id=event.trace_id,
+                                error=str(exc),
+                            )
+                    elif type(router_signals.get("tools_available")) is not bool:
+                        router_signals["tools_available"] = True
+
                 with tracer.start_as_current_span("router.decide"):
                     route = await self.router.decide(pre, session, signals=router_signals)
             except HookAbort as ha:
@@ -590,7 +785,6 @@ class DialogOrchestrator:
             ctx.route = route
             if faq_preview is not None and isinstance(route.hints, dict):
                 route.hints.setdefault("faq_preview", faq_preview)
-            agent_tool_scope = ctx.extras.get("agent_tool_scope")
             if agent_tool_scope and isinstance(route.hints, dict):
                 route.hints.setdefault("agent_tool_scope", agent_tool_scope)
             ROUTE_DECISIONS.labels(tenant=event.tenant_id, route=route.type.value).inc()
@@ -676,6 +870,7 @@ class DialogOrchestrator:
         except Exception as exc:
             PIPELINE_ERRORS.labels(stage="postprocess", code="exception").inc()
             logger.exception("postprocess.failed", error=str(exc))
+            result.metadata.setdefault("degradation_reason", "postprocess_failed")
             reply = self._fallback_reply(event, _canned().DEGRADATION_BUSY)
         ctx.reply = reply
         apply_response_guards(ctx, settings=self.settings)
@@ -683,6 +878,7 @@ class DialogOrchestrator:
 
         suppress_assistant_turn = bool(ctx.extras.get("skip_assistant_turn"))
         suppress_outbound = bool(ctx.extras.get("suppress_outbound"))
+        fallback_count_changed = _update_persisted_fallback_count(session, result)
 
         # 10. Append assistant turn
         if not suppress_assistant_turn:
@@ -693,10 +889,15 @@ class DialogOrchestrator:
                 tool_calls=list(result.tool_calls),
                 citations=list(result.citations),
                 trace_id=event.trace_id,
-                metadata={"route": result.route.value},
+                metadata=_assistant_turn_metadata(ctx, result),
             )
             with tracer.start_as_current_span("session.append_assistant_turn"):
                 await self.session_manager.append_turn(session, assistant_turn)
+        elif fallback_count_changed:
+            save = getattr(self.session_manager, "save", None)
+            if callable(save):
+                with tracer.start_as_current_span("session.save_fallback_count"):
+                    await save(session)
 
         # 11. Advance state machine (IDLE → CHATTING on first turn).
         if session.state == SessionState.IDLE and not bool(ctx.extras.get("skip_state_transition")):
@@ -758,7 +959,14 @@ class DialogOrchestrator:
         if faq is not None and exclude != RouteType.FAQ:
             try:
                 with tracer.start_as_current_span("capability.faq_fallback"):
-                    return await faq.answer(pre, session, {"fallback": True})
+                    result = await faq.answer(pre, session, {"fallback": True})
+                route_label = (failed_route or exclude).value
+                result.metadata.setdefault("fallback_from", route_label)
+                result.metadata.setdefault(
+                    "fallback_reason",
+                    f"capability_failed:{route_label}",
+                )
+                return result
             except Exception as exc:
                 PIPELINE_ERRORS.labels(stage="faq_fallback", code="exception").inc()
                 logger.exception("faq_fallback.failed", error=str(exc))

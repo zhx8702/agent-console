@@ -23,6 +23,17 @@ from plugins.memory.store import (
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "memory_eval_cases.json"
 
 
+@pytest.fixture(autouse=True)
+def _bind_unit_memory_transaction():
+    token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(
+        SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    try:
+        yield
+    finally:
+        memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+
 def _fixture() -> dict[str, Any]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
@@ -178,6 +189,71 @@ async def test_manual_pinned_memory_is_not_overwritten_or_invalidated(
     assert "manual_or_pinned_conflict" in inserted[0]["value_json"]["reason"]
 
 
+@pytest.mark.asyncio
+async def test_llm_target_item_id_cannot_invalidate_cross_key_manual_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manual = {
+        "id": 41,
+        "tenant_id": "demo",
+        "channel": "wechat",
+        "source_key": "wxbot",
+        "user_id": "wxid_a",
+        "session_id": "",
+        "scope_type": "identity",
+        "source_type": "manual",
+        "memory_type": "constraint",
+        "content": "人工锁定：任何时候都不要覆盖",
+        "normalized_key": "constraint:manual:protected",
+        "confidence": 1.0,
+        "status": "active",
+        "pinned": True,
+        "sensitivity": "normal",
+        "audience_scope": "private",
+        "origin_session_kind": "unknown",
+        "allowed_session_ids": [],
+        "deleted_at": None,
+    }
+    invalidated: list[int] = []
+    store = MemoryStore(_settings())
+
+    async def fake_find(**_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    async def fake_get(item_id: int) -> dict[str, Any] | None:
+        return manual if item_id == 41 else None
+
+    async def fake_invalidate(item_id: int, **_kwargs: Any) -> None:
+        invalidated.append(item_id)
+
+    monkeypatch.setattr(store, "_find_memory_item_by_normalized_key", fake_find)
+    monkeypatch.setattr(store, "get_memory_item", fake_get)
+    monkeypatch.setattr(store, "_mark_memory_item_invalidated", fake_invalidate)
+
+    result = await store._apply_structured_memory_action(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        user_id="wxid_a",
+        action={
+            "op": "invalidate",
+            "content": "模型要求删除另一条自动记忆",
+            "source_type": "auto",
+            "memory_type": "note",
+            "normalized_key": "note:auto:other",
+            "confidence": 0.95,
+            "status": "active",
+            "sensitivity": "normal",
+            "reason": "llm_cross_key_target",
+            "target_item_id": 41,
+        },
+        original_text="模型要求删除另一条自动记忆",
+    )
+
+    assert result is None
+    assert invalidated == []
+
+
 def test_group_multi_user_and_source_key_fallback_isolation() -> None:
     items = [
         _item(1, "wxid_a", "wxbot", "A exact source"),
@@ -227,7 +303,10 @@ def test_relevant_retrieval_topk_excludes_inactive_deleted_sensitive_and_cross_s
         _item(7, "wxid_b", "wxbot", "B Adidas"),
         _item(8, "wxid_a", "other", "other source Adidas"),
         _item(9, "wxid_a", "wxbot", "deleted_at Adidas", deleted_at="2026-05-10"),
-        {**_item(10, "wxid_a", "wxbot", "review Adidas"), "value_json": {"acceptance": {"status": "needs_review", "score": 0.7}}},
+        {
+            **_item(10, "wxid_a", "wxbot", "review Adidas"),
+            "value_json": {"acceptance": {"status": "needs_review", "score": 0.7}},
+        },
     ]
 
     ranked = _rank_retrieved_memory_items(
@@ -263,13 +342,13 @@ def test_session_rolling_state_tracks_and_closes_open_item() -> None:
         )
     )
     profile.update(
-            _update_session_state(
-                profile,
-                session_id="s1",
-                user_text="done invoice",
-                assistant_text="ok",
-                created_at="2026-05-10T00:00:03",
-            )
+        _update_session_state(
+            profile,
+            session_id="s1",
+            user_text="done invoice",
+            assistant_text="ok",
+            created_at="2026-05-10T00:00:03",
+        )
     )
 
     assert profile["open_items"] == []
@@ -419,15 +498,20 @@ async def test_job_queue_idempotency_retry_and_dead_behavior(
                     "trace_id": "trace-1",
                 }
             ]
-        if "UPDATE plugin_memory_extraction_job SET" in sql and params:
+        if "status = CAST(:status AS VARCHAR)" in sql and params:
             status_updates.append(str(params["status"]))
+            return [{"id": 9, "status": str(params["status"])}]
         return []
 
     async def fake_list_memory_items(**kwargs: Any) -> list[dict[str, Any]]:
         return []
 
+    async def renew_claim(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
     monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
     monkeypatch.setattr(store, "list_memory_items", fake_list_memory_items)
+    monkeypatch.setattr(store, "renew_llm_extraction_job_lease", renew_claim)
 
     failed = await store.process_llm_extraction_job(
         _job(attempts=0, max_attempts=2),
@@ -605,6 +689,7 @@ def _job(**kwargs: Any) -> dict[str, Any]:
         "source_event_id": 7,
         "source_trace_id": "trace-1",
         "status": "running",
+        "locked_by": "worker-a:claimed-eval-token",
         "attempts": 0,
         "max_attempts": 2,
     }

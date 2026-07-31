@@ -153,6 +153,12 @@ export function GroupPolicyPanel({ controller }: GroupPolicyPanelProps) {
               }))
             }
           />
+          <ToggleCard
+            checked={policyDraft.policy.file_send_enabled}
+            label="允许群文件发送"
+            description="默认关闭；关闭时群管理员、智能体工具和后台直发都不能向当前群发送文件"
+            onChange={(checked) => updateParticipationValue("file_send_enabled", checked)}
+          />
         </div>
       </section>
 

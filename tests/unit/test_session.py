@@ -123,6 +123,36 @@ async def test_load_hits_cache_after_write(manager, redis):
     assert reloaded.turns[0].content == "hello"
 
 
+async def test_load_clears_legacy_runtime_memory_from_private_cache(manager, redis):
+    session = await manager.load("demo", "u1", "se_cache_memory", Channel.WEB)
+    session.variables = {
+        "user_memory": {"manual_notes": "stale private memory"},
+        "group_memory": {"session_summary": "stale shared memory"},
+        "group_observation_context": {"recent_text": "stale prompt context"},
+        "memory_settings": {"retrieval_enabled": False},
+        "persona_profile": {"name": "durable persona"},
+    }
+    # Model a private-session blob written by an older worker, before runtime
+    # prompt context was excluded from durable session snapshots.
+    await redis.hset(
+        "session:v2:ctx:demo:se_cache_memory",
+        "blob",
+        session.model_dump_json(),
+    )
+
+    reloaded = await manager.load(
+        "demo",
+        "u1",
+        "se_cache_memory",
+        Channel.WEB,
+    )
+
+    assert reloaded.variables == {
+        "memory_settings": {"retrieval_enabled": False},
+        "persona_profile": {"name": "durable persona"},
+    }
+
+
 async def test_load_falls_back_to_db_when_cache_empty(manager, redis):
     session = await manager.load("demo", "u1", "se_db_01", Channel.WEB)
     for i in range(2):
@@ -138,6 +168,45 @@ async def test_load_falls_back_to_db_when_cache_empty(manager, redis):
     assert len(reloaded.turns) == 2
     contents = [t.content for t in reloaded.turns]
     assert contents == ["m0", "m1"]
+
+
+async def test_load_clears_legacy_runtime_memory_from_private_db(
+    manager,
+    factory,
+):
+    async with factory() as db:
+        db.add(
+            SessionRow(
+                tenant_id="demo",
+                session_id="se_db_memory",
+                user_id="u1",
+                channel=Channel.WEB.value,
+                state=SessionState.IDLE.value,
+                variables={
+                    "user_memory": {"manual_notes": "stale private memory"},
+                    "group_memory": {"session_summary": "stale shared memory"},
+                    "group_observation_context": {"recent_text": "stale prompt context"},
+                    "memory_settings": {"retrieval_enabled": False},
+                    "persona_profile": {"name": "durable persona"},
+                },
+                pii_map={"<PII:phone:1>": "13800138000"},
+                meta={},
+            )
+        )
+        await db.commit()
+
+    reloaded = await manager.load(
+        "demo",
+        "u1",
+        "se_db_memory",
+        Channel.WEB,
+    )
+
+    assert reloaded.variables == {
+        "memory_settings": {"retrieval_enabled": False},
+        "persona_profile": {"name": "durable persona"},
+    }
+    assert reloaded.pii_map == {}
 
 
 # ---------------------------------------------------------------------------

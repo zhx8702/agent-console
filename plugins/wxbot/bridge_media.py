@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -16,7 +17,7 @@ from app.channel.identity import (
 )
 from app.common.ids import new_trace_id
 from app.common.logging import get_logger
-from app.common.types import Channel, InboundEvent, Message, MessageType
+from app.common.types import Attachment, Channel, InboundEvent, Message, MessageType
 from plugins.wxbot.bridge_contract import (
     _IMAGE_PREVIEW_VARIANTS,
     _IMAGE_THUMBNAIL_VARIANTS,
@@ -93,6 +94,15 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         return normalized.lstrip("/")
 
     @staticmethod
+    def _file_url(sdk_url: str, file_url: str) -> str:
+        value = str(file_url or "").strip()
+        if not value:
+            return ""
+        if value.startswith(("http://", "https://")):
+            return value
+        return f"{sdk_url.rstrip('/')}/{value.lstrip('/')}"
+
+    @staticmethod
     def _first_nonempty_str(*values: Any) -> str:
         for value in values:
             text = str(value or "").strip()
@@ -103,6 +113,141 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
     @staticmethod
     def _record(value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _first_present_value(*values: Any) -> Any:
+        for value in values:
+            if value is not None and value != "":
+                return value
+        return ""
+
+    def _file_fields(
+        self,
+        message: dict[str, Any],
+        media: dict[str, Any] | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        media_record = self._record(media)
+        raw_record = self._record(raw)
+        file_size = self._first_present_value(
+            message.get("file_size"),
+            media_record.get("file_size"),
+            media_record.get("size"),
+            raw_record.get("file_size"),
+            raw_record.get("size"),
+        )
+        try:
+            normalized_file_size = int(file_size) if file_size != "" else 0
+        except (TypeError, ValueError):
+            normalized_file_size = 0
+
+        file_url = self._first_nonempty_str(
+            message.get("file_url"),
+            media_record.get("file_url"),
+            raw_record.get("file_url"),
+        )
+        file_download_status = self._first_nonempty_str(
+            media_record.get("file_download_status"),
+            message.get("file_download_status"),
+            media_record.get("status"),
+            raw_record.get("file_download_status"),
+        ).lower()
+        media_status = self._first_nonempty_str(
+            media_record.get("media_status"),
+            media_record.get("status"),
+            message.get("media_status"),
+            raw_record.get("media_status"),
+            file_download_status,
+        ).lower()
+        return {
+            "file_raw_name": self._first_nonempty_str(
+                message.get("file_raw_name"),
+                media_record.get("file_raw_name"),
+                raw_record.get("file_raw_name"),
+            ),
+            "file_name": self._first_nonempty_str(
+                message.get("file_name"),
+                media_record.get("file_name"),
+                raw_record.get("file_name"),
+            ),
+            "file_ext": self._first_nonempty_str(
+                message.get("file_ext"),
+                media_record.get("file_ext"),
+                raw_record.get("file_ext"),
+            ),
+            "file_size": normalized_file_size,
+            "file_md5": self._first_nonempty_str(
+                message.get("file_md5"),
+                media_record.get("file_md5"),
+                media_record.get("md5"),
+                raw_record.get("file_md5"),
+                raw_record.get("md5"),
+            ),
+            "file_sha256": self._first_nonempty_str(
+                message.get("file_sha256"),
+                media_record.get("file_sha256"),
+                media_record.get("sha256"),
+                raw_record.get("file_sha256"),
+                raw_record.get("sha256"),
+            ),
+            "file_url": self._file_url(self._sdk_url, file_url),
+            "file_download_status": file_download_status,
+            "file_failure_reason": self._first_nonempty_str(
+                message.get("file_failure_reason"),
+                media_record.get("file_failure_reason"),
+                media_record.get("failure_reason"),
+                raw_record.get("file_failure_reason"),
+            ),
+            "media_status": media_status,
+        }
+
+    @staticmethod
+    def _file_placeholder(file_name: str) -> str:
+        return f"[文件] {file_name}".rstrip()
+
+    @staticmethod
+    def _file_attachment(fields: dict[str, Any]) -> dict[str, Any]:
+        """Project one SDK file into the shared inbound attachment contract."""
+
+        extension = str(fields.get("file_ext") or "").strip().lower().lstrip(".")
+        mime_by_ext = {
+            "txt": "text/plain",
+            "md": "text/markdown",
+            "csv": "text/csv",
+            "json": "application/json",
+            "pdf": "application/pdf",
+            "doc": "application/msword",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls": "application/vnd.ms-excel",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "zip": "application/zip",
+        }
+        attachment = Attachment(
+            type=MessageType.FILE,
+            url=str(fields.get("file_url") or "").strip() or None,
+            mime=mime_by_ext.get(extension),
+            size=max(0, int(fields.get("file_size") or 0)),
+            name=str(fields.get("file_name") or fields.get("file_raw_name") or "").strip()
+            or None,
+            ext=extension or None,
+            md5=str(fields.get("file_md5") or "").strip() or None,
+            sha256=str(fields.get("file_sha256") or "").strip() or None,
+            status=str(fields.get("media_status") or "").strip() or None,
+            download_status=str(fields.get("file_download_status") or "").strip() or None,
+            failure_reason=str(fields.get("file_failure_reason") or "").strip() or None,
+        )
+        return attachment.model_dump(exclude_none=True)
+
+    def _media_payload_type(
+        self,
+        message: dict[str, Any],
+        media: dict[str, Any],
+    ) -> str:
+        return self._first_nonempty_str(
+            message.get("type"),
+            media.get("message_type"),
+            media.get("type"),
+        ).lower()
 
     def _image_variant_records(
         self,
@@ -171,6 +316,11 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         message: dict[str, Any],
         media: dict[str, Any],
     ) -> str:
+        if self._media_payload_type(message, media) == "file":
+            return self._first_nonempty_str(
+                media.get("file_path"),
+                message.get("file_path"),
+            )
         return self._first_nonempty_str(
             media.get("image_path"),
             media.get("path"),
@@ -185,6 +335,14 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         message: dict[str, Any],
         media: dict[str, Any],
     ) -> str:
+        if self._media_payload_type(message, media) == "file":
+            return self._file_url(
+                self._sdk_url,
+                self._first_nonempty_str(
+                    media.get("file_url"),
+                    message.get("file_url"),
+                ),
+            )
         explicit = self._first_nonempty_str(
             media.get("image_url"),
             media.get("url"),
@@ -407,7 +565,7 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
             .lower()
         )
 
-    def _stream_image_media(self, envelope: dict[str, Any]) -> tuple[str, str]:
+    def _stream_ready_media(self, envelope: dict[str, Any]) -> tuple[str, str]:
         message = envelope.get("message") if isinstance(envelope.get("message"), dict) else {}
         media = envelope.get("media") if isinstance(envelope.get("media"), dict) else {}
         image_path = self._resolve_media_ready_path(message, media)
@@ -421,17 +579,23 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         meta = envelope.get("meta") if isinstance(envelope.get("meta"), dict) else {}
         return (
             str(
-                media.get("status") or message.get("media_status") or meta.get("media_status") or ""
+                media.get("status")
+                or message.get("media_status")
+                or message.get("file_download_status")
+                or media.get("file_download_status")
+                or meta.get("media_status")
+                or ""
             )
             .strip()
             .lower()
         )
 
-    def _track_stream_image_until_media_ready(self, envelope: dict[str, Any]) -> None:
-        if self._stream_message_type(envelope) != "image":
+    def _track_stream_media_until_ready(self, envelope: dict[str, Any]) -> None:
+        msg_type = self._stream_message_type(envelope)
+        if msg_type not in {"image", "file"}:
             return
-        image_path, image_url = self._stream_image_media(envelope)
-        if image_path or image_url:
+        media_path, media_url = self._stream_ready_media(envelope)
+        if media_path or media_url:
             return
         media_status = self._stream_media_status(envelope)
         if media_status == "failed":
@@ -439,12 +603,61 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         message_id = self._stream_message_id(envelope)
         if not message_id:
             return
-        self._pending_media_messages[message_id] = dict(envelope)
+        self._prune_pending_media()
+        tracked = dict(envelope)
+        tracked["_tracked_at_monotonic"] = time.monotonic()
+        self._pending_media_messages[message_id] = tracked
         log.info(
-            "wxbot.bridge.image_message_tracked_until_media_ready",
+            "wxbot.bridge.media_message_tracked_until_ready",
             message_id=message_id,
+            media_type=msg_type,
             session_id=str((envelope.get("session") or {}).get("id") or ""),
         )
+
+    def _prune_pending_media(self) -> None:
+        """Bound deferred-media memory and avoid polling abandoned messages forever."""
+
+        now = time.monotonic()
+        ttl = max(
+            60.0,
+            float(
+                getattr(self._settings, "wxbot_pending_media_ttl_seconds", 15 * 60)
+                or 15 * 60
+            ),
+        )
+        stale_ids = [
+            message_id
+            for message_id, envelope in self._pending_media_messages.items()
+            if now - float(envelope.get("_tracked_at_monotonic") or now) > ttl
+        ]
+        for message_id in stale_ids:
+            self._pending_media_messages.pop(message_id, None)
+            log.warning(
+                "wxbot.bridge.pending_media_expired",
+                message_id=message_id,
+                ttl_seconds=int(ttl),
+            )
+        max_items = max(
+            1,
+            int(
+                getattr(self._settings, "wxbot_pending_media_max_items", 1000)
+                or 1000
+            ),
+        )
+        overflow = len(self._pending_media_messages) - max_items
+        if overflow <= 0:
+            return
+        oldest = sorted(
+            self._pending_media_messages.items(),
+            key=lambda item: float(item[1].get("_tracked_at_monotonic") or now),
+        )[:overflow]
+        for message_id, _envelope in oldest:
+            self._pending_media_messages.pop(message_id, None)
+            log.warning(
+                "wxbot.bridge.pending_media_capacity_evicted",
+                message_id=message_id,
+                max_items=max_items,
+            )
 
     def _merge_media_ready_into_pending_message(self, envelope: dict[str, Any]) -> dict[str, Any]:
         message_id = self._stream_message_id(envelope)
@@ -459,6 +672,37 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         ready_message = envelope.get("message") if isinstance(envelope.get("message"), dict) else {}
         ready_media = envelope.get("media") if isinstance(envelope.get("media"), dict) else {}
         message = {**pending_message, **ready_message}
+        msg_type = self._first_nonempty_str(
+            message.get("type"),
+            ready_media.get("message_type"),
+            ready_media.get("type"),
+            self._stream_message_type(pending or {}),
+            "image",
+        ).lower()
+        if msg_type == "file":
+            file_fields = self._file_fields(
+                message,
+                ready_media,
+                envelope.get("raw") if isinstance(envelope.get("raw"), dict) else {},
+            )
+            message.update(file_fields)
+            if message_id and not message.get("id"):
+                message["id"] = message_id
+            message["type"] = "file"
+            merged_media = {**ready_media, **file_fields, "type": "file"}
+            if file_fields["media_status"]:
+                merged_media["status"] = file_fields["media_status"]
+            merged["event_type"] = "message.received"
+            merged["message"] = message
+            merged["media"] = merged_media
+            for key in ("session", "sender", "raw", "meta"):
+                if key not in merged or not merged.get(key):
+                    merged[key] = envelope.get(key)
+            if envelope.get("occurred_at") or envelope.get("occurred_ts"):
+                merged["occurred_at"] = envelope.get("occurred_at") or merged.get("occurred_at")
+                merged["occurred_ts"] = envelope.get("occurred_ts") or merged.get("occurred_ts")
+            return merged
+
         image_path = self._resolve_media_ready_path(ready_message, ready_media)
         image_url = self._resolve_media_ready_url(ready_message, ready_media)
         if image_path:
@@ -514,15 +758,16 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
             await asyncio.sleep(max(1.0, self._poll_interval))
 
     async def _resolve_pending_media_from_sdk(self, stream: str, bus: Any) -> int:
+        self._prune_pending_media()
         if not self._pending_media_messages or self._client is None:
             return 0
 
         pending_ids = list(self._pending_media_messages)
         batch_size = min(50, len(pending_ids))
         start = self._pending_media_resolve_offset % len(pending_ids)
-        selected_ids = pending_ids[start:start + batch_size]
+        selected_ids = pending_ids[start : start + batch_size]
         if len(selected_ids) < batch_size:
-            selected_ids.extend(pending_ids[:batch_size - len(selected_ids)])
+            selected_ids.extend(pending_ids[: batch_size - len(selected_ids)])
         self._pending_media_resolve_offset = (start + batch_size) % len(pending_ids)
 
         semaphore = asyncio.Semaphore(8)
@@ -560,8 +805,7 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
                         row
                         for row in rows
                         if isinstance(row, dict)
-                        and str(row.get("msg_svr_id") or row.get("id") or "").strip()
-                        == message_id
+                        and str(row.get("msg_svr_id") or row.get("id") or "").strip() == message_id
                     ),
                     None,
                 )
@@ -578,55 +822,79 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
             message_id = str(msg.get("msg_svr_id") or msg.get("id") or "").strip()
             if message_id not in pending_id_set:
                 continue
-            image_path = str(msg.get("image_path") or "").strip()
-            image_url = str(msg.get("image_url") or "").strip()
-            if not image_path and not image_url:
-                continue
 
             pending = self._pending_media_messages.get(message_id) or {}
+            pending_type = self._stream_message_type(pending)
+            msg_type = str(msg.get("msg_type") or pending_type or "image").strip().lower()
             ready_envelope = dict(pending)
             ready_message = dict(
                 pending.get("message") if isinstance(pending.get("message"), dict) else {}
             )
-            ready_message.update(
-                {
-                    "id": message_id,
-                    "type": "image",
-                    "text": ready_message.get("text") or msg.get("msg_text") or "[图片]",
+            if msg_type == "file":
+                file_fields = self._file_fields(msg, msg, self._record(msg.get("raw")))
+                if not file_fields["file_url"]:
+                    continue
+                ready_message.update(
+                    {
+                        "id": message_id,
+                        "type": "file",
+                        "text": (
+                            ready_message.get("text")
+                            or msg.get("msg_text")
+                            or self._file_placeholder(str(file_fields["file_name"]))
+                        ),
+                        **file_fields,
+                    }
+                )
+                media = {
+                    "type": "file",
+                    "status": file_fields["media_status"] or "ready",
+                    **file_fields,
                 }
-            )
-            if image_path:
-                ready_message["image_path"] = image_path
-            if image_url:
-                ready_message["image_url"] = image_url
-            for key in (
-                "image_preview_path",
-                "image_preview_url",
-                "image_thumbnail_path",
-                "image_thumbnail_url",
-            ):
-                value = str(msg.get(key) or "").strip()
-                if value:
-                    ready_message[key] = value
-            if isinstance(msg.get("image_variants"), dict):
-                ready_message["image_variants"] = dict(msg["image_variants"])
+            else:
+                image_path = str(msg.get("image_path") or "").strip()
+                image_url = str(msg.get("image_url") or "").strip()
+                if not image_path and not image_url:
+                    continue
+                ready_message.update(
+                    {
+                        "id": message_id,
+                        "type": "image",
+                        "text": ready_message.get("text") or msg.get("msg_text") or "[图片]",
+                    }
+                )
+                if image_path:
+                    ready_message["image_path"] = image_path
+                if image_url:
+                    ready_message["image_url"] = image_url
+                for key in (
+                    "image_preview_path",
+                    "image_preview_url",
+                    "image_thumbnail_path",
+                    "image_thumbnail_url",
+                ):
+                    value = str(msg.get(key) or "").strip()
+                    if value:
+                        ready_message[key] = value
+                if isinstance(msg.get("image_variants"), dict):
+                    ready_message["image_variants"] = dict(msg["image_variants"])
 
-            media = {"type": "image"}
-            if image_path:
-                media["image_path"] = image_path
-            if image_url:
-                media["image_url"] = image_url
-            for key in (
-                "image_preview_path",
-                "image_preview_url",
-                "image_thumbnail_path",
-                "image_thumbnail_url",
-            ):
-                value = str(msg.get(key) or "").strip()
-                if value:
-                    media[key] = value
-            if isinstance(msg.get("image_variants"), dict):
-                media["image_variants"] = dict(msg["image_variants"])
+                media = {"type": "image"}
+                if image_path:
+                    media["image_path"] = image_path
+                if image_url:
+                    media["image_url"] = image_url
+                for key in (
+                    "image_preview_path",
+                    "image_preview_url",
+                    "image_thumbnail_path",
+                    "image_thumbnail_url",
+                ):
+                    value = str(msg.get(key) or "").strip()
+                    if value:
+                        media[key] = value
+                if isinstance(msg.get("image_variants"), dict):
+                    media["image_variants"] = dict(msg["image_variants"])
 
             ready_at = datetime.now(UTC)
             ready_envelope.update(
@@ -749,7 +1017,7 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
         # inbound event until then makes a real WeChat message disappear from the
         # queue and from downstream observability.  Keep a copy only so a later
         # media-ready event can still be recorded and correlated.
-        self._track_stream_image_until_media_ready(envelope)
+        self._track_stream_media_until_ready(envelope)
 
         message_id = str(message.get("id") or envelope.get("event_id") or "").strip()
         if not await self._mark_inbound_seen(message_id):
@@ -798,6 +1066,33 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
             "session_name": str(session.get("name") or ""),
             "sender_wxid": str(sender.get("id") or ""),
             "sender_name": str(sender.get("name") or ""),
+            "sender_roles": (
+                list(sender.get("roles") or [])
+                if isinstance(sender.get("roles"), list)
+                else [
+                    str(sender.get("role") or sender.get("member_role") or "").strip()
+                ]
+                if str(sender.get("role") or sender.get("member_role") or "").strip()
+                else []
+            ),
+            "sender_is_group_admin": bool(
+                sender.get("is_group_admin")
+                or sender.get("group_admin")
+                or sender.get("is_admin")
+                or str(sender.get("role") or sender.get("member_role") or "")
+                .strip()
+                .lower()
+                in {"admin", "group_admin", "owner"}
+            ),
+            "sender_is_group_owner": bool(
+                sender.get("is_group_owner")
+                or sender.get("group_owner")
+                or sender.get("is_owner")
+                or str(sender.get("role") or sender.get("member_role") or "")
+                .strip()
+                .lower()
+                == "owner"
+            ),
             "msg_svr_id": str(message.get("id") or ""),
             "mentioned_me": bool(message.get("mentioned_me")),
             "at_wxids": list(message.get("at_wxids") or []),
@@ -881,6 +1176,24 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
                 "image_variants": metadata.get("image_variants") or {},
                 "failure_reason": metadata["image_failure_reason"],
             }
+        elif msg_type == "file":
+            media = envelope.get("media") if isinstance(envelope.get("media"), dict) else {}
+            file_fields = self._file_fields(message, media, raw)
+            if not file_fields["media_status"]:
+                file_fields["media_status"] = "ready" if file_fields["file_url"] else "pending"
+            if not file_fields["file_download_status"]:
+                file_fields["file_download_status"] = file_fields["media_status"]
+            for key, value in file_fields.items():
+                metadata[key] = value
+            metadata["media"] = {
+                "type": "file",
+                "status": file_fields["media_status"],
+                **file_fields,
+            }
+            metadata["msg_type"] = "file"
+            metadata["file_attachment"] = self._file_attachment(metadata)
+            if not content:
+                content = self._file_placeholder(str(file_fields["file_name"]))
         self._apply_quote_metadata(metadata, message.get("quote") or envelope.get("quote"))
         self._apply_image_observation_metadata(metadata, msg_type)
 
@@ -921,6 +1234,8 @@ class WxbotBridgeMediaMixin(WxbotBridgeState):
             canonical_conversation_id=canonical_session_id,
             external_participant_id=external_participant_id,
             canonical_participant_id=canonical_user_id,
+            # Preserve the existing placeholder message contract; file
+            # metadata below is the canonical attachment projection.
             message=Message(type=MessageType.TEXT, content=content),
             trace_id=trace_id,
             metadata=metadata,

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 import plugins.memory.store as memory_store_module
+import plugins.memory.store_jobs as memory_store_jobs_module
 from app.common.types import ChatResponse
 from plugins.memory.graph_extractor import MemoryGraphLLMExtractor
 from plugins.memory.store import (
@@ -70,11 +71,58 @@ def _job(**kwargs):
         "source_event_id": 7,
         "source_trace_id": "trace-1",
         "status": "running",
+        "locked_by": "worker-a:claimed-test-token",
         "attempts": 0,
         "max_attempts": 3,
     }
     data.update(kwargs)
     return data
+
+
+@pytest.fixture(autouse=True)
+def _stub_claim_lifecycle_for_extraction_unit_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep extraction tests focused; claim fencing has dedicated stateful tests."""
+
+    @asynccontextmanager
+    async def mutation_transaction(_self: MemoryStore):
+        connection = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+        token = memory_store_module._ACTIVE_MUTATION_CONNECTION.set(connection)
+        try:
+            yield connection
+        finally:
+            memory_store_module._ACTIVE_MUTATION_CONNECTION.reset(token)
+
+    async def renew_claim(
+        _self: MemoryStore,
+        _job: dict[str, Any],
+        **_kwargs: Any,
+    ) -> bool:
+        return True
+
+    async def transition_applied(
+        *,
+        intended_status: str,
+        **_kwargs: Any,
+    ) -> str:
+        return intended_status
+
+    monkeypatch.setattr(
+        MemoryStore,
+        "renew_llm_extraction_job_lease",
+        renew_claim,
+    )
+    monkeypatch.setattr(
+        MemoryStore,
+        "_mutation_transaction",
+        mutation_transaction,
+    )
+    monkeypatch.setattr(
+        memory_store_jobs_module,
+        "_llm_job_transition_result",
+        transition_applied,
+    )
 
 
 async def _allow_memory_scope(_tenant_id: str, _session_id: str) -> bool:
@@ -295,6 +343,17 @@ def _graph_store_with_fakes(monkeypatch: pytest.MonkeyPatch, llm: _LLM):
                     "user_text": "我喜欢 Adidas",
                     "assistant_text": "好的",
                     "trace_id": "trace-1",
+                }
+            ]
+        if (
+            "FROM plugin_memory_event WHERE id = :source_event_id" in sql
+            or "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql
+        ):
+            return [
+                {
+                    "id": 7,
+                    "source_member_id": "wxid_a",
+                    "source_message_id": "msg-7",
                 }
             ]
         if "UPDATE plugin_memory_extraction_job SET" in sql:
@@ -1072,6 +1131,17 @@ async def test_process_manual_pinned_protection_still_applies(
                     "trace_id": "trace-1",
                 }
             ]
+        if (
+            "FROM plugin_memory_event WHERE id = :source_event_id" in sql
+            or "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql
+        ):
+            return [
+                {
+                    "id": 7,
+                    "source_member_id": "wxid_a",
+                    "source_message_id": "msg-7",
+                }
+            ]
         if "SELECT id FROM plugin_memory_item" in sql:
             return []
         if sql.startswith("SELECT id, audience_scope"):
@@ -1225,6 +1295,17 @@ async def test_graph_llm_success_writes_entities_fact_and_episode(
                     "user_text": "我喜欢 Adidas",
                     "assistant_text": "好的",
                     "trace_id": "trace-1",
+                }
+            ]
+        if (
+            "FROM plugin_memory_event WHERE id = :source_event_id" in sql
+            or "FROM plugin_memory_event WHERE id = ANY(:event_ids)" in sql
+        ):
+            return [
+                {
+                    "id": 7,
+                    "source_member_id": "wxid_a",
+                    "source_message_id": "msg-7",
                 }
             ]
         if "UPDATE plugin_memory_extraction_job SET" in sql:
@@ -1471,9 +1552,7 @@ async def test_graph_llm_branch_exception_result_includes_type_only(
     monkeypatch.setattr(store, "_enhance_memory_graph_with_llm", fail_graph)
 
     assert (
-        await store.process_llm_extraction_job(
-            _job(), scope_execution_allowed=_allow_memory_scope
-        )
+        await store.process_llm_extraction_job(_job(), scope_execution_allowed=_allow_memory_scope)
         == "succeeded"
     )
 
@@ -1697,15 +1776,11 @@ async def test_graph_llm_duplicate_run_is_idempotent(monkeypatch: pytest.MonkeyP
     store, graph, _updates = _graph_store_with_fakes(monkeypatch, llm)
 
     assert (
-        await store.process_llm_extraction_job(
-            _job(), scope_execution_allowed=_allow_memory_scope
-        )
+        await store.process_llm_extraction_job(_job(), scope_execution_allowed=_allow_memory_scope)
         == "succeeded"
     )
     assert (
-        await store.process_llm_extraction_job(
-            _job(), scope_execution_allowed=_allow_memory_scope
-        )
+        await store.process_llm_extraction_job(_job(), scope_execution_allowed=_allow_memory_scope)
         == "succeeded"
     )
 

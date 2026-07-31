@@ -5,6 +5,7 @@ Bridges cs-system with wx-bot SDK running on Windows alongside WeChat.
 The SDK exposes a local HTTP API; this plugin polls it for inbound
 messages and pushes replies back via the same API.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -39,8 +40,10 @@ from app.social.store import SocialPolicyStore
 from plugins.memory.store import MemoryStore
 from plugins.wxbot.agent_tools import (
     WxbotAgentToolService,
+    build_wxbot_file_analysis_agent_tools,
     build_wxbot_group_agent_tools,
     build_wxbot_group_plugin_status_agent_tools,
+    build_wxbot_message_export_agent_tools,
 )
 from plugins.wxbot.bridge_runtime import read_bridge_runtime_status
 from plugins.wxbot.channel import WxbotChannelOutbound
@@ -185,23 +188,129 @@ class WxbotAdminMediaEventProvider:
             else ""
         )
         user_id = (
-            canonical_participant_id(connection_id, external_user_id)
-            if external_user_id
-            else ""
+            canonical_participant_id(connection_id, external_user_id) if external_user_id else ""
         )
-        media_url = str(row.get("media_url") or "") or _read_string(event_media, "image_url") or _read_string(event_message, "image_url")
-        media_path = str(row.get("media_path") or "") or _read_string(event_media, "image_path") or _read_string(event_message, "image_path")
         media_type = str(row.get("media_type") or "") or "image"
         msg_type = str(row.get("msg_type") or "") or media_type
-        event_id = str(row.get("stream_event_id") or row.get("sdk_event_id") or message_id or "unknown")
-        created_ts_ms = _parse_time_ms(row.get("created_ts")) or _parse_time_ms(row.get("received_at"))
+        is_file = media_type.lower() == "file" or msg_type.lower() == "file"
+        if is_file:
+            media_url = (
+                str(row.get("media_url") or "")
+                or _read_string(event_media, "file_url")
+                or _read_string(event_message, "file_url")
+            )
+            media_path = (
+                str(row.get("media_path") or "")
+                or _read_string(event_media, "file_path")
+                or _read_string(event_message, "file_path")
+            )
+        else:
+            media_url = (
+                str(row.get("media_url") or "")
+                or _read_string(event_media, "image_url")
+                or _read_string(event_message, "image_url")
+            )
+            media_path = (
+                str(row.get("media_path") or "")
+                or _read_string(event_media, "image_path")
+                or _read_string(event_message, "image_path")
+            )
+        event_id = str(
+            row.get("stream_event_id") or row.get("sdk_event_id") or message_id or "unknown"
+        )
+        created_ts_ms = _parse_time_ms(row.get("created_ts")) or _parse_time_ms(
+            row.get("received_at")
+        )
         if created_ts_ms is None:
             created_raw = row.get("created_ts")
             try:
                 created_ts_ms = int(created_raw) * 1000
             except (TypeError, ValueError):
                 created_ts_ms = None
-        variants = _as_dict(event_media.get("variants")) or _as_dict(event_message.get("image_variants"))
+        variants = _as_dict(event_media.get("variants")) or _as_dict(
+            event_message.get("image_variants")
+        )
+        if is_file:
+            raw_file_size = (
+                event_message.get("file_size")
+                if event_message.get("file_size") is not None
+                else event_media.get("file_size", event_media.get("size"))
+            )
+            try:
+                file_size = int(raw_file_size or 0)
+            except (TypeError, ValueError):
+                file_size = 0
+            file_name = _read_string(event_message, "file_name") or _read_string(
+                event_media, "file_name"
+            )
+            file_ext = _read_string(event_message, "file_ext") or _read_string(
+                event_media, "file_ext"
+            )
+            file_md5 = (
+                _read_string(event_message, "file_md5")
+                or _read_string(event_media, "file_md5")
+                or _read_string(event_media, "md5")
+            )
+            file_sha256 = (
+                _read_string(event_message, "file_sha256")
+                or _read_string(event_media, "file_sha256")
+                or _read_string(event_media, "sha256")
+            )
+            file_download_status = (
+                _read_string(event_media, "file_download_status")
+                or _read_string(event_message, "file_download_status")
+                or _read_string(event_media, "status")
+                or "ready"
+            )
+            file_failure_reason = (
+                _read_string(event_message, "file_failure_reason")
+                or _read_string(event_media, "file_failure_reason")
+                or _read_string(event_media, "failure_reason")
+            )
+            media_status = (
+                _read_string(event_media, "media_status")
+                or _read_string(event_media, "status")
+                or _read_string(event_message, "media_status")
+                or file_download_status
+            )
+            file_attachment = {
+                "type": "file",
+                "file_name": file_name,
+                "file_ext": file_ext,
+                "file_size": file_size,
+                "file_md5": file_md5,
+                "file_sha256": file_sha256,
+                "file_url": media_url,
+                "file_download_status": file_download_status,
+                "file_failure_reason": file_failure_reason,
+                "media_status": media_status,
+            }
+            message_content = _read_string(event_message, "text") or f"[文件] {file_name}".rstrip()
+            media_projection = {
+                **event_media,
+                **file_attachment,
+                "status": media_status,
+            }
+            raw_projection = event_raw
+        else:
+            media_status = _read_string(event_media, "status") or "ready"
+            file_attachment = {
+                "type": media_type,
+                "image_url": media_url,
+                "image_path": media_path,
+                "image_variants": variants,
+                "variants": variants,
+            }
+            message_content = _read_string(event_message, "text") or "[图片]"
+            media_projection = {
+                **event_media,
+                "image_url": media_url,
+                "image_path": media_path,
+            }
+            raw_projection = {
+                **event_raw,
+                "image_variants": _as_dict(event_raw.get("image_variants")) or variants,
+            }
         payload = {
             "admin_event_source": "media_event",
             "media_event_owner": "wxbot",
@@ -216,16 +325,8 @@ class WxbotAdminMediaEventProvider:
             "external_conversation_id": external_session_id,
             "message": {
                 "type": msg_type,
-                "content": _read_string(event_message, "text") or "[图片]",
-                "attachments": [
-                    {
-                        "type": media_type,
-                        "image_url": media_url,
-                        "image_path": media_path,
-                        "image_variants": variants,
-                        "variants": variants,
-                    }
-                ],
+                "content": message_content,
+                "attachments": [file_attachment],
             },
             "received_at": row.get("received_at") or "",
             "metadata": {
@@ -242,31 +343,26 @@ class WxbotAdminMediaEventProvider:
                 "sender_name": row.get("sender_name") or "",
                 "msg_svr_id": external_message_id,
                 "session_kind": "group" if external_session_id.endswith("@chatroom") else "private",
-                "media_status": _read_string(event_media, "status") or "ready",
-                "media": {
-                    **event_media,
-                    "image_url": media_url,
-                    "image_path": media_path,
-                },
-                "raw": {
-                    **event_raw,
-                    "image_variants": _as_dict(event_raw.get("image_variants")) or variants,
-                },
-                "image_observation": {
-                    "current_image_found": True,
-                    "quote_image_found": False,
-                    "attachment_count": 1,
-                    "quote_attachment_count": 0,
-                    "media_status": _read_string(event_media, "status") or "ready",
-                    "failure_reason": "",
-                    "skip_reason": "",
-                },
+                "media_status": media_status,
+                "media": media_projection,
+                "raw": raw_projection,
+                **(
+                    {}
+                    if is_file
+                    else {
+                        "image_observation": {
+                            "current_image_found": True,
+                            "quote_image_found": False,
+                            "attachment_count": 1,
+                            "quote_attachment_count": 0,
+                            "media_status": media_status,
+                            "failure_reason": "",
+                            "skip_reason": "",
+                        }
+                    }
+                ),
             },
-            "media": {
-                **event_media,
-                "image_url": media_url,
-                "image_path": media_path,
-            },
+            "media": media_projection,
             "raw": event_raw,
             "media_ready_event": row,
         }
@@ -500,16 +596,29 @@ class WxbotPlugin(Plugin):
             )
         )
         self._register_channel()
-        self._agent_tool_service = WxbotAgentToolService(
-            ctx.settings,
-            wxbot_store=self._store,
-            data_owner_scope_execution_allowed=self._owner_scope_execution_allowed,
-            data_owners_scope_execution_allowed=self._owners_scope_execution_allowed,
-        )
         self._report_service = WxbotReportService(
             self._store,
             ctx.container,
             scope_execution_allowed=self._scope_execution_allowed,
+        )
+        self._agent_tool_service = WxbotAgentToolService(
+            ctx.settings,
+            wxbot_store=self._store,
+            report_service=self._report_service,
+            effect_reply_enabled=self._effect_handler_enabled,
+            message_export_root=getattr(
+                ctx.settings,
+                "wxbot_outbound_file_dir",
+                "/data/wxbot-outbound",
+            ),
+            message_export_max_bytes=getattr(
+                ctx.settings,
+                "wxbot_outbound_file_max_bytes",
+                10 * 1024 * 1024,
+            ),
+            data_owner_scope_execution_allowed=self._owner_scope_execution_allowed,
+            data_owners_scope_execution_allowed=self._owners_scope_execution_allowed,
+            social_policy_store=self._social_policy_store,
         )
         self._self_review_service = WxbotSelfReviewService(
             self._store,
@@ -585,9 +694,7 @@ class WxbotPlugin(Plugin):
         return bool(
             self._ctx is not None
             and self._ctx.db_ok
-            and str(
-                getattr(self._ctx.settings, "app_process_role", "api") or "api"
-            ).lower()
+            and str(getattr(self._ctx.settings, "app_process_role", "api") or "api").lower()
             == "scheduler"
         )
 
@@ -691,9 +798,7 @@ class WxbotPlugin(Plugin):
         if callable(is_active) and not bool(is_active(self.meta.name)):
             return None
         if callable(is_active) and self._execution_gate_grace_deadline <= 0:
-            self._execution_gate_grace_deadline = (
-                asyncio.get_running_loop().time() + 5.0
-            )
+            self._execution_gate_grace_deadline = asyncio.get_running_loop().time() + 5.0
         gate = getattr(registry, "global_execution_allowed", None)
         if not callable(gate):
             return True
@@ -705,8 +810,7 @@ class WxbotPlugin(Plugin):
             if (
                 callable(is_active)
                 and not self._execution_gate_confirmed
-                and asyncio.get_running_loop().time()
-                < self._execution_gate_grace_deadline
+                and asyncio.get_running_loop().time() < self._execution_gate_grace_deadline
             ):
                 return None
             return False
@@ -775,9 +879,7 @@ class WxbotPlugin(Plugin):
         tenant_id: str,
         session_id: str = "",
     ) -> bool:
-        normalized_owners = tuple(
-            dict.fromkeys(str(owner or "").strip() for owner in owners)
-        )
+        normalized_owners = tuple(dict.fromkeys(str(owner or "").strip() for owner in owners))
         if not normalized_owners:
             return False
         registry = getattr(self._ctx.container, "plugin_registry", None) if self._ctx else None
@@ -858,8 +960,7 @@ class WxbotPlugin(Plugin):
         if self._store is None:
             return ""
         return str(
-            getattr(self._store.settings, "wxbot_default_tenant_id", "default")
-            or "default"
+            getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default"
         ).strip()
 
     def get_pipeline_hooks(self):
@@ -872,7 +973,10 @@ class WxbotPlugin(Plugin):
                 social_policy_store=self._social_policy_store,
                 natural_feedback_service=self._natural_feedback_service,
             ),
-            WxbotAgentIntentHook(self._store),
+            WxbotAgentIntentHook(
+                self._store,
+                social_policy_store=self._social_policy_store,
+            ),
             WxbotGroupContextHook(
                 self._store,
                 self._ctx.settings if self._ctx else self._store.settings,
@@ -891,6 +995,8 @@ class WxbotPlugin(Plugin):
         return [
             *build_wxbot_group_agent_tools(self._agent_tool_service),
             *build_wxbot_group_plugin_status_agent_tools(self._agent_tool_service),
+            *build_wxbot_message_export_agent_tools(self._agent_tool_service),
+            *build_wxbot_file_analysis_agent_tools(self._agent_tool_service),
         ]
 
     def get_profile_report_builder(self):
@@ -959,6 +1065,7 @@ class WxbotPlugin(Plugin):
                 outputs={
                     "effects.enqueue_channel_reply",
                     "signals.agent.tool_scope",
+                    "signals.router.tool_intent_matched",
                     "signals.router.tools_available",
                 },
                 timeout_seconds=1.5,
@@ -1015,6 +1122,7 @@ class WxbotPlugin(Plugin):
             "plugin.wxbot.agent_scope_enrich": WxbotAgentScopeEnrichStep(
                 self._store,
                 effect_handler_enabled=self._effect_handler_enabled,
+                social_policy_store=self._social_policy_store,
             ),
             "plugin.wxbot.voice_profile_enrich": WxbotVoiceProfileEnrichStep(),
             "plugin.wxbot.group_context_load": WxbotGroupContextLoadStep(
@@ -1048,10 +1156,12 @@ class WxbotPlugin(Plugin):
         wxbot_handler = WxbotReplyEffectHandler(
             ChannelReplyEffectHandler(channel_registry, default_channel="wechat")
         )
-        handlers.extend([
-            ("enqueue_channel_reply", self.meta.name, channel_handler),
-            ("enqueue_wxbot_reply", self.meta.name, wxbot_handler),
-        ])
+        handlers.extend(
+            [
+                ("enqueue_channel_reply", self.meta.name, channel_handler),
+                ("enqueue_wxbot_reply", self.meta.name, wxbot_handler),
+            ]
+        )
         return handlers
 
     def get_admin_media_event_provider(self):
@@ -1072,7 +1182,9 @@ class WxbotPlugin(Plugin):
     async def get_runtime_status(self) -> dict[str, object]:
         if self._store is None:
             return {"bridge": {"running": False}, "pending": 0, "sessions": 0}
-        tenant_id = str(getattr(self._ctx.settings, "tenant_demo_id", "demo") if self._ctx else "demo")
+        tenant_id = str(
+            getattr(self._ctx.settings, "tenant_demo_id", "demo") if self._ctx else "demo"
+        )
         queue = await self._store.reply_queue_stats(tenant_id)
         pending = int(queue.get("pending") or 0)
         running = bool(self._background_tasks)
@@ -1090,7 +1202,9 @@ class WxbotPlugin(Plugin):
             "agent_tools": [tool.name for tool in self.get_agent_tools()],
         }
 
-    async def schedule_background(self, key: str, coro_factory: Callable[[], Awaitable[None]]) -> bool:
+    async def schedule_background(
+        self, key: str, coro_factory: Callable[[], Awaitable[None]]
+    ) -> bool:
         if not self._background_enabled:
             logger.info("wxbot.background_task_skipped_disabled", key=key)
             return False
@@ -1156,7 +1270,9 @@ class WxbotPlugin(Plugin):
             sender_name=str(event.metadata.get("sender_name") or ""),
             msg_type=str(message_type or "text"),
             content=str(event.message.content or ""),
-            mentioned_me=bool(event.metadata.get("bot_mentioned") or event.metadata.get("mentioned_me")),
+            mentioned_me=bool(
+                event.metadata.get("bot_mentioned") or event.metadata.get("mentioned_me")
+            ),
             bot_addressed=bool(
                 event.metadata.get("bot_addressed")
                 if event.metadata.get("bot_addressed") is not None
@@ -1166,8 +1282,7 @@ class WxbotPlugin(Plugin):
             occurred_ts=int(occurred_ts or 0),
             metadata=self._group_observation_metadata(event),
             summary_debounce_seconds=float(
-                getattr(self._store.settings, "wxbot_group_summary_debounce_seconds", 5.0)
-                or 5.0
+                getattr(self._store.settings, "wxbot_group_summary_debounce_seconds", 5.0) or 5.0
             ),
         )
 
@@ -1184,9 +1299,7 @@ class WxbotPlugin(Plugin):
         for _ in range(max(1, min(int(limit or 1), 20))):
             current = await self._group_summary_service.drain_once(
                 worker_id=worker_id or "wxbot-group-summary",
-                scope_execution_allowed=(
-                    scope_execution_allowed or self._scope_execution_allowed
-                ),
+                scope_execution_allowed=(scope_execution_allowed or self._scope_execution_allowed),
             )
             for key in result:
                 result[key] += int(current.get(key, 0) or 0)
@@ -1203,7 +1316,9 @@ class WxbotPlugin(Plugin):
     async def _process_due_report_subscriptions(self) -> None:
         if self._store is None or self._report_service is None:
             return
-        tenant_id = str(getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default")
+        tenant_id = str(
+            getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default"
+        )
         queued_jobs = await self._store.list_report_deliveries_to_reconcile(
             tenant_id,
             limit=100,
@@ -1217,9 +1332,7 @@ class WxbotPlugin(Plugin):
                 continue
             await self.schedule_background(
                 f"report-reconcile-{queued_job['id']}",
-                lambda job_id=int(queued_job["id"]): self._reconcile_report_job(
-                    job_id
-                ),
+                lambda job_id=int(queued_job["id"]): self._reconcile_report_job(job_id),
             )
         subscriptions = await self._store.list_enabled_report_subscriptions(tenant_id)
         for sub in subscriptions:
@@ -1251,9 +1364,7 @@ class WxbotPlugin(Plugin):
                 if status == "running":
                     await self.schedule_background(
                         f"report-job-{job['id']}",
-                        lambda job_id=int(job["id"]): self._run_and_send_due_report_job(
-                            job_id
-                        ),
+                        lambda job_id=int(job["id"]): self._run_and_send_due_report_job(job_id),
                     )
                     continue
                 if should_defer_report_job_retry(job):
@@ -1292,7 +1403,9 @@ class WxbotPlugin(Plugin):
     async def _process_due_self_review_subscriptions(self) -> None:
         if self._store is None or self._self_review_service is None:
             return
-        tenant_id = str(getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default")
+        tenant_id = str(
+            getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default"
+        )
         subscriptions = await self._store.list_enabled_self_review_subscriptions(tenant_id)
         for sub in subscriptions:
             session_id = str(sub["session_id"])
@@ -1315,9 +1428,7 @@ class WxbotPlugin(Plugin):
             if status == "running":
                 await self.schedule_background(
                     f"self-review-job-{job['id']}",
-                    lambda job_id=int(job["id"]): self._run_due_self_review_job(
-                        job_id
-                    ),
+                    lambda job_id=int(job["id"]): self._run_due_self_review_job(job_id),
                 )
                 continue
             reset = await self._store.update_self_review_job(
@@ -1368,9 +1479,7 @@ class WxbotPlugin(Plugin):
             str(job.get("session_id") or ""),
         ):
             return
-        await self._await_persistent_section(
-            self._report_service.send_report_job(job_id)
-        )
+        await self._await_persistent_section(self._report_service.send_report_job(job_id))
         refreshed = await self._store.get_report_job(job_id)
         # Wake immediately only when an SDK row now needs acknowledgement.
         # Waking after a failed claim (network outage, speech guard, etc.)
@@ -1388,9 +1497,7 @@ class WxbotPlugin(Plugin):
             str(job.get("session_id") or ""),
         ):
             return
-        await self._await_persistent_section(
-            self._report_service.reconcile_report_delivery(job_id)
-        )
+        await self._await_persistent_section(self._report_service.reconcile_report_delivery(job_id))
 
     async def _run_due_self_review_job(self, job_id: int) -> None:
         if self._self_review_service is None or self._store is None:
@@ -1409,7 +1516,9 @@ class WxbotPlugin(Plugin):
     ) -> None:
         if self._store is None:
             return
-        tenant_id = str(getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default")
+        tenant_id = str(
+            getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default"
+        )
         while not stop_event.is_set():
             try:
                 execution_allowed = await self._execution_allowed()
@@ -1423,9 +1532,7 @@ class WxbotPlugin(Plugin):
                     self._background_enabled = False
                     stop_event.set()
                     break
-                await self._await_persistent_section(
-                    self._process_due_report_subscriptions()
-                )
+                await self._await_persistent_section(self._process_due_report_subscriptions())
                 if stop_event.is_set():
                     break
                 subscriptions = await self._store.list_enabled_report_subscriptions(tenant_id)
@@ -1457,7 +1564,9 @@ class WxbotPlugin(Plugin):
     ) -> None:
         if self._store is None:
             return
-        tenant_id = str(getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default")
+        tenant_id = str(
+            getattr(self._store.settings, "wxbot_default_tenant_id", "default") or "default"
+        )
         while not stop_event.is_set():
             try:
                 execution_allowed = await self._execution_allowed()
@@ -1471,15 +1580,15 @@ class WxbotPlugin(Plugin):
                     self._background_enabled = False
                     stop_event.set()
                     break
-                await self._await_persistent_section(
-                    self._process_due_self_review_subscriptions()
-                )
+                await self._await_persistent_section(self._process_due_self_review_subscriptions())
                 if stop_event.is_set():
                     break
                 subscriptions = await self._store.list_enabled_self_review_subscriptions(tenant_id)
                 timeout = min(seconds_to_next_self_review_fire(subscriptions), 300.0)
                 try:
-                    await asyncio.wait_for(self._self_review_scheduler_wakeup.wait(), timeout=timeout)
+                    await asyncio.wait_for(
+                        self._self_review_scheduler_wakeup.wait(), timeout=timeout
+                    )
                     self._self_review_scheduler_wakeup.clear()
                 except TimeoutError:
                     continue
