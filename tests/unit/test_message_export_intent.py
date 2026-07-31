@@ -131,6 +131,32 @@ async def test_group_export_requires_mention_and_private_export_does_not() -> No
 
 
 @pytest.mark.asyncio
+async def test_group_export_detects_real_trailing_bot_mention_payload() -> None:
+    hook = WxbotAgentIntentHook(
+        social_policy_store=_EnabledGroupFilePolicyStore(),
+    )
+    ctx = _pipeline_context(
+        "把今天的群消息汇总成 TXT 文件发给我 \u2005@zzz",
+        session_id="room@chatroom",
+        mentioned_me=True,
+    )
+    ctx.event.metadata.update(
+        {
+            "bot_addressed": True,
+            "bot_normalized_content": "",
+            "wxbot_normalized_content": "",
+        }
+    )
+
+    await hook.run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == MESSAGE_EXPORT_SCOPE
+    assert ctx.extras["wxbot_file_intent"]["operation"] == "export_history"
+    assert ctx.extras["wxbot_file_intent"]["requested_format"] == "txt"
+    assert ctx.extras["wxbot_file_intent"]["delivery_required"] is True
+
+
+@pytest.mark.asyncio
 async def test_private_session_enables_only_combined_message_export_intent() -> None:
     hook = WxbotAgentIntentHook()
     ordinary_summary = _pipeline_context(

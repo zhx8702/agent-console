@@ -325,6 +325,28 @@ class WxbotAgentIntentHook:
             ctx.event.metadata.get("session_kind")
             or ("group" if _event_is_group(ctx) else "private")
         )
+        external_conversation_id = str(
+            ctx.event.external_conversation_id
+            or ctx.event.metadata.get("external_conversation_id")
+            or ctx.event.session_id
+            or ""
+        ).strip()
+        canonical_conversation_id = str(
+            ctx.event.canonical_conversation_id
+            or ctx.event.metadata.get("canonical_conversation_id")
+            or ctx.event.session_id
+            or ""
+        ).strip()
+        adapter_id = str(
+            ctx.event.adapter_id
+            or ctx.event.metadata.get("adapter_id")
+            or ""
+        ).strip()
+        connection_id = str(
+            ctx.event.connection_id
+            or ctx.event.metadata.get("connection_id")
+            or ""
+        ).strip()
         mention_sender = False
         feature_state = ctx.extras.get("wxbot_humanization_features")
         speech_budget_enabled = bool(
@@ -361,7 +383,11 @@ class WxbotAgentIntentHook:
             "command_id": command_id,
             "idempotency_key": command_id,
             "tenant_id": ctx.event.tenant_id,
+            "adapter_id": adapter_id,
+            "connection_id": connection_id,
             "session_id": ctx.event.session_id,
+            "external_conversation_id": external_conversation_id,
+            "canonical_conversation_id": canonical_conversation_id,
             "session_name": str(ctx.event.metadata.get("session_name") or ""),
             "session_kind": session_kind,
             "sender_name": str(ctx.event.metadata.get("sender_name") or ""),
@@ -382,7 +408,11 @@ class WxbotAgentIntentHook:
                 {
                     "tenant_id": ctx.event.tenant_id,
                     "channel": "wechat",
+                    "adapter_id": adapter_id,
+                    "connection_id": connection_id,
                     "session_id": ctx.event.session_id,
+                    "external_conversation_id": external_conversation_id,
+                    "canonical_conversation_id": canonical_conversation_id,
                     "session_name": str(ctx.event.metadata.get("session_name") or ""),
                     "session_kind": session_kind,
                     "user_id": ctx.event.user_id,

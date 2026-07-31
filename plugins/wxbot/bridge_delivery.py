@@ -7,6 +7,10 @@ from typing import Any
 
 import httpx
 
+from app.channel.identity import (
+    LEGACY_WXBOT_CONNECTION_ID,
+    canonical_conversation_id,
+)
 from app.common.logging import get_logger
 from app.social import (
     ParticipationContext,
@@ -156,6 +160,55 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
             raise RuntimeError("proactive_revalidation_audit_failed") from exc
         observe_runtime_event_persistence(succeeded=True, obligation=True)
 
+    def _managed_reply_observation_scope(
+        self,
+        reply: dict[str, Any],
+        *,
+        delivery: dict[str, Any],
+    ) -> tuple[str, str]:
+        queue_session_id = str(reply.get("session_id") or "").strip()
+        bridge_connection_id = str(self._connection_id or "").strip()
+        if (
+            not bridge_connection_id
+            or bridge_connection_id == LEGACY_WXBOT_CONNECTION_ID
+        ):
+            return queue_session_id, ""
+
+        external_session_id = str(
+            delivery.get("external_conversation_id")
+            or reply.get("external_conversation_id")
+            or ""
+        ).strip()
+        if not external_session_id:
+            return "", "managed_wxbot_external_conversation_required"
+        expected_canonical_id = canonical_conversation_id(
+            bridge_connection_id,
+            external_session_id,
+        )
+        declared_connection_id = str(
+            delivery.get("connection_id")
+            or reply.get("connection_id")
+            or ""
+        ).strip()
+        if (
+            declared_connection_id
+            and declared_connection_id != bridge_connection_id
+        ):
+            return expected_canonical_id, "managed_wxbot_connection_scope_mismatch"
+        declared_canonical_id = str(
+            delivery.get("canonical_conversation_id")
+            or reply.get("canonical_conversation_id")
+            or ""
+        ).strip()
+        if declared_canonical_id != expected_canonical_id:
+            return expected_canonical_id, "managed_wxbot_conversation_scope_mismatch"
+        if queue_session_id not in {
+            external_session_id,
+            expected_canonical_id,
+        }:
+            return expected_canonical_id, "managed_wxbot_queue_scope_mismatch"
+        return expected_canonical_id, ""
+
     async def _persist_send_revalidation_metadata(
         self,
         reply: dict[str, Any],
@@ -252,6 +305,13 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
             or reply.get("session_id")
             or ""
         ).strip()
+        (
+            observation_session_id,
+            identity_error,
+        ) = self._managed_reply_observation_scope(
+            reply,
+            delivery=delivery,
+        )
         source_message_id = str(reply.get("source_message_id") or "").strip()
         original_reasons = delivery.get("participation_reason_codes") or []
         if not isinstance(original_reasons, list | tuple):
@@ -307,6 +367,15 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                 "actual_delay_seconds": self._reply_delivery_delay_seconds(reply),
             }
 
+        if identity_error:
+            return await cancel(
+                replace(
+                    before,
+                    status=ParticipationStatus.CANCEL,
+                    reason_codes=(*before.reason_codes, identity_error),
+                )
+            )
+
         if bool(delivery.get("requested_proactive")) and not bool(
             delivery.get("send_revalidation_enabled")
         ):
@@ -354,7 +423,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                     before,
                     ParticipationContext(
                         tenant_id=self._tenant_id,
-                        session_id=str(reply.get("session_id") or ""),
+                        session_id=observation_session_id,
                         message_id=source_message_id,
                         now=datetime.now(UTC),
                     ),
@@ -433,7 +502,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
 
         state = await analyzer(
             tenant_id=self._tenant_id,
-            session_id=str(reply.get("session_id") or ""),
+            session_id=observation_session_id,
             source_message_id=source_message_id,
             participation_status=status_value,
         )
@@ -452,7 +521,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         now = datetime.now(UTC)
         snapshot = await snapshot_loader(
             self._tenant_id,
-            str(reply.get("session_id") or ""),
+            observation_session_id,
             now=now,
         )
         if not isinstance(snapshot, dict):
@@ -460,7 +529,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         if send_policy is None:
             session_policy = await policy_loader(
                 self._tenant_id,
-                str(reply.get("session_id") or ""),
+                observation_session_id,
             )
             if not isinstance(session_policy, dict):
                 raise TypeError("wxbot session policy must be a mapping")
@@ -472,7 +541,7 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
         soft_offset = 1 if status_value == ParticipationStatus.MAY_REPLY.value else 0
         context = ParticipationContext(
             tenant_id=self._tenant_id,
-            session_id=str(reply.get("session_id") or ""),
+            session_id=observation_session_id,
             message_id=source_message_id,
             now=now,
             valid_member_answer_exists=bool(state.get("valid_member_answer_exists")),
@@ -772,6 +841,35 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
             return False
         return True
 
+    async def _require_managed_reply_identity_before_sdk(
+        self,
+        reply: dict[str, Any],
+        *,
+        claim_token: str,
+    ) -> bool:
+        delivery_value = reply.get("delivery")
+        delivery = delivery_value if isinstance(delivery_value, dict) else {}
+        _observation_session_id, reason = self._managed_reply_observation_scope(
+            reply,
+            delivery=delivery,
+        )
+        if not reason:
+            return True
+        cancelled = await self._store.cancel_claimed_reply(
+            int(reply["id"]),
+            tenant_id=self._tenant_id,
+            connection_id=self._connection_id,
+            claim_token=claim_token,
+            reason=reason,
+        )
+        log.warning(
+            "wxbot.bridge.reply_identity_cancelled",
+            reply_id=reply.get("id"),
+            reason=reason,
+            cancelled=cancelled,
+        )
+        return False
+
     async def _send_one_reply(self, reply: dict[str, Any]) -> None:
         reply_id = reply["id"]
         claim_token = str(reply.get("claim_token") or "").strip()
@@ -779,6 +877,11 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
             log.warning("wxbot.bridge.reply_missing_claim", reply_id=reply_id)
             return
         try:
+            if not await self._require_managed_reply_identity_before_sdk(
+                reply,
+                claim_token=claim_token,
+            ):
+                return
             if not await self._require_group_file_send_before_sdk(
                 reply,
                 claim_token=claim_token,

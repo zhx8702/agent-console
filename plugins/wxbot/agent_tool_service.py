@@ -17,6 +17,7 @@ import httpx
 from app.channel.identity import (
     LEGACY_WXBOT_CONNECTION_ID,
     canonical_conversation_id,
+    canonical_message_id,
     require_legacy_wxbot_history_scope,
 )
 from app.common.config import Settings
@@ -478,6 +479,15 @@ class WxbotAgentToolService:
             latest_metadata=latest_metadata,
             source_message_id=source_id,
         )
+        delivery_session_id = self._canonical_delivery_session_id(
+            session,
+            external_session_id=session_id,
+        )
+        reply_to_message_id = self._external_reply_to_message_id(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_id,
+        )
         channel = str(getattr(getattr(session, "channel", "wechat"), "value", "wechat"))
         sender_id = str(
             latest_metadata.get("sender_id")
@@ -492,22 +502,22 @@ class WxbotAgentToolService:
             "channel": channel,
             "adapter_id": str(getattr(session, "adapter_id", "") or ""),
             "connection_id": str(getattr(session, "connection_id", "") or ""),
-            "session_id": session_id,
+            "session_id": delivery_session_id,
             "external_conversation_id": session_id,
-            "canonical_conversation_id": str(
-                getattr(session, "canonical_conversation_id", "") or session_id
-            ),
+            "canonical_conversation_id": delivery_session_id,
             "session_name": str(latest_metadata.get("session_name") or session_id),
             "session_kind": session_kind,
             "user_id": str(getattr(session, "user_id", "") or ""),
             "sender_id": sender_id,
             "sender_name": str(latest_metadata.get("sender_name") or ""),
-            "reply_to_message_id": source_id,
+            "reply_to_message_id": reply_to_message_id,
             "trace_id": str(latest_metadata.get("trace_id") or source_id)[:64],
             "source_message": {
                 "agent_tool": "convert_current_file",
                 "message_id": source_id,
-                "session_id": session_id,
+                "external_message_id": reply_to_message_id,
+                "session_id": delivery_session_id,
+                "external_conversation_id": session_id,
             },
             "file": {
                 "file_path": artifact["file_path"],
@@ -521,8 +531,9 @@ class WxbotAgentToolService:
                 "adapter_id": str(getattr(session, "adapter_id", "") or ""),
                 "connection_id": str(getattr(session, "connection_id", "") or ""),
                 "tenant_id": tenant_id,
-                "session_id": session_id,
+                "session_id": delivery_session_id,
                 "external_conversation_id": session_id,
+                "canonical_conversation_id": delivery_session_id,
                 "session_kind": session_kind,
                 "sender_wxid": sender_id,
                 "command_id": command_id,
@@ -641,6 +652,15 @@ class WxbotAgentToolService:
             latest_metadata=latest_metadata,
             source_message_id=source_id,
         )
+        delivery_session_id = self._canonical_delivery_session_id(
+            session,
+            external_session_id=session_id,
+        )
+        reply_to_message_id = self._external_reply_to_message_id(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_id,
+        )
         channel = str(getattr(getattr(session, "channel", "wechat"), "value", "wechat"))
         sender_id = str(
             latest_metadata.get("sender_id")
@@ -655,22 +675,22 @@ class WxbotAgentToolService:
             "channel": channel,
             "adapter_id": str(getattr(session, "adapter_id", "") or ""),
             "connection_id": str(getattr(session, "connection_id", "") or ""),
-            "session_id": session_id,
+            "session_id": delivery_session_id,
             "external_conversation_id": session_id,
-            "canonical_conversation_id": str(
-                getattr(session, "canonical_conversation_id", "") or session_id
-            ),
+            "canonical_conversation_id": delivery_session_id,
             "session_name": str(latest_metadata.get("session_name") or session_id),
             "session_kind": session_kind,
             "user_id": str(getattr(session, "user_id", "") or ""),
             "sender_id": sender_id,
             "sender_name": str(latest_metadata.get("sender_name") or ""),
-            "reply_to_message_id": source_id,
+            "reply_to_message_id": reply_to_message_id,
             "trace_id": str(latest_metadata.get("trace_id") or source_id)[:64],
             "source_message": {
                 "agent_tool": "generate_text_file",
                 "message_id": source_id,
-                "session_id": session_id,
+                "external_message_id": reply_to_message_id,
+                "session_id": delivery_session_id,
+                "external_conversation_id": session_id,
             },
             "file": {
                 "file_path": artifact["file_path"],
@@ -684,8 +704,9 @@ class WxbotAgentToolService:
                 "adapter_id": str(getattr(session, "adapter_id", "") or ""),
                 "connection_id": str(getattr(session, "connection_id", "") or ""),
                 "tenant_id": tenant_id,
-                "session_id": session_id,
+                "session_id": delivery_session_id,
                 "external_conversation_id": session_id,
+                "canonical_conversation_id": delivery_session_id,
                 "session_kind": session_kind,
                 "sender_wxid": sender_id,
                 "command_id": command_id,
@@ -1368,17 +1389,54 @@ class WxbotAgentToolService:
         if not isinstance(captured, dict):
             captured = session_metadata.get(_DELIVERY_CONTRACT_METADATA_KEY)
         captured_contract = dict(captured) if isinstance(captured, dict) else {}
-        for value in (
-            captured_contract.get("source_message_id"),
-            latest_metadata.get("message_id"),
-            latest_metadata.get("msg_svr_id"),
-            latest_metadata.get("reply_to_message_id"),
-            session_metadata.get("message_id"),
-            session_metadata.get("msg_svr_id"),
-        ):
-            normalized = str(value or "").strip()
-            if normalized:
-                return normalized[:128]
+        connection_id = (
+            str(getattr(session, "connection_id", "") or "").strip()
+            or LEGACY_WXBOT_CONNECTION_ID
+        )
+        if connection_id == LEGACY_WXBOT_CONNECTION_ID:
+            for value in (
+                captured_contract.get("source_message_id"),
+                latest_metadata.get("message_id"),
+                latest_metadata.get("msg_svr_id"),
+                latest_metadata.get("reply_to_message_id"),
+                session_metadata.get("message_id"),
+                session_metadata.get("msg_svr_id"),
+                latest_metadata.get("canonical_message_id"),
+                latest_metadata.get("external_message_id"),
+                session_metadata.get("canonical_message_id"),
+                session_metadata.get("external_message_id"),
+            ):
+                normalized = str(value or "").strip()
+                if normalized:
+                    return normalized[:128]
+        else:
+            for value in (
+                captured_contract.get("source_message_id"),
+                latest_metadata.get("canonical_message_id"),
+                latest_metadata.get("message_id"),
+                session_metadata.get("canonical_message_id"),
+                session_metadata.get("message_id"),
+            ):
+                normalized = str(value or "").strip()
+                if normalized.startswith("cx1:m:"):
+                    return normalized[:128]
+            for value in (
+                latest_metadata.get("external_message_id"),
+                latest_metadata.get("msg_svr_id"),
+                latest_metadata.get("reply_to_message_id"),
+                session_metadata.get("external_message_id"),
+                session_metadata.get("msg_svr_id"),
+                session_metadata.get("reply_to_message_id"),
+                captured_contract.get("source_message_id"),
+                latest_metadata.get("message_id"),
+                session_metadata.get("message_id"),
+            ):
+                external_message_id = str(value or "").strip()
+                if external_message_id and not external_message_id.startswith("cx1:"):
+                    return canonical_message_id(
+                        connection_id,
+                        external_message_id,
+                    )[:128]
 
         turn_created_at = str(getattr(latest_turn, "created_at", "") or "")
         turn_content = str(getattr(latest_turn, "content", "") or "")
@@ -1456,11 +1514,21 @@ class WxbotAgentToolService:
             or dict(getattr(session, "metadata", {}) or {}).get("trace_id")
             or source_message_id
         ).strip()[:64]
+        delivery_session_id = WxbotAgentToolService._canonical_delivery_session_id(
+            session,
+            external_session_id=session_id,
+        )
+        reply_to_message_id = WxbotAgentToolService._external_reply_to_message_id(
+            session,
+            latest_metadata=latest_metadata,
+            source_message_id=source_message_id,
+        )
         source_message = {
             "agent_tool": "export_current_messages_file",
             "request_id": request_id,
             "message_id": source_message_id,
-            "session_id": session_id,
+            "external_message_id": reply_to_message_id,
+            "session_id": delivery_session_id,
             "external_conversation_id": session_id,
             "adapter_id": str(getattr(session, "adapter_id", "") or ""),
             "connection_id": str(getattr(session, "connection_id", "") or ""),
@@ -1472,8 +1540,9 @@ class WxbotAgentToolService:
             "adapter_id": str(getattr(session, "adapter_id", "") or ""),
             "connection_id": str(getattr(session, "connection_id", "") or ""),
             "tenant_id": tenant_id,
-            "session_id": session_id,
+            "session_id": delivery_session_id,
             "external_conversation_id": session_id,
+            "canonical_conversation_id": delivery_session_id,
             "session_name": session_name,
             "session_kind": session_kind,
             "sender_name": sender_name,
@@ -1484,17 +1553,15 @@ class WxbotAgentToolService:
             "channel": channel,
             "adapter_id": str(getattr(session, "adapter_id", "") or ""),
             "connection_id": str(getattr(session, "connection_id", "") or ""),
-            "session_id": session_id,
+            "session_id": delivery_session_id,
             "external_conversation_id": session_id,
-            "canonical_conversation_id": str(
-                getattr(session, "canonical_conversation_id", "") or session_id
-            ),
+            "canonical_conversation_id": delivery_session_id,
             "session_name": session_name,
             "session_kind": session_kind,
             "user_id": str(getattr(session, "user_id", "") or ""),
             "sender_id": sender_id,
             "sender_name": sender_name,
-            "reply_to_message_id": source_message_id,
+            "reply_to_message_id": reply_to_message_id,
             "trace_id": trace_id,
             "source_message": source_message,
         }
@@ -3011,6 +3078,74 @@ class WxbotAgentToolService:
             or getattr(session, "session_id", "")
             or ""
         )
+
+    @staticmethod
+    def _canonical_delivery_session_id(
+        session: Any,
+        *,
+        external_session_id: str,
+    ) -> str:
+        external_id = str(external_session_id or "").strip()
+        if not external_id:
+            raise ValueError("当前会话标识不可用")
+        connection_id = (
+            str(getattr(session, "connection_id", "") or "").strip() or LEGACY_WXBOT_CONNECTION_ID
+        )
+        if connection_id == LEGACY_WXBOT_CONNECTION_ID:
+            return external_id
+
+        expected = canonical_conversation_id(connection_id, external_id)
+        declared = str(
+            getattr(session, "canonical_conversation_id", "")
+            or getattr(session, "session_id", "")
+            or ""
+        ).strip()
+        if declared and declared != expected:
+            raise ValueError("managed_wxbot_conversation_scope_mismatch")
+        return expected
+
+    @staticmethod
+    def _external_reply_to_message_id(
+        session: Any,
+        *,
+        latest_metadata: dict[str, Any],
+        source_message_id: str,
+    ) -> str:
+        session_metadata = dict(getattr(session, "metadata", {}) or {})
+        candidates = (
+            latest_metadata.get("external_message_id"),
+            latest_metadata.get("msg_svr_id"),
+            session_metadata.get("external_message_id"),
+            session_metadata.get("msg_svr_id"),
+            latest_metadata.get("reply_to_message_id"),
+            session_metadata.get("reply_to_message_id"),
+        )
+        connection_id = (
+            str(getattr(session, "connection_id", "") or "").strip() or LEGACY_WXBOT_CONNECTION_ID
+        )
+        if connection_id == LEGACY_WXBOT_CONNECTION_ID:
+            for value in candidates:
+                normalized = str(value or "").strip()
+                if normalized:
+                    return normalized[:128]
+            return str(source_message_id or "").strip()[:128]
+
+        canonical_source_id = str(source_message_id or "").strip()
+        for value in candidates:
+            external_message_id = str(value or "").strip()
+            if not external_message_id or external_message_id.startswith("cx1:"):
+                continue
+            if (
+                canonical_message_id(
+                    connection_id,
+                    external_message_id,
+                )
+                == canonical_source_id
+            ):
+                return external_message_id[:128]
+        # Quoting a source message is optional. Sending without a quote is
+        # safer than leaking a canonical persistence ID into the SDK boundary.
+        return ""
 
     def _require_sdk_boundary_available(self) -> None:
         if (self._sdk_scope.get() or {}).get("mode") == "managed_unavailable":

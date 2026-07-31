@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import plugins.wxbot.bridge as bridge_module
+from app.channel.identity import canonical_conversation_id
 from app.channel.reply_policy import match_reply_policy
 from app.common.types import Channel, InboundEvent, Message, MessageType
 from app.social.contracts import (
@@ -2731,6 +2732,131 @@ async def test_sdk_bridge_cancels_group_reply_after_semantic_revalidation(
     assert cancelled[0]["tenant_id"] == "demo"
     assert cancelled[0]["claim_token"] == "claim-21"
     assert cancelled[0]["reason"] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_sdk_bridge_revalidates_managed_reply_in_canonical_session_scope() -> None:
+    store = _FakeStore()
+    calls: list[tuple[str, str]] = []
+    connection_id = "managed-wechat-account"
+    external_session_id = "53876528317@chatroom"
+    canonical_session_id = canonical_conversation_id(
+        connection_id,
+        external_session_id,
+    )
+
+    async def analyze(**kwargs: object) -> dict[str, object]:
+        calls.append(("analyze", str(kwargs["session_id"])))
+        return {
+            "context_available": True,
+            "source_is_self_sent": False,
+            "reason_codes": ["source_observation_found"],
+        }
+
+    async def snapshot(
+        tenant_id: str,
+        session_id: str,
+        **kwargs: object,
+    ) -> dict[str, int]:
+        _ = tenant_id, kwargs
+        calls.append(("snapshot", session_id))
+        return {
+            "bot_messages_last_40": 0,
+            "total_messages_last_40": 5,
+            "soft_replies_last_10m": 0,
+            "soft_replies_last_hour": 0,
+            "consecutive_bot_messages": 0,
+        }
+
+    async def policy(tenant_id: str, session_id: str) -> dict[str, object]:
+        _ = tenant_id
+        calls.append(("policy", session_id))
+        current_hour = datetime.now(UTC).hour
+        return {
+            "effective_mode": "all",
+            "participation_policy": {
+                "timezone": "UTC",
+                "quiet_start_hour": (current_hour + 1) % 24,
+                "quiet_end_hour": (current_hour + 2) % 24,
+            },
+        }
+
+    store.get_group_reply_revalidation = analyze  # type: ignore[attr-defined]
+    store.get_participation_snapshot = snapshot  # type: ignore[attr-defined]
+    store.get_session_policy = policy  # type: ignore[attr-defined]
+    bridge, _ = _build_bridge(store, connection_id=connection_id)
+    bridge._client = _FakeClient()
+
+    await bridge._send_one_reply(
+        {
+            "id": 22,
+            "claim_token": "claim-22",
+            "connection_id": connection_id,
+            "session_id": external_session_id,
+            "session_kind": "group",
+            "reply_text": "文件准备好了",
+            "reply_to_msg_svr_id": "5665164121400123687",
+            "msg_type": "text",
+            "participation_status": "must_reply",
+            "source_message_id": "cx1:m:source",
+            "delivery": {
+                "connection_id": connection_id,
+                "external_conversation_id": external_session_id,
+                "canonical_conversation_id": canonical_session_id,
+                "participation_reason_codes": ["direct_tool_request"],
+            },
+        }
+    )
+
+    assert calls == [
+        ("analyze", canonical_session_id),
+        ("snapshot", canonical_session_id),
+        ("policy", canonical_session_id),
+    ]
+    assert store.sent_ids == [22]
+    assert len(bridge._client.calls) == 1
+    envelope = bridge._client.calls[0]["json"]
+    assert envelope["target"]["session_id"] == external_session_id
+    assert envelope["reply"]["reply_to_msg_svr_id"] == "5665164121400123687"
+
+
+@pytest.mark.asyncio
+async def test_sdk_bridge_cancels_managed_reply_with_mismatched_canonical_scope() -> None:
+    store = _FakeStore()
+    cancelled: list[dict[str, object]] = []
+    connection_id = "managed-wechat-account"
+
+    async def cancel(reply_id: int, **kwargs: object) -> bool:
+        cancelled.append({"reply_id": reply_id, **kwargs})
+        return True
+
+    store.cancel_claimed_reply = cancel  # type: ignore[attr-defined]
+    bridge, _ = _build_bridge(store, connection_id=connection_id)
+
+    result = await bridge._revalidate_reply_for_send(
+        {
+            "id": 23,
+            "claim_token": "claim-23",
+            "connection_id": connection_id,
+            "session_id": "53876528317@chatroom",
+            "participation_status": "must_reply",
+            "source_message_id": "cx1:m:source",
+            "delivery": {
+                "connection_id": connection_id,
+                "external_conversation_id": "53876528317@chatroom",
+                "canonical_conversation_id": "cx1:c:wrong@chatroom",
+                "participation_reason_codes": ["direct_tool_request"],
+            },
+        },
+        claim_token="claim-23",
+    )
+
+    assert result["allowed"] is False
+    assert result["cancelled"] is True
+    assert result["reason_codes"][-1] == (
+        "managed_wxbot_conversation_scope_mismatch"
+    )
+    assert cancelled[0]["reason"] == "managed_wxbot_conversation_scope_mismatch"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.channel import ChannelRegistry, set_reply_policy_override
+from app.channel.identity import (
+    canonical_conversation_id,
+    canonical_message_id,
+)
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -3000,6 +3004,80 @@ async def test_wxbot_agent_intent_hook_enqueues_map_generation_progress() -> Non
     expires_at = datetime.fromisoformat(str(progress_delivery["expires_at"]))
     assert 0.35 <= (not_before - started).total_seconds() <= 1.3
     assert 19.9 <= (expires_at - started).total_seconds() <= 20.2
+
+
+@pytest.mark.asyncio
+async def test_managed_wxbot_map_progress_preserves_delivery_identity() -> None:
+    store = _FakeStore()
+    hook = WxbotAgentIntentHook(store)
+    connection_id = "managed-wechat-account"
+    external_session_id = "wx-session-managed@chatroom"
+    external_message_id = "msg-map-progress-managed"
+    canonical_session_id = canonical_conversation_id(
+        connection_id,
+        external_session_id,
+    )
+    canonical_source_id = canonical_message_id(
+        connection_id,
+        external_message_id,
+    )
+    session = Session(
+        session_id=canonical_session_id,
+        tenant_id="demo",
+        user_id="cx1:p:managed",
+        channel=Channel.WECHAT,
+        adapter_id="wechat-sdk",
+        connection_id=connection_id,
+        external_conversation_id=external_session_id,
+        canonical_conversation_id=canonical_session_id,
+    )
+    event = InboundEvent(
+        message_id=canonical_source_id,
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        adapter_id="wechat-sdk",
+        connection_id=connection_id,
+        user_id="cx1:p:managed",
+        session_id=canonical_session_id,
+        external_message_id=external_message_id,
+        canonical_message_id=canonical_source_id,
+        external_conversation_id=external_session_id,
+        canonical_conversation_id=canonical_session_id,
+        message=Message(content="@zzz 帮我安排长沙一日游，生成地图"),
+        trace_id="trace-agent-map-progress-managed",
+        metadata={
+            "mentioned_me": True,
+            "wxbot_normalized_content": "帮我安排长沙一日游，生成地图",
+            "session_name": "测试群",
+            "sender_name": "小石",
+            "sender_wxid": "wxid_sender",
+            "msg_svr_id": external_message_id,
+            "session_kind": "group",
+        },
+    )
+    pipeline_ctx = PipelineContext(
+        event=event,
+        trace_id=event.trace_id,
+        session=session,
+    )
+    pipeline_ctx.extras["wxbot_reply_policy"] = {
+        "participation_policy_version": 11,
+        "send_revalidation_enabled": True,
+    }
+
+    await hook.run(pipeline_ctx)
+
+    assert len(store.calls) == 1
+    queued = store.calls[0]
+    assert queued["session_id"] == canonical_session_id
+    assert queued["reply_to_msg_svr_id"] == external_message_id
+    delivery = queued["delivery"]
+    assert delivery["adapter_id"] == "wechat-sdk"
+    assert delivery["connection_id"] == connection_id
+    assert delivery["session_id"] == canonical_session_id
+    assert delivery["external_conversation_id"] == external_session_id
+    assert delivery["canonical_conversation_id"] == canonical_session_id
+    assert delivery["source_message_id"] == canonical_source_id
 
 
 @pytest.mark.asyncio

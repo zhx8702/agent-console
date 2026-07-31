@@ -10,6 +10,7 @@ from app.agent.scopes import MESSAGE_EXPORT_SCOPE
 from app.channel.identity import (
     LEGACY_WXBOT_CONNECTION_ID,
     canonical_conversation_id,
+    canonical_message_id,
 )
 from app.common.config import Settings
 from app.common.types import Channel, Role, Session, Turn
@@ -369,6 +370,57 @@ async def test_generate_text_file_requires_explicit_file_request_and_queues_arti
 
 
 @pytest.mark.asyncio
+async def test_managed_private_file_generation_canonicalizes_source_and_target(
+    tmp_path: Path,
+) -> None:
+    service, store = _service(
+        tmp_path,
+        report_service=_FakeReportService(),
+        effect_reply_enabled=True,
+    )
+    connection_id = "managed-wechat-account"
+    external_session_id = "wxid_friend"
+    external_source_message_id = "5665164121400123687"
+    canonical_session_id = canonical_conversation_id(
+        connection_id,
+        external_session_id,
+    )
+    canonical_source_message_id = canonical_message_id(
+        connection_id,
+        external_source_message_id,
+    )
+    session = _session(
+        external_session_id=external_session_id,
+        session_kind="private",
+        session_name="好友",
+        source_message_id=external_source_message_id,
+    )
+    session.connection_id = connection_id
+    session.session_id = canonical_session_id
+    session.canonical_conversation_id = canonical_session_id
+    session.metadata.pop("_wxbot_delivery_contract")
+    session.turns[0].metadata.pop("_wxbot_delivery_contract")
+    session.turns[0].metadata["external_message_id"] = (
+        external_source_message_id
+    )
+    session.turns[0].content = "把上面的内容整理成 txt 文件发我"
+
+    result = await service.generate_text_file(
+        session,
+        {"content": "这是文件正文。", "format": "txt"},
+    )
+
+    assert store.enqueued == []
+    payload = result["channel_reply_effects"][0]["payload"]
+    assert payload["session_id"] == canonical_session_id
+    assert payload["external_conversation_id"] == external_session_id
+    assert payload["canonical_conversation_id"] == canonical_session_id
+    assert payload["reply_to_message_id"] == external_source_message_id
+    assert payload["source_message"]["message_id"] == canonical_source_message_id
+    assert payload["delivery"]["source_message_id"] == canonical_source_message_id
+
+
+@pytest.mark.asyncio
 async def test_generate_json_file_preserves_structured_content(tmp_path: Path) -> None:
     service, _store = _service(
         tmp_path,
@@ -426,6 +478,11 @@ async def test_group_export_uses_connection_scoped_managed_observations(
 ) -> None:
     report_service = _FakeReportService(period="2026-07-29")
     connection_id = "managed-wechat-account"
+    external_source_message_id = "5665164121400123687"
+    canonical_source_message_id = canonical_message_id(
+        connection_id,
+        external_source_message_id,
+    )
     canonical_session_id = canonical_conversation_id(
         connection_id,
         "room@chatroom",
@@ -454,11 +511,13 @@ async def test_group_export_uses_connection_scoped_managed_observations(
         external_session_id="room@chatroom",
         session_kind="group",
         session_name="测试群",
-        source_message_id="msg-managed-group",
+        source_message_id=canonical_source_message_id,
     )
     session.connection_id = connection_id
     session.session_id = canonical_session_id
     session.canonical_conversation_id = canonical_session_id
+    session.turns[0].metadata["external_message_id"] = external_source_message_id
+    session.turns[0].metadata["msg_svr_id"] = external_source_message_id
 
     result = await service.export_current_messages_file(
         session,
@@ -481,6 +540,28 @@ async def test_group_export_uses_connection_scoped_managed_observations(
         }
     ]
     assert store.enqueued == []
+    for effect in result["channel_reply_effects"]:
+        payload = effect["payload"]
+        assert payload["session_id"] == canonical_session_id
+        assert payload["external_conversation_id"] == "room@chatroom"
+        assert payload["canonical_conversation_id"] == canonical_session_id
+        assert payload["reply_to_message_id"] == external_source_message_id
+        assert payload["source_message"]["message_id"] == canonical_source_message_id
+        assert (
+            payload["source_message"]["external_message_id"]
+            == external_source_message_id
+        )
+        assert payload["source_message"]["session_id"] == canonical_session_id
+        assert payload["delivery"]["session_id"] == canonical_session_id
+        assert payload["delivery"]["external_conversation_id"] == "room@chatroom"
+        assert (
+            payload["delivery"]["canonical_conversation_id"]
+            == canonical_session_id
+        )
+        assert (
+            payload["delivery"]["source_message_id"]
+            == canonical_source_message_id
+        )
     export_path = Path(
         result["channel_reply_effects"][1]["payload"]["file"]["file_path"]
     )
