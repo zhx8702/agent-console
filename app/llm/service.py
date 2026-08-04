@@ -56,8 +56,18 @@ def validate_llm_settings(settings: Settings) -> list[str]:
             "OPENAI_API_MODE must be one of: "
             + ", ".join(sorted(_SUPPORTED_OPENAI_API_MODES))
         )
-    if settings.openai_web_search_enabled and settings.openai_api_mode != "responses":
-        errors.append("OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses")
+    if settings.openai_web_search_enabled:
+        if settings.llm_provider != "openai":
+            errors.append("OPENAI_WEB_SEARCH_ENABLED requires LLM_PROVIDER=openai")
+        if settings.openai_api_mode != "responses":
+            errors.append("OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses")
+        if settings.openai_web_search_tool not in {
+            "web_search",
+            "web_search_preview",
+        }:
+            errors.append(
+                "OPENAI_WEB_SEARCH_TOOL must be one of: web_search, web_search_preview"
+            )
 
     if settings.llm_embed_provider not in _SUPPORTED_EMBED_PROVIDERS:
         errors.append(f"unsupported LLM_EMBED_PROVIDER={settings.llm_embed_provider}")

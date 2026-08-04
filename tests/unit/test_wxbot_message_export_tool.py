@@ -13,7 +13,10 @@ from app.channel.identity import (
     canonical_message_id,
 )
 from app.common.config import Settings
-from app.common.types import Channel, Role, Session, Turn
+from app.common.types import Channel, InboundEvent, Message, Role, Session, Turn
+from app.orchestrator.effects import EFFECT_STATUS_DUPLICATE, InMemoryEffectCommitter
+from app.orchestrator.flow import MessageEffect
+from app.orchestrator.pipeline import PipelineContext
 from app.social.contracts import (
     GroupParticipationPolicyDocument,
     KillSwitches,
@@ -367,6 +370,140 @@ async def test_generate_text_file_requires_explicit_file_request_and_queues_arti
     file_payload = result["channel_reply_effects"][0]["payload"]["file"]
     assert file_payload["file_name"].endswith(".md")
     assert "# 已整理" in Path(file_payload["file_path"]).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_generated_file_retry_keeps_one_delivery_identity(tmp_path: Path) -> None:
+    service, _store = _service(
+        tmp_path,
+        report_service=_FakeReportService(),
+        effect_reply_enabled=True,
+    )
+    session = _session(
+        external_session_id="wxid_friend",
+        session_kind="private",
+        session_name="好友",
+        source_message_id="msg-generate-retry-1",
+    )
+    session.turns[0].content = "把热点新闻整理成文件发我"
+
+    first = await service.generate_text_file(
+        session,
+        {
+            "content": "第一次模型措辞",
+            "format": "txt",
+            "file_name": "第一次名称",
+        },
+    )
+    second = await service.generate_text_file(
+        session,
+        {
+            "content": "重试后的不同措辞",
+            "format": "md",
+            "file_name": "第二次名称",
+        },
+    )
+
+    first_effect = first["channel_reply_effects"][0]
+    second_effect = second["channel_reply_effects"][0]
+    assert first_effect == second_effect
+    assert first_effect["idempotency_key"] == second_effect["idempotency_key"]
+    assert first_effect["payload"]["command_id"] == second_effect["payload"]["command_id"]
+    assert first_effect["payload"]["file"]["file_path"] == (
+        second_effect["payload"]["file"]["file_path"]
+    )
+    assert first_effect["payload"]["file"]["file_name"] == "第一次名称.txt"
+    artifact_path = Path(first_effect["payload"]["file"]["file_path"])
+    assert artifact_path.read_text(encoding="utf-8") == "第一次模型措辞"
+
+    event = InboundEvent(
+        message_id="msg-generate-retry-1",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="wxid_friend",
+        session_id="wxid_friend",
+        message=Message(content=session.turns[0].content),
+        trace_id="trace-generate-retry-1",
+    )
+    ctx = PipelineContext(event=event, trace_id=event.trace_id)
+    committer = InMemoryEffectCommitter()
+    await committer.commit(MessageEffect(**first_effect), ctx)
+    duplicate = await committer.commit(MessageEffect(**second_effect), ctx)
+    assert duplicate.status == EFFECT_STATUS_DUPLICATE
+
+
+@pytest.mark.asyncio
+async def test_generated_file_fallback_identity_uses_stable_trace(tmp_path: Path) -> None:
+    service, _store = _service(
+        tmp_path,
+        report_service=_FakeReportService(),
+        effect_reply_enabled=True,
+    )
+    first_session = _session(
+        external_session_id="wxid_friend",
+        session_kind="private",
+        session_name="好友",
+        source_message_id="",
+    )
+    second_session = _session(
+        external_session_id="wxid_friend",
+        session_kind="private",
+        session_name="好友",
+        source_message_id="",
+    )
+    for session in (first_session, second_session):
+        session.turns[0].content = "把热点新闻整理成文件发我"
+        session.turns[0].trace_id = "trace-stable-file-request"
+
+    first = await service.generate_text_file(
+        first_session,
+        {"content": "第一次正文", "file_name": "第一次名称"},
+    )
+    second = await service.generate_text_file(
+        second_session,
+        {"content": "重试正文", "file_name": "第二次名称"},
+    )
+
+    first_effect = first["channel_reply_effects"][0]
+    second_effect = second["channel_reply_effects"][0]
+    assert first_effect == second_effect
+    assert first_effect["payload"]["delivery"]["source_message_id"].startswith(
+        "message-export-source-"
+    )
+
+
+@pytest.mark.asyncio
+async def test_artifact_cleanup_retention_covers_effect_idempotency_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _store = _service(
+        tmp_path,
+        report_service=_FakeReportService(),
+        effect_reply_enabled=True,
+    )
+    service._settings = service._settings.model_copy(
+        update={
+            "wxbot_outbound_file_retention_seconds": 5 * 60,
+            "wxbot_outbound_file_cleanup_grace_seconds": 0,
+            "orchestrator_flow_effect_commit_ttl_seconds": 7 * 24 * 60 * 60,
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture_cleanup(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"errors": []}
+
+    monkeypatch.setattr(
+        "plugins.wxbot.agent_tool_service.cleanup_message_exports",
+        _capture_cleanup,
+    )
+
+    await service._cleanup_message_export_artifacts()
+
+    assert captured["retention_seconds"] == 7 * 24 * 60 * 60
+    assert captured["cleanup_grace_seconds"] == 0
 
 
 @pytest.mark.asyncio

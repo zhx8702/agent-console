@@ -28,6 +28,8 @@ _STAGED_FILE_RE = re.compile(r"message-export\.(?:txt|md|csv|json)$")
 _STAGED_FILE_TEMP_RE = re.compile(r"\.message-export\.(?:txt|md|csv|json)\.[0-9a-f]+\.tmp$")
 _GENERIC_STAGED_FILE_RE = re.compile(r"artifact\.(?:txt|md|csv|json)$")
 _GENERIC_STAGED_TEMP_RE = re.compile(r"\.artifact\.(?:txt|md|csv|json)\.[0-9a-f]+\.tmp$")
+_DISPLAY_NAME_FILE_RE = re.compile(r"display-name\.txt$")
+_DISPLAY_NAME_TEMP_RE = re.compile(r"\.display-name\.txt\.[0-9a-f]+\.tmp$")
 _HASHED_DIRECTORY_RE = re.compile(r"^(?:tenant|session|request)-[0-9a-f]{24}$")
 _HOUR_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b")
 _WINDOWS_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -598,6 +600,8 @@ def _is_owned_artifact(path: Path, root: Path) -> bool:
             or bool(_GENERIC_STAGED_FILE_RE.fullmatch(relative.name))
             or bool(_STAGED_FILE_TEMP_RE.fullmatch(relative.name))
             or bool(_GENERIC_STAGED_TEMP_RE.fullmatch(relative.name))
+            or bool(_DISPLAY_NAME_FILE_RE.fullmatch(relative.name))
+            or bool(_DISPLAY_NAME_TEMP_RE.fullmatch(relative.name))
         )
     )
 
@@ -633,6 +637,7 @@ def cleanup_message_exports(
         if not path.is_absolute():
             raise InvalidMessageExportPath("protected artifact paths must be absolute")
         protected.add(_assert_under_root(path, root))
+    protected_directories = {path.parent for path in protected}
 
     for directory, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
         directory_path = Path(directory)
@@ -647,7 +652,11 @@ def cleanup_message_exports(
                 file_stat = path.lstat()
                 if not stat.S_ISREG(file_stat.st_mode):
                     continue
-                if path.resolve(strict=False) in protected:
+                resolved_path = path.resolve(strict=False)
+                if resolved_path in protected or (
+                    path.name == "display-name.txt"
+                    and resolved_path.parent in protected_directories
+                ):
                     result["retained_count"] += 1
                     continue
                 age_seconds = max(0.0, now_timestamp - file_stat.st_mtime)

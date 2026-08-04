@@ -575,7 +575,6 @@ class WxbotAgentToolService:
     ) -> dict[str, Any]:
         """Stage explicitly requested answer content as a file and queue it."""
 
-        target_format = normalize_file_format(arguments.get("format") or "txt")
         latest_turn, latest_metadata = self._latest_user_context(session)
         if latest_turn is None:
             raise ValueError("当前轮次没有可生成文件的请求")
@@ -594,8 +593,9 @@ class WxbotAgentToolService:
                 raise ValueError(
                     f"当前版本不支持生成 {intent.requested_format}，请使用 txt、md、csv 或 json"
                 )
-            if target_format != intent.requested_format:
-                raise ValueError("工具格式与用户明确要求的文件格式不一致")
+        # Model-supplied arguments can change across retries. The user's
+        # explicit format (or the product default) is the stable contract.
+        target_format = normalize_file_format(intent.requested_format or "txt")
         raw_content = str(arguments.get("content") or "").strip()
         if not raw_content:
             return {
@@ -624,10 +624,8 @@ class WxbotAgentToolService:
             tenant_id=tenant_id,
             session_id=session_id,
         )
-        digest = hashlib.sha256(
-            "\0".join((tenant_id, session_id, source_id, target_format, raw_content)).encode(
-                "utf-8"
-            )
+        delivery_digest = hashlib.sha256(
+            "\0".join((tenant_id, session_id, source_id, target_format)).encode("utf-8")
         ).hexdigest()[:32]
         content = convert_file_bytes(
             raw_content.encode("utf-8"),
@@ -641,11 +639,12 @@ class WxbotAgentToolService:
             self._message_export_root,
             tenant_id=tenant_id,
             session_id=session_id,
-            request_id=f"wxbot-file-generate-{digest}",
+            request_id=f"wxbot-file-generate-{delivery_digest}",
             file_name=str(arguments.get("file_name") or "整理内容").strip(),
             content=content,
             file_format=target_format,
             max_bytes=self._message_export_max_bytes,
+            reuse_existing_on_conflict=True,
         )
         delivery_contract = self._message_export_delivery_contract(
             session,
@@ -669,7 +668,12 @@ class WxbotAgentToolService:
             or getattr(session, "user_id", "")
             or ""
         ).strip()
-        command_id = f"channel-reply:{tenant_id}:wxbot-file-generate:{digest}"
+        # Delivery identity is bound to the inbound request, not model text.
+        # A retry may word the same answer differently; it must still resolve
+        # to one outbound command instead of sending duplicate files.
+        command_id = (
+            f"channel-reply:{tenant_id}:wxbot-file-generate:{delivery_digest}"
+        )
         payload = {
             "tenant_id": tenant_id,
             "channel": channel,
@@ -1061,19 +1065,36 @@ class WxbotAgentToolService:
                 resolved = candidate.resolve(strict=False)
                 if resolved.is_relative_to(export_root):
                     protected_paths.append(resolved)
-            result = cleanup_message_exports(
-                self._message_export_root,
-                protected_paths=protected_paths,
-                retention_seconds=getattr(
-                    self._settings,
-                    "wxbot_outbound_file_retention_seconds",
-                    24 * 60 * 60,
-                ),
-                cleanup_grace_seconds=getattr(
+            cleanup_grace_seconds = int(
+                getattr(
                     self._settings,
                     "wxbot_outbound_file_cleanup_grace_seconds",
                     5 * 60,
-                ),
+                )
+            )
+            configured_retention_seconds = int(
+                getattr(
+                    self._settings,
+                    "wxbot_outbound_file_retention_seconds",
+                    7 * 24 * 60 * 60,
+                )
+            )
+            effect_commit_ttl_seconds = int(
+                getattr(
+                    self._settings,
+                    "orchestrator_flow_effect_commit_ttl_seconds",
+                    7 * 24 * 60 * 60,
+                )
+            )
+            retention_seconds = max(
+                configured_retention_seconds,
+                effect_commit_ttl_seconds - cleanup_grace_seconds,
+            )
+            result = cleanup_message_exports(
+                self._message_export_root,
+                protected_paths=protected_paths,
+                retention_seconds=retention_seconds,
+                cleanup_grace_seconds=cleanup_grace_seconds,
             )
             if result.get("errors"):
                 logger.warning(
@@ -1438,17 +1459,22 @@ class WxbotAgentToolService:
                         external_message_id,
                     )[:128]
 
-        turn_created_at = str(getattr(latest_turn, "created_at", "") or "")
-        turn_content = str(getattr(latest_turn, "content", "") or "")
+        trace_id = str(
+            latest_metadata.get("trace_id")
+            or getattr(latest_turn, "trace_id", "")
+            or session_metadata.get("trace_id")
+            or ""
+        ).strip()
+        if not trace_id:
+            raise ValueError("当前消息缺少稳定标识，无法安全发送文件")
         fallback = hashlib.sha256(
             "\0".join(
                 (
                     tenant_id,
+                    connection_id,
                     session_id,
                     str(getattr(session, "user_id", "") or ""),
-                    turn_created_at,
-                    turn_content,
-                    str(getattr(session, "last_active_at", "") or ""),
+                    trace_id,
                 )
             ).encode("utf-8")
         ).hexdigest()[:32]

@@ -233,7 +233,9 @@ async def test_generate_file_scope_requires_explicit_delivery() -> None:
 
 @pytest.mark.asyncio
 async def test_private_news_file_request_requires_generated_file_delivery() -> None:
-    ctx = _private_context("搜一下今天热点新闻，整理成 TXT 文件发给我")
+    ctx = _private_context(
+        "联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我"
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -246,7 +248,78 @@ async def test_private_news_file_request_requires_generated_file_delivery() -> N
         "tool": "generate_text_file",
         "operation": "generate",
         "format": "txt",
+        "web_search_required": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_private_file_request_does_not_require_negated_web_search() -> None:
+    ctx = _private_context("不要联网搜索，把我给你的内容整理成 TXT 文件发给我")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == FILE_ANALYSIS_SCOPE
+    assert ctx.extras["agent_required_effect"].get("web_search_required") is None
+
+
+@pytest.mark.asyncio
+async def test_model_memory_negation_does_not_cancel_explicit_live_search() -> None:
+    ctx = _private_context(
+        "不要用模型记忆，请联网搜索今天热点新闻，整理成 TXT 文件发给我"
+    )
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_required_effect"]["web_search_required"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "不要立刻联网搜索今天新闻，把已有内容整理成 TXT 文件发我",
+        "不要去网上搜索今天新闻，把已有内容整理成 TXT 文件发我",
+        "不要使用任何网络搜索，把已有内容整理成 TXT 文件发我",
+        "请勿联网搜索今天新闻，把已有内容整理成 TXT 文件发我",
+        "不允许联网搜索今天新闻，把已有内容整理成 TXT 文件发我",
+        "没必要联网搜索今天新闻，把已有内容整理成 TXT 文件发我",
+    ],
+)
+async def test_web_search_negation_accepts_common_modifiers(text: str) -> None:
+    ctx = _private_context(text)
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_required_effect"].get("web_search_required") is None
+
+
+@pytest.mark.asyncio
+async def test_later_positive_clause_overrides_earlier_search_negation() -> None:
+    ctx = _private_context(
+        "不要联网搜索旧新闻，但请联网搜索今天热点，整理成 TXT 文件发我"
+    )
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_required_effect"]["web_search_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_fresh_non_news_search_requires_live_web_access() -> None:
+    ctx = _private_context("搜索最新天气，整理成 TXT 文件发我")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_required_effect"]["web_search_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_knowledge_search_does_not_require_live_web_access() -> None:
+    ctx = _private_context("搜索知识库最新内容，整理成 TXT 文件发我")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_required_effect"].get("web_search_required") is None
 
 
 @pytest.mark.asyncio

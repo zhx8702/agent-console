@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.agent.registry import AgentToolDefinition, AgentToolRegistry
 from app.agent.scopes import (
@@ -44,6 +45,7 @@ from app.common.types import (
     ChatMessage,
     ChatRequest,
     ChatUsage,
+    Citation,
     PreprocessedMessage,
     Role,
     RouteType,
@@ -63,6 +65,7 @@ MAX_TOOL_OWNER_GATE_TIMEOUT_SECONDS = 30.0
 MIN_CLEAR_TOOL_PRESELECTION_SCORE = 2
 MIN_CLEAR_TOOL_PRESELECTION_MARGIN = 2
 AMBIGUOUS_TOOL_PRESELECTION_TOP_K = 3
+REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS = 45.0
 
 ToolOwnerGate = Callable[[str, Session], Awaitable[bool]]
 
@@ -172,6 +175,7 @@ class AgentCapabilityEngine:
     ) -> CapabilityResult:
         scope = normalize_agent_scope((hints or {}).get("agent_tool_scope"))
         required_effect = self._required_agent_effect(hints, scope)
+        required_web_search = required_effect.get("web_search_required") is True
         model_tier, temperature = self._generation_config(hints)
         tools, policy = await self._available_tools(session, hints, pre)
         if not tools:
@@ -215,13 +219,43 @@ class AgentCapabilityEngine:
                 temperature=temperature,
             )
 
+        if required_web_search and not self._required_web_search_configured():
+            return self._required_web_search_failure_result(
+                scope=scope,
+                required_effect=required_effect,
+                policy=policy,
+                reason="required_web_search_not_configured",
+            )
+
         system_prompt = self._compose_system_prompt(session, scope)
+        if required_web_search:
+            system_prompt += (
+                "\n\n本轮用户明确要求实时联网搜索。必须先使用联网搜索取得当前资料，"
+                "再按标题、摘要和可访问的来源链接整理正文；不得使用模型记忆冒充实时结果。"
+            )
         messages = self._build_messages(pre, session)
         aggregate_usage = ChatUsage()
         executed_tool_calls: list[ToolCall] = []
         final_response = None
+        terminal_tool_effect = False
 
         for round_index in range(self._max_tool_rounds):
+            request_metadata: dict[str, Any] = {
+                "agent_round": round_index + 1,
+                "agent_scope": scope,
+            }
+            request_tools = [tool.schema for tool in tools.values()]
+            if required_web_search:
+                # Search is phase one. File creation stays local and
+                # deterministic after fresh citations are verified.
+                request_tools = []
+                request_metadata.update(
+                    {
+                        "openai_web_search": True,
+                        "openai_web_search_required": True,
+                        "disable_openai_fallback": True,
+                    }
+                )
             request = ChatRequest(
                 tenant_id=session.tenant_id,
                 trace_id=get_trace_id() or new_trace_id(),
@@ -230,17 +264,60 @@ class AgentCapabilityEngine:
                 system=system_prompt,
                 max_tokens=self._max_tokens,
                 temperature=temperature,
-                tools=[tool.schema for tool in tools.values()],
+                tools=request_tools,
                 cache_system=True,
-                metadata={"agent_round": round_index + 1, "agent_scope": scope},
+                metadata=request_metadata,
             )
-            response = await self._llm.chat(request)
+            try:
+                if required_web_search:
+                    response = await self._chat_with_hard_timeout(
+                        request,
+                        timeout=REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS,
+                    )
+                else:
+                    response = await self._llm.chat(request)
+            except Exception as exc:
+                if not required_web_search:
+                    raise
+                log.warning(
+                    "agent.required_web_search_failed",
+                    session_id=session.session_id,
+                    error_class=exc.__class__.__name__,
+                )
+                reason = (
+                    "required_web_search_timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "required_web_search_failed"
+                )
+                return self._required_web_search_failure_result(
+                    scope=scope,
+                    required_effect=required_effect,
+                    policy=policy,
+                    reason=reason,
+                )
             final_response = response
             aggregate_usage.input_tokens += int(response.usage.input_tokens or 0)
             aggregate_usage.output_tokens += int(response.usage.output_tokens or 0)
             aggregate_usage.cache_read_tokens += int(response.usage.cache_read_tokens or 0)
             aggregate_usage.cache_write_tokens += int(response.usage.cache_write_tokens or 0)
             aggregate_usage.cost_usd += float(response.usage.cost_usd or 0.0)
+
+            if required_web_search and response.tool_calls:
+                # No custom function tools are exposed during the hosted-search
+                # phase. A proxy/model returning one anyway must not be allowed
+                # to execute a local side effect before search evidence is
+                # verified.
+                log.warning(
+                    "agent.required_web_search_unexpected_tool_call",
+                    session_id=session.session_id,
+                    tool_names=[item.name for item in response.tool_calls],
+                )
+                return self._required_web_search_failure_result(
+                    scope=scope,
+                    required_effect=required_effect,
+                    policy=policy,
+                    reason="required_web_search_invalid_response",
+                )
 
             if not response.tool_calls:
                 break
@@ -272,8 +349,17 @@ class AgentCapabilityEngine:
                         ),
                     )
                 )
+                if self._tool_calls_suppress_final_reply([executed]):
+                    terminal_tool_effect = True
+                    break
+            if terminal_tool_effect:
+                break
 
-        if final_response is not None and final_response.tool_calls:
+        if (
+            final_response is not None
+            and final_response.tool_calls
+            and not terminal_tool_effect
+        ):
             auto_tool_call = await self._maybe_execute_auto_personal_map(
                 pre,
                 session,
@@ -387,17 +473,28 @@ class AgentCapabilityEngine:
 
         required_effect_auto_fulfilled = False
         required_effect_failure = ""
-        required_effect_satisfied = self._required_effect_satisfied(
-            required_effect,
-            executed_tool_calls,
+        required_web_search_satisfied = (
+            self._required_web_search_satisfied(final_response)
+            if required_web_search
+            else True
         )
-        if required_effect and not required_effect_satisfied:
+        required_effect_satisfied = bool(
+            required_web_search_satisfied
+            and self._required_effect_satisfied(
+                required_effect,
+                executed_tool_calls,
+            )
+        )
+        if required_web_search and not required_web_search_satisfied:
+            required_effect_failure = "required_web_search_evidence_missing"
+        elif required_effect and not required_effect_satisfied:
             auto_tool_call, required_effect_failure = await self._maybe_fulfill_required_effect(
                 session,
                 required_effect=required_effect,
                 tools=tools,
                 executed_tool_calls=executed_tool_calls,
                 response_text=str(getattr(final_response, "content", "") or ""),
+                response_citations=list(getattr(final_response, "citations", []) or []),
             )
             if auto_tool_call is not None:
                 executed_tool_calls.append(auto_tool_call)
@@ -449,6 +546,7 @@ class AgentCapabilityEngine:
         return CapabilityResult(
             route=RouteType.AGENT,
             reply_text=final_text,
+            citations=list(final_response.citations),
             tool_calls=executed_tool_calls,
             usage=aggregate_usage,
             metadata={
@@ -472,6 +570,8 @@ class AgentCapabilityEngine:
                         "required_effect_satisfied": required_effect_satisfied,
                         "required_effect_auto_fulfilled": required_effect_auto_fulfilled,
                         "required_effect_failure": required_effect_failure,
+                        "required_web_search": required_web_search,
+                        "required_web_search_satisfied": required_web_search_satisfied,
                     }
                     if required_effect
                     else {}
@@ -717,7 +817,7 @@ class AgentCapabilityEngine:
     def _required_agent_effect(
         hints: dict[str, Any] | None,
         scope: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         raw = (hints or {}).get("agent_required_effect")
         if not isinstance(raw, dict):
             return {}
@@ -742,11 +842,128 @@ class AgentCapabilityEngine:
             "operation": operation,
             "tool": tool_name,
             "format": str(raw.get("format") or "txt").strip().lower() or "txt",
+            "web_search_required": bool(
+                raw.get("web_search_required") is True
+                and contract_scope == FILE_ANALYSIS_SCOPE
+                and operation == "generate"
+            ),
         }
+
+    def _required_web_search_configured(self) -> bool:
+        return bool(
+            self._settings.llm_provider == "openai"
+            and self._settings.openai_api_mode == "responses"
+            and self._settings.openai_web_search_enabled
+            and self._settings.openai_web_search_live_enabled
+            and self._settings.openai_web_search_tool
+            in {"web_search", "web_search_preview"}
+        )
+
+    async def _chat_with_hard_timeout(
+        self,
+        request: ChatRequest,
+        *,
+        timeout: float,
+    ) -> Any:
+        task = asyncio.ensure_future(self._llm.chat(request))
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            self._cancel_background_task(task)
+            raise
+        if task not in done:
+            self._cancel_background_task(task)
+            raise TimeoutError
+        return task.result()
+
+    @classmethod
+    def _cancel_background_task(cls, task: asyncio.Future[Any]) -> None:
+        task.add_done_callback(cls._consume_background_task_result)
+        task.cancel()
+
+    @staticmethod
+    def _consume_background_task_result(task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.debug(
+                "agent.background_llm_task_finished_with_error",
+                error_class=exc.__class__.__name__,
+            )
+
+    @staticmethod
+    def _valid_https_citation_url(value: object) -> bool:
+        try:
+            parsed = urlsplit(str(value or "").strip())
+            _port = parsed.port
+        except ValueError:
+            return False
+        return bool(
+            parsed.scheme.lower() == "https"
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+
+    @staticmethod
+    def _required_web_search_satisfied(response: Any) -> bool:
+        if response is None:
+            return False
+        if str(getattr(response, "finish_reason", "") or "").strip().lower() not in {
+            "completed",
+            "stop",
+        }:
+            return False
+        for citation in list(getattr(response, "citations", []) or []):
+            if (
+                str(getattr(citation, "source", "") or "").strip()
+                == "openai_web_search"
+                and AgentCapabilityEngine._valid_https_citation_url(
+                    getattr(citation, "url", "")
+                )
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _required_web_search_failure_result(
+        *,
+        scope: str,
+        required_effect: dict[str, Any],
+        policy: dict[str, Any],
+        reason: str,
+    ) -> CapabilityResult:
+        if reason == "required_web_search_not_configured":
+            reply = (
+                "当前未启用可用的实时联网搜索。请先在 Web 的“模型配置”中开启"
+                "“OpenAI 联网搜索”和“实时网页访问”，保存并重启服务后再试；"
+                "这次没有生成文件。"
+            )
+        elif reason == "required_web_search_timeout":
+            reply = "实时联网搜索超时了，这次没有生成文件，请稍后重试。"
+        else:
+            reply = "实时联网搜索暂时不可用，这次没有生成文件，请稍后重试。"
+        return CapabilityResult(
+            route=RouteType.AGENT,
+            reply_text=reply,
+            tool_calls=[],
+            usage=ChatUsage(),
+            metadata={
+                "agent_tool_scope": scope,
+                "effective_tools": policy.get("effective_tools") or [],
+                "required_effect": required_effect.get("type", "outbound_file"),
+                "required_effect_satisfied": False,
+                "required_effect_failure": reason,
+                "required_web_search": True,
+                "required_web_search_satisfied": False,
+            },
+        )
 
     @staticmethod
     def _required_effect_satisfied(
-        required_effect: dict[str, str],
+        required_effect: dict[str, Any],
         tool_calls: list[ToolCall],
     ) -> bool:
         if not required_effect:
@@ -771,10 +988,11 @@ class AgentCapabilityEngine:
         self,
         session: Session,
         *,
-        required_effect: dict[str, str],
+        required_effect: dict[str, Any],
         tools: dict[str, _AgentTool],
         executed_tool_calls: list[ToolCall],
         response_text: str,
+        response_citations: list[Citation] | None = None,
     ) -> tuple[ToolCall | None, str]:
         tool_name = required_effect.get("tool", "")
         if any(item.name == tool_name for item in executed_tool_calls):
@@ -790,6 +1008,11 @@ class AgentCapabilityEngine:
         content = str(response_text or "").strip()
         if not content:
             return None, "required_content_missing"
+        if required_effect.get("web_search_required") is True:
+            content = self._append_citation_sources(
+                content,
+                list(response_citations or []),
+            )
         tool_call = ToolCall(
             id=f"auto_required_file_delivery_{len(executed_tool_calls) + 1}",
             name=tool_name,
@@ -804,7 +1027,30 @@ class AgentCapabilityEngine:
         return executed, ""
 
     @staticmethod
+    def _append_citation_sources(content: str, citations: list[Citation]) -> str:
+        value = str(content or "").strip()
+        source_lines: list[str] = []
+        seen_urls: set[str] = set()
+        for citation in citations:
+            url = str(citation.url or "").strip()
+            if (
+                not AgentCapabilityEngine._valid_https_citation_url(url)
+                or url in seen_urls
+            ):
+                continue
+            seen_urls.add(url)
+            if url in value:
+                continue
+            title = str(citation.title or "来源").strip() or "来源"
+            source_lines.append(f"{len(source_lines) + 1}. {title}\n   {url}")
+        if not source_lines:
+            return value
+        return value + "\n\n来源链接：\n" + "\n".join(source_lines)
+
+    @staticmethod
     def _required_effect_failure_reply(reason: str) -> str:
+        if reason == "required_web_search_evidence_missing":
+            return "这次没有取得可验证的实时来源链接，因此没有生成文件。请稍后重试。"
         if reason == "required_content_missing":
             return "这次没有整理出可写入文件的正文，请重新说明要生成的内容。"
         if reason == "required_tool_unavailable":

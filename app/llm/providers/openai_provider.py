@@ -351,8 +351,15 @@ def _extract_responses_payload(raw: Any) -> tuple[str, list[ToolCall], list[Cita
     text_parts: list[str] = []
     citations: list[Citation] = []
     seen_citation_urls: set[str] = set()
+    web_search_completed = False
     for item in output:
         item_type = str(getattr(item, "type", "") or "")
+        if item_type == "web_search_call":
+            web_search_completed = (
+                str(getattr(item, "status", "") or "").strip().lower()
+                == "completed"
+            ) or web_search_completed
+            continue
         if item_type == "function_call":
             tool_calls.append(
                 ToolCall(
@@ -372,6 +379,10 @@ def _extract_responses_payload(raw: Any) -> tuple[str, list[ToolCall], list[Cita
             if citation.url:
                 seen_citation_urls.add(citation.url)
             citations.append(citation)
+    if not web_search_completed:
+        # URL-shaped annotations without a completed hosted search call are
+        # not sufficient evidence for a fresh web-grounded answer.
+        citations = []
     if not text_parts:
         text_parts.append(_extract_text_content(getattr(raw, "output_text", None)))
 
@@ -454,6 +465,8 @@ class OpenAIProvider:
 
     def _should_use_web_search(self, req: ChatRequest) -> bool:
         metadata = req.metadata or {}
+        if metadata.get("openai_web_search_required") is True:
+            return True
         if "openai_web_search" in metadata:
             return bool(metadata.get("openai_web_search"))
         if "web_search" in metadata:
@@ -492,13 +505,27 @@ class OpenAIProvider:
             "temperature": req.temperature,
             "max_output_tokens": req.max_tokens,
         }
-        tools: list[dict[str, Any]] = []
-        if req.tools:
-            tools.extend(_convert_responses_tools(req.tools))
-        if self._should_use_web_search(req):
-            tools.append(self._build_web_search_tool(req))
+        web_search_required = (req.metadata or {}).get("openai_web_search_required") is True
+        tools: list[dict[str, Any]]
+        if web_search_required:
+            # Required search is a separate hosted-tool phase. Ignore custom
+            # functions defensively so generic tool_choice="required" cannot
+            # be satisfied by a local function instead of web search.
+            tools = [self._build_web_search_tool(req)]
+        else:
+            tools = []
+            if req.tools:
+                tools.extend(_convert_responses_tools(req.tools))
+            if self._should_use_web_search(req):
+                tools.append(self._build_web_search_tool(req))
         if tools:
             kwargs["tools"] = tools
+        if web_search_required:
+            # Required live-search requests are issued without custom
+            # function tools, so "required" deterministically selects the
+            # only available hosted tool instead of leaving fresh evidence to
+            # the model's optional tool choice.
+            kwargs["tool_choice"] = "required"
         return kwargs
 
     async def chat(self, request: ChatRequest) -> ChatResponse:

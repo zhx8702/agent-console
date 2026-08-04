@@ -190,6 +190,7 @@ def stage_outbound_artifact(
     content: bytes,
     file_format: str,
     max_bytes: int,
+    reuse_existing_on_conflict: bool = False,
 ) -> dict[str, Any]:
     """Atomically publish a private, idempotent artifact under the outbox."""
 
@@ -215,8 +216,45 @@ def stage_outbound_artifact(
     safe_name = _safe_filename_component(file_name, fallback="artifact")
     stem = Path(safe_name).stem or "artifact"
     extension = normalized_format
+    if reuse_existing_on_conflict:
+        name_path = _assert_under_root(directory / "display-name.txt", root)
+        try:
+            _publish_immutable(name_path, stem.encode("utf-8"))
+        except MessageExportConflict as exc:
+            if name_path.is_symlink() or not name_path.is_file():
+                raise FileArtifactConflict(str(exc)) from exc
+            name_size = name_path.stat().st_size
+            if name_size <= 0 or name_size > 256:
+                raise FileArtifactConflict("stored artifact name is invalid") from exc
+            try:
+                stored_name = name_path.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as decode_exc:
+                raise FileArtifactConflict("stored artifact name is invalid") from decode_exc
+            if _safe_filename_component(stored_name, fallback="文件") != stored_name:
+                raise FileArtifactConflict("stored artifact name is invalid") from exc
+            stem = stored_name
     artifact_path = _assert_under_root(directory / f"artifact.{extension}", root)
-    _publish_immutable(artifact_path, content)
+    artifact_content = content
+    try:
+        _publish_immutable(artifact_path, content)
+    except MessageExportConflict as exc:
+        if (
+            not reuse_existing_on_conflict
+            or artifact_path.is_symlink()
+            or not artifact_path.is_file()
+        ):
+            raise FileArtifactConflict(str(exc)) from exc
+        # A source-message retry may produce slightly different model text.
+        # Reuse the first immutable artifact so the effect payload remains
+        # byte-for-byte stable under the same delivery idempotency key.
+        artifact_size = artifact_path.stat().st_size
+        if artifact_size > max_bytes:
+            raise FileArtifactTooLarge(
+                f"file artifact is {artifact_size} bytes; limit is {max_bytes} bytes"
+            ) from exc
+        artifact_content = artifact_path.read_bytes()
+        if len(artifact_content) != artifact_size:
+            raise FileArtifactConflict("existing artifact changed while being read") from exc
     if os.name == "posix" and artifact_path.stat().st_gid != root.stat().st_gid:
         os.chown(artifact_path, -1, root.stat().st_gid)
     artifact_path.chmod(0o640)
@@ -224,9 +262,9 @@ def stage_outbound_artifact(
     return {
         "file_path": str(artifact_path),
         "file_name": display_name,
-        "file_size": len(content),
-        "file_md5": hashlib.md5(content).hexdigest(),
-        "file_sha256": hashlib.sha256(content).hexdigest(),
+        "file_size": len(artifact_content),
+        "file_md5": hashlib.md5(artifact_content).hexdigest(),
+        "file_sha256": hashlib.sha256(artifact_content).hexdigest(),
         "format": normalized_format,
         "mime": _MIME_TYPES.get(normalized_format)
         or mimetypes.guess_type(display_name)[0]

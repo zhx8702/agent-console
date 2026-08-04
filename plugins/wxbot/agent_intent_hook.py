@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -41,6 +42,38 @@ _OUTBOUND_FILE_TOOLS = {
     (FILE_ANALYSIS_SCOPE, "convert"): "convert_current_file",
     (FILE_ANALYSIS_SCOPE, "generate"): "generate_text_file",
 }
+
+_EXPLICIT_LIVE_WEB_SEARCH_RE = re.compile(
+    r"(?:联网|上网|网上|网络).{0,6}(?:搜|搜索|查|查询|检索)"
+    r"|(?:搜|搜索|查|查询|检索).{0,10}(?:今天|今日|最新|实时|刚刚|热点)"
+    r"|(?:今天|今日|最新|实时|刚刚|热点).{0,10}(?:搜|搜索|查|查询|检索)"
+)
+_WEB_SEARCH_CLAUSE_SPLIT_RE = re.compile(
+    r"[,，。！？!?；;\n]|(?:但是|但|不过|然而|而是|改成|改为|然后|请(?!勿))"
+)
+_WEB_SEARCH_NEGATION_PREFIX_RE = re.compile(
+    r"(?:不要|别|无需|无须|不用|不必|不需要|禁止|请勿|切勿|"
+    r"不准|不允许|不想|没必要|避免).{0,12}$"
+)
+_LOCAL_DATA_SEARCH_RE = re.compile(
+    r"(?:群|聊天|会话|历史).{0,4}(?:消息|记录)|知识库|本地(?:文件|数据)|模型记忆"
+)
+
+
+def _explicit_live_web_search_requested(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    for clause in _WEB_SEARCH_CLAUSE_SPLIT_RE.split(value):
+        for match in _EXPLICIT_LIVE_WEB_SEARCH_RE.finditer(clause):
+            if (
+                _LOCAL_DATA_SEARCH_RE.search(clause)
+                and not re.search(r"(?:联网|上网|网上|网络)", match.group(0))
+            ):
+                continue
+            if not _WEB_SEARCH_NEGATION_PREFIX_RE.search(clause[: match.start()]):
+                return True
+    return False
 
 
 def _complete_async_delivery_contract(contract: dict[str, object]) -> bool:
@@ -274,6 +307,11 @@ class WxbotAgentIntentHook:
                 "operation": file_intent.operation,
                 "format": file_intent.requested_format or "txt",
             }
+            if (
+                required_file_tool == "generate_text_file"
+                and _explicit_live_web_search_requested(text)
+            ):
+                ctx.extras["agent_required_effect"]["web_search_required"] = True
         if is_group:
             self._capture_async_delivery_contract(ctx)
         if scope == GROUP_PERSONAL_MAP_SCOPE and _explicit_map_generation_requested(text):

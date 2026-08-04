@@ -682,7 +682,10 @@ def build_wxbot_file_analysis_agent_tools(
                     },
                     "format": {
                         "type": "string",
-                        "description": "目标格式，默认 txt。",
+                        "description": (
+                            "兼容字段；实际格式以用户原话明确指定为准，"
+                            "用户未指定时固定使用 txt。"
+                        ),
                         "enum": list(SUPPORTED_FILE_FORMATS),
                     },
                     "file_name": {

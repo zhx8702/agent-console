@@ -191,12 +191,15 @@ def test_cleanup_preserves_protected_files_and_expires_only_owned_regular_files(
     tmp_path: Path,
 ) -> None:
     old_protected = Path(str(_stage(tmp_path, request_id="protected-old")["file_path"]))
+    protected_name = old_protected.with_name("display-name.txt")
+    protected_name.write_text("第一次名称", encoding="utf-8")
     expired = Path(str(_stage(tmp_path, request_id="expired")["file_path"]))
     within_grace = Path(str(_stage(tmp_path, request_id="within-grace")["file_path"]))
     fresh = Path(str(_stage(tmp_path, request_id="fresh")["file_path"]))
     unknown = tmp_path / "do-not-delete.txt"
     unknown.write_text("owned by somebody else", encoding="utf-8")
     os.utime(old_protected, (1, 1))
+    os.utime(protected_name, (1, 1))
     os.utime(expired, (8_800, 8_800))
     os.utime(within_grace, (9_050, 9_050))
     os.utime(fresh, (9_500, 9_500))
@@ -212,13 +215,25 @@ def test_cleanup_preserves_protected_files_and_expires_only_owned_regular_files(
 
     assert result["removed_count"] == 1
     assert result["removed_paths"] == [str(expired)]
-    assert result["retained_count"] == 3
+    assert result["retained_count"] == 4
     assert result["errors"] == []
     assert old_protected.exists()
+    assert protected_name.exists()
     assert not expired.exists()
     assert within_grace.exists()
     assert fresh.exists()
     assert unknown.read_text(encoding="utf-8") == "owned by somebody else"
+
+    released = cleanup_message_exports(
+        tmp_path,
+        protected_paths=[],
+        retention_seconds=900,
+        cleanup_grace_seconds=100,
+        now=10_000,
+    )
+    assert released["removed_count"] == 2
+    assert not old_protected.exists()
+    assert not protected_name.exists()
 
 
 def test_cleanup_rejects_protected_paths_outside_staging_root(tmp_path: Path) -> None:
@@ -228,6 +243,25 @@ def test_cleanup_rejects_protected_paths_outside_staging_root(tmp_path: Path) ->
     with pytest.raises(InvalidMessageExportPath, match="escapes"):
         cleanup_message_exports(tmp_path, protected_paths=[outside])
     assert artifact.exists()
+
+
+def test_cleanup_removes_stale_display_name_temp_file(tmp_path: Path) -> None:
+    artifact = Path(str(_stage(tmp_path)["file_path"]))
+    temporary = artifact.with_name(".display-name.txt.deadbeef.tmp")
+    temporary.write_bytes(b"stale")
+    os.utime(temporary, (1, 1))
+
+    result = cleanup_message_exports(
+        tmp_path,
+        protected_paths=[artifact],
+        retention_seconds=900,
+        cleanup_grace_seconds=100,
+        now=10_000,
+    )
+
+    assert result["removed_paths"] == [str(temporary)]
+    assert artifact.exists()
+    assert not temporary.exists()
 
 
 def test_build_message_export_summary_calculates_daily_statistics_deterministically() -> None:

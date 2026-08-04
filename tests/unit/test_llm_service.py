@@ -215,6 +215,26 @@ def test_validate_llm_settings_requires_openai_key() -> None:
     assert "OPENAI_API_KEY is required when LLM_EMBED_PROVIDER=openai" in errors
 
 
+def test_validate_llm_settings_rejects_invalid_web_search_configuration() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_provider": "fake",
+            "openai_web_search_enabled": True,
+            "openai_api_mode": "chat",
+            "openai_web_search_tool": "unknown_search",
+        }
+    )
+
+    errors = validate_llm_settings(settings)
+
+    assert "OPENAI_WEB_SEARCH_ENABLED requires LLM_PROVIDER=openai" in errors
+    assert "OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses" in errors
+    assert (
+        "OPENAI_WEB_SEARCH_TOOL must be one of: web_search, web_search_preview"
+        in errors
+    )
+
+
 def test_build_llm_service_rejects_fake_providers_in_prod() -> None:
     redis = _InMemoryRedis()
     settings = get_settings().model_copy(

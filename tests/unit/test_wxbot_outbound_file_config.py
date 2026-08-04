@@ -44,11 +44,12 @@ def test_wxbot_outbound_file_settings_have_bounded_safe_defaults() -> None:
 
     assert settings.wxbot_outbound_file_dir == DEFAULT_CONTAINER_DIR
     assert settings.wxbot_outbound_file_max_bytes == 10 * 1024 * 1024
-    assert settings.wxbot_outbound_file_retention_seconds == 24 * 60 * 60
+    assert settings.wxbot_outbound_file_retention_seconds == 7 * 24 * 60 * 60
     assert settings.wxbot_outbound_file_cleanup_grace_seconds == 5 * 60
 
     with pytest.raises(ValidationError, match="wxbot_outbound_file_max_bytes"):
         Settings(_env_file=None, wxbot_outbound_file_max_bytes=1024)
+
 
 
 def test_base_compose_uses_a_portable_named_volume_for_export_writers() -> None:

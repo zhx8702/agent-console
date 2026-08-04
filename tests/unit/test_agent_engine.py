@@ -1818,8 +1818,10 @@ async def test_agent_capability_suppresses_final_reply_when_tool_self_enqueues()
             },
         }
     ]
-    tool_message = llm.requests[1].messages[-1]
-    assert "channel_reply_effects" not in tool_message.content
+    # A self-enqueued terminal reply is already complete; do not call the LLM
+    # again or risk repeating the same side effect until the flow times out.
+    assert len(llm.requests) == 1
+    assert len(result.tool_calls) == 1
     assert len(agent_store.audit_rows) == 1
     assert agent_store.audit_rows[0]["final_reply_text"] == ""
 

@@ -503,7 +503,7 @@ class Settings(BaseSettings):
         le=100 * 1024 * 1024,
     )
     wxbot_outbound_file_retention_seconds: int = Field(
-        default=24 * 60 * 60,
+        default=7 * 24 * 60 * 60,
         ge=5 * 60,
         le=30 * 24 * 60 * 60,
     )

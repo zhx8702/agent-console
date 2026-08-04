@@ -172,6 +172,7 @@ def test_extract_responses_payload_collects_url_citations() -> None:
         model="gpt-5.4",
         status="completed",
         output=[
+            SimpleNamespace(type="web_search_call", status="completed"),
             SimpleNamespace(
                 type="message",
                 content=[
@@ -204,6 +205,38 @@ def test_extract_responses_payload_collects_url_citations() -> None:
     assert citations[0].source == "openai_web_search"
     assert citations[0].title == "Example News"
     assert citations[0].url == "https://example.com/news"
+
+
+def test_extract_responses_payload_rejects_citation_without_search_call() -> None:
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="未验证来源。",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url="https://example.com/unverified",
+                                title="Unverified",
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=2, output_tokens=2),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = (
+        _extract_responses_payload(raw)
+    )
+
+    assert citations == []
 
 
 def _chat_response(model: str = "gpt-5.4", content: str = "chat ok") -> SimpleNamespace:
@@ -569,6 +602,55 @@ async def test_openai_provider_adds_web_search_tool_for_responses_metadata(
             "external_web_access": True,
         }
     ]
+    assert "tool_choice" not in call
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_requires_explicit_web_search_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        assert max_retries == 0
+        client = _FakeClient(base_url=base_url)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+
+    settings = get_settings().model_copy(
+        update={
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": False,
+            "openai_web_search_tool": "web_search",
+            "openai_web_search_live_enabled": True,
+        }
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+    req = _make_request().model_copy(
+        update={
+            "metadata": {"openai_web_search_required": True},
+            "tools": [
+                ToolSchema(
+                    name="must_not_replace_search",
+                    description="local side effect",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ],
+        }
+    )
+
+    await provider.chat(req)
+
+    call = created_clients[0].responses_calls[0]
+    assert call["tools"] == [
+        {"type": "web_search", "external_web_access": True}
+    ]
+    assert call["tool_choice"] == "required"
 
 
 @pytest.mark.asyncio
