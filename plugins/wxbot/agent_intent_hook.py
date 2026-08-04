@@ -36,6 +36,12 @@ _GROUP_FILE_SEND_DISABLED_REPLY = (
     "请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
 )
 
+_OUTBOUND_FILE_TOOLS = {
+    (MESSAGE_EXPORT_SCOPE, "export_history"): "export_current_messages_file",
+    (FILE_ANALYSIS_SCOPE, "convert"): "convert_current_file",
+    (FILE_ANALYSIS_SCOPE, "generate"): "generate_text_file",
+}
+
 
 def _complete_async_delivery_contract(contract: dict[str, object]) -> bool:
     if str(contract.get("participation_status") or "") != "must_reply":
@@ -256,6 +262,18 @@ class WxbotAgentIntentHook:
             )
             return
         ctx.extras["agent_tool_scope"] = scope
+        required_file_tool = _OUTBOUND_FILE_TOOLS.get((scope, file_intent.operation))
+        if outbound_file_required and required_file_tool:
+            # Keep explicit file delivery as an execution contract, not merely
+            # a routing hint.  The Agent engine uses this trusted metadata to
+            # prevent a model response from silently degrading to plain text.
+            ctx.extras["agent_required_effect"] = {
+                "type": "outbound_file",
+                "scope": scope,
+                "tool": required_file_tool,
+                "operation": file_intent.operation,
+                "format": file_intent.requested_format or "txt",
+            }
         if is_group:
             self._capture_async_delivery_contract(ctx)
         if scope == GROUP_PERSONAL_MAP_SCOPE and _explicit_map_generation_requested(text):

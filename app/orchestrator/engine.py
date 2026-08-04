@@ -704,6 +704,7 @@ class DialogOrchestrator:
                         )
 
                 agent_tool_scope = ctx.extras.get("agent_tool_scope")
+                agent_required_effect = ctx.extras.get("agent_required_effect")
                 if _tool_intent_matched(router_signals):
                     router_signals.setdefault("tool_intent_matched", True)
                     agent_engine = self.capabilities.get(RouteType.AGENT)
@@ -787,6 +788,11 @@ class DialogOrchestrator:
                 route.hints.setdefault("faq_preview", faq_preview)
             if agent_tool_scope and isinstance(route.hints, dict):
                 route.hints.setdefault("agent_tool_scope", agent_tool_scope)
+            if isinstance(agent_required_effect, dict) and isinstance(route.hints, dict):
+                route.hints.setdefault(
+                    "agent_required_effect",
+                    dict(agent_required_effect),
+                )
             ROUTE_DECISIONS.labels(tenant=event.tenant_id, route=route.type.value).inc()
             await self.hooks.run(HookPoint.AFTER_ROUTE, ctx)
 

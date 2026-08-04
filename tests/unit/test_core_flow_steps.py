@@ -213,6 +213,7 @@ class _AgentCapability:
         self.effective_tool_count = effective_tool_count
         self.preflight_error = preflight_error
         self.preview_hints: dict[str, Any] | None = None
+        self.answer_hints: dict[str, Any] | None = None
 
     async def preview_availability(
         self,
@@ -238,7 +239,8 @@ class _AgentCapability:
         session: Session,
         hints: dict[str, Any] | None = None,
     ) -> CapabilityResult:
-        _ = pre, session, hints
+        _ = pre, session
+        self.answer_hints = dict(hints or {})
         return CapabilityResult(route=RouteType.AGENT, reply_text="agent answer")
 
 
@@ -496,6 +498,38 @@ async def test_core_route_uses_effective_agent_tool_preflight() -> None:
     assert router.signals["tool_denial_reason"] == "role_denied"
     assert capability.preview_hints is not None
     assert capability.preview_hints["agent_tool_scope"] == "map"
+
+
+@pytest.mark.asyncio
+async def test_core_route_passes_required_agent_effect_to_capability() -> None:
+    capability = _AgentCapability(effective_tool_count=1)
+    deps, _sessions, _router, _capability, _bus = _deps(
+        capability=capability,  # type: ignore[arg-type]
+        route=RouteType.AGENT,
+    )
+    ctx = PipelineContext(event=_event("生成文件发给我"), trace_id="trace")
+    ctx.signals["router"] = {
+        "tool_intent_matched": True,
+        "tools_available": True,
+    }
+    ctx.signals["agent"] = {"tool_scope": "file_analysis"}
+    required_effect = {
+        "type": "outbound_file",
+        "scope": "file_analysis",
+        "tool": "generate_text_file",
+        "operation": "generate",
+        "format": "txt",
+    }
+    ctx.extras["agent_required_effect"] = required_effect
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(
+        _happy_flow(),
+        ctx,
+    )
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert capability.answer_hints is not None
+    assert capability.answer_hints["agent_required_effect"] == required_effect
 
 
 @pytest.mark.asyncio

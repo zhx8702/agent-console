@@ -2606,6 +2606,26 @@ class _ToolIntentSignalsHook:
         ctx.extras["agent_tool_scope"] = "map"
 
 
+class _RequiredFileIntentSignalsHook:
+    name = "test.required_file_intent_signals"
+    point = HookPoint.BEFORE_ROUTE
+    priority = 1
+
+    async def run(self, ctx: PipelineContext) -> None:
+        ctx.extras["router_signals"] = {
+            "tool_intent_matched": True,
+            "tools_available": True,
+        }
+        ctx.extras["agent_tool_scope"] = "file_analysis"
+        ctx.extras["agent_required_effect"] = {
+            "type": "outbound_file",
+            "scope": "file_analysis",
+            "tool": "generate_text_file",
+            "operation": "generate",
+            "format": "txt",
+        }
+
+
 async def test_legacy_route_uses_effective_agent_tool_preflight(
     session_manager,
     settings,
@@ -2632,6 +2652,34 @@ async def test_legacy_route_uses_effective_agent_tool_preflight(
     assert router.last_signals["tool_denial_reason"] == "role_denied"
     assert agent.preview_hints is not None
     assert agent.preview_hints["agent_tool_scope"] == "map"
+
+
+async def test_legacy_route_passes_required_agent_effect_to_capability(
+    session_manager,
+    settings,
+):
+    hooks = HookRunner()
+    hooks.register(_RequiredFileIntentSignalsHook())
+    agent = FakeAgentPreviewCapability(effective_tool_count=1)
+    router = FakeRouter(RouteType.AGENT)
+    orc, _bus, _ = _build(
+        session_manager,
+        settings,
+        router=router,
+        extra_capabilities={RouteType.AGENT: agent},
+        hook_runner=hooks,
+    )
+
+    await orc.handle(_make_event("生成文件发给我"))
+
+    assert agent.last_hints is not None
+    assert agent.last_hints["agent_required_effect"] == {
+        "type": "outbound_file",
+        "scope": "file_analysis",
+        "tool": "generate_text_file",
+        "operation": "generate",
+        "format": "txt",
+    }
 
 
 async def test_legacy_tool_preflight_failure_is_fail_closed(

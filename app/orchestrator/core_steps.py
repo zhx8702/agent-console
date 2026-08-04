@@ -479,6 +479,7 @@ class RouteStep(_BaseCoreStep):
         agent_tool_scope = ctx.signals.get("agent", {}).get("tool_scope")
         if not agent_tool_scope:
             agent_tool_scope = ctx.extras.get("agent_tool_scope")
+        agent_required_effect = ctx.extras.get("agent_required_effect")
         if _tool_intent_matched(router_signals):
             router_signals.setdefault("tool_intent_matched", True)
             agent_engine = self.deps.capabilities.get(RouteType.AGENT)
@@ -545,6 +546,8 @@ class RouteStep(_BaseCoreStep):
             route.hints.setdefault("faq_preview", faq_preview)
         if agent_tool_scope and isinstance(route.hints, dict):
             route.hints.setdefault("agent_tool_scope", agent_tool_scope)
+        if isinstance(agent_required_effect, dict) and isinstance(route.hints, dict):
+            route.hints.setdefault("agent_required_effect", dict(agent_required_effect))
         ctx.route = route
         return StepResult(route_label=route.type.value)
 

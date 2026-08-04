@@ -13,8 +13,10 @@ from typing import Any
 from app.agent.registry import AgentToolDefinition, AgentToolRegistry
 from app.agent.scopes import (
     DEFAULT_AGENT_SCOPE,
+    FILE_ANALYSIS_SCOPE,
     GROUP_PERSONAL_MAP_SCOPE,
     GROUP_PLUGIN_STATUS_SCOPE,
+    MESSAGE_EXPORT_SCOPE,
     agent_scope_disabled_reply,
     agent_scope_empty_reply,
     agent_scope_lookup_order,
@@ -169,9 +171,24 @@ class AgentCapabilityEngine:
         hints: dict[str, Any] | None = None,
     ) -> CapabilityResult:
         scope = normalize_agent_scope((hints or {}).get("agent_tool_scope"))
+        required_effect = self._required_agent_effect(hints, scope)
         model_tier, temperature = self._generation_config(hints)
         tools, policy = await self._available_tools(session, hints, pre)
         if not tools:
+            if required_effect:
+                return CapabilityResult(
+                    route=RouteType.AGENT,
+                    reply_text="当前会话的文件生成或发送能力暂时不可用，请稍后再试。",
+                    tool_calls=[],
+                    usage=ChatUsage(),
+                    metadata={
+                        "agent_tool_scope": scope,
+                        "effective_tools": [],
+                        "required_effect": required_effect["type"],
+                        "required_effect_satisfied": False,
+                        "required_effect_failure": "required_tool_unavailable",
+                    },
+                )
             if self._is_group_session(session):
                 if policy.get("enabled") is False:
                     return CapabilityResult(
@@ -368,6 +385,30 @@ class AgentCapabilityEngine:
             aggregate_usage.cache_write_tokens += int(response.usage.cache_write_tokens or 0)
             aggregate_usage.cost_usd += float(response.usage.cost_usd or 0.0)
 
+        required_effect_auto_fulfilled = False
+        required_effect_failure = ""
+        required_effect_satisfied = self._required_effect_satisfied(
+            required_effect,
+            executed_tool_calls,
+        )
+        if required_effect and not required_effect_satisfied:
+            auto_tool_call, required_effect_failure = await self._maybe_fulfill_required_effect(
+                session,
+                required_effect=required_effect,
+                tools=tools,
+                executed_tool_calls=executed_tool_calls,
+                response_text=str(getattr(final_response, "content", "") or ""),
+            )
+            if auto_tool_call is not None:
+                executed_tool_calls.append(auto_tool_call)
+                required_effect_satisfied = self._required_effect_satisfied(
+                    required_effect,
+                    executed_tool_calls,
+                )
+                required_effect_auto_fulfilled = required_effect_satisfied
+                if not required_effect_satisfied and not required_effect_failure:
+                    required_effect_failure = "required_tool_failed"
+
         if final_response is None:
             return await self._fallback_chat(
                 pre,
@@ -382,7 +423,10 @@ class AgentCapabilityEngine:
             executed_tool_calls,
             tools,
         )
-        if suppress_final_reply:
+        if required_effect and not required_effect_satisfied:
+            suppress_final_reply = False
+            final_text = self._required_effect_failure_reply(required_effect_failure)
+        elif suppress_final_reply:
             final_text = ""
         elif not final_text and executed_tool_calls:
             final_text = agent_scope_empty_reply(scope)
@@ -422,6 +466,16 @@ class AgentCapabilityEngine:
                 "tool_preselection_selected": policy.get("tool_preselection_selected", []),
                 "tool_preselection_scores": policy.get("tool_preselection_scores", {}),
                 "agent_billing_operation": billing_operation,
+                **(
+                    {
+                        "required_effect": required_effect["type"],
+                        "required_effect_satisfied": required_effect_satisfied,
+                        "required_effect_auto_fulfilled": required_effect_auto_fulfilled,
+                        "required_effect_failure": required_effect_failure,
+                    }
+                    if required_effect
+                    else {}
+                ),
             },
         )
 
@@ -658,6 +712,104 @@ class AgentCapabilityEngine:
                 metadata = dict(turn.metadata or {})
                 return str(metadata.get("sender_name") or metadata.get("sender_wxid") or "").strip()
         return ""
+
+    @staticmethod
+    def _required_agent_effect(
+        hints: dict[str, Any] | None,
+        scope: str,
+    ) -> dict[str, str]:
+        raw = (hints or {}).get("agent_required_effect")
+        if not isinstance(raw, dict):
+            return {}
+        effect_type = str(raw.get("type") or "").strip().lower()
+        contract_scope = normalize_agent_scope(str(raw.get("scope") or ""))
+        operation = str(raw.get("operation") or "").strip().lower()
+        tool_name = str(raw.get("tool") or "").strip()
+        expected_tools = {
+            (MESSAGE_EXPORT_SCOPE, "export_history"): "export_current_messages_file",
+            (FILE_ANALYSIS_SCOPE, "convert"): "convert_current_file",
+            (FILE_ANALYSIS_SCOPE, "generate"): "generate_text_file",
+        }
+        if (
+            effect_type != "outbound_file"
+            or contract_scope != normalize_agent_scope(scope)
+            or expected_tools.get((contract_scope, operation)) != tool_name
+        ):
+            return {}
+        return {
+            "type": effect_type,
+            "scope": contract_scope,
+            "operation": operation,
+            "tool": tool_name,
+            "format": str(raw.get("format") or "txt").strip().lower() or "txt",
+        }
+
+    @staticmethod
+    def _required_effect_satisfied(
+        required_effect: dict[str, str],
+        tool_calls: list[ToolCall],
+    ) -> bool:
+        if not required_effect:
+            return True
+        required_tool = required_effect.get("tool", "")
+        for item in tool_calls:
+            if item.name != required_tool or item.error:
+                continue
+            result = item.result
+            if not isinstance(result, dict):
+                continue
+            if (
+                result.get("ok") is True
+                and result.get("sent_to_current_session") is True
+                and str(result.get("delivery_status") or "").strip().lower()
+                in {"queued", "sent", "delivered"}
+            ):
+                return True
+        return False
+
+    async def _maybe_fulfill_required_effect(
+        self,
+        session: Session,
+        *,
+        required_effect: dict[str, str],
+        tools: dict[str, _AgentTool],
+        executed_tool_calls: list[ToolCall],
+        response_text: str,
+    ) -> tuple[ToolCall | None, str]:
+        tool_name = required_effect.get("tool", "")
+        if any(item.name == tool_name for item in executed_tool_calls):
+            return None, "required_tool_failed"
+        if tool_name not in tools:
+            return None, "required_tool_unavailable"
+        # Only generated answer content can be completed safely after the
+        # model skipped its required function call.  Conversion and history
+        # export need their own structured arguments and must fail explicitly
+        # instead of guessing a source file or time range.
+        if tool_name != "generate_text_file":
+            return None, "required_tool_not_called"
+        content = str(response_text or "").strip()
+        if not content:
+            return None, "required_content_missing"
+        tool_call = ToolCall(
+            id=f"auto_required_file_delivery_{len(executed_tool_calls) + 1}",
+            name=tool_name,
+            arguments={
+                "content": content,
+                "format": required_effect.get("format") or "txt",
+            },
+        )
+        executed = await self._execute_tool_call(session, tool_call, tools)
+        if executed.error or not self._required_effect_satisfied(required_effect, [executed]):
+            return executed, "required_tool_failed"
+        return executed, ""
+
+    @staticmethod
+    def _required_effect_failure_reply(reason: str) -> str:
+        if reason == "required_content_missing":
+            return "这次没有整理出可写入文件的正文，请重新说明要生成的内容。"
+        if reason == "required_tool_unavailable":
+            return "当前会话的文件生成或发送能力暂时不可用，请稍后再试。"
+        return "这次文件没有生成或发送成功，请稍后重试。"
 
     @staticmethod
     def _tool_calls_suppress_final_reply(tool_calls: list[ToolCall]) -> bool:

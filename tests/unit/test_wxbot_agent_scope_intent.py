@@ -72,6 +72,30 @@ def _group_context(text: str) -> PipelineContext:
     return PipelineContext(event=event, trace_id=event.trace_id, session=session)
 
 
+def _private_context(text: str) -> PipelineContext:
+    session = Session(
+        session_id="wxid_private",
+        tenant_id="demo",
+        user_id="wxid_private",
+        channel=Channel.WECHAT,
+        metadata={"session_kind": "private"},
+    )
+    event = InboundEvent(
+        message_id=f"private-message-{abs(hash(text))}",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="wxid_private",
+        session_id=session.session_id,
+        message=Message(content=text),
+        trace_id=f"private-trace-{abs(hash(text))}",
+        metadata={
+            "session_kind": "private",
+            "wxbot_normalized_content": text,
+        },
+    )
+    return PipelineContext(event=event, trace_id=event.trace_id, session=session)
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -197,7 +221,32 @@ async def test_generate_file_scope_requires_explicit_delivery() -> None:
     await WxbotAgentIntentHook().run(denied)
 
     assert requested.extras["agent_tool_scope"] == FILE_ANALYSIS_SCOPE
+    assert requested.extras["agent_required_effect"] == {
+        "type": "outbound_file",
+        "scope": FILE_ANALYSIS_SCOPE,
+        "tool": "generate_text_file",
+        "operation": "generate",
+        "format": "txt",
+    }
     assert "agent_tool_scope" not in denied.extras
+
+
+@pytest.mark.asyncio
+async def test_private_news_file_request_requires_generated_file_delivery() -> None:
+    ctx = _private_context("搜一下今天热点新闻，整理成 TXT 文件发给我")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == FILE_ANALYSIS_SCOPE
+    assert ctx.extras["router_signals"]["tool_intent_matched"] is True
+    assert ctx.extras["router_signals"]["tools_available"] is True
+    assert ctx.extras["agent_required_effect"] == {
+        "type": "outbound_file",
+        "scope": FILE_ANALYSIS_SCOPE,
+        "tool": "generate_text_file",
+        "operation": "generate",
+        "format": "txt",
+    }
 
 
 @pytest.mark.asyncio
