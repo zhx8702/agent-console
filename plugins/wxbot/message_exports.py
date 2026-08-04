@@ -292,6 +292,7 @@ def build_message_export_summary(
 
     normalized_report_type = str(report_type or "daily").strip().lower()
     report_title = {
+        "recent": "最近消息汇总",
         "daily": "日报",
         "weekly": "周报",
         "monthly": "月报",
@@ -339,8 +340,7 @@ def build_message_export_summary(
         if hours:
             peak_hour, peak_count = min(hours.items(), key=lambda item: (-item[1], item[0]))
             lines.append(
-                f"高峰时段：{peak_hour:02d}:00 - {(peak_hour + 1) % 24:02d}:00"
-                f"（{peak_count} 条）"
+                f"高峰时段：{peak_hour:02d}:00 - {(peak_hour + 1) % 24:02d}:00（{peak_count} 条）"
             )
         else:
             lines.append("高峰时段：时间信息不足")
@@ -381,7 +381,9 @@ def _render_export(
     normalized_format = str(export_format or "txt").strip().lower()
     if normalized_format == "txt":
         return b"\xef\xbb\xbf" + "\n".join(lines).encode("utf-8"), len(message_lines)
-    included = [item for item in messages if isinstance(item, Mapping) and not item.get("is_self_sent")]
+    included = [
+        item for item in messages if isinstance(item, Mapping) and not item.get("is_self_sent")
+    ]
     if normalized_format == "md":
         markdown = [
             f"# {_single_line(session_name or session_id, fallback='当前会话')} 消息汇总",
@@ -397,7 +399,9 @@ def _render_export(
         ]
         for item in included:
             timestamp = _single_line(item.get("timestamp"), fallback="")
-            sender = _single_line(item.get("sender_name") or item.get("sender_wxid"), fallback="未知成员")
+            sender = _single_line(
+                item.get("sender_name") or item.get("sender_wxid"), fallback="未知成员"
+            )
             msg_type = _single_line(item.get("msg_type") or "text", fallback="text")
             content = _message_text(item).replace("|", "\\|").replace("\n", "<br>")
             markdown.append(f"| {timestamp} | {sender} | {msg_type} | {content} |")

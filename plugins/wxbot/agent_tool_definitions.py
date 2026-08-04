@@ -11,6 +11,7 @@ from app.agent.scopes import (
     MESSAGE_EXPORT_SCOPE,
 )
 from plugins.wxbot.file_artifacts import SUPPORTED_FILE_FORMATS
+from plugins.wxbot.file_intent import MAX_RECENT_MESSAGE_EXPORT_MINUTES
 
 if TYPE_CHECKING:
     from plugins.wxbot.agent_tool_service import WxbotAgentToolService
@@ -573,7 +574,8 @@ def build_wxbot_message_export_agent_tools(
             scope=MESSAGE_EXPORT_SCOPE,
             name="export_current_messages_file",
             description=(
-                "把当前群聊或当前私聊指定日期/月度的消息记录整理成文件并发送回当前会话。"
+                "把当前群聊或当前私聊最近若干分钟、指定日期或月度的消息记录"
+                "整理成文件并发送回当前会话。"
                 "仅当用户同时明确要求消息汇总和发送/导出文件时调用；不能指定、改写或跨越目的会话。"
             ),
             parameters={
@@ -581,8 +583,19 @@ def build_wxbot_message_export_agent_tools(
                 "properties": {
                     "report_type": {
                         "type": "string",
-                        "description": "导出时间范围类型，daily=按日，monthly=按月；默认 daily。",
-                        "enum": ["daily", "monthly"],
+                        "description": (
+                            "导出时间范围类型，recent=最近若干分钟，daily=按日，"
+                            "monthly=按月；默认 daily。"
+                        ),
+                        "enum": ["recent", "daily", "monthly"],
+                    },
+                    "minutes": {
+                        "type": "integer",
+                        "description": (
+                            "最近消息窗口分钟数；仅 report_type=recent 且用户明确说出分钟数时使用。"
+                        ),
+                        "minimum": 1,
+                        "maximum": MAX_RECENT_MESSAGE_EXPORT_MINUTES,
                     },
                     "date": {
                         "type": "string",
@@ -683,8 +696,7 @@ def build_wxbot_file_analysis_agent_tools(
                     "format": {
                         "type": "string",
                         "description": (
-                            "兼容字段；实际格式以用户原话明确指定为准，"
-                            "用户未指定时固定使用 txt。"
+                            "兼容字段；实际格式以用户原话明确指定为准，用户未指定时固定使用 txt。"
                         ),
                         "enum": list(SUPPORTED_FILE_FORMATS),
                     },

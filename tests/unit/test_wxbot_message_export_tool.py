@@ -75,6 +75,7 @@ class _FakeReportService:
         *,
         report: str = "大家主要讨论了项目排期。",
         messages: list[dict[str, Any]] | None = None,
+        messages_by_date: dict[str, list[dict[str, Any]]] | None = None,
         period: str = "2026-07-29",
         message_error: str = "",
     ) -> None:
@@ -88,6 +89,9 @@ class _FakeReportService:
                 "text": "今天确认项目排期。",
             }
         ]
+        self.messages_by_date = {
+            str(key): list(value) for key, value in (messages_by_date or {}).items()
+        }
         self.period = period
         self.message_error = message_error
         self.message_calls: list[dict[str, Any]] = []
@@ -115,7 +119,7 @@ class _FakeReportService:
         return {
             "ok": True,
             "period": self.period,
-            "messages": list(self.messages),
+            "messages": list(self.messages_by_date.get(date, self.messages)),
         }
 
 
@@ -236,7 +240,10 @@ def test_message_export_definition_is_current_session_only_and_group_switch_gate
     assert "required_group_role" not in tool.metadata
     assert tool.metadata["requires_group_file_send"] is True
     properties = tool.parameters["properties"]
-    assert set(properties) == {"report_type", "date", "year_month", "format"}
+    assert set(properties) == {"report_type", "minutes", "date", "year_month", "format"}
+    assert properties["report_type"]["enum"] == ["recent", "daily", "monthly"]
+    assert properties["minutes"]["minimum"] == 1
+    assert properties["minutes"]["maximum"] == 1440
     assert "session_id" not in properties
     assert "target" not in properties
 
@@ -247,10 +254,7 @@ def test_file_delivery_tools_require_group_master_switch_without_admin_role() ->
         report_service=_FakeReportService(),
     )
 
-    tools = {
-        tool.name: tool
-        for tool in build_wxbot_file_analysis_agent_tools(service)
-    }
+    tools = {tool.name: tool for tool in build_wxbot_file_analysis_agent_tools(service)}
 
     assert "required_group_role" not in tools["inspect_current_file"].metadata
     for name in ("convert_current_file", "generate_text_file"):
@@ -294,16 +298,13 @@ async def test_group_daily_export_binds_effects_to_current_external_session(
         "room@chatroom",
     ]
     assert all(
-        effect["payload"]["external_conversation_id"] == "room@chatroom"
-        for effect in effects
+        effect["payload"]["external_conversation_id"] == "room@chatroom" for effect in effects
     )
     assert effects[0]["payload"]["body"]["text"].endswith("共 1 条，文件已排队发送。")
     assert effects[0]["payload"]["delivery"]["source_message_id"] == "msg-group-1"
     assert effects[0]["payload"]["delivery"]["participation_policy_version"] == 17
     assert (
-        effects[0]["payload"]["source_message"]["_wxbot_delivery_contract"][
-            "source_message_id"
-        ]
+        effects[0]["payload"]["source_message"]["_wxbot_delivery_contract"]["source_message_id"]
         == "msg-group-1"
     )
     file_payload = effects[1]["payload"]["file"]
@@ -312,6 +313,169 @@ async def test_group_daily_export_binds_effects_to_current_external_session(
     assert file_payload["file_name"].endswith(".txt")
     assert export_path.read_bytes().startswith(b"\xef\xbb\xbf")
     assert "二、原始消息记录" in export_path.read_text(encoding="utf-8-sig")
+
+
+@pytest.mark.asyncio
+async def test_legacy_group_recent_export_uses_user_window_and_filters_daily_payload(
+    tmp_path: Path,
+) -> None:
+    report_service = _FakeReportService(
+        messages=[
+            {
+                "timestamp": "2026-07-29 09:49:59",
+                "sender_wxid": "wxid_old",
+                "sender_name": "旧消息",
+                "msg_type": "text",
+                "text": "范围外旧消息",
+            },
+            {
+                "timestamp": "2026-07-29 09:50:00",
+                "sender_wxid": "wxid_a",
+                "sender_name": "张三",
+                "msg_type": "text",
+                "text": "范围起点消息",
+            },
+            {
+                "timestamp": "2026-07-29 09:59:59",
+                "sender_wxid": "wxid_b",
+                "sender_name": "李四",
+                "msg_type": "text",
+                "text": "范围内最新消息",
+            },
+            {
+                "timestamp": "2026-07-29 10:00:00",
+                "sender_wxid": "wxid_command",
+                "sender_name": "当前用户",
+                "msg_type": "text",
+                "text": "导出命令本身",
+            },
+        ],
+    )
+    service, store = _service(tmp_path, report_service=report_service)
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="msg-recent-legacy",
+    )
+    session.turns[0].content = "整理十分钟群里话题 以文件方式发给我"
+    session.turns[0].created_at = datetime(2026, 7, 29, 1, 0, tzinfo=UTC)
+    session.turns[0].metadata["occurred_ts"] = int(
+        datetime(2026, 7, 29, 2, 0, tzinfo=UTC).timestamp()
+    )
+
+    result = await service.export_current_messages_file(
+        session,
+        {"report_type": "daily", "date": "2026-07-29", "format": "txt"},
+    )
+
+    assert store.enqueued == []
+    assert result["report_type"] == "recent"
+    assert result["minutes"] == 10
+    assert result["message_count"] == 2
+    assert result["period"] == ("最近 10 分钟（2026-07-29 09:50:00 至 2026-07-29 10:00:00）")
+    assert report_service.message_calls == [
+        {
+            "session_id": "room@chatroom",
+            "session_name": "测试群",
+            "report_type": "daily",
+            "date": "2026-07-29",
+            "year_month": "",
+        }
+    ]
+    export_path = Path(result["channel_reply_effects"][1]["payload"]["file"]["file_path"])
+    exported = export_path.read_text(encoding="utf-8-sig")
+    assert "范围起点消息" in exported
+    assert "范围内最新消息" in exported
+    assert "范围外旧消息" not in exported
+    assert "导出命令本身" not in exported
+
+
+@pytest.mark.asyncio
+async def test_legacy_group_recent_export_fetches_both_dates_across_midnight(
+    tmp_path: Path,
+) -> None:
+    report_service = _FakeReportService(
+        messages_by_date={
+            "2026-07-29": [
+                {
+                    "timestamp": "2026-07-29 23:56:00",
+                    "sender_wxid": "wxid_a",
+                    "sender_name": "张三",
+                    "msg_type": "text",
+                    "text": "午夜前消息",
+                }
+            ],
+            "2026-07-30": [
+                {
+                    "timestamp": "2026-07-30 00:04:00",
+                    "sender_wxid": "wxid_b",
+                    "sender_name": "李四",
+                    "msg_type": "text",
+                    "text": "午夜后消息",
+                }
+            ],
+        }
+    )
+    service, _store = _service(tmp_path, report_service=report_service)
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="msg-recent-midnight",
+    )
+    session.turns[0].content = "整理十分钟群里话题，以文件方式发给我"
+    session.turns[0].created_at = datetime(2026, 7, 29, 16, 5, tzinfo=UTC)
+
+    result = await service.export_current_messages_file(
+        session,
+        {"report_type": "recent", "minutes": 10},
+    )
+
+    assert [item["date"] for item in report_service.message_calls] == [
+        "2026-07-29",
+        "2026-07-30",
+    ]
+    assert result["message_count"] == 2
+    export_path = Path(result["channel_reply_effects"][1]["payload"]["file"]["file_path"])
+    exported = export_path.read_text(encoding="utf-8-sig")
+    assert "午夜前消息" in exported
+    assert "午夜后消息" in exported
+
+
+@pytest.mark.asyncio
+async def test_legacy_group_recent_export_fails_closed_on_missing_timestamp(
+    tmp_path: Path,
+) -> None:
+    report_service = _FakeReportService(
+        messages=[
+            {
+                "timestamp": "not-a-time",
+                "sender_wxid": "wxid_a",
+                "sender_name": "张三",
+                "msg_type": "text",
+                "text": "无法证明是否在范围内",
+            }
+        ]
+    )
+    service, store = _service(tmp_path, report_service=report_service)
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="msg-recent-invalid-ts",
+    )
+    session.turns[0].content = "整理十分钟群里话题，以文件方式发给我"
+    session.turns[0].created_at = datetime(2026, 7, 29, 2, 0, tzinfo=UTC)
+
+    with pytest.raises(RuntimeError, match="valid timestamp"):
+        await service.export_current_messages_file(
+            session,
+            {"report_type": "recent", "minutes": 10},
+        )
+
+    assert store.enqueued == []
+    assert list(tmp_path.rglob("*.txt")) == []
 
 
 @pytest.mark.asyncio
@@ -409,8 +573,9 @@ async def test_generated_file_retry_keeps_one_delivery_identity(tmp_path: Path) 
     assert first_effect == second_effect
     assert first_effect["idempotency_key"] == second_effect["idempotency_key"]
     assert first_effect["payload"]["command_id"] == second_effect["payload"]["command_id"]
-    assert first_effect["payload"]["file"]["file_path"] == (
-        second_effect["payload"]["file"]["file_path"]
+    assert (
+        first_effect["payload"]["file"]["file_path"]
+        == (second_effect["payload"]["file"]["file_path"])
     )
     assert first_effect["payload"]["file"]["file_name"] == "第一次名称.txt"
     artifact_path = Path(first_effect["payload"]["file"]["file_path"])
@@ -537,9 +702,7 @@ async def test_managed_private_file_generation_canonicalizes_source_and_target(
     session.canonical_conversation_id = canonical_session_id
     session.metadata.pop("_wxbot_delivery_contract")
     session.turns[0].metadata.pop("_wxbot_delivery_contract")
-    session.turns[0].metadata["external_message_id"] = (
-        external_source_message_id
-    )
+    session.turns[0].metadata["external_message_id"] = external_source_message_id
     session.turns[0].content = "把上面的内容整理成 txt 文件发我"
 
     result = await service.generate_text_file(
@@ -667,12 +830,8 @@ async def test_group_export_uses_connection_scoped_managed_observations(
         {
             "tenant_id": "demo",
             "session_id": canonical_session_id,
-            "start_occurred_ts": int(
-                datetime(2026, 7, 28, 16, 0, tzinfo=UTC).timestamp()
-            ),
-            "end_occurred_ts": int(
-                datetime(2026, 7, 29, 16, 0, tzinfo=UTC).timestamp()
-            ),
+            "start_occurred_ts": int(datetime(2026, 7, 28, 16, 0, tzinfo=UTC).timestamp()),
+            "end_occurred_ts": int(datetime(2026, 7, 29, 16, 0, tzinfo=UTC).timestamp()),
             "limit": 10001,
         }
     ]
@@ -684,26 +843,73 @@ async def test_group_export_uses_connection_scoped_managed_observations(
         assert payload["canonical_conversation_id"] == canonical_session_id
         assert payload["reply_to_message_id"] == external_source_message_id
         assert payload["source_message"]["message_id"] == canonical_source_message_id
-        assert (
-            payload["source_message"]["external_message_id"]
-            == external_source_message_id
-        )
+        assert payload["source_message"]["external_message_id"] == external_source_message_id
         assert payload["source_message"]["session_id"] == canonical_session_id
         assert payload["delivery"]["session_id"] == canonical_session_id
         assert payload["delivery"]["external_conversation_id"] == "room@chatroom"
-        assert (
-            payload["delivery"]["canonical_conversation_id"]
-            == canonical_session_id
-        )
-        assert (
-            payload["delivery"]["source_message_id"]
-            == canonical_source_message_id
-        )
-    export_path = Path(
-        result["channel_reply_effects"][1]["payload"]["file"]["file_path"]
-    )
+        assert payload["delivery"]["canonical_conversation_id"] == canonical_session_id
+        assert payload["delivery"]["source_message_id"] == canonical_source_message_id
+    export_path = Path(result["channel_reply_effects"][1]["payload"]["file"]["file_path"])
     exported = export_path.read_text(encoding="utf-8-sig")
     assert "[2026-07-29 09:30:00] 张三: 托管连接里的当天消息" in exported
+
+
+@pytest.mark.asyncio
+async def test_managed_group_recent_export_queries_exact_occurred_ts_window(
+    tmp_path: Path,
+) -> None:
+    connection_id = "managed-wechat-account"
+    external_session_id = "room@chatroom"
+    canonical_session_id = canonical_conversation_id(connection_id, external_session_id)
+    anchor = datetime(2026, 7, 29, 2, 0, tzinfo=UTC)
+    store = _FakeStore(
+        observations=[
+            {
+                "message_id": "managed-recent-1",
+                "sender_wxid": "wxid_a",
+                "sender_name": "张三",
+                "msg_type": "text",
+                "content": "最近十分钟的消息",
+                "is_self_sent": False,
+                "occurred_ts": int((anchor.timestamp()) - 120),
+                "metadata": {},
+            }
+        ]
+    )
+    service, store = _service(
+        tmp_path,
+        report_service=_FakeReportService(),
+        store=store,
+    )
+    session = _session(
+        external_session_id=external_session_id,
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="managed-recent-command",
+    )
+    session.connection_id = connection_id
+    session.session_id = canonical_session_id
+    session.canonical_conversation_id = canonical_session_id
+    session.turns[0].content = "把最近10分钟群消息汇总成文件发给我"
+    session.turns[0].created_at = anchor
+
+    result = await service.export_current_messages_file(
+        session,
+        {"report_type": "recent", "minutes": 10},
+    )
+
+    assert result["report_type"] == "recent"
+    assert result["minutes"] == 10
+    assert result["message_count"] == 1
+    assert store.observation_period_calls == [
+        {
+            "tenant_id": "demo",
+            "session_id": canonical_session_id,
+            "start_occurred_ts": int(anchor.timestamp()) - 600,
+            "end_occurred_ts": int(anchor.timestamp()),
+            "limit": 10001,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -858,3 +1064,114 @@ async def test_private_daily_export_filters_only_current_session_turns_for_date(
     assert "好友: 当天用户消息" in content
     assert "助手: 当天助手回复" in content
     assert "次日消息不应导出" not in content
+
+
+@pytest.mark.asyncio
+async def test_private_recent_export_filters_turns_before_command_anchor(
+    tmp_path: Path,
+) -> None:
+    service, _store = _service(
+        tmp_path,
+        report_service=_FakeReportService(period="unused"),
+    )
+    session = _session(
+        external_session_id="wxid_friend",
+        session_kind="private",
+        session_name="好友",
+        source_message_id="msg-private-recent",
+    )
+    session.turns = [
+        Turn(
+            session_id=session.session_id,
+            role=Role.USER,
+            content="范围外旧消息",
+            created_at=datetime(2026, 7, 29, 1, 49, 59, tzinfo=UTC),
+        ),
+        Turn(
+            session_id=session.session_id,
+            role=Role.USER,
+            content="范围起点消息",
+            created_at=datetime(2026, 7, 29, 1, 0, tzinfo=UTC),
+            metadata={"occurred_ts": int(datetime(2026, 7, 29, 1, 50, tzinfo=UTC).timestamp())},
+        ),
+        Turn(
+            session_id=session.session_id,
+            role=Role.ASSISTANT,
+            content="范围内助手消息",
+            created_at=datetime(2026, 7, 29, 1, 59, 59, tzinfo=UTC),
+        ),
+        Turn(
+            session_id=session.session_id,
+            role=Role.USER,
+            content="整理十分钟聊天记录，以文件方式发给我",
+            created_at=datetime(2026, 7, 29, 2, 0, tzinfo=UTC),
+            metadata={"msg_svr_id": "msg-private-recent"},
+        ),
+    ]
+
+    result = await service.export_current_messages_file(
+        session,
+        {"report_type": "daily", "date": "2026-07-29"},
+    )
+
+    assert result["report_type"] == "recent"
+    assert result["minutes"] == 10
+    assert result["message_count"] == 2
+    export_path = Path(result["channel_reply_effects"][1]["payload"]["file"]["file_path"])
+    exported = export_path.read_text(encoding="utf-8-sig")
+    assert "范围起点消息" in exported
+    assert "范围内助手消息" in exported
+    assert "范围外旧消息" not in exported
+    assert "整理十分钟聊天记录" not in exported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minutes", [0, 1441])
+async def test_recent_export_rejects_out_of_bounds_minutes_before_read_or_send(
+    tmp_path: Path,
+    minutes: int,
+) -> None:
+    report_service = _FakeReportService()
+    service, store = _service(tmp_path, report_service=report_service)
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id=f"msg-invalid-recent-{minutes}",
+    )
+    session.turns[0].content = f"汇总最近{minutes}分钟群消息并导出文件给我"
+
+    with pytest.raises(ValueError, match="1 到 1440 分钟"):
+        await service.export_current_messages_file(
+            session,
+            {"report_type": "recent", "minutes": minutes},
+        )
+
+    assert report_service.message_calls == []
+    assert store.enqueued == []
+    assert list(tmp_path.rglob("*.txt")) == []
+
+
+@pytest.mark.asyncio
+async def test_recent_export_rejects_ambiguous_user_range_before_read_or_send(
+    tmp_path: Path,
+) -> None:
+    report_service = _FakeReportService()
+    service, store = _service(tmp_path, report_service=report_service)
+    session = _session(
+        external_session_id="room@chatroom",
+        session_kind="group",
+        session_name="测试群",
+        source_message_id="msg-ambiguous-recent",
+    )
+    session.turns[0].content = "汇总最近10分钟还是20分钟群消息并输出文件给我"
+
+    with pytest.raises(ValueError, match="无效或不明确"):
+        await service.export_current_messages_file(
+            session,
+            {"report_type": "daily"},
+        )
+
+    assert report_service.message_calls == []
+    assert store.enqueued == []
+    assert list(tmp_path.rglob("*.txt")) == []

@@ -11,7 +11,10 @@ from app.common.types import (
     ChatResponse,
     InboundEvent,
     Message,
+    PreprocessedMessage,
+    Role,
     Session,
+    Turn,
 )
 from app.orchestrator.pipeline import PipelineContext
 from app.social.contracts import (
@@ -20,6 +23,11 @@ from app.social.contracts import (
     ParticipationPolicyValues,
 )
 from plugins.wxbot.agent_intent_hook import WxbotAgentIntentHook
+from plugins.wxbot.file_intent import (
+    MAX_RECENT_MESSAGE_EXPORT_MINUTES,
+    classify_file_intent,
+    parse_recent_message_minutes,
+)
 from plugins.wxbot.hook_context import _message_export_requested
 
 
@@ -78,10 +86,63 @@ def _pipeline_context(
         "把今天的消息记录总结一下，发我一个文件",
         "把聊天记录生成文件给我",
         "把聊天记录分析成文件发我",
+        "整理十分钟群里话题 以文件方式发给我",
     ],
 )
 def test_message_export_intent_requires_explicit_combined_request(text: str) -> None:
     assert _message_export_requested(text) is True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_minutes"),
+    [
+        ("整理十分钟群里话题 以文件方式发给我", 10),
+        ("把最近15分钟的群消息汇总成 TXT 文件发我", 15),
+        ("汇总过去一百二十分钟聊天记录并导出文件", 120),
+        ("把群里20分钟内的话题整理成文件给我", 20),
+        ("汇总最近１４４０分钟群消息并输出文件", MAX_RECENT_MESSAGE_EXPORT_MINUTES),
+    ],
+)
+def test_recent_message_export_minutes_are_parsed_deterministically(
+    text: str,
+    expected_minutes: int,
+) -> None:
+    intent = classify_file_intent(text)
+
+    assert intent.operation == "export_history"
+    assert intent.delivery_required is True
+    assert intent.recent_minutes == expected_minutes
+    assert parse_recent_message_minutes(text) == expected_minutes
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "十分钟后整理群消息并导出文件给我",
+        "请花十分钟整理今天群消息并导出文件给我",
+        "用十分钟汇总群聊记录并输出文件",
+        "请在十分钟内整理今天群消息并导出文件给我",
+    ],
+)
+def test_recent_message_export_rejects_future_or_effort_durations(text: str) -> None:
+    assert parse_recent_message_minutes(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "整理未来十分钟群里话题并导出文件给我",
+        "汇总最近10分钟还是20分钟群消息并输出文件",
+        "汇总最近一二分钟群消息并输出文件",
+        "不要汇总最近十分钟群里话题，改为汇总今天群消息并输出文件",
+    ],
+)
+def test_ambiguous_or_negated_recent_ranges_are_marked_invalid(text: str) -> None:
+    intent = classify_file_intent(text)
+
+    assert intent.operation == "export_history"
+    assert intent.recent_minutes is None
+    assert intent.recent_minutes_invalid is True
 
 
 @pytest.mark.parametrize(
@@ -191,6 +252,27 @@ class _CapturingLLM:
         return ChatResponse(content="ok")
 
 
+class _CapturingExportHandler:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(
+        self,
+        _session: Session,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        self.calls.append(dict(arguments))
+        return {
+            "ok": True,
+            "report_type": "recent",
+            "minutes": int(arguments["minutes"]),
+            "sent_to_current_session": True,
+            "delivery_status": "queued",
+            "self_enqueued_reply": True,
+            "suppress_final_reply": True,
+        }
+
+
 @pytest.mark.asyncio
 async def test_private_tool_visibility_is_explicit_and_keeps_group_tools_isolated() -> None:
     registry = AgentToolRegistry()
@@ -275,3 +357,64 @@ def test_message_export_scope_prompt_forbids_implicit_file_delivery() -> None:
     assert "同时明确要求" in prompt
     assert "普通的消息汇总请求不得调用导出工具" in prompt
     assert "只能导出当前群聊或当前私聊" in prompt
+
+
+@pytest.mark.asyncio
+async def test_required_recent_export_is_auto_fulfilled_when_model_skips_tool() -> None:
+    registry = AgentToolRegistry()
+    handler = _CapturingExportHandler()
+    registry.register(
+        AgentToolDefinition(
+            scope=MESSAGE_EXPORT_SCOPE,
+            name="export_current_messages_file",
+            description="export recent messages",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            metadata={"channels": ["wechat"], "session_kinds": ["private"]},
+        )
+    )
+    llm = _CapturingLLM()
+    engine = AgentCapabilityEngine(
+        llm,
+        settings=Settings(
+            customer_service_prompt_enabled=False,
+            agent_tools_require_explicit_policy=False,
+        ),
+        agent_tool_registry=registry,
+    )
+    text = "整理十分钟聊天记录，以文件方式发给我"
+    session = Session(
+        session_id="wxid_private",
+        tenant_id="demo",
+        user_id="wxid_private",
+        channel=Channel.WECHAT,
+        metadata={"session_kind": "private"},
+        turns=[
+            Turn(
+                session_id="wxid_private",
+                role=Role.USER,
+                content=text,
+            )
+        ],
+    )
+
+    result = await engine.answer(
+        PreprocessedMessage(original_text=text, cleaned_text=text),
+        session,
+        {
+            "agent_tool_scope": MESSAGE_EXPORT_SCOPE,
+            "agent_required_effect": {
+                "type": "outbound_file",
+                "scope": MESSAGE_EXPORT_SCOPE,
+                "tool": "export_current_messages_file",
+                "operation": "export_history",
+                "format": "txt",
+                "recent_minutes": 10,
+            },
+        },
+    )
+
+    assert handler.calls == [{"report_type": "recent", "minutes": 10, "format": "txt"}]
+    assert result.metadata["required_effect_satisfied"] is True
+    assert result.metadata["required_effect_auto_fulfilled"] is True
+    assert result.reply_text == ""

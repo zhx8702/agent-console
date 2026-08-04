@@ -65,6 +65,7 @@ MAX_TOOL_OWNER_GATE_TIMEOUT_SECONDS = 30.0
 MIN_CLEAR_TOOL_PRESELECTION_SCORE = 2
 MIN_CLEAR_TOOL_PRESELECTION_MARGIN = 2
 AMBIGUOUS_TOOL_PRESELECTION_TOP_K = 3
+MAX_REQUIRED_MESSAGE_EXPORT_MINUTES = 24 * 60
 ToolOwnerGate = Callable[[str, Session], Awaitable[bool]]
 
 
@@ -884,7 +885,7 @@ class AgentCapabilityEngine:
             or expected_tools.get((contract_scope, operation)) != tool_name
         ):
             return {}
-        return {
+        effect: dict[str, Any] = {
             "type": effect_type,
             "scope": contract_scope,
             "operation": operation,
@@ -896,6 +897,19 @@ class AgentCapabilityEngine:
                 and operation == "generate"
             ),
         }
+        if contract_scope == MESSAGE_EXPORT_SCOPE and operation == "export_history":
+            raw_recent_minutes = raw.get("recent_minutes")
+            recent_minutes = (
+                int(raw_recent_minutes)
+                if (
+                    isinstance(raw_recent_minutes, int) and not isinstance(raw_recent_minutes, bool)
+                )
+                or (isinstance(raw_recent_minutes, str) and raw_recent_minutes.isdigit())
+                else 0
+            )
+            if 1 <= recent_minutes <= MAX_REQUIRED_MESSAGE_EXPORT_MINUTES:
+                effect["recent_minutes"] = recent_minutes
+        return effect
 
     def _required_web_search_configured(self) -> bool:
         return bool(
@@ -1027,6 +1041,16 @@ class AgentCapabilityEngine:
                 and str(result.get("delivery_status") or "").strip().lower()
                 in {"queued", "sent", "delivered"}
             ):
+                required_minutes = required_effect.get("recent_minutes")
+                if required_tool == "export_current_messages_file" and required_minutes:
+                    result_minutes = result.get("minutes")
+                    if (
+                        str(result.get("report_type") or "").strip().lower() != "recent"
+                        or isinstance(result_minutes, bool)
+                        or not isinstance(result_minutes, int)
+                        or result_minutes != required_minutes
+                    ):
+                        continue
                 return True
         return False
 
@@ -1045,27 +1069,38 @@ class AgentCapabilityEngine:
             return None, "required_tool_failed"
         if tool_name not in tools:
             return None, "required_tool_unavailable"
-        # Only generated answer content can be completed safely after the
-        # model skipped its required function call.  Conversion and history
-        # export need their own structured arguments and must fail explicitly
-        # instead of guessing a source file or time range.
-        if tool_name != "generate_text_file":
+        # A recent-message export carries a trusted, deterministic range from
+        # the intent hook, so it can be completed safely if the model omits the
+        # tool call. Other history ranges and conversions still fail closed
+        # instead of guessing structured arguments or a source file.
+        if tool_name == "export_current_messages_file":
+            recent_minutes = int(required_effect.get("recent_minutes") or 0)
+            if not 1 <= recent_minutes <= MAX_REQUIRED_MESSAGE_EXPORT_MINUTES:
+                return None, "required_tool_not_called"
+            arguments = {
+                "report_type": "recent",
+                "minutes": recent_minutes,
+                "format": required_effect.get("format") or "txt",
+            }
+        elif tool_name == "generate_text_file":
+            content = str(response_text or "").strip()
+            if not content:
+                return None, "required_content_missing"
+            if required_effect.get("web_search_required") is True:
+                content = self._append_citation_sources(
+                    content,
+                    list(response_citations or []),
+                )
+            arguments = {
+                "content": content,
+                "format": required_effect.get("format") or "txt",
+            }
+        else:
             return None, "required_tool_not_called"
-        content = str(response_text or "").strip()
-        if not content:
-            return None, "required_content_missing"
-        if required_effect.get("web_search_required") is True:
-            content = self._append_citation_sources(
-                content,
-                list(response_citations or []),
-            )
         tool_call = ToolCall(
             id=f"auto_required_file_delivery_{len(executed_tool_calls) + 1}",
             name=tool_name,
-            arguments={
-                "content": content,
-                "format": required_effect.get("format") or "txt",
-            },
+            arguments=arguments,
         )
         executed = await self._execute_tool_call(session, tool_call, tools)
         if executed.error or not self._required_effect_satisfied(required_effect, [executed]):

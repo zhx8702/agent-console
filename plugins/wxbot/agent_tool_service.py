@@ -52,7 +52,10 @@ from plugins.wxbot.file_artifacts import (
     normalize_file_format,
     stage_outbound_artifact,
 )
-from plugins.wxbot.file_intent import classify_file_intent
+from plugins.wxbot.file_intent import (
+    MAX_RECENT_MESSAGE_EXPORT_MINUTES,
+    classify_file_intent,
+)
 from plugins.wxbot.group_file_policy import (
     GroupFilePolicyReader,
     require_group_file_send_enabled,
@@ -109,12 +112,8 @@ class WxbotAgentToolService:
         effect_reply_enabled: bool = False,
         message_export_root: str | Path | None = None,
         message_export_max_bytes: int | None = None,
-        data_owner_scope_execution_allowed: (
-            WxbotDataOwnerScopeExecutionAllowed | None
-        ) = None,
-        data_owners_scope_execution_allowed: (
-            WxbotDataOwnersScopeExecutionAllowed | None
-        ) = None,
+        data_owner_scope_execution_allowed: (WxbotDataOwnerScopeExecutionAllowed | None) = None,
+        data_owners_scope_execution_allowed: (WxbotDataOwnersScopeExecutionAllowed | None) = None,
         social_policy_store: GroupFilePolicyReader | None = None,
     ) -> None:
         self._settings = settings
@@ -161,19 +160,21 @@ class WxbotAgentToolService:
         await self._cleanup_message_export_artifacts()
         latest_turn, latest_metadata = self._latest_user_context(session)
         session_metadata = dict(getattr(session, "metadata", {}) or {})
-        session_name = str(
-            latest_metadata.get("session_name")
-            or session_metadata.get("session_name")
+        session_name = (
+            str(
+                latest_metadata.get("session_name")
+                or session_metadata.get("session_name")
+                or session_id
+            ).strip()
             or session_id
-        ).strip() or session_id
+        )
 
-        report_type = str(arguments.get("report_type") or "daily").strip().lower()
-        if report_type not in {"daily", "monthly"}:
-            raise ValueError("report_type 仅支持 daily 或 monthly")
         export_format = normalize_file_format(arguments.get("format") or "txt")
         request_intent = classify_file_intent(
             str(getattr(latest_turn, "content", "") or ""),
         )
+        if request_intent.recent_minutes_invalid:
+            raise ValueError("最近消息时间范围无效或不明确，请只指定一个分钟数")
         if request_intent.requested_format:
             if request_intent.requested_format not in {"txt", "md", "csv", "json"}:
                 raise ValueError(
@@ -182,11 +183,42 @@ class WxbotAgentToolService:
             if export_format != request_intent.requested_format:
                 raise ValueError("工具格式与用户明确要求的文件格式不一致")
 
-        date, year_month = self._message_export_period_arguments(
-            report_type,
-            date=str(arguments.get("date") or "").strip(),
-            year_month=str(arguments.get("year_month") or "").strip(),
-        )
+        report_type = str(arguments.get("report_type") or "daily").strip().lower()
+        recent_minutes = request_intent.recent_minutes
+        if recent_minutes is not None:
+            # The deterministic user-intent parser owns relative ranges. This
+            # prevents a model-supplied default of `daily` from widening an
+            # explicit "最近十分钟" request to the whole day.
+            report_type = "recent"
+        if report_type not in {"recent", "daily", "monthly"}:
+            raise ValueError("report_type 仅支持 recent、daily 或 monthly")
+
+        if report_type == "recent":
+            if recent_minutes is None:
+                raise ValueError("recent 导出要求用户明确说出最近多少分钟")
+            if not 1 <= recent_minutes <= MAX_RECENT_MESSAGE_EXPORT_MINUTES:
+                raise ValueError(
+                    f"最近消息导出仅支持 1 到 {MAX_RECENT_MESSAGE_EXPORT_MINUTES} 分钟"
+                )
+            date = ""
+            year_month = ""
+            range_start_ts, range_end_ts, period = self._recent_message_export_range(
+                recent_minutes,
+                latest_turn=latest_turn,
+                latest_metadata=latest_metadata,
+                session=session,
+            )
+        else:
+            date, year_month = self._message_export_period_arguments(
+                report_type,
+                date=str(arguments.get("date") or "").strip(),
+                year_month=str(arguments.get("year_month") or "").strip(),
+            )
+            period = date if report_type == "daily" else year_month
+            range_start_ts, range_end_ts = self._message_export_period_bounds(
+                report_type=report_type,
+                period=period,
+            )
         session_kind = self._message_export_session_kind(
             session,
             latest_metadata=latest_metadata,
@@ -202,7 +234,6 @@ class WxbotAgentToolService:
                 str(getattr(session, "connection_id", "") or "").strip()
                 or LEGACY_WXBOT_CONNECTION_ID
             )
-            period = date if report_type == "daily" else year_month
             if connection_id == LEGACY_WXBOT_CONNECTION_ID:
                 require_legacy_wxbot_history_scope(
                     self._settings,
@@ -212,37 +243,45 @@ class WxbotAgentToolService:
                 report_service = self._report_service
                 if report_service is None:
                     raise RuntimeError("wxbot report service is unavailable")
-                messages_payload = await report_service.fetch_report_messages_payload(
-                    session_id,
-                    session_name=session_name,
-                    report_type=report_type,
-                    date=date if report_type == "daily" else "",
-                    year_month=year_month if report_type == "monthly" else "",
-                )
-                if messages_payload.get("ok") is False:
-                    raise RuntimeError(
-                        str(messages_payload.get("error") or "wxbot report messages failed")
+                if report_type == "recent":
+                    messages = await self._legacy_group_message_records_for_range(
+                        report_service,
+                        session_id=session_id,
+                        session_name=session_name,
+                        start_ts=range_start_ts,
+                        end_ts=range_end_ts,
                     )
-                raw_messages = messages_payload.get("messages")
-                if not isinstance(raw_messages, list):
-                    raise RuntimeError("wxbot report messages payload missing messages list")
-                messages = [item for item in raw_messages if isinstance(item, dict)]
-                period = str(messages_payload.get("period") or period).strip()
+                else:
+                    messages_payload = await report_service.fetch_report_messages_payload(
+                        session_id,
+                        session_name=session_name,
+                        report_type=report_type,
+                        date=date if report_type == "daily" else "",
+                        year_month=year_month if report_type == "monthly" else "",
+                    )
+                    if messages_payload.get("ok") is False:
+                        raise RuntimeError(
+                            str(messages_payload.get("error") or "wxbot report messages failed")
+                        )
+                    raw_messages = messages_payload.get("messages")
+                    if not isinstance(raw_messages, list):
+                        raise RuntimeError("wxbot report messages payload missing messages list")
+                    messages = [item for item in raw_messages if isinstance(item, dict)]
+                    period = str(messages_payload.get("period") or period).strip()
             else:
                 messages = await self._managed_group_message_records(
                     session,
                     tenant_id=tenant_id,
                     external_session_id=session_id,
                     connection_id=connection_id,
-                    report_type=report_type,
-                    period=period,
+                    start_ts=range_start_ts,
+                    end_ts=range_end_ts,
                 )
         else:
-            period = date if report_type == "daily" else year_month
             messages = self._current_private_message_records(
                 session,
-                report_type=report_type,
-                period=period,
+                start_ts=range_start_ts,
+                end_ts=range_end_ts,
             )
         summary_text = build_message_export_summary(
             session_name,
@@ -311,6 +350,7 @@ class WxbotAgentToolService:
         return {
             "ok": True,
             "report_type": report_type,
+            "minutes": recent_minutes if report_type == "recent" else None,
             "period": period,
             "format": export_format,
             "message_count": int(artifact.get("message_count") or 0),
@@ -375,9 +415,7 @@ class WxbotAgentToolService:
             "file": descriptor,
             "extractable": True,
             "content": (
-                "[UNTRUSTED_FILE_CONTENT_BEGIN]\n"
-                + preview
-                + "\n[UNTRUSTED_FILE_CONTENT_END]"
+                "[UNTRUSTED_FILE_CONTENT_BEGIN]\n" + preview + "\n[UNTRUSTED_FILE_CONTENT_END]"
             ),
             "truncated": len(preview) >= 12_000,
         }
@@ -459,9 +497,7 @@ class WxbotAgentToolService:
             session_id=session_id,
         )
         digest = hashlib.sha256(
-            "\0".join((tenant_id, session_id, source_id, target_format, file_name)).encode(
-                "utf-8"
-            )
+            "\0".join((tenant_id, session_id, source_id, target_format, file_name)).encode("utf-8")
         ).hexdigest()[:32]
         request_id = f"wxbot-file-convert-{digest}"
         artifact = stage_outbound_artifact(
@@ -631,9 +667,7 @@ class WxbotAgentToolService:
             raw_content.encode("utf-8"),
             source_name="generated.json" if target_format == "json" else "generated.txt",
             target_format=target_format,
-            source_content_type=(
-                "application/json" if target_format == "json" else "text/plain"
-            ),
+            source_content_type=("application/json" if target_format == "json" else "text/plain"),
         )
         artifact = stage_outbound_artifact(
             self._message_export_root,
@@ -671,9 +705,7 @@ class WxbotAgentToolService:
         # Delivery identity is bound to the inbound request, not model text.
         # A retry may word the same answer differently; it must still resolve
         # to one outbound command instead of sending duplicate files.
-        command_id = (
-            f"channel-reply:{tenant_id}:wxbot-file-generate:{delivery_digest}"
-        )
+        command_id = f"channel-reply:{tenant_id}:wxbot-file-generate:{delivery_digest}"
         payload = {
             "tenant_id": tenant_id,
             "channel": channel,
@@ -767,10 +799,18 @@ class WxbotAgentToolService:
 
     @classmethod
     def _latest_file_context(cls, session: Any) -> tuple[Any | None, dict[str, Any]]:
-        session_id = str(getattr(session, "external_conversation_id", "") or getattr(session, "session_id", "") or "")
-        is_group = session_id.endswith("@chatroom") or str(
-            dict(getattr(session, "metadata", {}) or {}).get("session_kind") or ""
-        ).strip().lower() == "group"
+        session_id = str(
+            getattr(session, "external_conversation_id", "")
+            or getattr(session, "session_id", "")
+            or ""
+        )
+        is_group = (
+            session_id.endswith("@chatroom")
+            or str(dict(getattr(session, "metadata", {}) or {}).get("session_kind") or "")
+            .strip()
+            .lower()
+            == "group"
+        )
         _request_turn, request_metadata = cls._latest_user_context(session)
         requester_id = str(
             request_metadata.get("sender_wxid")
@@ -852,7 +892,9 @@ class WxbotAgentToolService:
             if not isinstance(row, dict):
                 continue
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            ready_message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+            ready_message = (
+                payload.get("message") if isinstance(payload.get("message"), dict) else {}
+            )
             ready_media = payload.get("media") if isinstance(payload.get("media"), dict) else {}
             merged = dict(metadata)
             merged_media = {**media, **ready_media}
@@ -946,7 +988,9 @@ class WxbotAgentToolService:
             1024 * 1024,
             min(configured_limit, sdk_download_limit, 100 * 1024 * 1024),
         )
-        async with httpx.AsyncClient(timeout=None, trust_env=False, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=None, trust_env=False, follow_redirects=False
+        ) as client:
             response = await safe_trusted_service_request(
                 client,
                 "GET",
@@ -989,26 +1033,34 @@ class WxbotAgentToolService:
                 raise ValueError("当前文件大小元数据无效") from exc
             if expected_size > 0 and expected_size != len(content):
                 raise ValueError("当前文件大小校验失败，已拒绝继续处理")
-        expected_sha256 = str(
-            metadata.get("file_sha256")
-            or media.get("file_sha256")
-            or media.get("sha256")
-            or attachment.get("sha256")
-            or ""
-        ).strip().lower()
+        expected_sha256 = (
+            str(
+                metadata.get("file_sha256")
+                or media.get("file_sha256")
+                or media.get("sha256")
+                or attachment.get("sha256")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         if expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             raise ValueError("当前文件校验值格式无效")
         if expected_sha256:
             actual_sha256 = hashlib.sha256(content).hexdigest()
             if actual_sha256 != expected_sha256:
                 raise ValueError("当前文件校验失败，已拒绝继续处理")
-        expected_md5 = str(
-            metadata.get("file_md5")
-            or media.get("file_md5")
-            or media.get("md5")
-            or attachment.get("md5")
-            or ""
-        ).strip().lower()
+        expected_md5 = (
+            str(
+                metadata.get("file_md5")
+                or media.get("file_md5")
+                or media.get("md5")
+                or attachment.get("md5")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         if expected_md5 and not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
             raise ValueError("当前文件校验值格式无效")
         if expected_md5:
@@ -1144,13 +1196,137 @@ class WxbotAgentToolService:
     def _message_export_timezone(self) -> ZoneInfo:
         try:
             return ZoneInfo(
-                str(
-                    getattr(self._settings, "timezone", "Asia/Shanghai")
-                    or "Asia/Shanghai"
-                )
+                str(getattr(self._settings, "timezone", "Asia/Shanghai") or "Asia/Shanghai")
             )
         except Exception:
             return ZoneInfo("Asia/Shanghai")
+
+    def _message_export_anchor_time(
+        self,
+        *,
+        latest_turn: Any,
+        latest_metadata: dict[str, Any],
+        session: Any,
+    ) -> datetime:
+        timezone = self._message_export_timezone()
+        raw_occurred_ts = latest_metadata.get("occurred_ts")
+        try:
+            occurred_ts = float(raw_occurred_ts or 0)
+            if occurred_ts > 1_000_000_000_000:
+                occurred_ts /= 1000.0
+            if occurred_ts > 0:
+                return datetime.fromtimestamp(occurred_ts, tz=timezone)
+        except (OverflowError, TypeError, ValueError):
+            pass
+
+        for candidate in (
+            getattr(latest_turn, "created_at", None),
+            getattr(session, "last_active_at", None),
+        ):
+            if not isinstance(candidate, datetime):
+                continue
+            if candidate.tzinfo is None:
+                candidate = candidate.replace(tzinfo=UTC)
+            return candidate.astimezone(timezone)
+        raise ValueError("当前消息缺少稳定时间，无法计算最近消息范围")
+
+    def _recent_message_export_range(
+        self,
+        minutes: int,
+        *,
+        latest_turn: Any,
+        latest_metadata: dict[str, Any],
+        session: Any,
+    ) -> tuple[int, int, str]:
+        end = self._message_export_anchor_time(
+            latest_turn=latest_turn,
+            latest_metadata=latest_metadata,
+            session=session,
+        ).replace(microsecond=0)
+        start = end - timedelta(minutes=minutes)
+        period = (
+            f"最近 {minutes} 分钟（{start.strftime('%Y-%m-%d %H:%M:%S')} 至 "
+            f"{end.strftime('%Y-%m-%d %H:%M:%S')}）"
+        )
+        return int(start.timestamp()), int(end.timestamp()), period
+
+    def _message_record_timestamp(self, item: dict[str, Any]) -> int:
+        timezone = self._message_export_timezone()
+        for key in ("ts", "occurred_ts"):
+            try:
+                timestamp = float(item.get(key) or 0)
+                if timestamp > 1_000_000_000_000:
+                    timestamp /= 1000.0
+                if timestamp > 0:
+                    return int(timestamp)
+            except (OverflowError, TypeError, ValueError):
+                continue
+
+        raw = str(item.get("timestamp") or item.get("occurred_at") or "").strip()
+        if not raw:
+            return 0
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone)
+            return int(parsed.timestamp())
+        except ValueError:
+            pass
+        for value_format in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y/%m/%d %H:%M",
+        ):
+            try:
+                return int(
+                    datetime.strptime(raw, value_format).replace(tzinfo=timezone).timestamp()
+                )
+            except ValueError:
+                continue
+        return 0
+
+    async def _legacy_group_message_records_for_range(
+        self,
+        report_service: WxbotReportService,
+        *,
+        session_id: str,
+        session_name: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[dict[str, Any]]:
+        timezone = self._message_export_timezone()
+        first_date = datetime.fromtimestamp(start_ts, tz=timezone).date()
+        last_date = datetime.fromtimestamp(max(start_ts, end_ts - 1), tz=timezone).date()
+        cursor = first_date
+        messages: list[dict[str, Any]] = []
+        while cursor <= last_date:
+            messages_payload = await report_service.fetch_report_messages_payload(
+                session_id,
+                session_name=session_name,
+                report_type="daily",
+                date=cursor.strftime("%Y-%m-%d"),
+                year_month="",
+            )
+            if messages_payload.get("ok") is False:
+                raise RuntimeError(
+                    str(messages_payload.get("error") or "wxbot report messages failed")
+                )
+            raw_messages = messages_payload.get("messages")
+            if not isinstance(raw_messages, list):
+                raise RuntimeError("wxbot report messages payload missing messages list")
+            messages.extend(item for item in raw_messages if isinstance(item, dict))
+            cursor += timedelta(days=1)
+        filtered: list[dict[str, Any]] = []
+        for item in messages:
+            occurred_ts = self._message_record_timestamp(item)
+            if occurred_ts <= 0:
+                raise RuntimeError("wxbot report message missing a valid timestamp")
+            if start_ts <= occurred_ts < end_ts:
+                filtered.append(item)
+        if len(filtered) > _MANAGED_MESSAGE_EXPORT_MAX_RECORDS:
+            raise ValueError("当前时间范围内的群消息超过 10000 条，请缩小导出时间范围")
+        return filtered
 
     def _message_export_period_bounds(
         self,
@@ -1178,8 +1354,8 @@ class WxbotAgentToolService:
         tenant_id: str,
         external_session_id: str,
         connection_id: str,
-        report_type: str,
-        period: str,
+        start_ts: int,
+        end_ts: int,
     ) -> list[dict[str, Any]]:
         canonical_session_id = canonical_conversation_id(
             connection_id,
@@ -1193,10 +1369,6 @@ class WxbotAgentToolService:
         if declared_canonical_id and declared_canonical_id != canonical_session_id:
             raise ValueError("managed_wxbot_conversation_scope_mismatch")
 
-        start_ts, end_ts = self._message_export_period_bounds(
-            report_type=report_type,
-            period=period,
-        )
         observations = await self._wxbot_store.list_group_observations_for_period(
             tenant_id,
             canonical_session_id,
@@ -1205,9 +1377,7 @@ class WxbotAgentToolService:
             limit=_MANAGED_MESSAGE_EXPORT_MAX_RECORDS + 1,
         )
         if len(observations) > _MANAGED_MESSAGE_EXPORT_MAX_RECORDS:
-            raise ValueError(
-                "当前时间范围内的群消息超过 10000 条，请缩小导出时间范围"
-            )
+            raise ValueError("当前时间范围内的群消息超过 10000 条，请缩小导出时间范围")
         return [
             self._managed_group_observation_record(item)
             for item in observations
@@ -1241,20 +1411,15 @@ class WxbotAgentToolService:
             "occurred_ts": occurred_ts,
             "sender_wxid": str(observation.get("sender_wxid") or "").strip(),
             "sender_name": str(observation.get("sender_name") or "").strip(),
-            "msg_type": str(observation.get("msg_type") or "text").strip().lower()
-            or "text",
+            "msg_type": str(observation.get("msg_type") or "text").strip().lower() or "text",
             "text": str(observation.get("content") or ""),
             "is_self_sent": bool(observation.get("is_self_sent")),
         }
         if record["msg_type"] == "file":
             record["file_attachment"] = {
-                "name": str(
-                    metadata.get("file_name") or attachment.get("name") or ""
-                ).strip(),
+                "name": str(metadata.get("file_name") or attachment.get("name") or "").strip(),
                 "size": metadata.get("file_size", attachment.get("size")),
-                "sha256": str(
-                    metadata.get("file_sha256") or attachment.get("sha256") or ""
-                )
+                "sha256": str(metadata.get("file_sha256") or attachment.get("sha256") or "")
                 .strip()
                 .lower(),
                 "download_status": str(
@@ -1290,11 +1455,15 @@ class WxbotAgentToolService:
         latest_metadata: dict[str, Any],
         session_id: str,
     ) -> str:
-        declared = str(
-            latest_metadata.get("session_kind")
-            or dict(getattr(session, "metadata", {}) or {}).get("session_kind")
-            or ""
-        ).strip().lower()
+        declared = (
+            str(
+                latest_metadata.get("session_kind")
+                or dict(getattr(session, "metadata", {}) or {}).get("session_kind")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
         if declared in {"group", "private"}:
             return declared
         return "group" if session_id.endswith("@chatroom") else "private"
@@ -1303,33 +1472,46 @@ class WxbotAgentToolService:
         self,
         session: Any,
         *,
-        report_type: str,
-        period: str,
+        start_ts: int,
+        end_ts: int,
     ) -> list[dict[str, Any]]:
         timezone = self._message_export_timezone()
         fallback_created_at = getattr(session, "last_active_at", None)
         if not isinstance(fallback_created_at, datetime):
-            fallback_created_at = datetime.now(timezone)
+            fallback_created_at = None
         records: list[dict[str, Any]] = []
-        for turn in list(getattr(session, "turns", []) or []):
+        for turn_index, turn in enumerate(list(getattr(session, "turns", []) or [])):
             raw_role = getattr(turn, "role", "")
             role = str(getattr(raw_role, "value", raw_role) or "").strip().lower()
             if role not in {"user", "assistant"}:
                 continue
-            created_at = getattr(turn, "created_at", None)
+            metadata = dict(getattr(turn, "metadata", {}) or {})
+            created_at = None
+            raw_occurred_ts = metadata.get("occurred_ts")
+            try:
+                occurred_value = float(raw_occurred_ts or 0)
+                if occurred_value > 1_000_000_000_000:
+                    occurred_value /= 1000.0
+                if occurred_value > 0:
+                    created_at = datetime.fromtimestamp(occurred_value, tz=timezone)
+            except (OverflowError, TypeError, ValueError):
+                created_at = None
+            if created_at is None:
+                created_at = getattr(turn, "created_at", None)
             if not isinstance(created_at, datetime):
                 created_at = fallback_created_at
+            if not isinstance(created_at, datetime):
+                # A record without a source timestamp cannot be proven to be
+                # inside any requested window.  Do not use wall-clock now as
+                # a substitute: that would make retries and delayed turns
+                # export an arbitrary range.
+                continue
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
             local_created_at = created_at.astimezone(timezone)
-            local_period = (
-                local_created_at.strftime("%Y-%m-%d")
-                if report_type == "daily"
-                else local_created_at.strftime("%Y-%m")
-            )
-            if local_period != period:
+            occurred_ts = int(local_created_at.timestamp())
+            if not start_ts <= occurred_ts < end_ts:
                 continue
-            metadata = dict(getattr(turn, "metadata", {}) or {})
             if role == "assistant":
                 sender_wxid = "assistant"
                 sender_name = "助手"
@@ -1340,9 +1522,7 @@ class WxbotAgentToolService:
                     or getattr(session, "user_id", "")
                     or ""
                 ).strip()
-                sender_name = str(
-                    metadata.get("sender_name") or sender_wxid or "当前用户"
-                ).strip()
+                sender_name = str(metadata.get("sender_name") or sender_wxid or "当前用户").strip()
             msg_type = str(metadata.get("msg_type") or "text").strip().lower() or "text"
             turn_text = str(getattr(turn, "content", "") or "")
             if msg_type == "file" and not turn_text:
@@ -1352,26 +1532,28 @@ class WxbotAgentToolService:
                 if isinstance(metadata.get("file_attachment"), dict)
                 else {}
             )
-            file_name = str(
-                metadata.get("file_name") or attachment.get("name") or ""
-            ).strip()
+            file_name = str(metadata.get("file_name") or attachment.get("name") or "").strip()
             file_size = metadata.get("file_size", attachment.get("size"))
             try:
                 file_size = max(0, int(file_size or 0))
             except (TypeError, ValueError):
                 file_size = 0
-            file_sha256 = str(
-                metadata.get("file_sha256") or attachment.get("sha256") or ""
-            ).strip().lower()
-            file_status = str(
-                metadata.get("file_download_status")
-                or attachment.get("download_status")
-                or metadata.get("media_status")
-                or ""
-            ).strip().lower()
+            file_sha256 = (
+                str(metadata.get("file_sha256") or attachment.get("sha256") or "").strip().lower()
+            )
+            file_status = (
+                str(
+                    metadata.get("file_download_status")
+                    or attachment.get("download_status")
+                    or metadata.get("media_status")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
             records.append(
                 {
-                    "ts": int(local_created_at.timestamp()),
+                    "ts": occurred_ts,
                     "timestamp": local_created_at.strftime("%Y-%m-%d %H:%M:%S"),
                     "sender_wxid": sender_wxid,
                     "sender_name": sender_name,
@@ -1381,9 +1563,12 @@ class WxbotAgentToolService:
                     "file_size": file_size,
                     "file_sha256": file_sha256,
                     "file_status": file_status,
+                    "_turn_index": turn_index,
                 }
             )
-        records.sort(key=lambda item: (int(item.get("ts") or 0), str(item["sender_wxid"])))
+        records.sort(key=lambda item: (int(item.get("ts") or 0), int(item.get("_turn_index") or 0)))
+        for item in records:
+            item.pop("_turn_index", None)
         return records
 
     @staticmethod
@@ -1411,8 +1596,7 @@ class WxbotAgentToolService:
             captured = session_metadata.get(_DELIVERY_CONTRACT_METADATA_KEY)
         captured_contract = dict(captured) if isinstance(captured, dict) else {}
         connection_id = (
-            str(getattr(session, "connection_id", "") or "").strip()
-            or LEGACY_WXBOT_CONNECTION_ID
+            str(getattr(session, "connection_id", "") or "").strip() or LEGACY_WXBOT_CONNECTION_ID
         )
         if connection_id == LEGACY_WXBOT_CONNECTION_ID:
             for value in (
@@ -1591,15 +1775,11 @@ class WxbotAgentToolService:
             "trace_id": trace_id,
             "source_message": source_message,
         }
-        command_prefix = (
-            f"channel-reply:{tenant_id}:wxbot-message-export:{request_digest}"
-        )
+        command_prefix = f"channel-reply:{tenant_id}:wxbot-message-export:{request_digest}"
         confirmation_command = f"{command_prefix}:text"
         file_command = f"{command_prefix}:file"
         message_count = int(artifact.get("message_count") or 0)
-        confirmation_text = (
-            f"已整理 {period} 的消息记录，共 {message_count} 条，文件已排队发送。"
-        )
+        confirmation_text = f"已整理 {period} 的消息记录，共 {message_count} 条，文件已排队发送。"
         # The confirmation reserves the one conversational obligation.  The
         # file is the payload of that same response and must not consume a
         # second group speech-budget slot or be suppressed as a duplicate.
@@ -1668,28 +1848,14 @@ class WxbotAgentToolService:
                 session_name=str(payload.get("session_name") or ""),
                 sender_name=str(payload.get("sender_name") or ""),
                 sender_wxid=str(payload.get("sender_id") or ""),
-                reply_text=(
-                    str(body.get("text") or "")
-                    if isinstance(body, dict)
-                    else ""
-                ),
+                reply_text=(str(body.get("text") or "") if isinstance(body, dict) else ""),
                 trace_id=str(payload.get("trace_id") or ""),
                 msg_type="file" if is_file else "text",
-                file_path=(
-                    str(file_payload.get("file_path") or "") if is_file else ""
-                ),
-                file_name=(
-                    str(file_payload.get("file_name") or "") if is_file else ""
-                ),
-                file_size=(
-                    int(file_payload.get("file_size") or 0) if is_file else None
-                ),
-                file_md5=(
-                    str(file_payload.get("file_md5") or "") if is_file else ""
-                ),
-                file_sha256=(
-                    str(file_payload.get("file_sha256") or "") if is_file else ""
-                ),
+                file_path=(str(file_payload.get("file_path") or "") if is_file else ""),
+                file_name=(str(file_payload.get("file_name") or "") if is_file else ""),
+                file_size=(int(file_payload.get("file_size") or 0) if is_file else None),
+                file_md5=(str(file_payload.get("file_md5") or "") if is_file else ""),
+                file_sha256=(str(file_payload.get("file_sha256") or "") if is_file else ""),
                 mention_sender=False,
                 reply_to_msg_svr_id=str(payload.get("reply_to_message_id") or ""),
                 session_kind=str(payload.get("session_kind") or ""),
@@ -1726,9 +1892,7 @@ class WxbotAgentToolService:
         tenant_id: str,
         session_id: str,
     ) -> None:
-        normalized_owners = tuple(
-            dict.fromkeys(str(owner or "").strip() for owner in owners)
-        )
+        normalized_owners = tuple(dict.fromkeys(str(owner or "").strip() for owner in owners))
         gate = self._data_owners_scope_execution_allowed
         if not normalized_owners or not callable(gate):
             raise RuntimeError("plugin_owner_snapshot_unavailable")
@@ -1794,6 +1958,7 @@ class WxbotAgentToolService:
         tenant_id = str(getattr(session, "tenant_id", "") or "").strip() or "default"
         session_name, _ = await self._load_group_context(session)
         limit = _coerce_int(arguments.get("limit"), 5, minimum=1, maximum=20)
+
         async def read_credits() -> tuple[dict[str, Any], dict[str, Any]]:
             cfg_task = self._credits_store.get_config(tenant_id, session_id)
             members_task = self._credits_store.list_members(
@@ -1913,6 +2078,7 @@ class WxbotAgentToolService:
         session_name, _ = await self._load_group_context(session)
         keyword_limit = _coerce_int(arguments.get("keyword_limit"), 10, minimum=1, maximum=50)
         event_limit = _coerce_int(arguments.get("event_limit"), 5, minimum=1, maximum=20)
+
         async def read_moderation() -> tuple[
             dict[str, Any],
             list[dict[str, Any]],
@@ -2002,6 +2168,7 @@ class WxbotAgentToolService:
         tenant_id = str(getattr(session, "tenant_id", "") or "").strip() or "default"
         session_name, _ = await self._load_group_context(session)
         event_limit = _coerce_int(arguments.get("event_limit"), 5, minimum=1, maximum=20)
+
         async def read_repeater() -> tuple[dict[str, Any], list[dict[str, Any]]]:
             cfg_task = self._repeater_store.get_config(tenant_id, session_id)
             events_task = self._repeater_store.list_events(
@@ -2966,11 +3133,7 @@ class WxbotAgentToolService:
         )
         groups = list(groups_payload.get("sessions") or groups_payload.get("items") or [])
         group = next(
-            (
-                item
-                for item in groups
-                if str(item.get("session_id") or "") == external_session_id
-            ),
+            (item for item in groups if str(item.get("session_id") or "") == external_session_id),
             None,
         )
         members = list(
@@ -3175,9 +3338,7 @@ class WxbotAgentToolService:
 
     def _require_sdk_boundary_available(self) -> None:
         if (self._sdk_scope.get() or {}).get("mode") == "managed_unavailable":
-            raise ValueError(
-                "managed wxbot SDK tool requires a connection-scoped bridge RPC"
-            )
+            raise ValueError("managed wxbot SDK tool requires a connection-scoped bridge RPC")
 
     def _normalize_member(self, item: dict[str, Any]) -> dict[str, Any]:
         wxid = str(item.get("wxid") or item.get("user_id") or item.get("member_wxid") or "").strip()

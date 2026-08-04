@@ -11,6 +11,7 @@ invent the fact that a file should be sent.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
@@ -23,6 +24,8 @@ FileOperation = Literal[
     "export_history",
 ]
 FileSource = Literal["none", "incoming_attachment", "conversation", "user_path"]
+
+MAX_RECENT_MESSAGE_EXPORT_MINUTES = 24 * 60
 
 _FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("pdf", re.compile(r"(?:pdf|PDF|便携文档)")),
@@ -76,7 +79,10 @@ _INSPECT_RE = re.compile(
     r"里面|内容|上面写了什么|总结一下|summari[sz]e|inspect|read)",
     re.IGNORECASE,
 )
-_MESSAGE_RE = re.compile(r"(?:消息|聊天记录|群聊记录|私聊记录|消息记录|聊天内容|群消息)")
+_MESSAGE_RE = re.compile(
+    r"(?:消息|聊天记录|群聊记录|私聊记录|消息记录|聊天内容|群消息|"
+    r"群(?:里|内)(?:的)?话题|群(?:里|内).{1,12}话题|群聊话题)"
+)
 _SUMMARY_RE = re.compile(r"(?:汇总|总结|整理|归纳|摘要)")
 _PATH_RE = re.compile(r"(?:^|\s)(?:[A-Za-z]:[\\/]|/|\\\\)[^\s]+")
 _NEGATED_RE = re.compile(
@@ -93,6 +99,33 @@ _DELIVERY_NEGATION_RE = re.compile(
     r".{0,16}(?:不要|别|无需|不用|不必|不需要|不发|不发送|只要文字)",
     re.IGNORECASE,
 )
+_RECENT_MINUTES_RE = re.compile(
+    r"(?P<amount>\d{1,5}|[零〇一二两三四五六七八九十百千]+)\s*(?:个)?分钟"
+)
+_RECENT_PREFIX_RE = re.compile(r"(?:最近|近|过去|前|刚才|此前)\s*$")
+_RECENT_SUFFIX_RE = re.compile(r"^\s*(?:内|以内|之内|以来)")
+_FUTURE_DURATION_RE = re.compile(r"^\s*(?:后|以后|之后|再)")
+_PAST_DURATION_RE = re.compile(r"^\s*(?:前|以前|之前)")
+_APPROXIMATE_DURATION_PREFIX_RE = re.compile(
+    r"(?:大约|大概|大概要|约|差不多|超过|多于|大于|不到|不满|至少|最多|不超过)\s*$"
+)
+_APPROXIMATE_DURATION_SUFFIX_RE = re.compile(r"^\s*(?:左右|以上|以下|多|余)")
+_EFFORT_DURATION_RE = re.compile(r"(?:用|花|耗时|等待|在)\s*$")
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_UNITS = {"十": 10, "百": 100, "千": 1000}
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +139,8 @@ class FileIntent:
     confidence: float = 0.0
     has_attachment: bool = False
     needs_confirmation: bool = False
+    recent_minutes: int | None = None
+    recent_minutes_invalid: bool = False
     cues: tuple[str, ...] = ()
 
     @property
@@ -121,8 +156,78 @@ class FileIntent:
             "confidence": self.confidence,
             "has_attachment": self.has_attachment,
             "needs_confirmation": self.needs_confirmation,
+            "recent_minutes": self.recent_minutes,
+            "recent_minutes_invalid": self.recent_minutes_invalid,
             "cues": list(self.cues),
         }
+
+
+def _parse_chinese_integer(value: str) -> int | None:
+    if not value or any(
+        char not in _CHINESE_DIGITS and char not in _CHINESE_UNITS for char in value
+    ):
+        return None
+    if not any(char in _CHINESE_UNITS for char in value):
+        return _CHINESE_DIGITS[value] if len(value) == 1 else None
+
+    total = 0
+    digit = 0
+    previous_unit = 10_000
+    for char in value:
+        if char in _CHINESE_DIGITS:
+            digit = _CHINESE_DIGITS[char]
+            continue
+        unit = _CHINESE_UNITS[char]
+        if unit >= previous_unit:
+            return None
+        total += (digit or 1) * unit
+        digit = 0
+        previous_unit = unit
+    return total + digit
+
+
+def _recent_message_minutes_state(text: str) -> tuple[bool, int | None]:
+    value = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not value:
+        return False, None
+    requested = False
+    candidates: list[int] = []
+    for match in _RECENT_MINUTES_RE.finditer(value):
+        before = value[max(0, match.start() - 24) : match.start()]
+        after = value[match.end() : match.end() + 24]
+        if _EFFORT_DURATION_RE.search(before):
+            continue
+        has_recent_cue = bool(_RECENT_PREFIX_RE.search(before) or _RECENT_SUFFIX_RE.match(after))
+        has_message_summary_context = bool(
+            (_SUMMARY_RE.search(before) or _SUMMARY_RE.search(after))
+            and (_MESSAGE_RE.search(before) or _MESSAGE_RE.search(after))
+        )
+        if not has_recent_cue and not has_message_summary_context:
+            continue
+        requested = True
+        if (
+            _FUTURE_DURATION_RE.match(after)
+            or _PAST_DURATION_RE.match(after)
+            or re.search(r"(?:未来|接下来|随后|往后)\s*$", before)
+            or _APPROXIMATE_DURATION_PREFIX_RE.search(before)
+            or _APPROXIMATE_DURATION_SUFFIX_RE.match(after)
+            or _NEGATED_RE.search(before[-12:])
+        ):
+            continue
+        amount = match.group("amount")
+        minutes = int(amount) if amount.isdigit() else _parse_chinese_integer(amount)
+        if minutes is not None:
+            candidates.append(minutes)
+    if requested and len(candidates) == 1:
+        return True, candidates[0]
+    return requested, None
+
+
+def parse_recent_message_minutes(text: str) -> int | None:
+    """Return one unambiguous recent-message window, otherwise ``None``."""
+
+    _requested, minutes = _recent_message_minutes_state(text)
+    return minutes
 
 
 def _normalized(text: str) -> str:
@@ -226,15 +331,13 @@ def classify_file_intent(text: str, *, has_attachment: bool = False) -> FileInte
     # message cue mandatory so a normal attachment analysis is not mistaken
     # for a conversation export.
     history_action = bool(
-        summary_cues
-        or format_name
-        or (inspect_cues and file_cues)
-        or (file_cues and delivery_cues)
+        summary_cues or format_name or (inspect_cues and file_cues) or (file_cues and delivery_cues)
     )
     history_summary = bool(message_cues and history_action)
     delivery_required = _delivery_is_affirmative(value, delivery_cues)
     explicit_file_output = bool(_EXPLICIT_FILE_OUTPUT_RE.search(value))
     if history_summary and explicit_file_output:
+        recent_minutes_requested, recent_minutes = _recent_message_minutes_state(value)
         return FileIntent(
             operation="export_history",
             delivery_required=delivery_required,
@@ -243,6 +346,8 @@ def classify_file_intent(text: str, *, has_attachment: bool = False) -> FileInte
             confidence=0.98 if delivery_required else 0.72,
             has_attachment=attachment,
             needs_confirmation=not delivery_required,
+            recent_minutes=recent_minutes,
+            recent_minutes_invalid=(recent_minutes_requested and recent_minutes is None),
             cues=tuple(dict.fromkeys((*message_cues, *summary_cues, *delivery_cues))),
         )
 
@@ -275,7 +380,11 @@ def classify_file_intent(text: str, *, has_attachment: bool = False) -> FileInte
             # 发"), so never let it turn a negative request into a send.
             delivery_required=delivery_required,
             requested_format=format_name,
-            source="incoming_attachment" if attachment else "user_path" if path_cues else "conversation",
+            source="incoming_attachment"
+            if attachment
+            else "user_path"
+            if path_cues
+            else "conversation",
             confidence=0.94 if delivery_required else 0.78,
             has_attachment=attachment,
             needs_confirmation=not delivery_required,
@@ -296,11 +405,7 @@ def classify_file_intent(text: str, *, has_attachment: bool = False) -> FileInte
             cues=tuple(dict.fromkeys((*inspect_cues, *file_cues))),
         )
 
-    if delivery_cues and (
-        format_name
-        or path_cues
-        or (file_cues and explicit_file_output)
-    ):
+    if delivery_cues and (format_name or path_cues or (file_cues and explicit_file_output)):
         return FileIntent(
             operation="send_existing" if path_cues and not convert_cues else "generate",
             delivery_required=delivery_required,
@@ -330,4 +435,9 @@ def classify_file_intent(text: str, *, has_attachment: bool = False) -> FileInte
     )
 
 
-__all__ = ["FileIntent", "classify_file_intent"]
+__all__ = [
+    "MAX_RECENT_MESSAGE_EXPORT_MINUTES",
+    "FileIntent",
+    "classify_file_intent",
+    "parse_recent_message_minutes",
+]

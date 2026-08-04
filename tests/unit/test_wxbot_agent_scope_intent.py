@@ -204,9 +204,7 @@ async def test_agent_scope_step_syncs_new_and_legacy_router_signals() -> None:
         "tool_intent_matched": True,
         "tools_available": True,
     }
-    assert ctx.signals["channel"]["wechat"]["agent_scope"][
-        "tool_intent_matched"
-    ] is True
+    assert ctx.signals["channel"]["wechat"]["agent_scope"]["tool_intent_matched"] is True
     assert ctx.signals["channel"]["wechat"]["agent_scope"]["tools_available"] is True
 
 
@@ -232,10 +230,29 @@ async def test_generate_file_scope_requires_explicit_delivery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recent_group_topic_file_request_requires_bounded_history_export() -> None:
+    ctx = _group_context("整理十分钟群里话题 以文件方式发给我")
+
+    await WxbotAgentIntentHook(
+        social_policy_store=_FilePolicyStore(enabled=True),
+    ).run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == MESSAGE_EXPORT_SCOPE
+    assert ctx.extras["wxbot_file_intent"]["operation"] == "export_history"
+    assert ctx.extras["wxbot_file_intent"]["recent_minutes"] == 10
+    assert ctx.extras["agent_required_effect"] == {
+        "type": "outbound_file",
+        "scope": MESSAGE_EXPORT_SCOPE,
+        "tool": "export_current_messages_file",
+        "operation": "export_history",
+        "format": "txt",
+        "recent_minutes": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_private_news_file_request_requires_generated_file_delivery() -> None:
-    ctx = _private_context(
-        "联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我"
-    )
+    ctx = _private_context("联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我")
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -264,9 +281,7 @@ async def test_private_file_request_does_not_require_negated_web_search() -> Non
 
 @pytest.mark.asyncio
 async def test_model_memory_negation_does_not_cancel_explicit_live_search() -> None:
-    ctx = _private_context(
-        "不要用模型记忆，请联网搜索今天热点新闻，整理成 TXT 文件发给我"
-    )
+    ctx = _private_context("不要用模型记忆，请联网搜索今天热点新闻，整理成 TXT 文件发给我")
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -295,9 +310,7 @@ async def test_web_search_negation_accepts_common_modifiers(text: str) -> None:
 
 @pytest.mark.asyncio
 async def test_later_positive_clause_overrides_earlier_search_negation() -> None:
-    ctx = _private_context(
-        "不要联网搜索旧新闻，但请联网搜索今天热点，整理成 TXT 文件发我"
-    )
+    ctx = _private_context("不要联网搜索旧新闻，但请联网搜索今天热点，整理成 TXT 文件发我")
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -353,8 +366,7 @@ async def test_group_file_send_denial_finalizes_with_actionable_web_setting_repl
     assert isinstance(result.result, CapabilityResult)
     assert result.result.route is RouteType.CANNED
     assert result.result.reply_text == (
-        "当前群尚未开启“允许群文件发送”。"
-        "请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
+        "当前群尚未开启“允许群文件发送”。请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
     )
     assert result.result.metadata == {
         "wxbot_file_send_denied": True,

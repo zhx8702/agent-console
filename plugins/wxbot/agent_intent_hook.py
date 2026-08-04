@@ -33,8 +33,7 @@ logger = get_logger(__name__)
 
 _DELIVERY_CONTRACT_METADATA_KEY = "_wxbot_delivery_contract"
 _GROUP_FILE_SEND_DISABLED_REPLY = (
-    "当前群尚未开启“允许群文件发送”。"
-    "请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
+    "当前群尚未开启“允许群文件发送”。请先在 Web 的“群参与与行为”中开启并保存，然后再试。"
 )
 
 _OUTBOUND_FILE_TOOLS = {
@@ -66,9 +65,8 @@ def _explicit_live_web_search_requested(text: str) -> bool:
         return False
     for clause in _WEB_SEARCH_CLAUSE_SPLIT_RE.split(value):
         for match in _EXPLICIT_LIVE_WEB_SEARCH_RE.finditer(clause):
-            if (
-                _LOCAL_DATA_SEARCH_RE.search(clause)
-                and not re.search(r"(?:联网|上网|网上|网络)", match.group(0))
+            if _LOCAL_DATA_SEARCH_RE.search(clause) and not re.search(
+                r"(?:联网|上网|网上|网络)", match.group(0)
             ):
                 continue
             if not _WEB_SEARCH_NEGATION_PREFIX_RE.search(clause[: match.start()]):
@@ -106,19 +104,20 @@ def _event_has_file_attachment(ctx: PipelineContext) -> bool:
     metadata = dict(getattr(ctx.event, "metadata", {}) or {})
     media = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
     attachment = (
-        metadata.get("file_attachment")
-        if isinstance(metadata.get("file_attachment"), dict)
-        else {}
+        metadata.get("file_attachment") if isinstance(metadata.get("file_attachment"), dict) else {}
     )
     if str(attachment.get("type") or "").strip().lower() == "file":
         return True
-    return str(
-        metadata.get("file_name")
-        or metadata.get("file_url")
-        or media.get("file_name")
-        or media.get("file_url")
-        or ""
-    ).strip() != ""
+    return (
+        str(
+            metadata.get("file_name")
+            or metadata.get("file_url")
+            or media.get("file_name")
+            or media.get("file_url")
+            or ""
+        ).strip()
+        != ""
+    )
 
 
 def _event_is_group(ctx: PipelineContext) -> bool:
@@ -234,10 +233,7 @@ class WxbotAgentIntentHook:
                     and file_intent.has_attachment
                     and file_intent.source == "incoming_attachment"
                 )
-                or (
-                    file_intent.operation == "generate"
-                    and file_intent.delivery_required
-                )
+                or (file_intent.operation == "generate" and file_intent.delivery_required)
                 else None
             )
         if not scope:
@@ -279,13 +275,10 @@ class WxbotAgentIntentHook:
             router_signals["file_intent"] = file_intent.as_dict()
         if outbound_file_required and not group_file_send_enabled:
             denial_reason = str(
-                ctx.extras.get("wxbot_file_send_denial_reason")
-                or "group_file_send_disabled"
+                ctx.extras.get("wxbot_file_send_denial_reason") or "group_file_send_disabled"
             )
             router_signals["file_send_denied"] = denial_reason
-            ctx.extras["wxbot_file_send_denial_reply"] = (
-                _GROUP_FILE_SEND_DISABLED_REPLY
-            )
+            ctx.extras["wxbot_file_send_denial_reply"] = _GROUP_FILE_SEND_DISABLED_REPLY
             logger.info(
                 "wxbot.agent_intent.file_send_denied",
                 session_id=ctx.event.session_id,
@@ -308,8 +301,12 @@ class WxbotAgentIntentHook:
                 "format": file_intent.requested_format or "txt",
             }
             if (
-                required_file_tool == "generate_text_file"
-                and _explicit_live_web_search_requested(text)
+                required_file_tool == "export_current_messages_file"
+                and file_intent.recent_minutes is not None
+            ):
+                ctx.extras["agent_required_effect"]["recent_minutes"] = file_intent.recent_minutes
+            if required_file_tool == "generate_text_file" and _explicit_live_web_search_requested(
+                text
             ):
                 ctx.extras["agent_required_effect"]["web_search_required"] = True
         if is_group:
@@ -333,13 +330,11 @@ class WxbotAgentIntentHook:
             text_length=len(text),
             scope=scope,
         )
+
     @staticmethod
     def _capture_async_delivery_contract(ctx: PipelineContext) -> dict[str, object]:
         source_message_id = str(
-            ctx.event.message_id
-            or ctx.event.metadata.get("msg_svr_id")
-            or ctx.trace_id
-            or ""
+            ctx.event.message_id or ctx.event.metadata.get("msg_svr_id") or ctx.trace_id or ""
         ).strip()
         policy_state = ctx.extras.get("wxbot_reply_policy")
         contract = captured_group_delivery_contract(
@@ -393,15 +388,9 @@ class WxbotAgentIntentHook:
             or ctx.event.session_id
             or ""
         ).strip()
-        adapter_id = str(
-            ctx.event.adapter_id
-            or ctx.event.metadata.get("adapter_id")
-            or ""
-        ).strip()
+        adapter_id = str(ctx.event.adapter_id or ctx.event.metadata.get("adapter_id") or "").strip()
         connection_id = str(
-            ctx.event.connection_id
-            or ctx.event.metadata.get("connection_id")
-            or ""
+            ctx.event.connection_id or ctx.event.metadata.get("connection_id") or ""
         ).strip()
         mention_sender = False
         feature_state = ctx.extras.get("wxbot_humanization_features")
@@ -414,9 +403,7 @@ class WxbotAgentIntentHook:
         captured_value = ctx.extras.get("wxbot_async_delivery_contract")
         captured = dict(captured_value) if isinstance(captured_value, dict) else {}
         if not _complete_async_delivery_contract(captured):
-            ctx.extras["wxbot_map_progress_suppressed"] = (
-                "async_delivery_contract_unavailable"
-            )
+            ctx.extras["wxbot_map_progress_suppressed"] = "async_delivery_contract_unavailable"
             logger.warning(
                 "wxbot.agent_map_progress.contract_unavailable",
                 session_id=ctx.event.session_id,
