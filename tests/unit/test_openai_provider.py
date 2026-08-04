@@ -91,9 +91,7 @@ def test_convert_messages_for_responses_uses_function_call_output() -> None:
             ChatMessage(
                 role=Role.ASSISTANT,
                 content="",
-                tool_calls=[
-                    ToolCall(id="call_abc", name="get_group_info", arguments={})
-                ],
+                tool_calls=[ToolCall(id="call_abc", name="get_group_info", arguments={})],
             ),
             ChatMessage(
                 role=Role.TOOL,
@@ -188,7 +186,7 @@ def test_extract_responses_payload_collects_url_citations() -> None:
                         ],
                     )
                 ],
-            )
+            ),
         ],
         output_text="",
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
@@ -205,6 +203,216 @@ def test_extract_responses_payload_collects_url_citations() -> None:
     assert citations[0].source == "openai_web_search"
     assert citations[0].title == "Example News"
     assert citations[0].url == "https://example.com/news"
+
+
+def test_extract_responses_payload_collects_completed_search_action_sources() -> None:
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    type="search",
+                    sources=[
+                        SimpleNamespace(
+                            type="url",
+                            url="https://example.com/search-source",
+                        )
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="这是没有内联引用标注的联网搜索结果。",
+                        annotations=[],
+                    )
+                ],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    content, tool_calls, citations, _model, finish_reason, _usage = _extract_responses_payload(raw)
+
+    assert content == "这是没有内联引用标注的联网搜索结果。"
+    assert tool_calls == []
+    assert finish_reason == "completed"
+    assert len(citations) == 1
+    assert citations[0].source == "openai_web_search"
+    assert citations[0].url == "https://example.com/search-source"
+
+
+def test_extract_responses_payload_prefers_annotation_metadata_over_action_source() -> None:
+    duplicated_url = "https://example.com/richer-annotation"
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    type="search",
+                    sources=[SimpleNamespace(type="url", url=duplicated_url)],
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="这是带有内联引用标注的联网搜索结果。",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url=duplicated_url,
+                                title="Richer annotation title",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = _extract_responses_payload(
+        raw
+    )
+
+    assert len(citations) == 1
+    assert citations[0].url == duplicated_url
+    assert citations[0].title == "Richer annotation title"
+
+
+def test_extract_responses_payload_caps_sources_across_multiple_search_calls() -> None:
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    type="search",
+                    sources=[
+                        SimpleNamespace(type="url", url=f"https://example.com/first/{index}")
+                        for index in range(20)
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    type="search",
+                    sources=[
+                        SimpleNamespace(type="url", url=f"https://example.com/second/{index}")
+                        for index in range(20)
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text="联网结果。", annotations=[])],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=2, output_tokens=2),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = _extract_responses_payload(
+        raw
+    )
+
+    assert len(citations) == 20
+    assert citations[-1].url == "https://example.com/first/19"
+
+
+def test_extract_responses_payload_does_not_count_cross_call_duplicates_toward_cap() -> None:
+    duplicate_url = "https://example.com/first/0"
+    new_url = "https://example.com/second/new"
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    sources=[
+                        SimpleNamespace(type="url", url=f"https://example.com/first/{index}")
+                        for index in range(19)
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="web_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    sources=[
+                        SimpleNamespace(type="url", url=duplicate_url),
+                        SimpleNamespace(type="url", url=new_url),
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text="联网结果。", annotations=[])],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=2, output_tokens=2),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = _extract_responses_payload(
+        raw
+    )
+
+    assert len(citations) == 20
+    assert citations[-1].url == new_url
+
+
+@pytest.mark.parametrize("status", ["failed", "in_progress"])
+def test_extract_responses_payload_rejects_sources_from_incomplete_search_call(
+    status: str,
+) -> None:
+    raw = SimpleNamespace(
+        model="gpt-5.4",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="web_search_call",
+                status=status,
+                action=SimpleNamespace(
+                    type="search",
+                    sources=[
+                        SimpleNamespace(
+                            type="url",
+                            url="https://example.com/unverified-source",
+                        )
+                    ],
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text="未完成搜索。", annotations=[])],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=2, output_tokens=2),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = _extract_responses_payload(
+        raw
+    )
+
+    assert citations == []
 
 
 def test_extract_responses_payload_rejects_citation_without_search_call() -> None:
@@ -232,8 +440,8 @@ def test_extract_responses_payload_rejects_citation_without_search_call() -> Non
         usage=SimpleNamespace(input_tokens=2, output_tokens=2),
     )
 
-    _content, _tool_calls, citations, _model, _finish_reason, _usage = (
-        _extract_responses_payload(raw)
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = _extract_responses_payload(
+        raw
     )
 
     assert citations == []
@@ -475,6 +683,52 @@ async def test_openai_provider_records_502_responses_fallback_success(
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_caps_required_search_upstream_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    monkeypatch.setattr(
+        "app.llm.providers.openai_provider.wait_exponential",
+        lambda **_: wait_none(),
+    )
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        assert max_retries == 0
+        client = _FakeClient(
+            base_url=base_url,
+            responses_error=_internal_server_error(),
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://openai-gateway.example.test",
+            "openai_api_mode": "responses",
+        }
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+    request = _make_request().model_copy(
+        update={
+            "metadata": {
+                "openai_web_search_required": True,
+                "disable_openai_fallback": True,
+            }
+        }
+    )
+
+    with pytest.raises(UpstreamUnavailable):
+        await provider.chat(request)
+
+    assert len(created_clients[0].responses_calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_keeps_responses_success_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -527,11 +781,7 @@ async def test_openai_provider_stream_falls_back_after_generic_responses_error(
             chat_stream=_AsyncItems(
                 [
                     SimpleNamespace(
-                        choices=[
-                            SimpleNamespace(
-                                delta=SimpleNamespace(content="chat stream ok")
-                            )
-                        ]
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="chat stream ok"))]
                     )
                 ]
             ),
@@ -647,10 +897,27 @@ async def test_openai_provider_requires_explicit_web_search_contract(
     await provider.chat(req)
 
     call = created_clients[0].responses_calls[0]
-    assert call["tools"] == [
-        {"type": "web_search", "external_web_access": True}
-    ]
+    assert call["tools"] == [{"type": "web_search", "external_web_access": True}]
     assert call["tool_choice"] == "required"
+    assert call["include"] == ["web_search_call.action.sources"]
+
+
+def test_openai_provider_skips_sources_include_for_custom_gateway_by_default() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://gateway.example.test/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_tool": "web_search",
+            "openai_web_search_live_enabled": True,
+        }
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+    request = _make_request().model_copy(update={"metadata": {"openai_web_search_required": True}})
+
+    kwargs = provider._build_responses_kwargs(request)
+
+    assert kwargs["tool_choice"] == "required"
+    assert "include" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -733,9 +1000,7 @@ async def test_openai_provider_can_disable_responses_chat_fallback(
     )
     provider = OpenAIProvider(api_key="sk-test", settings=settings)
 
-    req = _make_request().model_copy(
-        update={"metadata": {"disable_openai_fallback": True}}
-    )
+    req = _make_request().model_copy(update={"metadata": {"disable_openai_fallback": True}})
 
     with pytest.raises(UpstreamUnavailable):
         await provider.chat(req)

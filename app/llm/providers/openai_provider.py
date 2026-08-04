@@ -8,6 +8,7 @@ Supports:
 - automatic fallback from ``responses`` to ``chat.completions``
 - embeddings via the standard embeddings endpoint
 """
+
 from __future__ import annotations
 
 import json
@@ -48,6 +49,7 @@ _TIER_ATTR = {
 }
 
 _SUPPORTED_API_MODES = {"chat", "responses"}
+_MAX_WEB_SEARCH_SOURCE_CITATIONS = 20
 
 
 def _fallback_label(fallback_from: str | None) -> str:
@@ -126,7 +128,9 @@ def _responses_content(msg: ChatMessage) -> str | list[dict[str, Any]]:
     return blocks
 
 
-def _convert_messages(messages: list[ChatMessage], system: str | None = None) -> list[dict[str, Any]]:
+def _convert_messages(
+    messages: list[ChatMessage], system: str | None = None
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
@@ -278,7 +282,9 @@ def _extract_text_content(value: Any) -> str:
     return ""
 
 
-def _extract_chat_completion_payload(raw: Any) -> tuple[str, list[ToolCall], list[Citation], str, str, ChatUsage]:
+def _extract_chat_completion_payload(
+    raw: Any,
+) -> tuple[str, list[ToolCall], list[Citation], str, str, ChatUsage]:
     choice = (getattr(raw, "choices", None) or [None])[0]
     message = getattr(choice, "message", None)
     tool_calls: list[ToolCall] = []
@@ -328,9 +334,17 @@ def _extract_citations_from_annotations(content: Any) -> list[Citation]:
             url = str(_field(annotation, "url", "") or _field(nested, "url", "") or "").strip()
             if not url or url in seen_urls:
                 continue
-            title = str(_field(annotation, "title", "") or _field(nested, "title", "") or "").strip()
-            snippet = str(_field(annotation, "snippet", "") or _field(nested, "snippet", "") or "").strip()
-            if annotation_type and annotation_type not in {"url_citation", "citation"} and not nested:
+            title = str(
+                _field(annotation, "title", "") or _field(nested, "title", "") or ""
+            ).strip()
+            snippet = str(
+                _field(annotation, "snippet", "") or _field(nested, "snippet", "") or ""
+            ).strip()
+            if (
+                annotation_type
+                and annotation_type not in {"url_citation", "citation"}
+                and not nested
+            ):
                 continue
             seen_urls.add(url)
             citations.append(
@@ -345,31 +359,73 @@ def _extract_citations_from_annotations(content: Any) -> list[Citation]:
     return citations
 
 
-def _extract_responses_payload(raw: Any) -> tuple[str, list[ToolCall], list[Citation], str, str, ChatUsage]:
-    output = getattr(raw, "output", None) or []
+def _extract_web_search_source_urls(
+    item: Any,
+    *,
+    limit: int = _MAX_WEB_SEARCH_SOURCE_CITATIONS,
+    exclude_urls: set[str] | None = None,
+) -> list[str]:
+    action = _field(item, "action", None)
+    if action is None:
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set(exclude_urls or ())
+    sources = _field(action, "sources", []) or []
+    if isinstance(sources, list):
+        for source in sources:
+            url = str(_field(source, "url", "") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+            if len(urls) >= limit:
+                return urls
+
+    action_url = str(_field(action, "url", "") or "").strip()
+    if action_url and action_url not in seen and len(urls) < limit:
+        urls.append(action_url)
+    return urls
+
+
+def _extract_responses_payload(
+    raw: Any,
+) -> tuple[str, list[ToolCall], list[Citation], str, str, ChatUsage]:
+    output = _field(raw, "output", None) or []
     tool_calls: list[ToolCall] = []
     text_parts: list[str] = []
     citations: list[Citation] = []
     seen_citation_urls: set[str] = set()
+    web_search_source_urls: list[str] = []
+    seen_web_search_source_urls: set[str] = set()
     web_search_completed = False
     for item in output:
-        item_type = str(getattr(item, "type", "") or "")
+        item_type = str(_field(item, "type", "") or "")
         if item_type == "web_search_call":
-            web_search_completed = (
-                str(getattr(item, "status", "") or "").strip().lower()
-                == "completed"
-            ) or web_search_completed
+            completed = str(_field(item, "status", "") or "").strip().lower() == "completed"
+            web_search_completed = completed or web_search_completed
+            remaining_source_slots = _MAX_WEB_SEARCH_SOURCE_CITATIONS - len(web_search_source_urls)
+            if completed and remaining_source_slots > 0:
+                for url in _extract_web_search_source_urls(
+                    item,
+                    limit=remaining_source_slots,
+                    exclude_urls=seen_web_search_source_urls,
+                ):
+                    if url in seen_web_search_source_urls:
+                        continue
+                    seen_web_search_source_urls.add(url)
+                    web_search_source_urls.append(url)
             continue
         if item_type == "function_call":
             tool_calls.append(
                 ToolCall(
-                    id=str(getattr(item, "call_id", "") or getattr(item, "id", "") or ""),
-                    name=str(getattr(item, "name", "") or ""),
-                    arguments=_serialise_args(getattr(item, "arguments", "") or ""),
+                    id=str(_field(item, "call_id", "") or _field(item, "id", "") or ""),
+                    name=str(_field(item, "name", "") or ""),
+                    arguments=_serialise_args(_field(item, "arguments", "") or ""),
                 )
             )
             continue
-        content = getattr(item, "content", None)
+        content = _field(item, "content", None)
         text = _extract_text_content(content)
         if text:
             text_parts.append(text)
@@ -383,12 +439,28 @@ def _extract_responses_payload(raw: Any) -> tuple[str, list[ToolCall], list[Cita
         # URL-shaped annotations without a completed hosted search call are
         # not sufficient evidence for a fresh web-grounded answer.
         citations = []
+    else:
+        # Inline annotations remain the preferred citations because they carry
+        # titles and are tied to the generated text.  The explicitly included
+        # hosted-search sources are a fail-closed fallback for otherwise valid
+        # searches whose answer omitted inline annotations.
+        for url in web_search_source_urls:
+            if url in seen_citation_urls:
+                continue
+            seen_citation_urls.add(url)
+            citations.append(
+                Citation(
+                    id=f"openai_web:{len(citations) + 1}",
+                    source="openai_web_search",
+                    url=url,
+                )
+            )
     if not text_parts:
-        text_parts.append(_extract_text_content(getattr(raw, "output_text", None)))
+        text_parts.append(_extract_text_content(_field(raw, "output_text", None)))
 
-    usage = getattr(raw, "usage", None)
-    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    usage = _field(raw, "usage", None)
+    input_tokens = int(_field(usage, "input_tokens", 0) or 0)
+    output_tokens = int(_field(usage, "output_tokens", 0) or 0)
     if input_tokens == 0 and output_tokens == 0:
         usage_dict = getattr(usage, "model_dump", None)
         if callable(usage_dict):
@@ -400,8 +472,8 @@ def _extract_responses_payload(raw: Any) -> tuple[str, list[ToolCall], list[Cita
         "".join(part for part in text_parts if part),
         tool_calls,
         citations,
-        str(getattr(raw, "model", "") or ""),
-        str(getattr(raw, "status", "completed") or "completed"),
+        str(_field(raw, "model", "") or ""),
+        str(_field(raw, "status", "completed") or "completed"),
         ChatUsage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
 
@@ -475,21 +547,22 @@ class OpenAIProvider:
 
     def _build_web_search_tool(self, req: ChatRequest) -> dict[str, Any]:
         metadata = req.metadata or {}
-        tool_type = str(
-            metadata.get("openai_web_search_tool")
-            or self._settings.openai_web_search_tool
+        tool_type = (
+            str(
+                metadata.get("openai_web_search_tool")
+                or self._settings.openai_web_search_tool
+                or "web_search"
+            ).strip()
             or "web_search"
-        ).strip() or "web_search"
+        )
         tool: dict[str, Any] = {"type": tool_type}
 
         allowed_domains = metadata.get("openai_web_search_allowed_domains") or []
         if isinstance(allowed_domains, str):
             allowed_domains = [allowed_domains]
-        if isinstance(allowed_domains, list):
+        if tool_type == "web_search" and isinstance(allowed_domains, list):
             cleaned_domains = [
-                str(domain).strip()
-                for domain in allowed_domains
-                if str(domain).strip()
+                str(domain).strip() for domain in allowed_domains if str(domain).strip()
             ]
             if cleaned_domains:
                 tool["filters"] = {"allowed_domains": cleaned_domains}
@@ -526,6 +599,13 @@ class OpenAIProvider:
             # only available hosted tool instead of leaving fresh evidence to
             # the model's optional tool choice.
             kwargs["tool_choice"] = "required"
+            include_sources = (req.metadata or {}).get("openai_web_search_include_sources")
+            if include_sources is None:
+                include_sources = (
+                    urlparse(self._responses_base_url).hostname or ""
+                ).lower() == "api.openai.com"
+            if bool(include_sources):
+                kwargs["include"] = ["web_search_call.action.sources"]
         return kwargs
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
@@ -596,7 +676,9 @@ class OpenAIProvider:
             raise UpstreamUnavailable(f"openai chat unavailable: {exc}") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
 
-        content, tool_calls, citations, resolved_model, finish_reason, usage = _extract_chat_completion_payload(raw)
+        content, tool_calls, citations, resolved_model, finish_reason, usage = (
+            _extract_chat_completion_payload(raw)
+        )
         _record_api_attempt(
             api_mode="chat",
             result="success",
@@ -615,10 +697,13 @@ class OpenAIProvider:
     async def _chat_via_responses(self, request: ChatRequest) -> ChatResponse:
         kwargs = self._build_responses_kwargs(request)
         model = str(kwargs["model"])
+        max_attempts = (
+            2 if (request.metadata or {}).get("openai_web_search_required") is True else 4
+        )
         started = time.monotonic()
         try:
             async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(4),
+                stop=stop_after_attempt(max_attempts),
                 wait=wait_exponential(multiplier=0.5, min=0.5, max=8.0),
                 retry=retry_if_exception_type(self._retry_exceptions),
                 reraise=True,
@@ -645,7 +730,9 @@ class OpenAIProvider:
             raise UpstreamUnavailable(f"openai responses unavailable: {exc}") from exc
 
         latency_ms = int((time.monotonic() - started) * 1000)
-        content, tool_calls, citations, resolved_model, finish_reason, usage = _extract_responses_payload(raw)
+        content, tool_calls, citations, resolved_model, finish_reason, usage = (
+            _extract_responses_payload(raw)
+        )
         _record_api_attempt(api_mode="responses", result="success")
         return ChatResponse(
             content=content,
@@ -765,7 +852,9 @@ async def _openai_stream(
     )
 
 
-async def _openai_responses_stream(provider: OpenAIProvider, request: ChatRequest) -> AsyncIterator[str]:
+async def _openai_responses_stream(
+    provider: OpenAIProvider, request: ChatRequest
+) -> AsyncIterator[str]:
     kwargs = provider._build_responses_kwargs(request)
     kwargs["stream"] = True
     try:

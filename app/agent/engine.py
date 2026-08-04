@@ -65,8 +65,6 @@ MAX_TOOL_OWNER_GATE_TIMEOUT_SECONDS = 30.0
 MIN_CLEAR_TOOL_PRESELECTION_SCORE = 2
 MIN_CLEAR_TOOL_PRESELECTION_MARGIN = 2
 AMBIGUOUS_TOOL_PRESELECTION_TOP_K = 3
-REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS = 45.0
-
 ToolOwnerGate = Callable[[str, Session], Awaitable[bool]]
 
 
@@ -238,8 +236,24 @@ class AgentCapabilityEngine:
         executed_tool_calls: list[ToolCall] = []
         final_response = None
         terminal_tool_effect = False
+        required_web_search_timeout_seconds = (
+            min(
+                self._settings.agent_required_web_search_timeout_seconds,
+                max(1.0, self._settings.orchestrator_handle_timeout_seconds - 15.0),
+            )
+            if required_web_search
+            else 0.0
+        )
+        required_web_search_deadline = (
+            time.monotonic() + required_web_search_timeout_seconds if required_web_search else 0.0
+        )
+        round_limit = (
+            self._settings.agent_required_web_search_max_attempts
+            if required_web_search
+            else self._max_tool_rounds
+        )
 
-        for round_index in range(self._max_tool_rounds):
+        for round_index in range(round_limit):
             request_metadata: dict[str, Any] = {
                 "agent_round": round_index + 1,
                 "agent_scope": scope,
@@ -254,6 +268,7 @@ class AgentCapabilityEngine:
                         "openai_web_search": True,
                         "openai_web_search_required": True,
                         "disable_openai_fallback": True,
+                        "required_web_search_attempt": round_index + 1,
                     }
                 )
             request = ChatRequest(
@@ -262,7 +277,11 @@ class AgentCapabilityEngine:
                 model_tier=model_tier,
                 messages=messages,
                 system=system_prompt,
-                max_tokens=self._max_tokens,
+                max_tokens=(
+                    self._settings.agent_required_web_search_max_output_tokens
+                    if required_web_search
+                    else self._max_tokens
+                ),
                 temperature=temperature,
                 tools=request_tools,
                 cache_system=True,
@@ -270,9 +289,12 @@ class AgentCapabilityEngine:
             )
             try:
                 if required_web_search:
+                    remaining_timeout = required_web_search_deadline - time.monotonic()
+                    if remaining_timeout <= 0:
+                        raise TimeoutError
                     response = await self._chat_with_hard_timeout(
                         request,
-                        timeout=REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS,
+                        timeout=remaining_timeout,
                     )
                 else:
                     response = await self._llm.chat(request)
@@ -283,6 +305,7 @@ class AgentCapabilityEngine:
                     "agent.required_web_search_failed",
                     session_id=session.session_id,
                     error_class=exc.__class__.__name__,
+                    timeout_seconds=required_web_search_timeout_seconds,
                 )
                 reason = (
                     "required_web_search_timeout"
@@ -294,8 +317,19 @@ class AgentCapabilityEngine:
                     required_effect=required_effect,
                     policy=policy,
                     reason=reason,
+                    usage=aggregate_usage,
                 )
             final_response = response
+            if required_web_search:
+                log.info(
+                    "agent.required_web_search_completed",
+                    session_id=session.session_id,
+                    finish_reason=str(response.finish_reason or ""),
+                    citation_count=len(response.citations),
+                    content_chars=len(response.content or ""),
+                    latency_ms=response.latency_ms,
+                    attempt=round_index + 1,
+                )
             aggregate_usage.input_tokens += int(response.usage.input_tokens or 0)
             aggregate_usage.output_tokens += int(response.usage.output_tokens or 0)
             aggregate_usage.cache_read_tokens += int(response.usage.cache_read_tokens or 0)
@@ -317,9 +351,24 @@ class AgentCapabilityEngine:
                     required_effect=required_effect,
                     policy=policy,
                     reason="required_web_search_invalid_response",
+                    usage=aggregate_usage,
                 )
 
             if not response.tool_calls:
+                if (
+                    required_web_search
+                    and not self._required_web_search_satisfied(response)
+                    and round_index + 1 < round_limit
+                ):
+                    log.warning(
+                        "agent.required_web_search_retrying_without_evidence",
+                        session_id=session.session_id,
+                        finish_reason=str(response.finish_reason or ""),
+                        citation_count=len(response.citations),
+                        attempt=round_index + 1,
+                        max_attempts=round_limit,
+                    )
+                    continue
                 break
 
             tool_calls = list(response.tool_calls[: self._max_tool_calls_per_round])
@@ -355,11 +404,7 @@ class AgentCapabilityEngine:
             if terminal_tool_effect:
                 break
 
-        if (
-            final_response is not None
-            and final_response.tool_calls
-            and not terminal_tool_effect
-        ):
+        if final_response is not None and final_response.tool_calls and not terminal_tool_effect:
             auto_tool_call = await self._maybe_execute_auto_personal_map(
                 pre,
                 session,
@@ -474,9 +519,7 @@ class AgentCapabilityEngine:
         required_effect_auto_fulfilled = False
         required_effect_failure = ""
         required_web_search_satisfied = (
-            self._required_web_search_satisfied(final_response)
-            if required_web_search
-            else True
+            self._required_web_search_satisfied(final_response) if required_web_search else True
         )
         required_effect_satisfied = bool(
             required_web_search_satisfied
@@ -487,6 +530,13 @@ class AgentCapabilityEngine:
         )
         if required_web_search and not required_web_search_satisfied:
             required_effect_failure = "required_web_search_evidence_missing"
+            log.warning(
+                "agent.required_web_search_evidence_missing",
+                session_id=session.session_id,
+                finish_reason=str(getattr(final_response, "finish_reason", "") or ""),
+                citation_count=len(list(getattr(final_response, "citations", []) or [])),
+                content_chars=len(str(getattr(final_response, "content", "") or "")),
+            )
         elif required_effect and not required_effect_satisfied:
             auto_tool_call, required_effect_failure = await self._maybe_fulfill_required_effect(
                 session,
@@ -693,9 +743,7 @@ class AgentCapabilityEngine:
             reservation = await self._billing.reserve(
                 BillingSubject(
                     tenant_id=session.tenant_id,
-                    session_id=(
-                        session.external_conversation_id or session.session_id
-                    ),
+                    session_id=(session.external_conversation_id or session.session_id),
                     user_id=str(session.user_id or ""),
                     display_name=self._sender_name(session),
                 ),
@@ -855,8 +903,7 @@ class AgentCapabilityEngine:
             and self._settings.openai_api_mode == "responses"
             and self._settings.openai_web_search_enabled
             and self._settings.openai_web_search_live_enabled
-            and self._settings.openai_web_search_tool
-            in {"web_search", "web_search_preview"}
+            and self._settings.openai_web_search_tool in {"web_search", "web_search_preview"}
         )
 
     async def _chat_with_hard_timeout(
@@ -917,12 +964,10 @@ class AgentCapabilityEngine:
         }:
             return False
         for citation in list(getattr(response, "citations", []) or []):
-            if (
-                str(getattr(citation, "source", "") or "").strip()
-                == "openai_web_search"
-                and AgentCapabilityEngine._valid_https_citation_url(
-                    getattr(citation, "url", "")
-                )
+            if str(
+                getattr(citation, "source", "") or ""
+            ).strip() == "openai_web_search" and AgentCapabilityEngine._valid_https_citation_url(
+                getattr(citation, "url", "")
             ):
                 return True
         return False
@@ -934,6 +979,7 @@ class AgentCapabilityEngine:
         required_effect: dict[str, Any],
         policy: dict[str, Any],
         reason: str,
+        usage: ChatUsage | None = None,
     ) -> CapabilityResult:
         if reason == "required_web_search_not_configured":
             reply = (
@@ -949,7 +995,7 @@ class AgentCapabilityEngine:
             route=RouteType.AGENT,
             reply_text=reply,
             tool_calls=[],
-            usage=ChatUsage(),
+            usage=usage if usage is not None else ChatUsage(),
             metadata={
                 "agent_tool_scope": scope,
                 "effective_tools": policy.get("effective_tools") or [],
@@ -1033,10 +1079,7 @@ class AgentCapabilityEngine:
         seen_urls: set[str] = set()
         for citation in citations:
             url = str(citation.url or "").strip()
-            if (
-                not AgentCapabilityEngine._valid_https_citation_url(url)
-                or url in seen_urls
-            ):
+            if not AgentCapabilityEngine._valid_https_citation_url(url) or url in seen_urls:
                 continue
             seen_urls.add(url)
             if url in value:
@@ -1486,11 +1529,7 @@ class AgentCapabilityEngine:
                 phase="expose",
                 reason="missing_gate",
             )
-            return [
-                item
-                for item in definitions
-                if self._definition_owner(item) == "core"
-            ]
+            return [item for item in definitions if self._definition_owner(item) == "core"]
         decisions = await asyncio.gather(
             *(self._tool_owner_allowed(owner, session, phase="expose") for owner in owners)
         )

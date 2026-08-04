@@ -66,9 +66,7 @@ def _normalize_env_name(name: object) -> str:
 
 def _is_non_settings_env(name: str) -> bool:
     normalized = _normalize_env_name(name)
-    return normalized in _NON_SETTINGS_ENV_KEYS or normalized.startswith(
-        _NON_SETTINGS_ENV_PREFIXES
-    )
+    return normalized in _NON_SETTINGS_ENV_KEYS or normalized.startswith(_NON_SETTINGS_ENV_PREFIXES)
 
 
 def _looks_like_settings_env(name: str, known_names: frozenset[str]) -> bool:
@@ -84,11 +82,7 @@ def _looks_like_settings_env(name: str, known_names: frozenset[str]) -> bool:
     if not normalized or normalized in known_names or _is_non_settings_env(normalized):
         return False
     parts = normalized.split("_", 2)
-    known_namespaces = {
-        "_".join(item.split("_", 2)[:2])
-        for item in known_names
-        if "_" in item
-    }
+    known_namespaces = {"_".join(item.split("_", 2)[:2]) for item in known_names if "_" in item}
     if len(parts) >= 2 and "_".join(parts[:2]) in known_namespaces:
         return True
     return bool(get_close_matches(normalized, known_names, n=1, cutoff=0.82))
@@ -155,6 +149,7 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         _ = settings_cls
+
         # Explicit process environment and mounted secrets must override the
         # developer-friendly dotenv file.  The previous ordering allowed a
         # checked-out .env to silently replace production-injected secrets.
@@ -389,6 +384,17 @@ class Settings(BaseSettings):
     memory_governance_batch_size: int = Field(default=500, ge=1, le=5000)
     agent_max_tool_rounds: int = Field(default=5, ge=1)
     agent_max_tool_calls_per_round: int = Field(default=4, ge=1)
+    agent_required_web_search_timeout_seconds: float = Field(
+        default=90.0,
+        ge=5.0,
+        le=120.0,
+    )
+    agent_required_web_search_max_output_tokens: int = Field(
+        default=2_400,
+        ge=512,
+        le=8_192,
+    )
+    agent_required_web_search_max_attempts: int = Field(default=2, ge=1, le=2)
     agent_tools_require_explicit_policy: bool = True
 
     inbound_signature_window_seconds: int = 300
@@ -622,13 +628,9 @@ class Settings(BaseSettings):
     def _validate_environment_safety(self) -> Settings:
         if self.bus_retry_max_seconds < self.bus_retry_base_seconds:
             raise ValueError(
-                "bus_retry_max_seconds must be greater than or equal to "
-                "bus_retry_base_seconds"
+                "bus_retry_max_seconds must be greater than or equal to bus_retry_base_seconds"
             )
-        if (
-            self.outbound_transport_retry_max_seconds
-            < self.outbound_transport_retry_base_seconds
-        ):
+        if self.outbound_transport_retry_max_seconds < self.outbound_transport_retry_base_seconds:
             raise ValueError(
                 "outbound_transport_retry_max_seconds must be greater than or "
                 "equal to outbound_transport_retry_base_seconds"
@@ -642,29 +644,18 @@ class Settings(BaseSettings):
                 "memory_llm_extraction_job_timeout_seconds"
             )
         if self.tibo_reset_enabled and not self.tibo_reset_api_url.strip():
-            raise ValueError(
-                "TIBO_RESET_API_URL is required when TIBO_RESET_ENABLED is true"
-            )
+            raise ValueError("TIBO_RESET_API_URL is required when TIBO_RESET_ENABLED is true")
         if self.is_prod and self.orchestrator_flow_effect_handlers_enabled:
-            commit_backend = (
-                self.orchestrator_flow_effect_commit_backend.strip().lower()
-            )
+            commit_backend = self.orchestrator_flow_effect_commit_backend.strip().lower()
             if commit_backend not in {"redis", "memory"}:
-                raise ValueError(
-                    "production effect handlers require an effect commit backend"
-                )
+                raise ValueError("production effect handlers require an effect commit backend")
             log_backend = self.orchestrator_flow_effect_log_backend.strip().lower()
             if log_backend not in {"postgres", "postgresql", "sql"}:
                 raise ValueError(
-                    "production effect handlers require a durable PostgreSQL "
-                    "effect log"
+                    "production effect handlers require a durable PostgreSQL effect log"
                 )
-            if self.orchestrator_flow_effect_log_failure_policy.strip().lower() != (
-                "fail_closed"
-            ):
-                raise ValueError(
-                    "production effect handlers require fail_closed effect logging"
-                )
+            if self.orchestrator_flow_effect_log_failure_policy.strip().lower() != ("fail_closed"):
+                raise ValueError("production effect handlers require fail_closed effect logging")
         return self
 
     @field_validator("memory_llm_extraction_job_drain_max_claims", mode="before")
@@ -710,10 +701,7 @@ class Settings(BaseSettings):
     @property
     def resolved_readiness_required_worker_roles(self) -> list[str]:
         allowed = {"inbound", "outbound", "scheduler", "wxbot_bridge"}
-        roles = (
-            item.strip().lower()
-            for item in self.readiness_required_worker_roles.split(",")
-        )
+        roles = (item.strip().lower() for item in self.readiness_required_worker_roles.split(","))
         return list(dict.fromkeys(role for role in roles if role in allowed))
 
     def get_tenant_secret(self, tenant_id: str) -> str | None:

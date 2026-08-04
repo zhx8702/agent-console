@@ -63,6 +63,19 @@ class _ToolCallingLLM:
         )
 
 
+class _SequenceLLM:
+    def __init__(self, responses: list[ChatResponse | BaseException]) -> None:
+        self.responses = list(responses)
+        self.requests = []
+
+    async def chat(self, request):
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
 class _SlowLLM:
     def __init__(self) -> None:
         self.requests = []
@@ -120,9 +133,7 @@ def _private_session() -> Session:
         Turn(
             session_id=session.session_id,
             role=Role.USER,
-            content=(
-                "联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我"
-            ),
+            content=("联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我"),
             trace_id="trace-private-file",
         )
     ]
@@ -152,6 +163,9 @@ def _engine(
     handler: _GenerateFileHandler,
     *,
     web_search_enabled: bool = False,
+    required_web_search_timeout_seconds: float | None = None,
+    required_web_search_max_output_tokens: int | None = None,
+    orchestrator_handle_timeout_seconds: float | None = None,
 ) -> AgentCapabilityEngine:
     registry = AgentToolRegistry()
     registry.register(
@@ -171,17 +185,42 @@ def _engine(
             metadata={"channels": ["wechat"], "session_kinds": ["private"]},
         )
     )
+    settings = Settings(
+        customer_service_prompt_enabled=False,
+        agent_tools_require_explicit_policy=False,
+        llm_provider="openai" if web_search_enabled else "fake",
+        openai_api_key="sk-test" if web_search_enabled else None,
+        openai_api_mode="responses",
+        openai_web_search_enabled=web_search_enabled,
+        openai_web_search_live_enabled=web_search_enabled,
+    )
+    if required_web_search_timeout_seconds is not None:
+        assert "agent_required_web_search_timeout_seconds" in Settings.model_fields
+        # model_copy deliberately bypasses the production lower bound so the
+        # hard-timeout behavior can be exercised without slowing the suite.
+        settings = settings.model_copy(
+            update={
+                "agent_required_web_search_timeout_seconds": (required_web_search_timeout_seconds)
+            }
+        )
+    if required_web_search_max_output_tokens is not None:
+        assert "agent_required_web_search_max_output_tokens" in Settings.model_fields
+        settings = settings.model_copy(
+            update={
+                "agent_required_web_search_max_output_tokens": (
+                    required_web_search_max_output_tokens
+                )
+            }
+        )
+    if orchestrator_handle_timeout_seconds is not None:
+        settings = settings.model_copy(
+            update={
+                "orchestrator_handle_timeout_seconds": orchestrator_handle_timeout_seconds,
+            }
+        )
     return AgentCapabilityEngine(
         llm,
-        settings=Settings(
-            customer_service_prompt_enabled=False,
-            agent_tools_require_explicit_policy=False,
-            llm_provider="openai" if web_search_enabled else "fake",
-            openai_api_key="sk-test" if web_search_enabled else None,
-            openai_api_mode="responses",
-            openai_web_search_enabled=web_search_enabled,
-            openai_web_search_live_enabled=web_search_enabled,
-        ),
+        settings=settings,
         agent_tool_registry=registry,
     )
 
@@ -201,9 +240,7 @@ async def test_required_private_file_is_generated_when_model_skips_tool_call() -
         },
     )
 
-    assert handler.calls == [
-        {"content": "今日热点：第一条新闻及来源链接。", "format": "txt"}
-    ]
+    assert handler.calls == [{"content": "今日热点：第一条新闻及来源链接。", "format": "txt"}]
     assert [item.name for item in result.tool_calls] == ["generate_text_file"]
     assert result.reply_text == ""
     assert result.metadata["required_effect_satisfied"] is True
@@ -319,6 +356,154 @@ async def test_required_live_search_is_verified_before_file_generation() -> None
 
 
 @pytest.mark.asyncio
+async def test_required_live_search_retries_once_when_first_response_has_no_evidence() -> None:
+    citation = Citation(
+        id="news-retry",
+        source="openai_web_search",
+        title="新闻来源",
+        url="https://news.example/retry",
+    )
+    llm = _SequenceLLM(
+        [
+            ChatResponse(content="第一次没有来源。", model="fake-agent"),
+            ChatResponse(
+                content="第二次取得有来源的结果。",
+                citations=[citation],
+                model="fake-agent",
+            ),
+        ]
+    )
+    handler = _GenerateFileHandler()
+    engine = _engine(llm, handler, web_search_enabled=True)
+
+    result = await engine.answer(
+        _preprocessed(),
+        _private_session(),
+        {
+            "agent_tool_scope": FILE_ANALYSIS_SCOPE,
+            "agent_required_effect": _required_effect(web_search_required=True),
+        },
+    )
+
+    assert len(llm.requests) == 2
+    assert [request.metadata["required_web_search_attempt"] for request in llm.requests] == [1, 2]
+    assert len(handler.calls) == 1
+    assert result.metadata["required_web_search_satisfied"] is True
+    assert result.metadata["required_effect_satisfied"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_max_output_tokens", [512, 3_200])
+async def test_required_live_search_uses_configured_max_output_budget(
+    configured_max_output_tokens: int,
+) -> None:
+    citation = Citation(
+        id="news-budget",
+        source="openai_web_search",
+        title="新闻来源",
+        url="https://news.example/budget",
+    )
+    llm = _TextOnlyLLM("足够长的联网搜索结果正文。", citations=[citation])
+    handler = _GenerateFileHandler()
+    engine = _engine(
+        llm,
+        handler,
+        web_search_enabled=True,
+        required_web_search_max_output_tokens=configured_max_output_tokens,
+    )
+
+    result = await engine.answer(
+        _preprocessed(),
+        _private_session(),
+        {
+            "agent_tool_scope": FILE_ANALYSIS_SCOPE,
+            "agent_required_effect": _required_effect(web_search_required=True),
+        },
+    )
+
+    assert len(llm.requests) == 1
+    assert llm.requests[0].max_tokens == configured_max_output_tokens
+    assert result.metadata["required_web_search_satisfied"] is True
+    assert result.metadata["required_effect_satisfied"] is True
+
+
+@pytest.mark.asyncio
+async def test_required_live_search_shares_clamped_timeout_across_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    citation = Citation(
+        id="news-timeout-budget",
+        source="openai_web_search",
+        url="https://news.example/timeout-budget",
+    )
+    responses = [
+        ChatResponse(content="第一次没有来源。", model="fake-agent"),
+        ChatResponse(content="第二次有来源。", citations=[citation], model="fake-agent"),
+    ]
+    handler = _GenerateFileHandler()
+    engine = _engine(
+        _SequenceLLM([]),
+        handler,
+        web_search_enabled=True,
+        required_web_search_timeout_seconds=90.0,
+        orchestrator_handle_timeout_seconds=60.0,
+    )
+    now = [100.0]
+    observed_timeouts: list[float] = []
+
+    monkeypatch.setattr("app.agent.engine.time.monotonic", lambda: now[0])
+
+    async def _chat_with_timeout(_request, *, timeout: float):
+        observed_timeouts.append(timeout)
+        response = responses.pop(0)
+        now[0] += 10.0
+        return response
+
+    monkeypatch.setattr(engine, "_chat_with_hard_timeout", _chat_with_timeout)
+
+    result = await engine.answer(
+        _preprocessed(),
+        _private_session(),
+        {
+            "agent_tool_scope": FILE_ANALYSIS_SCOPE,
+            "agent_required_effect": _required_effect(web_search_required=True),
+        },
+    )
+
+    assert observed_timeouts == pytest.approx([45.0, 35.0])
+    assert result.metadata["required_effect_satisfied"] is True
+
+
+@pytest.mark.asyncio
+async def test_required_live_search_failure_preserves_usage_from_earlier_attempt() -> None:
+    llm = _SequenceLLM(
+        [
+            ChatResponse(
+                content="第一次没有来源。",
+                model="fake-agent",
+                usage={"input_tokens": 12, "output_tokens": 8},
+            ),
+            TimeoutError(),
+        ]
+    )
+    handler = _GenerateFileHandler()
+    engine = _engine(llm, handler, web_search_enabled=True)
+
+    result = await engine.answer(
+        _preprocessed(),
+        _private_session(),
+        {
+            "agent_tool_scope": FILE_ANALYSIS_SCOPE,
+            "agent_required_effect": _required_effect(web_search_required=True),
+        },
+    )
+
+    assert result.usage.input_tokens == 12
+    assert result.usage.output_tokens == 8
+    assert result.metadata["required_effect_failure"] == "required_web_search_timeout"
+
+
+@pytest.mark.asyncio
 async def test_required_live_search_without_citations_does_not_generate_file() -> None:
     llm = _TextOnlyLLM("看起来像今天的热点，但没有来源。")
     handler = _GenerateFileHandler()
@@ -334,9 +519,7 @@ async def test_required_live_search_without_citations_does_not_generate_file() -
     )
 
     assert handler.calls == []
-    assert result.reply_text == (
-        "这次没有取得可验证的实时来源链接，因此没有生成文件。请稍后重试。"
-    )
+    assert result.reply_text == ("这次没有取得可验证的实时来源链接，因此没有生成文件。请稍后重试。")
     assert result.metadata["required_web_search_satisfied"] is False
     assert result.metadata["required_effect_satisfied"] is False
 
@@ -420,14 +603,10 @@ async def test_required_live_search_never_executes_unexposed_function_call() -> 
     assert llm.requests[0].tools == []
     assert handler.calls == []
     assert result.tool_calls == []
-    assert result.reply_text == (
-        "实时联网搜索暂时不可用，这次没有生成文件，请稍后重试。"
-    )
+    assert result.reply_text == ("实时联网搜索暂时不可用，这次没有生成文件，请稍后重试。")
     assert result.metadata["required_effect_satisfied"] is False
     assert result.metadata["required_web_search_satisfied"] is False
-    assert result.metadata["required_effect_failure"] == (
-        "required_web_search_invalid_response"
-    )
+    assert result.metadata["required_effect_failure"] == ("required_web_search_invalid_response")
 
 
 @pytest.mark.asyncio
@@ -449,9 +628,7 @@ async def test_required_live_search_configuration_failure_is_actionable() -> Non
     assert handler.calls == []
     assert "模型配置" in result.reply_text
     assert "这次没有生成文件" in result.reply_text
-    assert result.metadata["required_effect_failure"] == (
-        "required_web_search_not_configured"
-    )
+    assert result.metadata["required_effect_failure"] == ("required_web_search_not_configured")
 
 
 @pytest.mark.asyncio
@@ -470,23 +647,20 @@ async def test_required_live_search_upstream_failure_is_not_generic_system_busy(
     )
 
     assert handler.calls == []
-    assert result.reply_text == (
-        "实时联网搜索暂时不可用，这次没有生成文件，请稍后重试。"
-    )
+    assert result.reply_text == ("实时联网搜索暂时不可用，这次没有生成文件，请稍后重试。")
     assert result.metadata["required_effect_failure"] == "required_web_search_failed"
 
 
 @pytest.mark.asyncio
-async def test_required_live_search_timeout_is_not_generic_system_busy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "app.agent.engine.REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS",
-        0.01,
-    )
+async def test_required_live_search_timeout_is_not_generic_system_busy() -> None:
     llm = _SlowLLM()
     handler = _GenerateFileHandler()
-    engine = _engine(llm, handler, web_search_enabled=True)
+    engine = _engine(
+        llm,
+        handler,
+        web_search_enabled=True,
+        required_web_search_timeout_seconds=0.01,
+    )
 
     result = await engine.answer(
         _preprocessed(),
@@ -498,23 +672,20 @@ async def test_required_live_search_timeout_is_not_generic_system_busy(
     )
 
     assert handler.calls == []
-    assert result.reply_text == (
-        "实时联网搜索超时了，这次没有生成文件，请稍后重试。"
-    )
+    assert result.reply_text == ("实时联网搜索超时了，这次没有生成文件，请稍后重试。")
     assert result.metadata["required_effect_failure"] == "required_web_search_timeout"
 
 
 @pytest.mark.asyncio
-async def test_required_live_search_timeout_does_not_wait_for_cancellation_cleanup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "app.agent.engine.REQUIRED_WEB_SEARCH_TIMEOUT_SECONDS",
-        0.01,
-    )
+async def test_required_live_search_timeout_does_not_wait_for_cancellation_cleanup() -> None:
     llm = _SlowCancellationLLM()
     handler = _GenerateFileHandler()
-    engine = _engine(llm, handler, web_search_enabled=True)
+    engine = _engine(
+        llm,
+        handler,
+        web_search_enabled=True,
+        required_web_search_timeout_seconds=0.01,
+    )
 
     result = await engine.answer(
         _preprocessed(),
