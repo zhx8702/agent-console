@@ -430,6 +430,15 @@ class _SummaryLLM:
         return SimpleNamespace(content="已确认事项\n- 周五发布\n未完成事项\n- 发布前补回归测试")
 
 
+class _FiniteRetentionPolicyStore:
+    async def get_group_policy(self, tenant_id: str, session_id: str):
+        assert tenant_id == "demo"
+        assert session_id == "room@chatroom"
+        return SimpleNamespace(
+            policy=SimpleNamespace(prompt_context_retention_seconds=3600)
+        )
+
+
 @pytest.mark.asyncio
 async def test_group_summary_service_updates_job_without_session_lock() -> None:
     store = _SummaryStore()
@@ -461,6 +470,7 @@ async def test_group_summary_service_updates_job_without_session_lock() -> None:
     assert result == {"claimed": 1, "succeeded": 1, "failed": 0}
     assert len(llm.requests) == 1
     assert "周五发布" in llm.requests[0].messages[0].content
+    assert llm.requests[0].max_tokens == 600
     assert store.completed == [
         {
             "tenant_id": "demo",
@@ -508,6 +518,40 @@ async def test_group_summary_service_defers_disabled_scope_before_llm() -> None:
             "session_id": "room@chatroom",
             "worker_id": "worker-a",
             "claim_token": "claim-1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_group_summary_service_skips_when_finite_prompt_context_discards_summary() -> None:
+    store = _SummaryStore()
+    llm = _SummaryLLM()
+    service = WxbotGroupSummaryService(
+        store,  # type: ignore[arg-type]
+        llm,
+        SimpleNamespace(wxbot_group_summary_lock_ttl_seconds=180.0),
+        _FiniteRetentionPolicyStore(),  # type: ignore[arg-type]
+    )
+
+    async def allow_scope(_tenant_id: str, _session_id: str) -> bool:
+        return True
+
+    result = await service.drain_once(
+        worker_id="worker-a",
+        scope_execution_allowed=allow_scope,
+    )
+
+    assert result == {"claimed": 0, "succeeded": 0, "failed": 0}
+    assert llm.requests == []
+    assert store.completed == []
+    assert store.failed == []
+    assert store.deferred == [
+        {
+            "tenant_id": "demo",
+            "session_id": "room@chatroom",
+            "worker_id": "worker-a",
+            "claim_token": "claim-1",
+            "defer_seconds": 300.0,
         }
     ]
 

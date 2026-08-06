@@ -464,7 +464,11 @@ class Settings(BaseSettings):
     wxbot_group_context_recent_limit: int = Field(default=80, ge=10, le=500)
     wxbot_group_context_budget_chars: int = Field(default=6000, ge=1000, le=20000)
     wxbot_group_summary_enabled: bool = True
-    wxbot_group_summary_debounce_seconds: float = Field(default=5.0, ge=0.0, le=300.0)
+    # Recording observations is cheap and also feeds participation policy.  A
+    # rolling-summary LLM call is only useful when the bot was addressed by
+    # default; set this false to retain the old all-messages scheduling mode.
+    wxbot_group_summary_only_when_addressed: bool = True
+    wxbot_group_summary_debounce_seconds: float = Field(default=20.0, ge=0.0, le=300.0)
     wxbot_group_summary_drain_interval_seconds: float = Field(default=2.0, gt=0.0)
     wxbot_group_summary_batch_size: int = Field(default=80, ge=1, le=500)
     wxbot_group_summary_input_budget_chars: int = Field(
@@ -472,7 +476,22 @@ class Settings(BaseSettings):
         ge=2000,
         le=100_000,
     )
-    wxbot_group_summary_max_chars: int = Field(default=4000, ge=500, le=12000)
+    wxbot_group_summary_observation_max_chars: int = Field(
+        default=800,
+        ge=200,
+        le=4000,
+    )
+    wxbot_group_summary_old_summary_max_chars: int = Field(
+        default=2000,
+        ge=500,
+        le=12000,
+    )
+    wxbot_group_summary_max_output_tokens: int = Field(
+        default=600,
+        ge=128,
+        le=4000,
+    )
+    wxbot_group_summary_max_chars: int = Field(default=2500, ge=500, le=12000)
     wxbot_group_summary_timeout_seconds: float = Field(default=90.0, gt=0.0)
     wxbot_group_summary_lock_ttl_seconds: float = Field(default=180.0, gt=0.0)
     wxbot_group_summary_retry_backoff_seconds: float = Field(default=15.0, gt=0.0)

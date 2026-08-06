@@ -447,6 +447,7 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
             "bot_normalized_content",
             "wxbot_normalized_content",
             "bot_wxid",
+            "external_conversation_id",
             "sender_roles",
             "sender_is_group_admin",
             "sender_is_group_owner",
@@ -499,9 +500,9 @@ class WxbotBridgeStreamMixin(WxbotBridgeState):
                     getattr(
                         self._settings,
                         "wxbot_group_summary_debounce_seconds",
-                        5.0,
+                        20.0,
                     )
-                    or 5.0
+                    or 20.0
                 ),
             )
         except Exception as exc:

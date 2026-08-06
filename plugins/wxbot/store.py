@@ -2388,14 +2388,26 @@ class WxbotStore(WxbotReportStoreMixin):
         is_self_sent: bool = False,
         occurred_ts: int = 0,
         metadata: dict[str, Any] | None = None,
-        summary_debounce_seconds: float = 5.0,
+        summary_debounce_seconds: float = 20.0,
     ) -> bool:
-        """Persist one immutable group message and debounce its summary job."""
+        """Persist one immutable group message and conditionally schedule summary."""
         tenant_id = str(tenant_id or "").strip()
         session_id = str(session_id or "").strip()
         message_id = str(message_id or "").strip()
         if not tenant_id or not session_id.endswith("@chatroom") or not message_id:
             return False
+        summary_enabled = bool(
+            getattr(self.settings, "wxbot_group_summary_enabled", True)
+        )
+        context_enabled = bool(
+            getattr(self.settings, "wxbot_group_context_enabled", True)
+        )
+        only_when_addressed = bool(
+            getattr(self.settings, "wxbot_group_summary_only_when_addressed", True)
+        )
+        schedule_summary = summary_enabled and context_enabled and (
+            not only_when_addressed or bool(mentioned_me or bot_addressed)
+        )
         rows = await _exec(
             "WITH inserted AS ("
             " INSERT INTO plugin_wxbot_group_observations "
@@ -2411,6 +2423,7 @@ class WxbotStore(WxbotReportStoreMixin):
             "  next_attempt_at, created_at, updated_at) "
             " SELECT tenant_id, session_id, session_name, 'pending', id, "
             "  NOW() + (:debounce * INTERVAL '1 second'), NOW(), NOW() FROM inserted "
+            " WHERE :schedule_summary "
             " ON CONFLICT (tenant_id, session_id) DO UPDATE SET "
             " session_name = EXCLUDED.session_name, "
             " requested_through_observation_id = GREATEST("
@@ -2442,7 +2455,7 @@ class WxbotStore(WxbotReportStoreMixin):
             " RETURNING tenant_id, session_id"
             ") "
             "SELECT inserted.id FROM inserted "
-            "JOIN scheduled USING (tenant_id, session_id)",
+            "LEFT JOIN scheduled USING (tenant_id, session_id)",
             {
                 "tid": tenant_id,
                 "sid": session_id,
@@ -2458,6 +2471,7 @@ class WxbotStore(WxbotReportStoreMixin):
                 "occurred_ts": max(0, int(occurred_ts or 0)),
                 "metadata": json.dumps(metadata or {}, ensure_ascii=False, default=str),
                 "debounce": max(0.0, float(summary_debounce_seconds or 0.0)),
+                "schedule_summary": schedule_summary,
             },
         )
         if not is_self_sent and sender_wxid:

@@ -71,7 +71,70 @@ async def test_save_group_observation_is_idempotent_and_preserves_metadata(
         "at_wxids": ["wxid_bot"],
         "quote_text": "上一条",
     }
-    assert params["debounce"] == 5.0
+    assert params["debounce"] == 20.0
+    assert params["schedule_summary"] is True
+
+
+@pytest.mark.asyncio
+async def test_save_group_observation_keeps_unaddressed_messages_without_scheduling_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        calls.append((sql, params or {}))
+        return [{"id": 10}]
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fake_exec)
+
+    saved = await WxbotStore(
+        SimpleNamespace(
+            wxbot_group_summary_enabled=True,
+            wxbot_group_context_enabled=True,
+            wxbot_group_summary_only_when_addressed=True,
+        )
+    ).save_group_observation(
+        tenant_id="demo",
+        session_id="room@chatroom",
+        message_id="msg-10",
+        content="群友之间的普通闲聊",
+    )
+
+    assert saved is True
+    sql, params = calls[0]
+    assert "WHERE :schedule_summary" in sql
+    assert params["schedule_summary"] is False
+
+
+@pytest.mark.asyncio
+async def test_save_group_observation_does_not_schedule_when_summary_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        calls.append((sql, params or {}))
+        return [{"id": 11}]
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fake_exec)
+
+    saved = await WxbotStore(
+        SimpleNamespace(
+            wxbot_group_summary_enabled=False,
+            wxbot_group_context_enabled=True,
+            wxbot_group_summary_only_when_addressed=False,
+        )
+    ).save_group_observation(
+        tenant_id="demo",
+        session_id="room@chatroom",
+        message_id="msg-11",
+        content="@机器人 请总结",
+        mentioned_me=True,
+        bot_addressed=True,
+    )
+
+    assert saved is True
+    assert calls[0][1]["schedule_summary"] is False
 
 
 @pytest.mark.asyncio
