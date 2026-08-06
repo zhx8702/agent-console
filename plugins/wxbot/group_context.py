@@ -140,6 +140,26 @@ def _observation_relation(row: dict[str, Any]) -> str:
     return ""
 
 
+def _trim_summary_text(text: str, max_chars: int) -> str:
+    """Keep both the beginning and latest tail of a bounded summary."""
+    normalized = str(text or "").strip()
+    limit = max(1, int(max_chars or 1))
+    if len(normalized) <= limit:
+        return normalized
+    marker = "\n…\n"
+    if limit <= len(marker):
+        return normalized[:limit]
+    remaining = limit - len(marker)
+    head_chars = (remaining + 1) // 2
+    tail_chars = remaining - head_chars
+    tail = normalized[-tail_chars:] if tail_chars > 0 else ""
+    return (
+        normalized[:head_chars].rstrip()
+        + marker
+        + tail.lstrip()
+    )
+
+
 def render_group_observation(row: dict[str, Any], *, max_chars: int = 800) -> str:
     text = _observation_text(row)
     if not text:
@@ -375,11 +395,82 @@ class WxbotGroupContextLoadStep:
 
 
 class WxbotGroupSummaryService:
-    def __init__(self, store: WxbotStore, llm_service: Any, settings: Any) -> None:
+    def __init__(
+        self,
+        store: WxbotStore,
+        llm_service: Any,
+        settings: Any,
+        social_policy_store: SocialPolicyStore | None = None,
+    ) -> None:
         self._store = store
         self._llm = llm_service
         self._settings = settings
+        self._social_policy_store = social_policy_store
         self._last_prune_at = 0.0
+
+    async def _summary_context_consumer_allowed(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        observations: list[dict[str, Any]],
+    ) -> bool:
+        """Avoid generating summaries that the prompt hook will discard.
+
+        Finite retention deliberately excludes rolling summaries because the
+        stored facts do not carry per-fact timestamps.  The summary worker
+        must mirror that decision, otherwise it spends LLM tokens on data that
+        cannot be consumed by a later prompt.
+        """
+        if not bool(getattr(self._settings, "wxbot_group_context_enabled", True)):
+            return False
+        if self._social_policy_store is None:
+            # Preserve the standalone service contract used by older callers;
+            # the initialized wxbot plugin always supplies the policy store.
+            return True
+
+        policy_session_id = str(session_id or "").strip()
+        for row in reversed(observations):
+            metadata = row.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            external_id = str(
+                metadata.get("external_conversation_id")
+                or metadata.get("external_session_id")
+                or ""
+            ).strip()
+            if external_id:
+                policy_session_id = external_id
+                break
+        try:
+            document = await self._social_policy_store.get_group_policy(
+                tenant_id,
+                policy_session_id,
+            )
+            policy = getattr(document, "policy", None)
+            retention = getattr(policy, "prompt_context_retention_seconds", None)
+            # Only an explicit unbounded/legacy policy can consume the rolling
+            # summary. Normal policy values are finite and are intentionally
+            # rebuilt from timestamped recent observations by the hook.
+            return retention is None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            legacy_fallback = bool(
+                getattr(
+                    self._settings,
+                    "social_policy_legacy_wxbot_fallback_enabled",
+                    False,
+                )
+            )
+            logger.warning(
+                "wxbot.group_summary.policy_load_failed",
+                tenant_id=tenant_id,
+                session_id=session_id,
+                fallback_enabled=legacy_fallback,
+                error_type=exc.__class__.__name__,
+            )
+            return legacy_fallback
 
     async def _prune_if_due(self) -> None:
         interval = float(
@@ -415,24 +506,55 @@ class WxbotGroupSummaryService:
         observations: list[dict[str, Any]],
     ) -> tuple[str, list[dict[str, Any]]]:
         budget = int(
-            getattr(self._settings, "wxbot_group_summary_input_budget_chars", 12_000) or 12_000
+            getattr(self._settings, "wxbot_group_summary_input_budget_chars", 12_000)
+            or 12_000
+        )
+        observation_max_chars = int(
+            getattr(
+                self._settings,
+                "wxbot_group_summary_observation_max_chars",
+                800,
+            )
+            or 800
+        )
+        row_max_chars = max(
+            200,
+            min(
+                observation_max_chars,
+                4000,
+                max(200, budget - 128),
+            ),
         )
         included: list[dict[str, Any]] = []
         lines: list[str] = []
         used = 0
         for row in observations:
-            rendered = render_group_observation(row, max_chars=1200)
+            rendered = render_group_observation(
+                row,
+                max_chars=row_max_chars,
+            )
             remaining = budget - used
             if remaining <= 0:
                 break
             if len(rendered) > remaining:
-                rendered = rendered[:remaining].rstrip()
-            if not rendered:
+                # Never advance the durable cursor over a partially included
+                # message.  The row remains in the next summary batch.
                 break
             lines.append(rendered)
             included.append(row)
             used += len(rendered)
-        old = old_summary.strip() or "（暂无旧摘要）"
+        old_summary_max_chars = int(
+            getattr(
+                self._settings,
+                "wxbot_group_summary_old_summary_max_chars",
+                2000,
+            )
+            or 2000
+        )
+        old = _trim_summary_text(
+            old_summary,
+            max(500, min(old_summary_max_chars, 12000)),
+        ) or "（暂无旧摘要）"
         user = (
             "旧的群长期摘要（可能为空）：\n"
             f"<old_summary>{escape(old)}</old_summary>\n\n"
@@ -486,15 +608,22 @@ class WxbotGroupSummaryService:
                 )
                 return False
 
-        async def defer_claim(*, reason: str) -> dict[str, int]:
+        async def defer_claim(
+            *,
+            reason: str,
+            defer_seconds: float | None = None,
+        ) -> dict[str, int]:
             defer = getattr(self._store, "defer_group_summary_job", None)
             if callable(defer):
-                await defer(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    worker_id=worker_id,
-                    claim_token=claim_token,
-                )
+                kwargs: dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "session_id": session_id,
+                    "worker_id": worker_id,
+                    "claim_token": claim_token,
+                }
+                if defer_seconds is not None:
+                    kwargs["defer_seconds"] = max(1.0, float(defer_seconds))
+                await defer(**kwargs)
             else:
                 logger.error(
                     "wxbot.group_summary.scope_defer_unavailable",
@@ -545,6 +674,16 @@ class WxbotGroupSummaryService:
                     raise RuntimeError("group summary lease expired before completion")
                 return {"claimed": 1, "succeeded": 1, "failed": 0}
 
+            if not await self._summary_context_consumer_allowed(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                observations=observations,
+            ):
+                return await defer_claim(
+                    reason="summary_context_consumer_disabled",
+                    defer_seconds=300.0,
+                )
+
             user_prompt, included = self._summary_user_prompt(
                 old_summary=str((state or {}).get("summary_text") or ""),
                 observations=observations,
@@ -559,7 +698,20 @@ class WxbotGroupSummaryService:
                 messages=[ChatMessage(role=Role.USER, content=user_prompt)],
                 system=_SUMMARY_SYSTEM,
                 temperature=0.1,
-                max_tokens=1200,
+                max_tokens=max(
+                    128,
+                    min(
+                        int(
+                            getattr(
+                                self._settings,
+                                "wxbot_group_summary_max_output_tokens",
+                                600,
+                            )
+                            or 600
+                        ),
+                        4000,
+                    ),
+                ),
                 metadata={
                     "disable_openai_fallback": True,
                     "wxbot_group_summary_job": True,
@@ -572,7 +724,9 @@ class WxbotGroupSummaryService:
             response = await asyncio.wait_for(self._llm.chat(request), timeout=timeout)
             if not await scope_allowed_now():
                 return await defer_scope_denied()
-            max_chars = int(getattr(self._settings, "wxbot_group_summary_max_chars", 4000) or 4000)
+            max_chars = int(
+                getattr(self._settings, "wxbot_group_summary_max_chars", 2500) or 2500
+            )
             summary_text = str(response.content or "").strip()[:max_chars].rstrip()
             if not summary_text:
                 raise RuntimeError("group summary LLM returned empty content")

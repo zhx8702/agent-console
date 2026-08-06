@@ -627,7 +627,12 @@ class WxbotPlugin(Plugin):
         )
         llm_service = getattr(ctx.container, "llm_service", None)
         self._group_summary_service = (
-            WxbotGroupSummaryService(self._store, llm_service, ctx.settings)
+            WxbotGroupSummaryService(
+                self._store,
+                llm_service,
+                ctx.settings,
+                self._social_policy_store,
+            )
             if llm_service is not None
             else None
         )
@@ -1236,6 +1241,7 @@ class WxbotPlugin(Plugin):
             "bot_normalized_content",
             "wxbot_normalized_content",
             "bot_wxid",
+            "external_conversation_id",
             "quote",
             "quote_text",
             "quote_image_path",
@@ -1282,7 +1288,7 @@ class WxbotPlugin(Plugin):
             occurred_ts=int(occurred_ts or 0),
             metadata=self._group_observation_metadata(event),
             summary_debounce_seconds=float(
-                getattr(self._store.settings, "wxbot_group_summary_debounce_seconds", 5.0) or 5.0
+                getattr(self._store.settings, "wxbot_group_summary_debounce_seconds", 20.0) or 20.0
             ),
         )
 
