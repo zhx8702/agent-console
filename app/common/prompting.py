@@ -53,6 +53,10 @@ _GENERIC_RAG_SYSTEM = (
     "你是一名中文聊天助手，只根据下方资料回答；如资料里没有答案，就明确说不知道。"
     "不要使用客服专用话术。回答中在引用处标注 [1] [2]。"
 )
+_WEB_SEARCH_RESPONSE_RULES = (
+    "联网搜索只用于获取事实；若本轮使用搜索，先综合后直接回答，保持当前人格和场景语气。"
+    "不要复述搜索过程、原始结果或来源清单，不要输出 [[1]]、URL 或参考资料。"
+)
 _PERSONA_STYLE_PROMPT_MAX_CHARS = 12_000
 _MEMORY_PII_PLACEHOLDER_RE = re.compile(r"<PII:[a-z_]+:\d+>", re.I)
 _ENGLISH_OUTPUT_RULES = (
@@ -596,6 +600,11 @@ def augment_prompt_with_persona_and_memory(
         )
         if group_section:
             sections.append(group_section)
+
+    # Keep this compact because it is included in every chat prompt while the
+    # hosted web-search tool is enabled. The postprocessor also strips raw
+    # citation scaffolding as a defense-in-depth measure.
+    sections.append(_WEB_SEARCH_RESPONSE_RULES)
 
     if persona_response_language(session) == "en":
         # Append this after all persona and memory data so the language lock is

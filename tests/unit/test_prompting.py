@@ -51,6 +51,18 @@ def test_prompting_keeps_wechat_chatroom_fallback() -> None:
     assert "不要反复用“我是 AI 助手”作答" in prompt
 
 
+def test_prompting_synthesizes_web_search_results_instead_of_dumping_sources() -> None:
+    prompt = augment_prompt_with_persona_and_memory(
+        "base",
+        _session(channel=Channel.WEB, session_id="web-1"),
+        memory_intro="memory",
+    )
+
+    assert "先综合后直接回答" in prompt
+    assert "不要复述搜索过程、原始结果或来源清单" in prompt
+    assert "不要输出 [[1]]、URL 或参考资料" in prompt
+
+
 def test_persona_becomes_named_runtime_role_without_making_style_data_executable() -> None:
     session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
     session.variables["persona_profile"] = {
