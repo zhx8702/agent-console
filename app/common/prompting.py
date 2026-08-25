@@ -495,10 +495,12 @@ def persona_response_language(session: Session) -> str:
     value = " ".join(str(profile.get("response_language") or "").strip().split()).lower()
     if value in {"en", "en-us", "en-gb", "english"}:
         return "en"
-    # Keep the existing Tibo profile compatible with older stored artifacts
-    # that predate the response_language metadata field.
-    skill_slug = " ".join(str(profile.get("skill_slug") or "").strip().split()).lower()
-    return "en" if skill_slug == "thsottiaux" else ""
+    # Older persona artifacts do not carry a language field.  Do not infer a
+    # hard output-language lock from the persona slug: a Chinese group turn
+    # must remain answerable even when the persona's source material is
+    # English.  New profiles can opt into a language lock explicitly through
+    # ``response_language`` above.
+    return ""
 
 
 def augment_prompt_with_persona_and_memory(
