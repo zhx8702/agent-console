@@ -42,6 +42,11 @@ _WEB_SEARCH_URL_LINE_RE = re.compile(
     r"^\s*(?:\[\s*\d+\s*\]\s*)?(?:[^\n]{0,160}\s+-\s+)?https?://\S+\s*$",
     re.IGNORECASE,
 )
+_WEB_SEARCH_TOOL_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*)?(?:web_search|grok_web_search|openai_web_search|"
+    r"web_search_call|x_search)(?:\*\*)?\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _restore_pii(text: str, pii_map: dict[str, str]) -> str:
@@ -73,6 +78,8 @@ def _strip_web_search_artifacts(text: str) -> str:
     compact = _INLINE_WEB_MARKDOWN_LINK_RE.sub(r"\1", compact)
     kept_lines: list[str] = []
     for line in compact.splitlines():
+        if _WEB_SEARCH_TOOL_LABEL_RE.match(line):
+            continue
         if _WEB_SEARCH_REFERENCE_HEADING_RE.match(line):
             break
         if _WEB_SEARCH_SOURCE_LINE_RE.match(line) or _WEB_SEARCH_URL_LINE_RE.match(line):

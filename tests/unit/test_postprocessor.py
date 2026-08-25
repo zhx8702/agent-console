@@ -134,6 +134,27 @@ async def test_postprocessor_hides_openai_web_search_sources_too():
 
 
 @pytest.mark.asyncio
+async def test_postprocessor_hides_standalone_web_search_tool_label():
+    post = build_postprocessor()
+    session = _session()
+    result = CapabilityResult(
+        route=RouteType.LLM,
+        reply_text="结论：可以。\n\n**web_search**",
+        citations=[
+            Citation(
+                id="grok_web:1",
+                source="grok_web_search",
+                url="https://example.com",
+            )
+        ],
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.primary_text == "结论：可以。"
+
+
+@pytest.mark.asyncio
 async def test_postprocessor_truncates_long_text():
     post = build_postprocessor()
     session = _session()

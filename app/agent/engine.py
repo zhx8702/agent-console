@@ -35,10 +35,12 @@ from app.agent.tools.group import (
 from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
 from app.common.config import Settings, get_settings
 from app.common.context import get_trace_id
+from app.common.context_budget import select_recent_turns
 from app.common.conversation import render_turn as render_conversation_turn
 from app.common.ids import new_trace_id
 from app.common.logging import get_logger
 from app.common.prompting import augment_prompt_with_persona_and_memory, chat_system_prompt
+from app.common.tool_projection import project_tool_result
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -226,13 +228,20 @@ class AgentCapabilityEngine:
                 reason="required_web_search_not_configured",
             )
 
-        system_prompt = self._compose_system_prompt(session, scope)
+        prompt_trace: dict[str, Any] = {}
+        system_prompt = self._compose_system_prompt(
+            session,
+            scope,
+            web_search_enabled=required_web_search,
+            prompt_trace=prompt_trace,
+        )
         if required_web_search:
             system_prompt += (
                 "\n\n本轮用户明确要求实时联网搜索。必须先使用联网搜索取得当前资料，"
                 "再按标题、摘要和可访问的来源链接整理正文；不得使用模型记忆冒充实时结果。"
             )
-        messages = self._build_messages(pre, session)
+        context_trace: dict[str, Any] = {}
+        messages = self._build_messages(pre, session, context_trace=context_trace)
         aggregate_usage = ChatUsage()
         executed_tool_calls: list[ToolCall] = []
         final_response = None
@@ -258,6 +267,12 @@ class AgentCapabilityEngine:
             request_metadata: dict[str, Any] = {
                 "agent_round": round_index + 1,
                 "agent_scope": scope,
+                "route": "agent",
+                "openai_web_search": required_web_search,
+                "web_search_requested": required_web_search,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "prompt_section_chars": prompt_trace.get("section_chars", {}),
+                "context_window": context_trace,
             }
             request_tools = [tool.schema for tool in tools.values()]
             if required_web_search:
@@ -478,6 +493,8 @@ class AgentCapabilityEngine:
                         "agent_scope": scope,
                         "agent_final_synthesis": True,
                         "agent_fallback_search": True,
+                        "route": "agent",
+                        "openai_web_search": False,
                     },
                 )
                 response = await self._llm.chat(request)
@@ -507,6 +524,8 @@ class AgentCapabilityEngine:
                     "agent_round": self._max_tool_rounds + 1,
                     "agent_scope": scope,
                     "agent_final_synthesis": True,
+                    "route": "agent",
+                    "openai_web_search": False,
                 },
             )
             response = await self._llm.chat(request)
@@ -604,6 +623,9 @@ class AgentCapabilityEngine:
                 "model": final_response.model,
                 "latency_ms": final_response.latency_ms,
                 "agent_tool_scope": scope,
+                "web_search_requested": required_web_search,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "context_window": context_trace,
                 "tool_count": len(executed_tool_calls),
                 "suppress_final_reply": suppress_final_reply,
                 "suppress_outbound": suppress_final_reply,
@@ -638,15 +660,30 @@ class AgentCapabilityEngine:
         model_tier: str,
         temperature: float,
     ) -> CapabilityResult:
+        prompt_trace: dict[str, Any] = {}
+        context_trace: dict[str, Any] = {}
+        messages = self._build_messages(pre, session, context_trace=context_trace)
         request = ChatRequest(
             tenant_id=session.tenant_id,
             trace_id=get_trace_id() or new_trace_id(),
             model_tier=model_tier,
-            messages=self._build_messages(pre, session),
-            system=self._compose_system_prompt(session, None),
+            messages=messages,
+            system=self._compose_system_prompt(
+                session,
+                None,
+                web_search_enabled=False,
+                prompt_trace=prompt_trace,
+            ),
             max_tokens=self._max_tokens,
             temperature=temperature,
             cache_system=True,
+            metadata={
+                "route": "agent",
+                "openai_web_search": False,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "prompt_section_chars": prompt_trace.get("section_chars", {}),
+                "context_window": context_trace,
+            },
         )
         response = await self._llm.chat(request)
         return CapabilityResult(
@@ -921,7 +958,8 @@ class AgentCapabilityEngine:
             and self._settings.openai_api_mode == "responses"
             and self._settings.openai_web_search_enabled
             and self._settings.openai_web_search_live_enabled
-            and self._settings.openai_web_search_tool in {"web_search", "web_search_preview"}
+            and self._settings.openai_web_search_tool
+            in {"web_search", "web_search_preview", "x_search"}
         )
 
     async def _chat_with_hard_timeout(
@@ -1180,13 +1218,13 @@ class AgentCapabilityEngine:
                     effects.append(effect)
         return effects
 
-    @staticmethod
-    def _tool_result_for_llm(result: Any) -> Any:
+    def _tool_result_for_llm(self, result: Any) -> Any:
+        max_chars = getattr(self._settings, "agent_tool_result_max_chars", 6_000)
         if not isinstance(result, dict):
-            return result
+            return project_tool_result(result, max_chars=max_chars)
         value = dict(result)
         value.pop("channel_reply_effects", None)
-        return value
+        return project_tool_result(value, max_chars=max_chars)
 
     @staticmethod
     def _tool_result_for_audit(tool_name: str, result: Any) -> Any:
@@ -1948,7 +1986,14 @@ class AgentCapabilityEngine:
             return group_plugin_status_tool_catalog()
         return []
 
-    def _compose_system_prompt(self, session: Session, scope: str | None) -> str:
+    def _compose_system_prompt(
+        self,
+        session: Session,
+        scope: str | None,
+        *,
+        web_search_enabled: bool = False,
+        prompt_trace: dict[str, Any] | None = None,
+    ) -> str:
         base_system = chat_system_prompt(self._settings.customer_service_prompt_enabled)
         return augment_prompt_with_persona_and_memory(
             (base_system + "\n\n" + agent_scope_system_hint(scope)),
@@ -1958,15 +2003,40 @@ class AgentCapabilityEngine:
                 "但你回答的群事实必须以工具查询结果为准："
             ),
             memory_budget_chars=self._settings.memory_retrieval_budget_chars,
+            web_search_enabled=web_search_enabled,
+            prompt_trace=prompt_trace,
         )
 
-    def _build_messages(self, pre: PreprocessedMessage, session: Session) -> list[ChatMessage]:
+    def _build_messages(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        *,
+        context_trace: dict[str, Any] | None = None,
+    ) -> list[ChatMessage]:
         messages: list[ChatMessage] = []
         current_trace_id = get_trace_id()
         history_turns = (
             max(self._history_turns, 20) if self._is_group_session(session) else self._history_turns
         )
-        recent = session.turns[-history_turns:]
+        context_window = select_recent_turns(
+            session.turns,
+            max_turns=history_turns,
+            max_chars=getattr(self._settings, "llm_context_budget_chars", 12_000),
+            render=lambda turn: self._render_turn_content(session, turn, current=False),
+        )
+        if context_trace is not None:
+            context_trace.clear()
+            context_trace.update(
+                {
+                    "source_turns": context_window.source_turns,
+                    "selected_turns": len(context_window.turns),
+                    "dropped_turns": context_window.dropped_turns,
+                    "source_chars": context_window.source_chars,
+                    "selected_chars": context_window.selected_chars,
+                }
+            )
+        recent = context_window.turns
         current_turn = next(
             (
                 turn

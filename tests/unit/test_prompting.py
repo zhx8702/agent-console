@@ -56,6 +56,7 @@ def test_prompting_synthesizes_web_search_results_instead_of_dumping_sources() -
         "base",
         _session(channel=Channel.WEB, session_id="web-1"),
         memory_intro="memory",
+        web_search_enabled=True,
     )
 
     assert "先综合后直接回答" in prompt

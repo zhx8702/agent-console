@@ -252,6 +252,10 @@ class Settings(BaseSettings):
     llm_model_tier1: str = "gpt-5.5"
     llm_model_tier2: str = "gpt-5.5"
     llm_model_tier3: str = "gpt-5.5"
+    # Keep ordinary turns bounded; explicit live-search and tool contracts can
+    # still opt in through request metadata.
+    llm_context_budget_chars: int = Field(default=12_000, ge=2_000, le=100_000)
+    agent_tool_result_max_chars: int = Field(default=6_000, ge=1_000, le=30_000)
     llm_embed_model: str = "voyage-3"
     tenant_default_daily_tokens: int = 1_000_000
     rag_vector_relevance_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
