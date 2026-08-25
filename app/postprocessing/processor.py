@@ -35,7 +35,7 @@ _WEB_SEARCH_REFERENCE_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 _WEB_SEARCH_SOURCE_LINE_RE = re.compile(
-    r"^\s*(?:来源|source|sources?|reference|references?)\s*[:：]\s*https?://\S+\s*$",
+    r"^\s*(?:来源|source|sources?|reference|references?)\s*[:：]\s*.+$",
     re.IGNORECASE,
 )
 _WEB_SEARCH_URL_LINE_RE = re.compile(
@@ -71,14 +71,13 @@ def _strip_web_search_artifacts(text: str) -> str:
 
     compact = _INLINE_WEB_CITATION_RE.sub("", str(text or ""))
     compact = _INLINE_WEB_MARKDOWN_LINK_RE.sub(r"\1", compact)
-    compact = _INLINE_WEB_URL_RE.sub("", compact)
     kept_lines: list[str] = []
     for line in compact.splitlines():
         if _WEB_SEARCH_REFERENCE_HEADING_RE.match(line):
             break
         if _WEB_SEARCH_SOURCE_LINE_RE.match(line) or _WEB_SEARCH_URL_LINE_RE.match(line):
             continue
-        kept_lines.append(line.rstrip())
+        kept_lines.append(_INLINE_WEB_URL_RE.sub("", line).rstrip())
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines)).strip()
 
 

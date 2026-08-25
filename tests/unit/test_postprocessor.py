@@ -94,6 +94,7 @@ async def test_postprocessor_synthesizes_web_search_output_without_raw_sources()
         reply_text=(
             "Grok's tool is `web_search`. [[1]](https://docs.x.ai/developers/tools/web-search)\n\n"
             "Source: https://docs.x.ai/developers/tools/web-search\n"
+            "Source: xAI docs\n"
             "参考资料：\n"
             "[1] xAI docs - https://docs.x.ai/developers/tools/web-search"
         ),
