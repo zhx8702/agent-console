@@ -160,6 +160,21 @@ def test_tibo_cjk_output_is_replaced_before_send() -> None:
     assert ctx.reply.metadata["response_guard"]["reason"] == "persona_language_guard"
 
 
+def test_legacy_tibo_accepts_chinese_input_when_reply_is_english() -> None:
+    ctx = _ctx("这个问题请用中文回答", "I understand your question and will answer in English.")
+    assert ctx.session is not None
+    ctx.session.variables["persona_profile"] = {
+        "name": "Tibo",
+        "skill_slug": "thsottiaux",
+    }
+
+    apply_response_guards(ctx, settings=Settings())
+
+    assert ctx.reply is not None
+    assert ctx.reply.primary_text == "I understand your question and will answer in English."
+    assert "response_guard" not in ctx.reply.metadata
+
+
 def test_normal_command_reply_is_not_echo_replaced() -> None:
     ctx = _ctx("签到成功", "签到成功", command=True)
 

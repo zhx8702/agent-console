@@ -99,7 +99,7 @@ def test_tibo_persona_appends_english_output_lock() -> None:
     assert prompt.rindex("不得输出中文字符") > prompt.index("<active_persona_name>")
 
 
-def test_legacy_tibo_persona_does_not_infer_english_output_lock() -> None:
+def test_legacy_tibo_persona_keeps_english_output_lock_for_any_input_language() -> None:
     session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
     session.variables["persona_profile"] = {
         "name": "Tibo",
@@ -112,7 +112,9 @@ def test_legacy_tibo_persona_does_not_infer_english_output_lock() -> None:
         memory_intro="memory",
     )
 
-    assert "最终发送给用户的所有文字必须使用英文" not in prompt
+    assert "最终发送给用户的所有文字必须使用英文" in prompt
+    assert "用户可以使用任意语言提问，包括中文" in prompt
+    assert "不得因为输入语言不是英文而拒答" in prompt
 
 
 def test_persona_style_data_is_bounded_before_runtime_injection() -> None:

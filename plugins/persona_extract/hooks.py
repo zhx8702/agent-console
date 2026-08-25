@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.channel.models import configuration_session_id
+from app.common.prompting import persona_response_language
 from app.common.types import channel_id_value
 from app.orchestrator.flow import StepResult
 from app.plugin.hooks import HookPoint, PipelineHook
@@ -79,10 +80,7 @@ class PersonaSkillHook(PipelineHook):
             ),
             "session_name": source_meta.get("session_name"),
         }
-        response_language = str(
-            ctx.session.variables["persona_profile"].get("response_language") or ""
-        ).strip().lower()
-        if response_language in {"en", "en-us", "en-gb", "english"}:
+        if persona_response_language(ctx.session) == "en":
             # Async channel targets are built from the current event/session
             # metadata, not from the turn-local persona variables.
             ctx.event.metadata["persona_response_language"] = "en"

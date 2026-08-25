@@ -56,8 +56,10 @@ _GENERIC_RAG_SYSTEM = (
 _PERSONA_STYLE_PROMPT_MAX_CHARS = 12_000
 _MEMORY_PII_PLACEHOLDER_RE = re.compile(r"<PII:[a-z_]+:\d+>", re.I)
 _ENGLISH_OUTPUT_RULES = (
-    "当前运行人格的可见回复语言是 English。最终发送给用户的所有文字必须使用英文；"
-    "不得输出中文字符、中文解释或中英双语。URL、代码、产品名和用户明确要求保留的专有名词可原样保留。"
+    "当前运行人格的可见回复语言是 English。用户可以使用任意语言提问，包括中文；"
+    "先理解用户的真实意图，再直接回答问题，不得因为输入语言不是英文而拒答、要求用户重试或声称不支持该语言。"
+    "最终发送给用户的所有文字必须使用英文；不得输出中文字符、中文解释或中英双语。"
+    "URL、代码、产品名和用户明确要求保留的专有名词可原样保留。"
 )
 
 
@@ -487,7 +489,7 @@ def _active_persona_name(session: Session) -> str:
 
 
 def persona_response_language(session: Session) -> str:
-    """Return the explicitly configured output language for the active persona."""
+    """Return the active persona's enforced output language."""
 
     profile = session.variables.get("persona_profile")
     if not isinstance(profile, dict):
@@ -495,12 +497,12 @@ def persona_response_language(session: Session) -> str:
     value = " ".join(str(profile.get("response_language") or "").strip().split()).lower()
     if value in {"en", "en-us", "en-gb", "english"}:
         return "en"
-    # Older persona artifacts do not carry a language field.  Do not infer a
-    # hard output-language lock from the persona slug: a Chinese group turn
-    # must remain answerable even when the persona's source material is
-    # English.  New profiles can opt into a language lock explicitly through
-    # ``response_language`` above.
-    return ""
+    # Older Tibo artifacts predate the response_language metadata field, but
+    # the persona contract still requires English output for every input
+    # language. Keep that compatibility rule until the stored profile is
+    # migrated to an explicit response_language value.
+    skill_slug = " ".join(str(profile.get("skill_slug") or "").strip().split()).lower()
+    return "en" if skill_slug == "thsottiaux" else ""
 
 
 def augment_prompt_with_persona_and_memory(
