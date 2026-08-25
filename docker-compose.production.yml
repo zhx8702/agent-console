@@ -158,5 +158,7 @@ volumes:
     name: ${COMPOSE_PROD_CONFIGDATA_VOLUME:-agent-console-prod-configdata}
   drawdata:
     name: ${COMPOSE_PROD_DRAWDATA_VOLUME:-agent-console-prod-drawdata}
+  videodata:
+    name: ${COMPOSE_PROD_VIDEODATA_VOLUME:-agent-console-prod-videodata}
   amapdata:
     name: ${COMPOSE_PROD_AMAPDATA_VOLUME:-agent-console-prod-amapdata}

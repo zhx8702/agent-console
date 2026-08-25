@@ -13,10 +13,10 @@ WORKDIR /app
 COPY --from=uv /uv /uvx /bin/
 
 RUN useradd --create-home --shell /bin/bash appuser
-RUN mkdir -p /data/config /data/draw /data/amap \
+RUN mkdir -p /data/config /data/draw /data/video /data/amap \
     && touch /data/config/.env \
-    && chown -R appuser:appuser /data/config /data/draw /data/amap \
-    && chmod 700 /data/config /data/draw /data/amap \
+    && chown -R appuser:appuser /data/config /data/draw /data/video /data/amap \
+    && chmod 700 /data/config /data/draw /data/video /data/amap \
     && chmod 600 /data/config/.env
 
 COPY pyproject.toml uv.lock README.md ./

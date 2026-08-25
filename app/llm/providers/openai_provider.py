@@ -129,7 +129,10 @@ def _responses_content(msg: ChatMessage) -> str | list[dict[str, Any]]:
 
 
 def _convert_messages(
-    messages: list[ChatMessage], system: str | None = None
+    messages: list[ChatMessage],
+    system: str | None = None,
+    *,
+    include_compat_call_id: bool = True,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if system:
@@ -139,17 +142,18 @@ def _convert_messages(
             out.append({"role": "system", "content": msg.content or ""})
             continue
         if msg.role == Role.TOOL:
-            out.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id or "",
-                    # Some OpenAI-compatible proxies internally bridge tool
-                    # continuation through the Responses format and require
-                    # `call_id` even on chat-style HTTP requests.
-                    "call_id": msg.tool_call_id or "",
-                    "content": msg.content or "",
-                }
-            )
+            payload: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id or "",
+                "content": msg.content or "",
+            }
+            # Some OpenAI-compatible proxies internally bridge tool
+            # continuation through the Responses format and require
+            # `call_id` even on chat-style HTTP requests. xAI follows the
+            # standard Chat Completions shape and rejects this extra field.
+            if include_compat_call_id:
+                payload["call_id"] = msg.tool_call_id or ""
+            out.append(payload)
             continue
         if msg.role == Role.ASSISTANT:
             payload: dict[str, Any] = {
@@ -225,17 +229,25 @@ def _convert_chat_tools(tools: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _convert_responses_tools(tools: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {
+def _convert_responses_tools(
+    tools: list[Any],
+    *,
+    xai_compatible: bool = False,
+) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        item = {
             "type": "function",
             "name": tool.name,
             "description": tool.description,
             "parameters": tool.parameters,
-            "strict": False,
         }
-        for tool in tools
-    ]
+        # xAI treats function schemas as strict by default and does not need
+        # the OpenAI compatibility shim used by the existing gateway.
+        if not xai_compatible:
+            item["strict"] = False
+        converted.append(item)
+    return converted
 
 
 def _preserve_base_url(base_url: str | None, default: str = "https://api.openai.com/v1") -> str:
@@ -253,6 +265,12 @@ def _normalize_v1_base_url(base_url: str | None, default: str = "https://api.ope
         path = "/v1"
     normalized = parsed._replace(path=path)
     return urlunparse(normalized).rstrip("/")
+
+
+def is_xai_base_url(base_url: str | None) -> bool:
+    """Return whether a configured endpoint is the native xAI API."""
+    host = (urlparse(str(base_url or "")).hostname or "").lower().rstrip(".")
+    return host == "api.x.ai" or host == "mtls.api.x.ai" or host.endswith(".api.x.ai")
 
 
 def _extract_text_content(value: Any) -> str:
@@ -401,7 +419,7 @@ def _extract_responses_payload(
     web_search_completed = False
     for item in output:
         item_type = str(_field(item, "type", "") or "")
-        if item_type == "web_search_call":
+        if item_type in {"web_search_call", "x_search_call"}:
             completed = str(_field(item, "status", "") or "").strip().lower() == "completed"
             web_search_completed = completed or web_search_completed
             remaining_source_slots = _MAX_WEB_SEARCH_SOURCE_CITATIONS - len(web_search_source_urls)
@@ -498,6 +516,7 @@ class OpenAIProvider:
             raise ValueError(f"unsupported OPENAI_API_MODE={self._api_mode}")
         self._responses_base_url = _preserve_base_url(base_url or settings.openai_base_url)
         self._chat_base_url = _normalize_v1_base_url(base_url or settings.openai_base_url)
+        self._xai_compatible = is_xai_base_url(self._responses_base_url)
         self._responses_client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=self._responses_base_url,
@@ -527,7 +546,11 @@ class OpenAIProvider:
     def _build_chat_kwargs(self, req: ChatRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self._resolve_model(req),
-            "messages": _convert_messages(req.messages, req.system),
+            "messages": _convert_messages(
+                req.messages,
+                req.system,
+                include_compat_call_id=not self._xai_compatible,
+            ),
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
         }
@@ -555,6 +578,10 @@ class OpenAIProvider:
             ).strip()
             or "web_search"
         )
+        if self._xai_compatible and tool_type == "web_search_preview":
+            # xAI exposes the live search tool as `web_search`; the OpenAI
+            # preview alias is not part of the xAI tool vocabulary.
+            tool_type = "web_search"
         tool: dict[str, Any] = {"type": tool_type}
 
         allowed_domains = metadata.get("openai_web_search_allowed_domains") or []
@@ -567,7 +594,7 @@ class OpenAIProvider:
             if cleaned_domains:
                 tool["filters"] = {"allowed_domains": cleaned_domains}
 
-        if tool_type == "web_search":
+        if tool_type == "web_search" and not self._xai_compatible:
             tool["external_web_access"] = bool(self._settings.openai_web_search_live_enabled)
         return tool
 
@@ -588,7 +615,12 @@ class OpenAIProvider:
         else:
             tools = []
             if req.tools:
-                tools.extend(_convert_responses_tools(req.tools))
+                tools.extend(
+                    _convert_responses_tools(
+                        req.tools,
+                        xai_compatible=self._xai_compatible,
+                    )
+                )
             if self._should_use_web_search(req):
                 tools.append(self._build_web_search_tool(req))
         if tools:

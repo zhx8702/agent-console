@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -55,10 +56,35 @@ def _sdk_content_payload(reply: dict[str, Any], *, msg_type: str) -> dict[str, A
                 "image_url": reply.get("image_url", ""),
             }
         )
+        if msg_type == "video":
+            video_path = str(reply.get("image_path") or "")
+            video_url = str(reply.get("image_url") or "")
+            # The app worker and the SDK commonly run in different
+            # filesystems.  A provider URL is therefore preferred whenever
+            # one exists; a local path remains the fallback for same-host SDKs.
+            if video_url:
+                video_path = ""
+            content.update(
+                {
+                    "image_path": video_path,
+                    "image_url": video_url,
+                    "video_path": video_path,
+                    "video_url": video_url,
+                }
+            )
         return content
 
-    content["file_path"] = str(reply.get("file_path") or "")
+    file_path = str(reply.get("file_path") or "").strip()
+    # Older queued video rows used the media columns.  The companion SDK
+    # treats videos as ordinary file messages, so keep those rows deliverable
+    # during a rollout by translating the legacy path here.
+    legacy_video = str(reply.get("msg_type") or "").strip().lower() == "video"
+    if not file_path and legacy_video:
+        file_path = str(reply.get("image_path") or "").strip()
+    content["file_path"] = file_path
     file_name = str(reply.get("file_name") or "").strip()
+    if not file_name and legacy_video and file_path:
+        file_name = Path(file_path).name
     if file_name:
         content["file_name"] = file_name
     if reply.get("file_size") is not None:
@@ -909,7 +935,11 @@ class WxbotBridgeDeliveryMixin(WxbotBridgeState):
                     timeout=10,
                     trust_env=False,
                 )
-            msg_type = str(reply.get("msg_type") or "text")
+            msg_type = str(reply.get("msg_type") or "text").strip().lower()
+            if msg_type == "video":
+                # The deployed companion SDK accepts videos through its file
+                # sender, not a dedicated video message type.
+                msg_type = "file"
             command_id = str(reply.get("command_id") or "").strip() or f"wxbot-reply:{reply_id}"
             delivery = dict(reply.get("delivery") or {})
             delivery.setdefault("command_id", command_id)

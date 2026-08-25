@@ -13,6 +13,8 @@ x-app-env: &app-env
   LLM_PROVIDER: ${LLM_PROVIDER:-fake}
   OPENAI_API_KEY: ${COMPOSE_OPENAI_API_KEY:-}
   OPENAI_BASE_URL: ${COMPOSE_OPENAI_BASE_URL:-https://api.openai.com/v1}
+  XAI_API_KEY: ${XAI_API_KEY:-}
+  GROK_MODELS_BASE_URL: ${GROK_MODELS_BASE_URL:-}
   OPENAI_API_MODE: ${COMPOSE_OPENAI_API_MODE:-responses}
   OPENAI_WEB_SEARCH_ENABLED: ${COMPOSE_OPENAI_WEB_SEARCH_ENABLED:-false}
   OPENAI_WEB_SEARCH_TOOL: ${COMPOSE_OPENAI_WEB_SEARCH_TOOL:-web_search}
@@ -148,6 +150,7 @@ x-app-env: &app-env
   TENANT_DEMO_SECRET: ${COMPOSE_TENANT_DEMO_SECRET:-compose_dev_tenant_secret}
   FRONTEND_CORS_ORIGINS: ${COMPOSE_FRONTEND_CORS_ORIGINS:-http://127.0.0.1:4173,http://localhost:4173,http://127.0.0.1:5173,http://localhost:5173}
   WXBOT_DAILY_REPORT_FOOTER: ${COMPOSE_WXBOT_DAILY_REPORT_FOOTER:-}
+  WXBOT_REPORT_MAX_CHARS_PER_CHUNK: ${COMPOSE_WXBOT_REPORT_MAX_CHARS_PER_CHUNK:-12000}
   TIBO_RESET_ENABLED: ${COMPOSE_TIBO_RESET_ENABLED:-false}
   TIBO_RESET_API_URL: ${COMPOSE_TIBO_RESET_API_URL:-}
   TIBO_RESET_POLL_INTERVAL_SECONDS: ${COMPOSE_TIBO_RESET_POLL_INTERVAL_SECONDS:-300}
@@ -157,6 +160,7 @@ x-app-env: &app-env
   DRAW_API_EDIT_URL: ${COMPOSE_DRAW_API_EDIT_URL:-}
   DRAW_API_KEY: ${COMPOSE_DRAW_API_KEY:-}
   DRAW_API_MODEL: ${COMPOSE_DRAW_API_MODEL:-}
+  DRAW_API_PROVIDER: ${COMPOSE_DRAW_API_PROVIDER:-}
   DRAW_API_TIMEOUT_SECONDS: ${COMPOSE_DRAW_API_TIMEOUT_SECONDS:-600}
   DRAW_API_KEY_HEADER: ${COMPOSE_DRAW_API_KEY_HEADER:-Authorization}
   DRAW_API_KEY_PREFIX: ${COMPOSE_DRAW_API_KEY_PREFIX:-Bearer }
@@ -168,6 +172,7 @@ x-app-env: &app-env
   DRAW_FALLBACK_API_EDIT_URL: ${COMPOSE_DRAW_FALLBACK_API_EDIT_URL:-}
   DRAW_FALLBACK_API_KEY: ${COMPOSE_DRAW_FALLBACK_API_KEY:-}
   DRAW_FALLBACK_API_MODEL: ${COMPOSE_DRAW_FALLBACK_API_MODEL:-}
+  DRAW_FALLBACK_API_PROVIDER: ${COMPOSE_DRAW_FALLBACK_API_PROVIDER:-}
   DRAW_FALLBACK_API_TIMEOUT_SECONDS: ${COMPOSE_DRAW_FALLBACK_API_TIMEOUT_SECONDS:-600}
   DRAW_FALLBACK_API_KEY_HEADER: ${COMPOSE_DRAW_FALLBACK_API_KEY_HEADER:-Authorization}
   DRAW_FALLBACK_API_KEY_PREFIX: ${COMPOSE_DRAW_FALLBACK_API_KEY_PREFIX:-Bearer }
@@ -176,6 +181,16 @@ x-app-env: &app-env
   DRAW_FALLBACK_API_RESPONSE_FORMAT: ${COMPOSE_DRAW_FALLBACK_API_RESPONSE_FORMAT:-}
   DRAW_FALLBACK_API_EXTRA_BODY: ${COMPOSE_DRAW_FALLBACK_API_EXTRA_BODY:-}
   DRAW_STORAGE_DIR: ${COMPOSE_DRAW_STORAGE_DIR:-/data/draw}
+  VIDEO_API_URL: ${COMPOSE_VIDEO_API_URL:-}
+  VIDEO_API_KEY: ${COMPOSE_VIDEO_API_KEY:-}
+  VIDEO_API_MODEL: ${COMPOSE_VIDEO_API_MODEL:-grok-imagine-video-1.5-preview}
+  VIDEO_API_TIMEOUT_SECONDS: ${COMPOSE_VIDEO_API_TIMEOUT_SECONDS:-600}
+  VIDEO_API_POLL_INTERVAL_SECONDS: ${COMPOSE_VIDEO_API_POLL_INTERVAL_SECONDS:-5}
+  VIDEO_API_POLL_TIMEOUT_SECONDS: ${COMPOSE_VIDEO_API_POLL_TIMEOUT_SECONDS:-1800}
+  VIDEO_API_KEY_HEADER: ${COMPOSE_VIDEO_API_KEY_HEADER:-Authorization}
+  VIDEO_API_KEY_PREFIX: ${COMPOSE_VIDEO_API_KEY_PREFIX:-Bearer }
+  VIDEO_API_EXTRA_BODY: ${COMPOSE_VIDEO_API_EXTRA_BODY:-}
+  VIDEO_STORAGE_DIR: ${COMPOSE_VIDEO_STORAGE_DIR:-/data/video}
   MODERATION_WEBHOOK_ALLOWED_HOSTS: ${COMPOSE_MODERATION_WEBHOOK_ALLOWED_HOSTS:-qyapi.weixin.qq.com}
   AMAP_API_KEY: ${COMPOSE_AMAP_API_KEY:-}
   AMAP_API_TIMEOUT_SECONDS: ${COMPOSE_AMAP_API_TIMEOUT_SECONDS:-30}
@@ -315,6 +330,7 @@ services:
     volumes:
       - configdata:/data/config
       - drawdata:/data/draw
+      - videodata:/data/video
       - amapdata:/data/amap
       - wxbotoutbound:${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
     extra_hosts:
@@ -356,6 +372,7 @@ services:
     volumes:
       - configdata:/data/config
       - drawdata:/data/draw
+      - videodata:/data/video
       - amapdata:/data/amap
       - wxbotoutbound:${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
     command: ["python", "-m", "app.workers.inbound_worker"]
@@ -416,6 +433,7 @@ services:
     volumes:
       - configdata:/data/config
       - drawdata:/data/draw
+      - videodata:/data/video
       - amapdata:/data/amap
       - wxbotoutbound:${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
     command: ["python", "-m", "app.workers.scheduler_worker"]
@@ -446,6 +464,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - drawdata:/data/draw
+      - videodata:/data/video
     command: ["python", "-m", "app.workers.wxbot_bridge_worker"]
     healthcheck:
       test:
@@ -475,5 +494,6 @@ volumes:
   qdrantdata: {}
   configdata: {}
   drawdata: {}
+  videodata: {}
   amapdata: {}
   wxbotoutbound: {}

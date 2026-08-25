@@ -25,6 +25,7 @@ from app.infra.metrics import LLM_COST_USD, LLM_LATENCY, LLM_REQUESTS, LLM_TOKEN
 from app.llm.base import EmbedRequest, EmbedResponse, LLMProvider
 from app.llm.pricing import compute_cost
 from app.llm.providers.fake_provider import FakeProvider
+from app.llm.providers.openai_provider import is_xai_base_url
 from app.llm.quota import QuotaTracker
 
 logger = get_logger(__name__)
@@ -61,12 +62,15 @@ def validate_llm_settings(settings: Settings) -> list[str]:
             errors.append("OPENAI_WEB_SEARCH_ENABLED requires LLM_PROVIDER=openai")
         if settings.openai_api_mode != "responses":
             errors.append("OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses")
-        if settings.openai_web_search_tool not in {
-            "web_search",
-            "web_search_preview",
-        }:
+        allowed_search_tools = (
+            {"web_search", "x_search"}
+            if is_xai_base_url(settings.openai_base_url)
+            else {"web_search", "web_search_preview"}
+        )
+        if settings.openai_web_search_tool not in allowed_search_tools:
             errors.append(
-                "OPENAI_WEB_SEARCH_TOOL must be one of: web_search, web_search_preview"
+                "OPENAI_WEB_SEARCH_TOOL must be one of: "
+                + ", ".join(sorted(allowed_search_tools))
             )
 
     if settings.llm_embed_provider not in _SUPPORTED_EMBED_PROVIDERS:

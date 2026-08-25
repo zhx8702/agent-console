@@ -236,6 +236,10 @@ class Settings(BaseSettings):
     llm_provider: str = "fake"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
+    # Grok-compatible gateways commonly expose these names. They are mapped
+    # onto the existing OpenAI-compatible provider below.
+    xai_api_key: str | None = None
+    grok_models_base_url: str | None = None
     openai_api_mode: str = "responses"
     openai_disable_fallback: bool = False
     openai_web_search_enabled: bool = False
@@ -550,6 +554,7 @@ class Settings(BaseSettings):
     draw_api_edit_url: str = ""
     draw_api_key: str = ""
     draw_api_model: str = ""
+    draw_api_provider: str = ""
     draw_api_timeout_seconds: float = 600.0
     draw_api_key_header: str = "Authorization"
     draw_api_key_prefix: str = "Bearer "
@@ -561,6 +566,7 @@ class Settings(BaseSettings):
     draw_fallback_api_edit_url: str = ""
     draw_fallback_api_key: str = ""
     draw_fallback_api_model: str = ""
+    draw_fallback_api_provider: str = ""
     draw_fallback_api_timeout_seconds: float = 600.0
     draw_fallback_api_key_header: str = "Authorization"
     draw_fallback_api_key_prefix: str = "Bearer "
@@ -569,6 +575,16 @@ class Settings(BaseSettings):
     draw_fallback_api_response_format: str = ""
     draw_fallback_api_extra_body: str = ""
     draw_storage_dir: str = "/mnt/c/Users/Public/agent-console-draw"
+    video_api_url: str = ""
+    video_api_key: str = ""
+    video_api_model: str = "grok-imagine-video-1.5-preview"
+    video_api_timeout_seconds: float = 600.0
+    video_api_poll_interval_seconds: float = Field(default=5.0, gt=0)
+    video_api_poll_timeout_seconds: float = Field(default=1800.0, gt=0)
+    video_api_key_header: str = "Authorization"
+    video_api_key_prefix: str = "Bearer "
+    video_api_extra_body: str = ""
+    video_storage_dir: str = "/mnt/c/Users/Public/agent-console-video"
     draw_task_stale_seconds: float = Field(default=3600.0, gt=0)
     draw_task_recovery_enabled: bool = True
     draw_task_recovery_interval_seconds: float = Field(default=60.0, gt=0)
@@ -645,6 +661,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_environment_safety(self) -> Settings:
+        if self.xai_api_key:
+            self.openai_api_key = self.xai_api_key
+        if self.grok_models_base_url:
+            self.openai_base_url = self.grok_models_base_url.strip()
         if self.bus_retry_max_seconds < self.bus_retry_base_seconds:
             raise ValueError(
                 "bus_retry_max_seconds must be greater than or equal to bus_retry_base_seconds"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from app.channel import (
@@ -27,6 +29,8 @@ _GROUP_DELIVERY_CONTRACT_FIELDS = (
 )
 _GROUP_REVALIDATED_STATUSES = {"must_reply", "may_reply", "defer"}
 _DELIVERY_CONTRACT_METADATA_KEY = "_wxbot_delivery_contract"
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_ENGLISH_CHANNEL_FALLBACK = "I can only reply in English. Please send that again."
 
 
 class GroupParticipationPolicyReader(Protocol):
@@ -242,6 +246,24 @@ class WxbotChannelOutbound:
             metadata={"reply_queue_id": reply_id},
         )
 
+    async def send_video(
+        self,
+        target: ChannelTarget,
+        media: ChannelMedia,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult:
+        file_path = str(media.video_path or "").strip()
+        if not file_path:
+            raise ValueError("video_path is required for SDK file delivery")
+        return await self.send_file(
+            target,
+            ChannelFile(
+                file_path=file_path,
+                file_name=Path(file_path).name,
+            ),
+            options,
+        )
+
     async def send_file(
         self,
         target: ChannelTarget,
@@ -304,6 +326,15 @@ class WxbotChannelOutbound:
         options: ChannelSendOptions,
     ) -> int:
         await self._require_connection_enabled(target)
+        delivery_metadata = dict(options.delivery_metadata or {})
+        persona_language = str(
+            delivery_metadata.get("persona_response_language")
+            or target.metadata.get("persona_response_language")
+            or ""
+        ).strip().lower()
+        if msg_type == "text" and persona_language in {"en", "en-us", "en-gb", "english"}:
+            if _CJK_RE.search(str(reply_text or "")):
+                reply_text = _ENGLISH_CHANNEL_FALLBACK
         if msg_type == "file" and (
             target.session_kind == "group"
             or target.session_id.endswith("@chatroom")
@@ -333,8 +364,10 @@ class WxbotChannelOutbound:
             "sender_wxid": target.sender_id,
             "mention_sender": bool(mention_sender),
             "reply_to_msg_svr_id": reply_to_message_id,
-            **dict(options.delivery_metadata or {}),
+            **delivery_metadata,
         }
+        if persona_language in {"en", "en-us", "en-gb", "english"}:
+            delivery["persona_response_language"] = "en"
         if (
             target.session_kind == "group" or target.session_id.endswith("@chatroom")
         ) and _is_source_bound_group_delivery(

@@ -72,8 +72,21 @@ class PersonaSkillHook(PipelineHook):
             "artifact_version": artifact.get("version"),
             "generated_at": artifact.get("generated_at"),
             "impression": meta.get("impression"),
+            "response_language": (
+                profile.get("response_language")
+                or artifact.get("response_language")
+                or meta.get("response_language")
+            ),
             "session_name": source_meta.get("session_name"),
         }
+        response_language = str(
+            ctx.session.variables["persona_profile"].get("response_language") or ""
+        ).strip().lower()
+        if response_language in {"en", "en-us", "en-gb", "english"}:
+            # Async channel targets are built from the current event/session
+            # metadata, not from the turn-local persona variables.
+            ctx.event.metadata["persona_response_language"] = "en"
+            ctx.session.metadata["persona_response_language"] = "en"
 
 
 def _sync_persona_signal(ctx) -> dict[str, object]:

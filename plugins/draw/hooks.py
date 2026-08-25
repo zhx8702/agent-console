@@ -1093,6 +1093,15 @@ async def _send_task_callback_once(
         )
         return False
 
+    if image_path.strip() and task_ctx.target.channel == Channel.WECHAT.value:
+        stage_for_delivery = getattr(store, "stage_for_wxbot_delivery", None)
+        if callable(stage_for_delivery):
+            image_path = stage_for_delivery(
+                image_path,
+                task_ctx.task_id or task_ctx.trace_id,
+            )
+            image_url = ""
+
     async def _claim_send_and_ack() -> bool:
         claimed_callback = False
         if task_id and not force:

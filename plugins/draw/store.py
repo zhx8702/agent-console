@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -278,6 +279,7 @@ class DrawEndpoint:
     api_url: str
     api_key: str
     model: str
+    provider: str
     timeout: float
     key_header: str
     key_prefix: str
@@ -329,6 +331,12 @@ class DrawStore:
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._storage_dir = self._resolve_storage_dir(
             str(getattr(settings, "draw_storage_dir", "/mnt/c/Users/Public/cs-system-draw") or "")
+        )
+        self._outbound_dir = self._resolve_storage_dir(
+            str(
+                getattr(settings, "wxbot_outbound_file_dir", "/data/wxbot-outbound")
+                or "/data/wxbot-outbound"
+            )
         )
         self._index_path = self._storage_dir / "images.json"
 
@@ -1540,12 +1548,16 @@ class DrawStore:
         )
         if not api_url:
             return None
+        provider = str(getattr(self.settings, f"{prefix}_provider", "") or "").strip().lower()
+        if not provider and "airgate" in str(urlparse(api_url).hostname or "").lower():
+            provider = "airgate"
         return DrawEndpoint(
             name=name,
             client_name=client_name,
             api_url=api_url,
             api_key=str(getattr(self.settings, f"{prefix}_key", "") or "").strip(),
             model=str(getattr(self.settings, f"{prefix}_model", "") or "").strip(),
+            provider=provider or "generic",
             timeout=float(getattr(self.settings, f"{prefix}_timeout_seconds", 60.0) or 60.0),
             key_header=str(getattr(self.settings, f"{prefix}_key_header", "Authorization") or "Authorization").strip(),
             key_prefix=str(getattr(self.settings, f"{prefix}_key_prefix", "Bearer ") or ""),
@@ -1944,6 +1956,43 @@ class DrawStore:
                 "/mnt/c/Users/Public/cs-system-draw"
             ) from exc
 
+    def stage_for_wxbot_delivery(self, image_path: str | Path, image_id: str = "") -> str:
+        """Copy a generated image into the path shared with the SDK container."""
+
+        source = Path(str(image_path or "")).expanduser().resolve(strict=False)
+        if not source.is_file():
+            raise DrawApiError("生成图片文件不存在")
+        try:
+            self._outbound_dir.mkdir(parents=True, exist_ok=True)
+            if self._outbound_dir.is_symlink() or not self._outbound_dir.is_dir():
+                raise OSError("outbound directory is not a regular directory")
+            max_bytes = int(
+                getattr(self.settings, "wxbot_outbound_file_max_bytes", 10 * 1024 * 1024)
+                or 10 * 1024 * 1024
+            )
+            if source.stat().st_size > max_bytes:
+                raise DrawConfigError(f"图片超过文件发送大小限制（{max_bytes} 字节）")
+            safe_id = "".join(
+                ch for ch in str(image_id or "") if ch.isalnum() or ch in "-_"
+            )[-32:] or uuid4().hex[:8]
+            suffix = source.suffix.lower() or ".jpg"
+            destination = self._outbound_dir / (
+                f"draw_{datetime.now(UTC):%Y%m%dT%H%M%S}_{safe_id}{suffix}"
+            )
+            temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+            try:
+                shutil.copy2(source, temporary)
+                replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return str(destination)
+        except DrawConfigError:
+            raise
+        except OSError as exc:
+            raise DrawConfigError(
+                "图片已生成，但无法复制到 SDK 文件发送目录"
+            ) from exc
+
     def _build_payload(
         self,
         prompt: str,
@@ -1966,6 +2015,28 @@ class DrawStore:
             if not isinstance(extra_body, dict):
                 raise DrawConfigError("DRAW_API_EXTRA_BODY 必须是 JSON object")
             payload.update(extra_body)
+
+        if endpoint.provider == "airgate":
+            # AirGate follows the native gateway contract.  In particular,
+            # it is a raw pass-through gateway, so the configured upstream
+            # must receive the fields it actually supports.  The server-side
+            # Grok image channel requires both ``prompt`` and ``input`` and
+            # rejects the generic OpenAI compatibility fields that are often
+            # put in DRAW_API_EXTRA_BODY (notably size/stream/background).
+            for key in ("background", "output_format", "quality", "size", "stream"):
+                payload.pop(key, None)
+            payload["prompt"] = prompt
+            payload["input"] = prompt
+            selected_model = model
+            if not selected_model:
+                selected_model = (
+                    "grok-imagine-image-quality"
+                    if quality in {"medium", "high"}
+                    else "grok-imagine-image"
+                )
+            payload["model"] = selected_model
+            payload.setdefault("n", 1)
+            return payload
 
         payload[prompt_field] = prompt
         if model:
@@ -2012,6 +2083,12 @@ class DrawStore:
         header_name = endpoint.key_header
         key_prefix = endpoint.key_prefix
         if api_key and header_name:
+            # Environment files commonly trim the trailing space from
+            # ``Bearer ``. Normalize the scheme here so AirGate receives a
+            # valid ``Authorization: Bearer <key>`` header instead of the
+            # malformed ``Bearer<key>`` form.
+            if key_prefix.strip().casefold() == "bearer":
+                key_prefix = "Bearer "
             headers[header_name] = f"{key_prefix}{api_key}" if key_prefix else api_key
         return headers
 

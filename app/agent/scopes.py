@@ -5,6 +5,7 @@ from typing import Any
 GROUP_INFO_SCOPE = "group_info"
 GROUP_PLUGIN_STATUS_SCOPE = "group_plugin_status"
 GROUP_DRAW_GENERATION_SCOPE = "group_draw_generation"
+GROUP_VIDEO_GENERATION_SCOPE = "group_video_generation"
 GROUP_PERSONAL_MAP_SCOPE = "group_personal_map"
 MESSAGE_EXPORT_SCOPE = "message_export"
 FILE_ANALYSIS_SCOPE = "file_analysis"
@@ -14,6 +15,7 @@ DEFAULT_AGENT_SCOPE = GROUP_INFO_SCOPE
 WXBOT_GROUP_INFO_SCOPE = "wxbot_group_info"
 WXBOT_GROUP_PLUGIN_STATUS_SCOPE = "wxbot_group_plugin_status"
 WXBOT_GROUP_DRAW_GENERATION_SCOPE = "wxbot_group_draw_generation"
+WXBOT_GROUP_VIDEO_GENERATION_SCOPE = "wxbot_group_video_generation"
 WXBOT_GROUP_PERSONAL_MAP_SCOPE = "wxbot_group_personal_map"
 WXBOT_MESSAGE_EXPORT_SCOPE = "wxbot_message_export"
 WXBOT_FILE_ANALYSIS_SCOPE = "wxbot_file_analysis"
@@ -22,6 +24,7 @@ _SCOPE_ALIASES: dict[str, str] = {
     WXBOT_GROUP_INFO_SCOPE: GROUP_INFO_SCOPE,
     WXBOT_GROUP_PLUGIN_STATUS_SCOPE: GROUP_PLUGIN_STATUS_SCOPE,
     WXBOT_GROUP_DRAW_GENERATION_SCOPE: GROUP_DRAW_GENERATION_SCOPE,
+    WXBOT_GROUP_VIDEO_GENERATION_SCOPE: GROUP_VIDEO_GENERATION_SCOPE,
     WXBOT_GROUP_PERSONAL_MAP_SCOPE: GROUP_PERSONAL_MAP_SCOPE,
     WXBOT_MESSAGE_EXPORT_SCOPE: MESSAGE_EXPORT_SCOPE,
     WXBOT_FILE_ANALYSIS_SCOPE: FILE_ANALYSIS_SCOPE,
@@ -31,6 +34,7 @@ _CANONICAL_TO_ALIASES: dict[str, tuple[str, ...]] = {
     GROUP_INFO_SCOPE: (WXBOT_GROUP_INFO_SCOPE,),
     GROUP_PLUGIN_STATUS_SCOPE: (WXBOT_GROUP_PLUGIN_STATUS_SCOPE,),
     GROUP_DRAW_GENERATION_SCOPE: (WXBOT_GROUP_DRAW_GENERATION_SCOPE,),
+    GROUP_VIDEO_GENERATION_SCOPE: (WXBOT_GROUP_VIDEO_GENERATION_SCOPE,),
     GROUP_PERSONAL_MAP_SCOPE: (WXBOT_GROUP_PERSONAL_MAP_SCOPE,),
     MESSAGE_EXPORT_SCOPE: (WXBOT_MESSAGE_EXPORT_SCOPE,),
     FILE_ANALYSIS_SCOPE: (WXBOT_FILE_ANALYSIS_SCOPE,),
@@ -64,15 +68,27 @@ _SCOPE_CONFIG: dict[str, dict[str, str]] = {
         ),
     },
     GROUP_DRAW_GENERATION_SCOPE: {
-        "label": "群绘图生成",
-        "disabled_reply": "当前群未启用群绘图 Agent。",
+        "label": "绘图生成",
+        "disabled_reply": "当前会话未启用绘图 Agent。",
         "empty_reply": "绘图请求已处理，但这次没整理出可读结果。你可以换个问法再试。",
         "system_hint": (
-            "你当前处于群聊/频道绘图 Agent 模式。"
+            "你当前处于绘图 Agent 模式。"
             "当用户明确要求你画图、生图、生成图片、来一张图时，应优先调用绘图工具，不要把提示词润色成长篇教程。"
             "如果用户要求基于当前群某个成员头像生成图片，保留成员名和头像意图交给绘图工具处理。"
             "如果绘图工具已成功接单，你只需要简短确认正在生成、完成后会自动发送，不要重复输出大段提示词。"
-            "你只能处理当前群的绘图请求，不能跨群操作。"
+            "你只能处理当前会话的绘图请求，不能跨会话操作。"
+        ),
+    },
+    GROUP_VIDEO_GENERATION_SCOPE: {
+        "label": "视频生成",
+        "disabled_reply": "当前会话未启用视频 Agent。",
+        "empty_reply": "视频请求已处理，但这次没整理出可读结果。你可以换个描述再试。",
+        "system_hint": (
+            "你当前处于视频生成 Agent 模式。"
+            "当用户明确要求生成视频、短视频、动画或动态画面时，应优先调用视频生成工具。"
+            "把用户的主体、动作、镜头和风格意图完整交给工具，不要把视频请求改成静态图片。"
+            "如果视频工具已成功接单，你只需要简短确认正在生成，完成后会自动发送。"
+            "你只能处理当前会话的视频请求，不能跨会话操作。"
         ),
     },
     GROUP_PERSONAL_MAP_SCOPE: {

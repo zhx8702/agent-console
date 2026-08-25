@@ -957,6 +957,10 @@ class WxbotStore(WxbotReportStoreMixin):
                 file_md5=file_md5,
                 file_sha256=file_sha256,
             )
+        elif msg_type == "video" and not (
+            str(image_path or "").strip() or str(image_url or "").strip()
+        ):
+            raise ValueError("image_path or image_url is required for video messages")
         file_idempotency_material = (
             _outbound_file_idempotency_material(
                 file_path=file_path,

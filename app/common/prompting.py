@@ -55,6 +55,10 @@ _GENERIC_RAG_SYSTEM = (
 )
 _PERSONA_STYLE_PROMPT_MAX_CHARS = 12_000
 _MEMORY_PII_PLACEHOLDER_RE = re.compile(r"<PII:[a-z_]+:\d+>", re.I)
+_ENGLISH_OUTPUT_RULES = (
+    "当前运行人格的可见回复语言是 English。最终发送给用户的所有文字必须使用英文；"
+    "不得输出中文字符、中文解释或中英双语。URL、代码、产品名和用户明确要求保留的专有名词可原样保留。"
+)
 
 
 def _escape_memory_text(value: object) -> str:
@@ -482,6 +486,21 @@ def _active_persona_name(session: Session) -> str:
     return ""
 
 
+def persona_response_language(session: Session) -> str:
+    """Return the explicitly configured output language for the active persona."""
+
+    profile = session.variables.get("persona_profile")
+    if not isinstance(profile, dict):
+        return ""
+    value = " ".join(str(profile.get("response_language") or "").strip().split()).lower()
+    if value in {"en", "en-us", "en-gb", "english"}:
+        return "en"
+    # Keep the existing Tibo profile compatible with older stored artifacts
+    # that predate the response_language metadata field.
+    skill_slug = " ".join(str(profile.get("skill_slug") or "").strip().split()).lower()
+    return "en" if skill_slug == "thsottiaux" else ""
+
+
 def augment_prompt_with_persona_and_memory(
     base_system: str,
     session: Session,
@@ -573,5 +592,10 @@ def augment_prompt_with_persona_and_memory(
         )
         if group_section:
             sections.append(group_section)
+
+    if persona_response_language(session) == "en":
+        # Append this after all persona and memory data so the language lock is
+        # the last trusted instruction in the assembled system prompt.
+        sections.append(_ENGLISH_OUTPUT_RULES)
 
     return "\n\n".join(part for part in sections if part)

@@ -92,6 +92,20 @@ def test_development_dotenv_warns_and_ignores_unknown_names(tmp_path) -> None:
     assert settings.app_log_level == "INFO"
 
 
+def test_grok_gateway_aliases_map_to_openai_compatible_settings(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "XAI_API_KEY=xai-test-key\n"
+        "GROK_MODELS_BASE_URL=https://sub2api.example/v1\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=env_file)
+
+    assert settings.openai_api_key == "xai-test-key"
+    assert settings.openai_base_url == "https://sub2api.example/v1"
+
+
 def test_production_dotenv_rejects_unknown_names(monkeypatch, tmp_path) -> None:
     # tests/conftest.py sets APP_ENV=test; remove it so this case exercises the
     # dotenv-selected environment rather than the higher-priority process env.

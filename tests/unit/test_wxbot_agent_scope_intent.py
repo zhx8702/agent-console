@@ -7,6 +7,7 @@ from app.agent.scopes import (
     FILE_ANALYSIS_SCOPE,
     GROUP_DRAW_GENERATION_SCOPE,
     GROUP_PERSONAL_MAP_SCOPE,
+    GROUP_VIDEO_GENERATION_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
 from app.common.types import (
@@ -180,6 +181,35 @@ def test_group_scope_conflicts_use_specific_primary_intent(
     assert _resolve_group_agent_scope(text) == expected_scope
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "帮我生成一段海边日落视频",
+        "来个赛博朋克短视频",
+        "把这张图做成动画",
+        "帮我画个视频",
+    ],
+)
+def test_video_generation_scope_precedes_draw_scope(text: str) -> None:
+    assert _resolve_group_agent_scope(text) == GROUP_VIDEO_GENERATION_SCOPE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "生成的是什么视频",
+        "这生成的是什么视频",
+        "这个生成的是什么视频",
+        "视频生成成功了吗",
+        "视频发了吗",
+        "生成视频了吗",
+        "帮我生成视频了吗",
+    ],
+)
+def test_video_questions_do_not_activate_video_generation_scope(text: str) -> None:
+    assert _resolve_group_agent_scope(text) is None
+
+
 @pytest.mark.asyncio
 async def test_agent_intent_hook_emits_new_and_legacy_router_signals() -> None:
     ctx = _group_context("帮我查一下公司的详细地址")
@@ -266,6 +296,32 @@ async def test_private_news_file_request_requires_generated_file_delivery() -> N
         "operation": "generate",
         "format": "txt",
         "web_search_required": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_private_video_request_activates_video_scope_without_mention() -> None:
+    ctx = _private_context("帮我生成一段海边日落视频")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == GROUP_VIDEO_GENERATION_SCOPE
+    assert ctx.extras["router_signals"] == {
+        "tool_intent_matched": True,
+        "tools_available": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_private_draw_request_activates_draw_scope_without_mention() -> None:
+    ctx = _private_context("画个海边日落的图片")
+
+    await WxbotAgentIntentHook().run(ctx)
+
+    assert ctx.extras["agent_tool_scope"] == GROUP_DRAW_GENERATION_SCOPE
+    assert ctx.extras["router_signals"] == {
+        "tool_intent_matched": True,
+        "tools_available": True,
     }
 
 

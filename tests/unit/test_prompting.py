@@ -81,6 +81,24 @@ def test_persona_becomes_named_runtime_role_without_making_style_data_executable
     )
 
 
+def test_tibo_persona_appends_english_output_lock() -> None:
+    session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
+    session.variables["persona_profile"] = {
+        "name": "Tibo",
+        "skill_slug": "thsottiaux",
+        "response_language": "en",
+    }
+
+    prompt = augment_prompt_with_persona_and_memory(
+        "base",
+        session,
+        memory_intro="memory",
+    )
+
+    assert "最终发送给用户的所有文字必须使用英文" in prompt
+    assert prompt.rindex("不得输出中文字符") > prompt.index("<active_persona_name>")
+
+
 def test_persona_style_data_is_bounded_before_runtime_injection() -> None:
     session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
     session.variables["persona_skill"] = "海" * 50_000

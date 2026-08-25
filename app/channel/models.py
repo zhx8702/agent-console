@@ -220,6 +220,8 @@ class ChannelTarget:
 class ChannelMedia:
     image_path: str = ""
     image_url: str = ""
+    video_path: str = ""
+    video_url: str = ""
 
 
 @dataclass(frozen=True)

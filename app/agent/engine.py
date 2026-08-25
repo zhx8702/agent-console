@@ -665,12 +665,13 @@ class AgentCapabilityEngine:
         tools: dict[str, _AgentTool],
     ) -> ToolCall:
         started = time.monotonic()
+        arguments = dict(tool_call.arguments or {})
         tool = tools.get(tool_call.name)
         if tool is None:
             return ToolCall(
                 id=tool_call.id,
                 name=tool_call.name,
-                arguments=dict(tool_call.arguments or {}),
+                arguments=arguments,
                 error=f"unsupported_tool:{tool_call.name}",
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
@@ -682,12 +683,15 @@ class AgentCapabilityEngine:
             return ToolCall(
                 id=tool_call.id,
                 name=tool_call.name,
-                arguments=dict(tool_call.arguments or {}),
+                arguments=arguments,
                 error="tool_owner_execution_denied",
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
         try:
-            result = await tool.handler(session, dict(tool_call.arguments or {}))
+            # Keep one mutable argument object for the handler and the audit
+            # record. Tools may normalize trusted request arguments before
+            # executing an external side effect.
+            result = await tool.handler(session, arguments)
             # Tool handlers may contain long network or model calls.  Re-read
             # the durable owner policy after the handler settles so a scope
             # disabled in flight cannot publish its late result or deferred
@@ -700,14 +704,14 @@ class AgentCapabilityEngine:
                 return ToolCall(
                     id=tool_call.id,
                     name=tool_call.name,
-                    arguments=dict(tool_call.arguments or {}),
+                    arguments=arguments,
                     error="tool_owner_execution_denied",
                     latency_ms=int((time.monotonic() - started) * 1000),
                 )
             return ToolCall(
                 id=tool_call.id,
                 name=tool_call.name,
-                arguments=dict(tool_call.arguments or {}),
+                arguments=arguments,
                 result=result,
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
@@ -721,7 +725,7 @@ class AgentCapabilityEngine:
             return ToolCall(
                 id=tool_call.id,
                 name=tool_call.name,
-                arguments=dict(tool_call.arguments or {}),
+                arguments=arguments,
                 error=str(exc),
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
