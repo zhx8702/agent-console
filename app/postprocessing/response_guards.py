@@ -7,8 +7,8 @@ import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
-from app.common.types import OutboundReply, ReplySegment, ReplyType, RouteType
 from app.common.prompting import persona_response_language
+from app.common.types import OutboundReply, ReplySegment, ReplyType, RouteType
 
 _DEFAULT_BOT_ALIASES = ("zzz",)
 _TEXT_REPLY_TYPES = {ReplyType.TEXT, ReplyType.MARKDOWN}
