@@ -25,7 +25,7 @@ from app.infra.metrics import LLM_COST_USD, LLM_LATENCY, LLM_REQUESTS, LLM_TOKEN
 from app.llm.base import EmbedRequest, EmbedResponse, LLMProvider
 from app.llm.pricing import compute_cost
 from app.llm.providers.fake_provider import FakeProvider
-from app.llm.providers.openai_provider import is_xai_base_url
+from app.llm.providers.openai_provider import is_grok_compatible_settings
 from app.llm.quota import QuotaTracker
 
 logger = get_logger(__name__)
@@ -64,7 +64,7 @@ def validate_llm_settings(settings: Settings) -> list[str]:
             errors.append("OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses")
         allowed_search_tools = (
             {"web_search", "x_search"}
-            if is_xai_base_url(settings.openai_base_url)
+            if is_grok_compatible_settings(settings)
             else {"web_search", "web_search_preview"}
         )
         if settings.openai_web_search_tool not in allowed_search_tools:

@@ -252,6 +252,25 @@ def test_validate_llm_settings_accepts_xai_search_tools() -> None:
     assert errors == []
 
 
+def test_validate_llm_settings_accepts_grok_gateway_search_tools() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_provider": "openai",
+            "openai_api_key": "xai-test",
+            "xai_api_key": "xai-test",
+            "grok_models_base_url": "https://sub2api.example.test/v1",
+            "openai_base_url": "https://sub2api.example.test/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "x_search",
+        }
+    )
+
+    errors = validate_llm_settings(settings)
+
+    assert errors == []
+
+
 def test_build_llm_service_rejects_fake_providers_in_prod() -> None:
     redis = _InMemoryRedis()
     settings = get_settings().model_copy(

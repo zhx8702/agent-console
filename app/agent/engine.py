@@ -982,9 +982,10 @@ class AgentCapabilityEngine:
         }:
             return False
         for citation in list(getattr(response, "citations", []) or []):
-            if str(
-                getattr(citation, "source", "") or ""
-            ).strip() == "openai_web_search" and AgentCapabilityEngine._valid_https_citation_url(
+            if str(getattr(citation, "source", "") or "").strip() in {
+                "openai_web_search",
+                "grok_web_search",
+            } and AgentCapabilityEngine._valid_https_citation_url(
                 getattr(citation, "url", "")
             ):
                 return True
@@ -1002,7 +1003,7 @@ class AgentCapabilityEngine:
         if reason == "required_web_search_not_configured":
             reply = (
                 "当前未启用可用的实时联网搜索。请先在 Web 的“模型配置”中开启"
-                "“OpenAI 联网搜索”和“实时网页访问”，保存并重启服务后再试；"
+                "“联网搜索”和“实时网页访问”，保存并重启服务后再试；"
                 "这次没有生成文件。"
             )
         elif reason == "required_web_search_timeout":

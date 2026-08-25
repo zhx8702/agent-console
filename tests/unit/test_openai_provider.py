@@ -226,6 +226,43 @@ def test_extract_responses_payload_collects_url_citations() -> None:
     assert citations[0].url == "https://example.com/news"
 
 
+def test_extract_responses_payload_labels_grok_web_search_citations() -> None:
+    raw = SimpleNamespace(
+        model="grok-4.6",
+        status="completed",
+        output=[
+            SimpleNamespace(type="web_search_call", status="completed"),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="Grok web search result.",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url="https://example.com/grok-search",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = (
+        _extract_responses_payload(
+            raw,
+            citation_source="grok_web_search",
+            citation_id_prefix="grok_web",
+        )
+    )
+
+    assert citations[0].source == "grok_web_search"
+    assert citations[0].id == "grok_web:1"
+
+
 def test_extract_responses_payload_collects_completed_search_action_sources() -> None:
     raw = SimpleNamespace(
         model="gpt-5.4",
@@ -1003,6 +1040,29 @@ def test_openai_provider_uses_xai_responses_tool_shapes() -> None:
         },
         {"type": "web_search"},
     ]
+
+
+def test_openai_provider_uses_grok_web_search_shape_for_grok_gateway() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://sub2api.example.test/v1",
+            "grok_models_base_url": "https://sub2api.example.test/v1",
+            "xai_api_key": "xai-test",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "web_search",
+            "openai_web_search_live_enabled": True,
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={"metadata": {"openai_web_search_required": True}}
+    )
+
+    kwargs = provider._build_responses_kwargs(request)
+
+    assert kwargs["tools"] == [{"type": "web_search"}]
+    assert kwargs["include"] == ["web_search_call.action.sources"]
 
 
 def test_openai_provider_uses_standard_xai_chat_tool_messages() -> None:

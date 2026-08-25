@@ -313,11 +313,14 @@ async def test_terminal_file_delivery_stops_agent_tool_rounds_immediately() -> N
     assert result.metadata["required_effect_satisfied"] is True
 
 
+@pytest.mark.parametrize("citation_source", ["openai_web_search", "grok_web_search"])
 @pytest.mark.asyncio
-async def test_required_live_search_is_verified_before_file_generation() -> None:
+async def test_required_live_search_is_verified_before_file_generation(
+    citation_source: str,
+) -> None:
     citation = Citation(
         id="news-1",
-        source="openai_web_search",
+        source=citation_source,
         title="新闻来源",
         url="https://news.example/item-1",
     )
