@@ -273,6 +273,7 @@ class FAQEngine:
             {
                 "route": "faq",
                 "openai_web_search": web_search_enabled,
+                "openai_web_search_required": web_search_enabled,
                 "web_search_requested": web_search_enabled,
                 "prompt_sections": prompt_trace.get("section_names", []),
                 "prompt_section_chars": prompt_trace.get("section_chars", {}),

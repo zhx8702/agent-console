@@ -8,6 +8,11 @@ def test_explicit_search_request_enables_live_search() -> None:
     assert live_web_search_requested("现在上海天气怎么样") is True
 
 
+def test_current_popularity_ranking_enables_live_search() -> None:
+    assert live_web_search_requested("现在人气最高的av女优是谁") is True
+    assert live_web_search_requested("目前最受欢迎的模型是哪一个") is True
+
+
 def test_local_history_query_does_not_enable_live_search() -> None:
     assert live_web_search_requested("查一下群里最近提到的 draw") is False
 

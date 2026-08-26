@@ -223,6 +223,7 @@ class RAGEngine:
             {
                 "route": "rag",
                 "openai_web_search": web_search_requested,
+                "openai_web_search_required": web_search_requested,
                 "web_search_requested": web_search_requested,
             }
         )

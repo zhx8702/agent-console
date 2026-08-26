@@ -525,6 +525,7 @@ class LLMCapabilityEngine:
             {
                 "route": "llm",
                 "openai_web_search": web_search_requested,
+                "openai_web_search_required": web_search_requested,
                 "web_search_requested": web_search_requested,
                 "prompt_sections": prompt_trace.get("section_names", []),
                 "prompt_section_chars": prompt_trace.get("section_chars", {}),
