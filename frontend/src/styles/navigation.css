@@ -19,10 +19,10 @@
   left: 12px;
   z-index: 200;
   padding: var(--space-2-5) var(--space-3-5);
-  border: 1px solid var(--color-sky-300);
+  border: 1px solid var(--color-pine-400);
   border-radius: 6px;
-  background: var(--color-custom-0b1422);
-  color: var(--color-slate-50);
+  background: var(--color-ink-sidebar);
+  color: var(--color-sage-100);
   font-weight: 800;
   transform: translateY(-160%);
   transition: transform 120ms ease;
@@ -94,7 +94,7 @@
 
 .overview-degraded-notice li span {
   color: var(--color-orange-700);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-family: var(--font-mono);
   font-weight: 800;
   text-transform: uppercase;
 }
@@ -150,11 +150,11 @@
   gap: clamp(var(--space-6), 6vw, 90px);
   overflow: hidden;
   padding: clamp(var(--space-8), 7vw, 88px);
-  border: 1px solid var(--color-custom-d7e2ee);
+  border: 1px solid var(--line-strong);
   border-radius: 18px;
   background:
-    linear-gradient(115deg, rgba(15, 23, 42, 0.98) 0 34%, rgba(248, 250, 252, 0.98) 34% 100%),
-    var(--color-slate-50);
+    linear-gradient(115deg, rgba(16, 25, 21, 0.98) 0 34%, rgba(251, 250, 245, 0.98) 34% 100%),
+    var(--panel-alt);
   box-shadow: var(--shadow-md);
 }
 
@@ -165,14 +165,14 @@
   z-index: -1;
   width: 320px;
   height: 320px;
-  border: 1px solid rgba(14, 116, 144, 0.13);
+  border: 1px solid rgba(15, 118, 110, 0.16);
   transform: rotate(24deg);
   content: "";
 }
 
 .not-found-code {
-  color: var(--color-sky-300);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--color-pine-300);
+  font-family: var(--font-mono);
   font-size: clamp(4.8rem, 12vw, 9rem);
   font-weight: 900;
   letter-spacing: -0.11em;
@@ -213,10 +213,10 @@
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-2) var(--space-4);
-    border-bottom: 1px solid rgba(148, 163, 184, 0.18);
-    background: rgba(11, 20, 34, 0.97);
-    color: var(--color-custom-e5edf5);
-    box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
+    border-bottom: 1px solid rgba(167, 179, 169, 0.18);
+    background: rgba(16, 25, 21, 0.97);
+    color: var(--color-sage-100);
+    box-shadow: 0 8px 22px rgba(16, 25, 21, 0.16);
     backdrop-filter: blur(14px);
   }
 
@@ -226,17 +226,17 @@
     width: 38px;
     height: 38px;
     place-items: center;
-    border: 1px solid rgba(125, 211, 252, 0.22);
+    border: 1px solid rgba(94, 234, 212, 0.22);
     border-radius: 7px;
-    background: rgba(125, 211, 252, 0.07);
-    color: var(--color-blue-100);
+    background: rgba(94, 234, 212, 0.07);
+    color: var(--color-pine-300);
     font-size: var(--font-size-lg);
   }
 
   .mobile-menu-button:hover,
   .sidebar-close-button:hover {
-    border-color: rgba(125, 211, 252, 0.5);
-    background: rgba(125, 211, 252, 0.14);
+    border-color: rgba(94, 234, 212, 0.5);
+    background: rgba(94, 234, 212, 0.14);
   }
 
   .mobile-route-title {
@@ -246,8 +246,8 @@
   }
 
   .mobile-route-title span {
-    color: var(--color-custom-7890a8);
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    color: var(--color-sage-300);
+    font-family: var(--font-mono);
     font-size: var(--font-size-3xs);
     font-weight: 800;
     letter-spacing: 0.08em;
@@ -256,7 +256,7 @@
 
   .mobile-route-title strong {
     overflow: hidden;
-    color: var(--color-slate-50);
+    color: var(--color-sage-100);
     font-size: var(--font-size-base);
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -281,7 +281,7 @@
     flex-wrap: nowrap;
     overflow-y: auto;
     visibility: hidden;
-    box-shadow: 24px 0 60px rgba(2, 6, 23, 0.32);
+    box-shadow: 24px 0 60px rgba(10, 14, 11, 0.32);
     transform: translateX(-104%);
     transition:
       transform 180ms ease,
@@ -315,7 +315,7 @@
     inset: 0;
     z-index: 60;
     border: 0;
-    background: rgba(2, 6, 23, 0.56);
+    background: rgba(10, 14, 11, 0.56);
     backdrop-filter: blur(3px);
   }
 
@@ -334,8 +334,8 @@
     gap: var(--space-10);
     padding: var(--space-8) var(--space-6);
     background:
-      linear-gradient(170deg, rgba(15, 23, 42, 0.98) 0 32%, rgba(248, 250, 252, 0.98) 32% 100%),
-      var(--color-slate-50);
+      linear-gradient(170deg, rgba(16, 25, 21, 0.98) 0 32%, rgba(251, 250, 245, 0.98) 32% 100%),
+      var(--panel-alt);
   }
 
   .not-found-code {

@@ -38,7 +38,7 @@ summary:focus-visible {
   place-items: center;
   overflow-y: auto;
   padding: clamp(var(--space-4), 4vw, var(--space-12));
-  background: rgba(2, 6, 23, 0.68);
+  background: rgba(10, 14, 11, 0.68);
   backdrop-filter: blur(5px);
 }
 
@@ -46,10 +46,10 @@ summary:focus-visible {
   width: min(620px, 100%);
   max-height: min(760px, calc(100dvh - 32px));
   overflow: auto;
-  border: 1px solid var(--color-slate-300);
+  border: 1px solid var(--line-strong);
   border-radius: 14px;
   background: var(--bg-surface);
-  box-shadow: 0 28px 80px rgba(2, 6, 23, 0.34);
+  box-shadow: 0 28px 80px rgba(10, 14, 11, 0.34);
 }
 
 .dialog-header {
@@ -92,7 +92,7 @@ summary:focus-visible {
 
 .dialog-close:hover,
 .alert-dismiss:hover {
-  border-color: var(--color-slate-400);
+  border-color: var(--color-ink-500);
   color: var(--text);
 }
 
@@ -361,7 +361,7 @@ summary:focus-visible {
 }
 
 .data-table tbody tr:hover {
-  background: var(--color-slate-50);
+  background: var(--panel-alt);
 }
 
 .data-table-cell-action,
@@ -412,9 +412,9 @@ summary:focus-visible {
   height: 54px;
   margin-bottom: var(--space-3-5);
   place-items: center;
-  border: 1px solid var(--color-slate-300);
+  border: 1px solid var(--line-strong);
   border-radius: 14px;
-  background: linear-gradient(145deg, var(--color-white), var(--color-custom-eef2f7));
+  background: linear-gradient(145deg, var(--color-white), var(--panel-alt));
   color: var(--accent-hover);
   font-size: var(--font-size-3xl);
   box-shadow: var(--shadow-sm);

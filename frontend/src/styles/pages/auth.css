@@ -4,7 +4,7 @@
   min-height: 100vh;
   display: grid;
   grid-template-columns: minmax(340px, 0.9fr) minmax(500px, 1.1fr);
-  background: var(--color-custom-eef2f5);
+  background: var(--color-paper);
   color: var(--color-gray-900);
 }
 
@@ -17,8 +17,8 @@
   flex-direction: column;
   justify-content: space-between;
   padding: clamp(var(--space-8), 6vw, 80px);
-  background: var(--color-custom-0b1422);
-  color: var(--color-custom-e5edf5);
+  background: var(--color-ink-sidebar);
+  color: var(--color-sage-100);
 }
 
 .login-brand-mark {
@@ -26,9 +26,9 @@
   width: 54px;
   height: 54px;
   place-items: center;
-  border: 1px solid rgba(125, 211, 252, 0.55);
-  color: var(--color-sky-300);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  border: 1px solid rgba(94, 234, 212, 0.55);
+  color: var(--color-pine-300);
+  font-family: var(--font-mono);
   font-size: var(--font-size-base);
   font-weight: 800;
   letter-spacing: 0.13em;
@@ -42,8 +42,8 @@
 
 .login-eyebrow {
   margin: 0 0 var(--space-2-5);
-  color: var(--color-custom-36c9a5);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--color-pine-400);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   font-weight: 800;
   letter-spacing: 0.16em;
@@ -51,7 +51,7 @@
 
 .login-signal-copy h1 {
   margin: 0;
-  color: var(--color-slate-50);
+  color: var(--color-sage-100);
   font-size: clamp(2.5rem, 6vw, 5.4rem);
   line-height: 0.92;
   letter-spacing: -0.065em;
@@ -60,7 +60,7 @@
 .login-signal-copy > p:last-child {
   max-width: 430px;
   margin: var(--space-6) 0 0;
-  color: var(--color-custom-9fb0c3);
+  color: var(--color-sage-300);
   font-size: var(--font-size-lg);
   line-height: 1.75;
 }
@@ -71,7 +71,7 @@
   display: grid;
   gap: 0;
   max-width: 480px;
-  border-top: 1px solid rgba(148, 163, 184, 0.22);
+  border-top: 1px solid rgba(167, 179, 169, 0.22);
 }
 
 .login-system-list > div {
@@ -79,12 +79,12 @@
   grid-template-columns: 80px minmax(0, 1fr);
   gap: var(--space-4-5);
   padding: var(--space-3) 0;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  border-bottom: 1px solid rgba(167, 179, 169, 0.16);
 }
 
 .login-system-list span {
-  color: var(--color-custom-6f8297);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: rgba(167, 179, 169, 0.7);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   text-transform: uppercase;
 }
@@ -92,8 +92,8 @@
 .login-system-list strong {
   min-width: 0;
   overflow: hidden;
-  color: var(--color-custom-dbe7f3);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--color-sage-100);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   font-weight: 600;
   text-overflow: ellipsis;
@@ -107,7 +107,7 @@
   z-index: -1;
   width: 58%;
   aspect-ratio: 1;
-  border: 1px solid rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(45, 212, 191, 0.12);
   transform: rotate(16deg);
 }
 
@@ -115,7 +115,7 @@
 .login-grid-decoration::after {
   position: absolute;
   content: "";
-  border: 1px solid rgba(56, 189, 248, 0.09);
+  border: 1px solid rgba(45, 212, 191, 0.09);
 }
 
 .login-grid-decoration::before {
@@ -131,7 +131,7 @@
   min-height: 100vh;
   place-items: center;
   padding: clamp(var(--space-6), 7vw, 96px);
-  background: var(--color-custom-eef2f5);
+  background: var(--color-paper);
 }
 
 .login-card {
@@ -143,16 +143,16 @@
   align-items: flex-start;
   gap: var(--space-3-5);
   padding-bottom: var(--space-6);
-  border-bottom: 1px solid var(--color-custom-cfd8e3);
+  border-bottom: 1px solid var(--color-paper-line);
 }
 
 .login-status-dot {
   width: 10px;
   height: 10px;
   margin-top: var(--space-1-5);
-  border: 2px solid var(--color-custom-eef2f5);
-  outline: 2px solid var(--color-custom-13a87f);
-  background: var(--color-custom-13a87f);
+  border: 2px solid var(--color-paper);
+  outline: 2px solid var(--color-pine-600);
+  background: var(--color-pine-600);
 }
 
 .login-card-header h2 {
@@ -164,7 +164,7 @@
 
 .login-card-copy {
   margin: var(--space-6) 0 var(--space-6);
-  color: var(--color-custom-5b6878);
+  color: var(--color-ink-600);
   line-height: 1.75;
 }
 
@@ -174,8 +174,8 @@
 }
 
 .login-token-field > span {
-  color: var(--color-slate-700);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--color-ink-700);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   font-weight: 800;
   letter-spacing: 0.08em;
@@ -185,13 +185,13 @@
 .login-token-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  border: 1px solid var(--color-custom-b9c6d4);
-  background: var(--color-slate-50);
+  border: 1px solid var(--color-paper-line-strong);
+  background: var(--color-sage-100);
   transition: border-color 140ms, box-shadow 140ms;
 }
 
 .login-token-input:focus-within {
-  border-color: var(--color-teal-700);
+  border-color: var(--color-pine-800);
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
 }
 
@@ -200,16 +200,16 @@
   padding: var(--space-3-5) var(--space-4);
   border: 0;
   background: transparent;
-  color: var(--color-slate-900);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--color-ink-900);
+  font-family: var(--font-mono);
 }
 
 .login-token-input button {
   padding: 0 var(--space-4);
   border: 0;
-  border-left: 1px solid var(--color-custom-d7dee7);
+  border-left: 1px solid var(--color-paper-line);
   background: transparent;
-  color: var(--color-teal-700);
+  color: var(--color-pine-800);
   font-size: var(--font-size-xs);
   font-weight: 800;
 }
@@ -239,16 +239,16 @@
   justify-content: space-between;
   margin-top: var(--space-5);
   padding: var(--space-3-5) var(--space-4-5);
-  border: 1px solid var(--color-custom-0b1422);
-  background: var(--color-custom-0b1422);
-  color: var(--color-slate-50);
+  border: 1px solid var(--color-ink-sidebar);
+  background: var(--color-ink-sidebar);
+  color: var(--color-sage-100);
   font-weight: 800;
   transition: background 140ms, border-color 140ms, transform 140ms;
 }
 
 .login-submit:hover:not(:disabled) {
-  border-color: var(--color-teal-700);
-  background: var(--color-teal-700);
+  border-color: var(--color-pine-800);
+  background: var(--color-pine-800);
   transform: translateY(-1px);
 }
 
@@ -262,13 +262,13 @@
   align-items: flex-start;
   gap: var(--space-2);
   margin-top: var(--space-4);
-  color: var(--color-custom-7a8796);
+  color: rgba(167, 179, 169, 0.8);
   font-size: var(--font-size-xs);
   line-height: 1.6;
 }
 
 .login-lock-icon {
-  color: var(--color-custom-13a87f);
+  color: var(--color-pine-600);
   font-size: var(--font-size-3xs);
   line-height: 1.8;
 }
@@ -276,8 +276,8 @@
 .login-page-checking {
   grid-template-columns: 1fr;
   place-items: center;
-  background: var(--color-custom-0b1422);
-  color: var(--color-custom-e5edf5);
+  background: var(--color-ink-sidebar);
+  color: var(--color-sage-100);
 }
 
 .login-checking-card {
@@ -290,21 +290,21 @@
 
 .login-checking-card h1 {
   margin: var(--space-1) 0 var(--space-2-5);
-  color: var(--color-slate-50);
+  color: var(--color-sage-100);
   font-size: var(--font-size-3xl);
 }
 
 .login-checking-card > p:last-child {
   margin: 0;
-  color: var(--color-custom-93a4b8);
+  color: var(--color-sage-300);
 }
 
 .login-checking-spinner {
   width: 28px;
   height: 28px;
   margin-bottom: var(--space-6);
-  border: 2px solid rgba(125, 211, 252, 0.2);
-  border-top-color: var(--color-custom-36c9a5);
+  border: 2px solid rgba(94, 234, 212, 0.2);
+  border-top-color: var(--color-pine-400);
   border-radius: 50%;
   animation: login-spin 800ms linear infinite;
 }
@@ -348,8 +348,8 @@
 
 .sidebar-connection div span {
   overflow: hidden;
-  color: var(--color-custom-7f94aa);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: rgba(167, 179, 169, 0.75);
+  font-family: var(--font-mono);
   font-size: var(--font-size-3xs);
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -12,8 +12,8 @@
 .relationship-action-panel {
   display: grid;
   gap: var(--space-2-5);
-  border-color: var(--color-blue-200);
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+  border-color: rgba(15, 118, 110, 0.26);
+  box-shadow: 0 10px 24px rgba(16, 25, 21, 0.06);
 }
 
 .relationship-action-bar {
@@ -292,8 +292,8 @@
 
 .relationship-date-row:hover,
 .relationship-date-row.is-selected {
-  border-color: var(--color-blue-300);
-  background: var(--color-blue-50);
+  border-color: rgba(15, 118, 110, 0.4);
+  background: rgba(15, 118, 110, 0.07);
 }
 
 .relationship-date-row strong,
@@ -309,9 +309,9 @@
   width: fit-content;
   padding: var(--space-0-5) var(--space-1-5);
   border-radius: var(--radius);
-  border: 1px solid var(--color-slate-200);
-  background: var(--color-slate-50);
-  color: var(--color-slate-500);
+  border: 1px solid var(--line);
+  background: var(--color-paper-bright);
+  color: var(--color-ink-500);
   font-size: var(--font-size-2xs);
   font-weight: 800;
 }
@@ -466,9 +466,9 @@
 
 .relationship-view-tab:hover,
 .relationship-view-tab.is-active {
-  border-color: var(--color-blue-300);
-  background: var(--color-blue-50);
-  color: var(--color-blue-700);
+  border-color: rgba(15, 118, 110, 0.4);
+  background: rgba(15, 118, 110, 0.07);
+  color: var(--color-pine-700);
 }
 
 .relationship-graph-legend {
@@ -493,7 +493,7 @@
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: var(--color-slate-400);
+  background: var(--color-paper-line-strong);
 }
 
 .relationship-side-stack {
@@ -513,9 +513,9 @@
   border: 1px solid var(--line-light);
   border-radius: var(--radius);
   background:
-    linear-gradient(90deg, rgba(148, 163, 184, 0.1) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(148, 163, 184, 0.1) 1px, transparent 1px),
-    var(--color-custom-fbfdff);
+    linear-gradient(90deg, rgba(167, 179, 169, 0.1) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(167, 179, 169, 0.1) 1px, transparent 1px),
+    var(--panel);
   background-size: 32px 32px;
 }
 
@@ -528,7 +528,7 @@
 }
 
 .relationship-lane-labels text {
-  fill: var(--color-slate-400);
+  fill: var(--color-paper-line-strong);
   font-size: var(--font-size-2xs);
   font-weight: 800;
   letter-spacing: 0;
@@ -558,7 +558,7 @@
 }
 
 .relationship-edge-line {
-  stroke: var(--color-slate-500);
+  stroke: var(--color-ink-500);
   stroke-width: 1.5;
   stroke-linecap: round;
   opacity: 0.8;
@@ -569,19 +569,19 @@
 }
 
 .relationship-edge.is-neighbor .relationship-edge-line {
-  stroke: var(--color-slate-600);
+  stroke: var(--color-ink-600);
   stroke-width: 2;
   opacity: 0.82;
 }
 
 .relationship-edge.is-selected .relationship-edge-line {
-  stroke: var(--color-blue-600);
+  stroke: var(--color-pine-600);
   stroke-width: 2.8;
   opacity: 0.96;
 }
 
 .relationship-edge-label {
-  fill: var(--color-blue-700);
+  fill: var(--color-pine-700);
   font-size: var(--font-size-xs);
   font-weight: 800;
   text-anchor: middle;
@@ -598,17 +598,17 @@
 }
 
 .relationship-node circle {
-  fill: var(--color-slate-50);
-  stroke: var(--color-slate-500);
+  fill: var(--color-paper-bright);
+  stroke: var(--color-ink-500);
   stroke-width: 2;
-  filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.12));
+  filter: drop-shadow(0 2px 4px rgba(16, 25, 21, 0.12));
 }
 
 .relationship-node.is-person circle,
 .relationship-legend-dot.is-person {
-  fill: var(--color-blue-600);
-  background: var(--color-blue-600);
-  stroke: var(--color-blue-700);
+  fill: var(--color-pine-600);
+  background: var(--color-pine-600);
+  stroke: var(--color-pine-700);
 }
 
 .relationship-node.is-topic circle,
@@ -634,16 +634,16 @@
 
 .relationship-node.is-value circle,
 .relationship-legend-dot.is-value {
-  fill: var(--color-slate-400);
-  background: var(--color-slate-400);
-  stroke: var(--color-slate-500);
+  fill: var(--color-paper-line-strong);
+  background: var(--color-paper-line-strong);
+  stroke: var(--color-ink-500);
 }
 
 .relationship-node.is-other circle,
 .relationship-legend-dot.is-other {
-  fill: var(--color-slate-600);
-  background: var(--color-slate-600);
-  stroke: var(--color-slate-700);
+  fill: var(--color-ink-600);
+  background: var(--color-ink-600);
+  stroke: var(--color-ink-700);
 }
 
 .relationship-node.is-selected circle {
@@ -720,13 +720,13 @@
 .relationship-list-item:hover,
 .relationship-list-item.is-selected,
 .relationship-list-item.is-related {
-  border-color: var(--color-blue-300);
-  background: var(--color-blue-50);
+  border-color: rgba(15, 118, 110, 0.4);
+  background: rgba(15, 118, 110, 0.07);
 }
 
 .relationship-list-item.is-related:not(.is-selected) {
-  border-color: var(--color-blue-200);
-  background: var(--color-custom-f8fbff);
+  border-color: rgba(15, 118, 110, 0.26);
+  background: var(--panel);
 }
 
 .relationship-list-item strong,
@@ -748,7 +748,7 @@
   padding: var(--space-0-5) var(--space-1-5);
   border-radius: var(--radius);
   border: 1px solid var(--line);
-  background: var(--color-slate-50);
+  background: var(--color-paper-bright);
   color: var(--text-secondary);
   font-size: var(--font-size-xs);
   font-weight: 700;
@@ -767,9 +767,9 @@
 }
 
 .relationship-acceptance.is-muted {
-  border-color: var(--color-slate-200);
-  background: var(--color-slate-100);
-  color: var(--color-slate-500);
+  border-color: var(--line);
+  background: var(--panel-alt);
+  color: var(--color-ink-500);
 }
 
 .relationship-detail-list {
@@ -840,7 +840,7 @@
   margin: 0;
   padding: var(--space-2) var(--space-2-5);
   border-radius: var(--radius);
-  background: var(--color-slate-50);
+  background: var(--color-paper-bright);
   color: var(--text-secondary);
   border: 1px solid var(--line-light);
   font-size: var(--font-size-sm);

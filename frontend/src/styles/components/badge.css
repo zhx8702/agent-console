@@ -57,8 +57,8 @@
 .pill-feature,
 .marketplace-badge,
 .agent-tool-badge {
-  --badge-bg: var(--tone-info-bg);
-  --badge-text: var(--tone-info-text);
+  --badge-bg: var(--tone-accent-bg);
+  --badge-text: var(--tone-accent-text);
 }
 
 .ui-badge--muted,
