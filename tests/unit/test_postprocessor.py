@@ -80,6 +80,81 @@ async def test_postprocessor_formats_citations_and_marks_markdown():
 
 
 @pytest.mark.asyncio
+async def test_postprocessor_synthesizes_web_search_output_without_raw_sources():
+    post = build_postprocessor()
+    session = _session()
+    citation = Citation(
+        id="grok_web:1",
+        source="grok_web_search",
+        title="xAI docs",
+        url="https://docs.x.ai/developers/tools/web-search",
+    )
+    result = CapabilityResult(
+        route=RouteType.LLM,
+        reply_text=(
+            "Grok's tool is `web_search`. [[1]](https://docs.x.ai/developers/tools/web-search)\n\n"
+            "Source: https://docs.x.ai/developers/tools/web-search\n"
+            "Source: xAI docs\n"
+            "参考资料：\n"
+            "[1] xAI docs - https://docs.x.ai/developers/tools/web-search"
+        ),
+        citations=[citation],
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.type == ReplyType.TEXT
+    assert reply.primary_text == "Grok's tool is `web_search`."
+    assert "[[1]]" not in reply.primary_text
+    assert "参考资料" not in reply.primary_text
+    assert "https://" not in reply.primary_text
+    assert reply.citations == [citation]
+
+
+@pytest.mark.asyncio
+async def test_postprocessor_hides_openai_web_search_sources_too():
+    post = build_postprocessor()
+    session = _session()
+    result = CapabilityResult(
+        route=RouteType.LLM,
+        reply_text="结论：可以。\n\nSources:\n[1] https://example.com",
+        citations=[
+            Citation(
+                id="openai_web:1",
+                source="openai_web_search",
+                url="https://example.com",
+            )
+        ],
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.primary_text == "结论：可以。"
+    assert reply.type == ReplyType.TEXT
+
+
+@pytest.mark.asyncio
+async def test_postprocessor_hides_standalone_web_search_tool_label():
+    post = build_postprocessor()
+    session = _session()
+    result = CapabilityResult(
+        route=RouteType.LLM,
+        reply_text="结论：可以。\n\n**web_search**",
+        citations=[
+            Citation(
+                id="grok_web:1",
+                source="grok_web_search",
+                url="https://example.com",
+            )
+        ],
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.primary_text == "结论：可以。"
+
+
+@pytest.mark.asyncio
 async def test_postprocessor_truncates_long_text():
     post = build_postprocessor()
     session = _session()

@@ -9,6 +9,7 @@ from app.agent.scopes import (
     GROUP_DRAW_GENERATION_SCOPE,
     GROUP_PERSONAL_MAP_SCOPE,
     GROUP_PLUGIN_STATUS_SCOPE,
+    GROUP_VIDEO_GENERATION_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
 from app.orchestrator.pipeline import PipelineContext
@@ -105,9 +106,49 @@ _AGENT_GROUP_DRAW_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+_AGENT_GROUP_VIDEO_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^(帮我|给我|替我|请|麻烦).*(生成|做|来|制作|拍|画)(一个|一段|一条|个|段)?"
+        r"[^，。！？!?；;\n]{0,80}"
+        r"(视频|短视频|动画|动图)"
+    ),
+    re.compile(
+        r"^(生成|做|来|制作|拍|画)(一个|一段|一条|个|段)?"
+        r"[^，。！？!?；;\n]{0,80}(视频|短视频|动画|动图)"
+    ),
+    re.compile(
+        r"^(帮我|给我|替我|请|麻烦).*(做成|转成|变成|生成|制作).*(视频|短视频|动画|动图)"
+    ),
+    re.compile(
+        r"^(把|将|用).*(做成|转成|变成|生成|制作).*(视频|短视频|动画|动图)"
+    ),
+    re.compile(r"^(视频|短视频|动画|动图).*(生成|制作|做|来|拍)"),
+)
+
+
 _DRAW_SCOPE_CUE_RE = re.compile(
     r"画(?:一张|个|幅|只|套|版|下)?|生图|出图|"
     r"(?:生成|做|来)(?:一张|个|幅)?(?:图|图片|海报|头像|壁纸|插画)"
+)
+
+
+_VIDEO_SCOPE_CUE_RE = re.compile(
+    r"(?:生成|制作|做|来|拍|画|做成|转成|变成)(?:一个|一段|一条|个|段)?"
+    r"[^，。！？!?；;\n]{0,80}(?:视频|短视频|动画|动图)"
+    r"|(?:视频|短视频|动画|动图)(?:生成|制作|创作)"
+)
+
+
+_VIDEO_QUESTION_RE = re.compile(
+    r"(?:生成|制作|做|发|发送)的?(?:是什么|是啥|什么|啥|哪种)"
+    r".{0,20}(?:视频|短视频|动画|动图)"
+    r"|(?:这|这个|刚才|之前|上次)?(?:是什么|是啥|什么|啥|哪种)"
+    r".{0,20}(?:视频|短视频|动画|动图)"
+    r"|(?:视频|短视频|动画|动图).{0,16}"
+    r"(?:是什么|是啥|什么|啥|哪种|内容|生成了吗|制作了吗|发了吗|成功了吗|完成了吗|了吗)"
+    r"|(?:视频|短视频|动画|动图)(?:吗|呢|呀|没)[?？]?$"
+    r"|(?:生成|制作|做|发|发送).{0,16}(?:视频|短视频|动画|动图).{0,8}"
+    r"(?:生成了吗|制作了吗|完成了吗|成功了吗|发了吗|发没|做好了吗|好了吗|没(?:生成|做|发))"
 )
 
 
@@ -655,6 +696,10 @@ def _message_export_requested(text: str) -> bool:
     return intent.operation == "export_history" and intent.delivery_required
 
 
+def _video_question_requested(text: str) -> bool:
+    return bool(_VIDEO_QUESTION_RE.search(_normalize_agent_scope_text(text)))
+
+
 def _file_intent_requested(
     text: str,
     *,
@@ -711,6 +756,14 @@ def _resolve_group_agent_scope(text: str) -> str | None:
         return None
     if _message_export_requested(value):
         return MESSAGE_EXPORT_SCOPE
+    if _video_question_requested(value):
+        return None
+    if _patterns_have_affirmative_cue(
+        value,
+        _AGENT_GROUP_VIDEO_PATTERNS,
+        _VIDEO_SCOPE_CUE_RE,
+    ):
+        return GROUP_VIDEO_GENERATION_SCOPE
     if _patterns_have_affirmative_cue(
         value,
         _AGENT_GROUP_DRAW_PATTERNS,

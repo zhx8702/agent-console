@@ -52,4 +52,5 @@ else:
 
 send = _mod.send
 send_image = _mod.send_image
+send_video = getattr(_mod, "send_video", None)
 send_batch = _mod.send_batch

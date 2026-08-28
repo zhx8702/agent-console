@@ -4,6 +4,7 @@ import base64
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -1046,6 +1047,92 @@ async def test_draw_store_downloads_relative_image_url_from_gpt2api(
     assert listed[0].file_name == result.file_name
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_draw_store_normalizes_bearer_prefix_without_trailing_space(tmp_path) -> None:
+    captured: dict[str, str] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization", "")
+        return httpx.Response(
+            200,
+            content=b"\x89PNG\r\n\x1a\nfake-png",
+            headers={"content-type": "image/png"},
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://airgate.example/v1/images/generations",
+        draw_api_key="sk-test",
+        draw_api_key_prefix="Bearer",
+        draw_api_provider="airgate",
+        draw_api_model="grok-imagine-image",
+    )
+    store = DrawStore(settings)
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+
+    await store.generate_image("海边日落", trace_id="trace-airgate-auth")
+
+    assert captured["authorization"] == "Bearer sk-test"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_draw_store_builds_airgate_grok_image_payload(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["post_body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content=b"\xff\xd8\xff\xe0fake-jpeg",
+            headers={"content-type": "image/jpeg"},
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://airgate.example/v1",
+        draw_api_key="sk-test",
+        draw_api_provider="airgate",
+        draw_api_model="grok-imagine-image",
+        draw_api_extra_body=(
+            '{"stream":true,"size":"1024x1024","quality":"medium",'
+            '"background":"opaque","output_format":"png","n":1}'
+        ),
+    )
+    store = DrawStore(settings)
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+
+    await store.generate_image("海边日落", trace_id="trace-airgate-payload")
+
+    assert captured["post_body"] == {
+        "n": 1,
+        "prompt": "海边日落",
+        "input": "海边日落",
+        "model": "grok-imagine-image",
+    }
+    await store.close()
+
+
+def test_draw_store_stages_image_for_wxbot_delivery(tmp_path) -> None:
+    source = tmp_path / "draw-cache" / "generated.jpg"
+    outbound = tmp_path / "wxbot-outbound"
+    source.parent.mkdir()
+    source.write_bytes(b"generated-image")
+    settings = _draw_settings(
+        tmp_path,
+        draw_storage_dir=str(source.parent),
+        wxbot_outbound_file_dir=str(outbound),
+        wxbot_outbound_file_max_bytes=65536,
+    )
+    store = DrawStore(settings)
+
+    staged = Path(store.stage_for_wxbot_delivery(source, "img_test"))
+
+    assert staged.parent == outbound.resolve()
+    assert staged.name.endswith("_img_test.jpg")
+    assert staged.read_bytes() == source.read_bytes()
 
 
 @pytest.mark.asyncio

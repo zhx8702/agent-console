@@ -7,6 +7,7 @@ import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
+from app.common.prompting import persona_response_language
 from app.common.types import OutboundReply, ReplySegment, ReplyType, RouteType
 
 _DEFAULT_BOT_ALIASES = ("zzz",)
@@ -59,6 +60,12 @@ _HIGH_RISK_FACT_FALLBACK = (
     "这涉及付款、授权、身份核验、账户状态或凭据，我目前没有可验证的数据源，"
     "不能替你确认；请使用已授权工具或由人工核验。"
 )
+_HIGH_RISK_FACT_FALLBACK_EN = (
+    "This involves payment, authorization, identity verification, account status, or credentials. "
+    "I do not have a verifiable data source to confirm it; please use an authorized tool or have a human verify it."
+)
+_ENGLISH_LANGUAGE_FALLBACK = "I can only reply in English. Please send that again."
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
 
 def apply_response_guards(ctx: Any, *, settings: Any | None = None) -> None:
@@ -79,6 +86,7 @@ def apply_response_guards(ctx: Any, *, settings: Any | None = None) -> None:
     reply_text = str(segment.content or "").strip()
     aliases = _bot_aliases(ctx, settings=settings)
     identity = _preferred_identity(aliases)
+    english_only = _requires_english(ctx)
 
     replacement = None
     reason = "identity_transparency"
@@ -86,10 +94,10 @@ def apply_response_guards(ctx: Any, *, settings: Any | None = None) -> None:
         verified = _has_verified_fact_source(ctx)
         _mark_high_risk_fact(ctx, reply, verified=verified)
         if not verified and not _SAFE_UNCERTAINTY_RE.search(reply_text):
-            replacement = _HIGH_RISK_FACT_FALLBACK
+            replacement = _HIGH_RISK_FACT_FALLBACK_EN if english_only else _HIGH_RISK_FACT_FALLBACK
             reason = "high_risk_fact_unverified"
     if _IDENTITY_QUESTION_RE.search(user_text):
-        replacement = "我是 AI 助手，不是真人。我会尽量自然地参与对话，也会明确说明能力边界。"
+        replacement = _identity_transparency_reply(english_only)
         reason = "identity_transparency"
     if replacement is None:
         replacement = _self_reference_replacement(
@@ -97,17 +105,59 @@ def apply_response_guards(ctx: Any, *, settings: Any | None = None) -> None:
             reply_text=reply_text,
             aliases=aliases,
             identity=identity,
+            english_only=english_only,
         )
         reason = "self_reference"
     if replacement is None and _should_replace_echo(ctx, user_text, reply_text, aliases):
-        replacement = _echo_fallback(user_text)
+        replacement = _echo_fallback(user_text, english_only=english_only)
         reason = "echo"
 
-    if replacement is None:
-        return
+    if replacement is not None:
+        segment.content = replacement
+        _sync_guarded_reply_metadata(ctx, reply, replacement, reason)
 
-    segment.content = replacement
-    _sync_guarded_reply_metadata(ctx, reply, replacement, reason)
+    if english_only:
+        invalid_segments = [
+            candidate
+            for candidate in _text_reply_segments(reply)
+            if _contains_cjk(candidate.content)
+        ]
+        if invalid_segments:
+            for candidate in invalid_segments:
+                candidate.content = _ENGLISH_LANGUAGE_FALLBACK
+            _sync_guarded_reply_metadata(
+                ctx,
+                reply,
+                reply.primary_text,
+                "persona_language_guard",
+            )
+
+
+def _requires_english(ctx: Any) -> bool:
+    session = getattr(ctx, "session", None)
+    return session is not None and persona_response_language(session) == "en"
+
+
+def _contains_cjk(value: object) -> bool:
+    return bool(_CJK_RE.search(str(value or "")))
+
+
+def _text_reply_segments(reply: OutboundReply) -> list[ReplySegment]:
+    segments: list[ReplySegment] = []
+    for candidate in reply.segments:
+        if candidate.type not in _TEXT_REPLY_TYPES:
+            continue
+        metadata = candidate.metadata or {}
+        msg_type = str(metadata.get("wxbot_msg_type") or metadata.get("msg_type") or "").lower()
+        if msg_type != "image":
+            segments.append(candidate)
+    return segments
+
+
+def _identity_transparency_reply(english_only: bool) -> str:
+    if english_only:
+        return "I am an AI running in Tibo's style, not the real Tibo."
+    return "我是 AI 助手，不是真人。我会尽量自然地参与对话，也会明确说明能力边界。"
 
 
 def _is_high_risk_fact_exchange(user_text: str, reply_text: str) -> bool:
@@ -269,18 +319,28 @@ def _self_reference_replacement(
     reply_text: str,
     aliases: tuple[str, ...],
     identity: str,
+    english_only: bool = False,
 ) -> str | None:
     if not aliases:
         return None
     if not _tells_user_to_ask_self(reply_text, aliases):
         return None
     if _MODEL_QUESTION_RE.search(user_text):
+        if english_only:
+            return (
+                f"I am {identity}. The exact backend model ID needs to be checked by an administrator; "
+                "if this runtime exposes it, I can look it up."
+            )
         return (
             f"我就是 {identity}。具体后台 model id 需要管理员在后台查看；"
             "如果当前运行环境暴露了 model id，我可以直接查。"
         )
     if _is_credit_account_intent(user_text):
+        if english_only:
+            return f"I am {identity}. Ask me to check the credit balance."
         return f"我就是 {identity}。要查积分余额，请发送 /余额。"
+    if english_only:
+        return f"I am {identity}. Send me what you need handled directly."
     return f"我就是 {identity}。我不能把问题转给自己；请直接把要处理的内容发给我。"
 
 
@@ -479,7 +539,9 @@ def _strip_echo_scaffold(value: str) -> str:
     return stripped
 
 
-def _echo_fallback(user_text: str) -> str:
+def _echo_fallback(user_text: str, *, english_only: bool = False) -> str:
+    if english_only:
+        return "I did not generate a valid answer just now. Please send the question again."
     question = re.sub(r"\s+", " ", str(user_text or "")).strip() or "刚才的问题"
     if len(question) > 120:
         question = f"{question[:117]}..."

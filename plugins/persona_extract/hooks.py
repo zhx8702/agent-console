@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.channel.models import configuration_session_id
+from app.common.prompting import persona_response_language
 from app.common.types import channel_id_value
 from app.orchestrator.flow import StepResult
 from app.plugin.hooks import HookPoint, PipelineHook
@@ -72,8 +73,18 @@ class PersonaSkillHook(PipelineHook):
             "artifact_version": artifact.get("version"),
             "generated_at": artifact.get("generated_at"),
             "impression": meta.get("impression"),
+            "response_language": (
+                profile.get("response_language")
+                or artifact.get("response_language")
+                or meta.get("response_language")
+            ),
             "session_name": source_meta.get("session_name"),
         }
+        if persona_response_language(ctx.session) == "en":
+            # Async channel targets are built from the current event/session
+            # metadata, not from the turn-local persona variables.
+            ctx.event.metadata["persona_response_language"] = "en"
+            ctx.session.metadata["persona_response_language"] = "en"
 
 
 def _sync_persona_signal(ctx) -> dict[str, object]:

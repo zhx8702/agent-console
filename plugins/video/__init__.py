@@ -1,0 +1,1 @@
+"""Agent video generation plugin."""

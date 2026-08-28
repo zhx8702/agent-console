@@ -4,7 +4,13 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from app.agent.scopes import FILE_ANALYSIS_SCOPE, GROUP_PERSONAL_MAP_SCOPE, MESSAGE_EXPORT_SCOPE
+from app.agent.scopes import (
+    FILE_ANALYSIS_SCOPE,
+    GROUP_DRAW_GENERATION_SCOPE,
+    GROUP_PERSONAL_MAP_SCOPE,
+    GROUP_VIDEO_GENERATION_SCOPE,
+    MESSAGE_EXPORT_SCOPE,
+)
 from app.common.logging import get_logger
 from app.common.types import Channel, Role
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
@@ -222,10 +228,16 @@ class WxbotAgentIntentHook:
                 scope = FILE_ANALYSIS_SCOPE
         else:
             # Private sessions do not require an @ mention, but only the
-            # narrowly defined combined summary + file-delivery intent may
-            # activate tools.  Group-only query scopes remain unavailable.
+            # narrowly defined file-delivery intents and explicit media
+            # generation may activate tools. Group-only query scopes remain
+            # unavailable in private sessions.
+            detected_scope = _resolve_group_agent_scope(text)
             scope = (
-                MESSAGE_EXPORT_SCOPE
+                GROUP_DRAW_GENERATION_SCOPE
+                if detected_scope == GROUP_DRAW_GENERATION_SCOPE
+                else GROUP_VIDEO_GENERATION_SCOPE
+                if detected_scope == GROUP_VIDEO_GENERATION_SCOPE
+                else MESSAGE_EXPORT_SCOPE
                 if _message_export_requested(text)
                 else FILE_ANALYSIS_SCOPE
                 if (

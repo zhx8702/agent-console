@@ -809,6 +809,32 @@ def _agent_session() -> Session:
     return session
 
 
+def _private_agent_session() -> Session:
+    session = Session(
+        session_id="wxid_private",
+        tenant_id="demo",
+        user_id="wxid_private",
+        channel=Channel.WECHAT,
+        metadata={"session_kind": "private", "session_name": "Z"},
+    )
+    session.turns = [
+        Turn(
+            session_id="wxid_private",
+            role=Role.USER,
+            content="画个海边日落的图片",
+            trace_id="trace-agent-draw-private",
+            metadata={
+                "session_kind": "private",
+                "session_name": "Z",
+                "sender_name": "Z",
+                "sender_wxid": "wxid_private",
+                "msg_svr_id": "private-msg-1",
+            },
+        )
+    ]
+    return session
+
+
 def _discord_agent_session() -> Session:
     session = Session(
         session_id="discord-channel-1",
@@ -3179,6 +3205,31 @@ async def test_draw_agent_tool_accepts_job_and_enqueues_async_result() -> None:
     assert outbound.calls[1]["msg_type"] == "image"
     assert outbound.calls[1]["image_path"] == ""
     assert outbound.calls[1]["image_url"] == "http://127.0.0.1:18080/p/img/task/0"
+
+
+@pytest.mark.asyncio
+async def test_draw_agent_tool_accepts_private_session() -> None:
+    draw_store = _FakeDrawStore()
+    outbound = _FakeChannelOutbound()
+    spawned: list[asyncio.Task[None]] = []
+
+    service = DrawAgentToolService(
+        store=draw_store,
+        channel_registry=_fake_channel_registry(outbound),
+        register_background_task=spawned.append,
+        scope_execution_allowed=_allow_draw_scope,
+    )
+
+    result = await service.generate_group_image(
+        _private_agent_session(),
+        {"prompt": "海边日落"},
+    )
+
+    assert result["accepted"] is True
+    await spawned[0]
+    assert len(outbound.calls) == 2
+    assert outbound.calls[0]["target"].session_kind == "private"
+    assert outbound.calls[1]["msg_type"] == "image"
 
 
 @pytest.mark.asyncio

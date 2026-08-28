@@ -90,6 +90,43 @@ async def test_persona_skill_hook_injects_profile_by_channel_and_source() -> Non
 
 
 @pytest.mark.asyncio
+async def test_persona_skill_hook_marks_legacy_tibo_as_english_output() -> None:
+    store = _FakePersonaStore(
+        {
+            "id": 7,
+            "profile_name": "Tibo",
+            "channel": "wechat",
+            "source_key": "wxbot",
+            "source_label": "微信机器人",
+            "prompt_text": "Use Tibo's style.",
+            "skill_slug": "thsottiaux",
+        }
+    )
+    event = InboundEvent(
+        message_id="m-tibo-language",
+        tenant_id="demo",
+        channel=Channel.WECHAT,
+        user_id="u1",
+        session_id="s-tibo-language",
+        message=Message(content="这个问题怎么处理？"),
+        metadata={"source": "wxbot"},
+    )
+    session = Session(
+        session_id="s-tibo-language",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+    )
+
+    await PersonaSkillHook(store).run(
+        PipelineContext(event=event, trace_id="trace-tibo-language", session=session)
+    )
+
+    assert event.metadata["persona_response_language"] == "en"
+    assert session.metadata["persona_response_language"] == "en"
+
+
+@pytest.mark.asyncio
 async def test_persona_skill_hook_uses_external_session_for_managed_channel() -> None:
     external_session_id = "00000000000@chatroom"
     canonical_session_id = "cx1:c:managed@chatroom"

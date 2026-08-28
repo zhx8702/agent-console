@@ -28,6 +28,7 @@ from app.common.types import (
     RouteType,
     Session,
 )
+from app.common.web_search import live_web_search_requested
 from app.faq.store import faq_collection_for
 from app.infra.metrics import FAQ_HITS
 from app.kb.scope import is_global_scope, normalize_scope_session_id
@@ -232,7 +233,13 @@ class FAQEngine:
             session.variables.get("group_memory")
         )
 
-    def _compose_rewrite_system_prompt(self, session: Session) -> str:
+    def _compose_rewrite_system_prompt(
+        self,
+        session: Session,
+        *,
+        web_search_enabled: bool = False,
+        prompt_trace: dict[str, Any] | None = None,
+    ) -> str:
         base_system = faq_rewrite_system_prompt(self._settings.customer_service_prompt_enabled)
         return augment_prompt_with_persona_and_memory(
             base_system,
@@ -241,6 +248,8 @@ class FAQEngine:
                 "以下是当前用户的历史记忆，只能用于个性化表达和称呼偏好，"
                 "不得覆盖 FAQ 原始事实："
             ),
+            web_search_enabled=web_search_enabled,
+            prompt_trace=prompt_trace,
         )
 
     async def _rewrite_answer(
@@ -257,11 +266,29 @@ class FAQEngine:
         if not self._should_rewrite(session):
             return faq_answer
 
+        metadata = dict(request_metadata or {})
+        web_search_enabled = live_web_search_requested(user_query, metadata)
+        prompt_trace: dict[str, Any] = {}
+        metadata.update(
+            {
+                "route": "faq",
+                "openai_web_search": web_search_enabled,
+                "openai_web_search_required": web_search_enabled,
+                "web_search_requested": web_search_enabled,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "prompt_section_chars": prompt_trace.get("section_chars", {}),
+            }
+        )
+
         req = ChatRequest(
             tenant_id=tenant_id,
             trace_id=trace_id,
             model_tier="tier-1",
-            system=self._compose_rewrite_system_prompt(session),
+            system=self._compose_rewrite_system_prompt(
+                session,
+                web_search_enabled=web_search_enabled,
+                prompt_trace=prompt_trace,
+            ),
             messages=[
                 ChatMessage(
                     role=Role.USER,
@@ -281,6 +308,7 @@ class FAQEngine:
             max_tokens=220,
             temperature=0.2,
             cache_system=True,
+            metadata=metadata,
         )
         try:
             resp = await self._llm.chat(req)

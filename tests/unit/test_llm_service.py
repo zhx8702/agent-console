@@ -6,7 +6,7 @@ import pytest
 
 from app.common.config import Settings, get_settings
 from app.common.exceptions import QuotaExceeded
-from app.common.types import ChatMessage, ChatRequest, Role
+from app.common.types import ChatMessage, ChatRequest, ChatResponse, ChatUsage, Role
 from app.infra.metrics import LLM_COST_USD, LLM_REQUESTS, LLM_TOKENS
 from app.llm.providers.fake_provider import FakeProvider
 from app.llm.quota import QuotaTracker
@@ -48,6 +48,23 @@ class _StubProvider:
 
     async def chat(self, request):  # pragma: no cover - not used in these tests
         raise AssertionError("chat should not be called")
+
+    def stream_chat(self, request):  # pragma: no cover - not used in these tests
+        raise AssertionError("stream_chat should not be called")
+
+    async def embed(self, request):  # pragma: no cover - not used in these tests
+        raise AssertionError("embed should not be called")
+
+
+class _CaptureProvider:
+    name = "capture"
+
+    def __init__(self) -> None:
+        self.requests: list[ChatRequest] = []
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        self.requests.append(request)
+        return ChatResponse(content="ok", model=request.model or "capture", usage=ChatUsage())
 
     def stream_chat(self, request):  # pragma: no cover - not used in these tests
         raise AssertionError("stream_chat should not be called")
@@ -104,6 +121,39 @@ async def test_chat_records_metrics_and_usage(service: LLMService) -> None:
     out_tokens = _metric_total(LLM_TOKENS, provider="fake", model=expected_model, kind="output")
     assert in_tokens >= resp.usage.input_tokens
     assert out_tokens >= resp.usage.output_tokens
+
+
+@pytest.mark.asyncio
+async def test_chat_does_not_attach_enabled_search_by_default() -> None:
+    settings = get_settings().model_copy(update={"openai_web_search_enabled": True})
+    provider = _CaptureProvider()
+    svc = LLMService(
+        chat_provider=provider,
+        embed_provider=FakeProvider(),
+        quota=QuotaTracker(_InMemoryRedis(), default_daily_tokens=10_000),
+        settings=settings,
+    )
+
+    await svc.chat(_make_request("普通聊天"))
+
+    assert provider.requests[0].metadata["openai_web_search"] is False
+    assert provider.requests[0].metadata["web_search_decision"] == "not_requested"
+
+
+@pytest.mark.asyncio
+async def test_chat_preserves_explicit_search_request() -> None:
+    settings = get_settings().model_copy(update={"openai_web_search_enabled": True})
+    provider = _CaptureProvider()
+    svc = LLMService(
+        chat_provider=provider,
+        embed_provider=FakeProvider(),
+        quota=QuotaTracker(_InMemoryRedis(), default_daily_tokens=10_000),
+        settings=settings,
+    )
+
+    await svc.chat(_make_request("最新新闻").model_copy(update={"metadata": {"openai_web_search": True}}))
+
+    assert provider.requests[0].metadata["openai_web_search"] is True
 
 
 @pytest.mark.asyncio
@@ -233,6 +283,42 @@ def test_validate_llm_settings_rejects_invalid_web_search_configuration() -> Non
         "OPENAI_WEB_SEARCH_TOOL must be one of: web_search, web_search_preview"
         in errors
     )
+
+
+def test_validate_llm_settings_accepts_xai_search_tools() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_provider": "openai",
+            "openai_api_key": "xai-test",
+            "openai_base_url": "https://api.x.ai/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "x_search",
+        }
+    )
+
+    errors = validate_llm_settings(settings)
+
+    assert errors == []
+
+
+def test_validate_llm_settings_accepts_grok_gateway_search_tools() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_provider": "openai",
+            "openai_api_key": "xai-test",
+            "xai_api_key": "xai-test",
+            "grok_models_base_url": "https://sub2api.example.test/v1",
+            "openai_base_url": "https://sub2api.example.test/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "x_search",
+        }
+    )
+
+    errors = validate_llm_settings(settings)
+
+    assert errors == []
 
 
 def test_build_llm_service_rejects_fake_providers_in_prod() -> None:

@@ -128,6 +128,53 @@ def test_identity_question_always_gets_transparent_ai_answer() -> None:
     assert ctx.reply.metadata["response_guard"]["reason"] == "identity_transparency"
 
 
+def test_tibo_identity_answer_stays_english_and_transparent() -> None:
+    ctx = _ctx("@zzz 你是真人吗？", "I am the real Tibo.")
+    assert ctx.session is not None
+    ctx.session.variables["persona_profile"] = {
+        "name": "Tibo",
+        "skill_slug": "thsottiaux",
+        "response_language": "en",
+    }
+
+    apply_response_guards(ctx, settings=Settings())
+
+    assert ctx.reply is not None
+    assert ctx.reply.primary_text == "I am an AI running in Tibo's style, not the real Tibo."
+    assert "response_guard" in ctx.reply.metadata
+
+
+def test_tibo_cjk_output_is_replaced_before_send() -> None:
+    ctx = _ctx("Give me a short reply.", "这是中文回复。")
+    assert ctx.session is not None
+    ctx.session.variables["persona_profile"] = {
+        "name": "Tibo",
+        "skill_slug": "thsottiaux",
+        "response_language": "en",
+    }
+
+    apply_response_guards(ctx, settings=Settings())
+
+    assert ctx.reply is not None
+    assert ctx.reply.primary_text == "I can only reply in English. Please send that again."
+    assert ctx.reply.metadata["response_guard"]["reason"] == "persona_language_guard"
+
+
+def test_legacy_tibo_accepts_chinese_input_when_reply_is_english() -> None:
+    ctx = _ctx("这个问题请用中文回答", "I understand your question and will answer in English.")
+    assert ctx.session is not None
+    ctx.session.variables["persona_profile"] = {
+        "name": "Tibo",
+        "skill_slug": "thsottiaux",
+    }
+
+    apply_response_guards(ctx, settings=Settings())
+
+    assert ctx.reply is not None
+    assert ctx.reply.primary_text == "I understand your question and will answer in English."
+    assert "response_guard" not in ctx.reply.metadata
+
+
 def test_normal_command_reply_is_not_echo_replaced() -> None:
     ctx = _ctx("签到成功", "签到成功", command=True)
 

@@ -172,6 +172,43 @@ items:
       commands: [/draw, /redraw, /画图, /重绘]
     restart_policy: required_after_install
 
+  - name: video
+    display_name: 视频生成插件
+    version: 0.1.0
+    description: Slash-command and Agent video generation for wxbot chats
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/video
+    capability_digest: sha256:c36e13f635d7b9e4de0a5046e19af1887dab2f2a6f2252f27211aacdeafffc40
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: commands
+        version: ">=0.1.0"
+        required: false
+    permissions:
+      - id: network:*
+        level: external
+        description: 访问配置的视频生成服务
+      - id: storage:plugin
+        level: local
+        description: 写入生成视频到共享媒体目录
+      - id: agent_tools
+        level: runtime
+        description: 注册视频生成 Agent 工具
+      - id: commands
+        level: runtime
+        description: 注册视频生成命令
+    capabilities:
+      routes: []
+      hooks: []
+      agent_tools: [generate_group_video]
+      commands: [/video, /视频]
+    restart_policy: required_after_install
+
   - name: memory
     display_name: 用户记忆
     version: 0.1.0

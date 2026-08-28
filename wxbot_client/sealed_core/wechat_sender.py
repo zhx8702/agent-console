@@ -291,6 +291,21 @@ def send_image(session_name, image_path):
     _send_image_one(hwnd, image_path)
 
 
+def send_video(session_name, video_path):
+    """Send a video through the production sender implementation.
+
+    The checked-in Python fallback deliberately does not emulate WeChat's
+    video UI flow.  Production deployments use the updated compiled sender,
+    which exports this function; failing closed here avoids sending a video as
+    a misleading image.
+    """
+
+    require_capability("send_message")
+    raise RuntimeError(
+        "video sending requires a wxbot SDK sender with send_video support"
+    )
+
+
 def send_batch(tasks):
     require_capability("send_message_batch")
     global _last_session, _last_session_ts
@@ -329,7 +344,12 @@ def send_batch(tasks):
         for t in group:
             try:
                 image_path = t.get("image_path")
-                if image_path and os.path.isfile(image_path):
+                if str(t.get("msg_type") or "").strip().lower() == "video":
+                    is_remote_video = str(image_path or "").startswith(("http://", "https://"))
+                    if not image_path or (not is_remote_video and not os.path.isfile(image_path)):
+                        raise FileNotFoundError(f"video not found: {image_path}")
+                    send_video(session_name, image_path)
+                elif image_path and os.path.isfile(image_path):
                     _send_image_one(hwnd, image_path)
                 else:
                     body = t["reply_text"]

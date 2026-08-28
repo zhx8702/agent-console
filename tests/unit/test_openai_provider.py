@@ -57,6 +57,27 @@ def test_convert_messages_keeps_call_id_for_tool_outputs() -> None:
     assert converted[1]["call_id"] == "call_123"
 
 
+def test_convert_messages_omits_compat_call_id_for_xai_tool_outputs() -> None:
+    converted = _convert_messages(
+        [
+            ChatMessage(
+                role=Role.TOOL,
+                tool_call_id="call_xai",
+                content='{"ok": true}',
+            )
+        ],
+        include_compat_call_id=False,
+    )
+
+    assert converted == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_xai",
+            "content": '{"ok": true}',
+        }
+    ]
+
+
 def test_convert_messages_includes_image_attachments_for_chat_completions() -> None:
     converted = _convert_messages(
         [
@@ -205,6 +226,43 @@ def test_extract_responses_payload_collects_url_citations() -> None:
     assert citations[0].url == "https://example.com/news"
 
 
+def test_extract_responses_payload_labels_grok_web_search_citations() -> None:
+    raw = SimpleNamespace(
+        model="grok-4.6",
+        status="completed",
+        output=[
+            SimpleNamespace(type="web_search_call", status="completed"),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="Grok web search result.",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url="https://example.com/grok-search",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = (
+        _extract_responses_payload(
+            raw,
+            citation_source="grok_web_search",
+            citation_id_prefix="grok_web",
+        )
+    )
+
+    assert citations[0].source == "grok_web_search"
+    assert citations[0].id == "grok_web:1"
+
+
 def test_extract_responses_payload_collects_completed_search_action_sources() -> None:
     raw = SimpleNamespace(
         model="gpt-5.4",
@@ -245,6 +303,34 @@ def test_extract_responses_payload_collects_completed_search_action_sources() ->
     assert len(citations) == 1
     assert citations[0].source == "openai_web_search"
     assert citations[0].url == "https://example.com/search-source"
+
+
+def test_extract_responses_payload_accepts_x_search_call_sources() -> None:
+    raw = SimpleNamespace(
+        model="grok-4.6",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="x_search_call",
+                status="completed",
+                action=SimpleNamespace(
+                    sources=[SimpleNamespace(type="url", url="https://x.com/example")]
+                ),
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text="X search result.", annotations=[])],
+            ),
+        ],
+        output_text="",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    _content, _tool_calls, citations, _model, _finish_reason, _usage = (
+        _extract_responses_payload(raw)
+    )
+
+    assert [citation.url for citation in citations] == ["https://x.com/example"]
 
 
 def test_extract_responses_payload_prefers_annotation_metadata_over_action_source() -> None:
@@ -918,6 +1004,95 @@ def test_openai_provider_skips_sources_include_for_custom_gateway_by_default() -
 
     assert kwargs["tool_choice"] == "required"
     assert "include" not in kwargs
+
+
+def test_openai_provider_uses_xai_responses_tool_shapes() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://api.x.ai/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "web_search_preview",
+            "openai_web_search_live_enabled": True,
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={
+            "tools": [
+                ToolSchema(
+                    name="lookup_order",
+                    description="Lookup order",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        }
+    )
+
+    kwargs = provider._build_responses_kwargs(request)
+
+    assert kwargs["tools"] == [
+        {
+            "type": "function",
+            "name": "lookup_order",
+            "description": "Lookup order",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {"type": "web_search"},
+    ]
+
+
+def test_openai_provider_uses_grok_web_search_shape_for_grok_gateway() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://sub2api.example.test/v1",
+            "grok_models_base_url": "https://sub2api.example.test/v1",
+            "xai_api_key": "xai-test",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "web_search",
+            "openai_web_search_live_enabled": True,
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={"metadata": {"openai_web_search_required": True}}
+    )
+
+    kwargs = provider._build_responses_kwargs(request)
+
+    assert kwargs["tools"] == [{"type": "web_search"}]
+    assert kwargs["include"] == ["web_search_call.action.sources"]
+
+
+def test_openai_provider_uses_standard_xai_chat_tool_messages() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://api.x.ai/v1",
+            "openai_api_mode": "chat",
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={
+            "messages": [
+                ChatMessage(role=Role.USER, content="查一下"),
+                ChatMessage(
+                    role=Role.TOOL,
+                    tool_call_id="call_xai",
+                    content='{"ok": true}',
+                ),
+            ]
+        }
+    )
+
+    kwargs = provider._build_chat_kwargs(request)
+
+    assert kwargs["messages"][1] == {
+        "role": "tool",
+        "tool_call_id": "call_xai",
+        "content": '{"ok": true}',
+    }
 
 
 @pytest.mark.asyncio

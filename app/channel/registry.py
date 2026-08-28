@@ -30,6 +30,13 @@ class ChannelOutbound(Protocol):
         options: ChannelSendOptions | None = None,
     ) -> ChannelSendResult: ...
 
+    async def send_video(
+        self,
+        target: ChannelTarget,
+        media: ChannelMedia,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult: ...
+
     async def send_file(
         self,
         target: ChannelTarget,
@@ -90,6 +97,18 @@ class _GatedChannelOutbound:
     ) -> ChannelSendResult:
         await self._require_execution(target)
         return await self._provider.send_image(target, media, options)
+
+    async def send_video(
+        self,
+        target: ChannelTarget,
+        media: ChannelMedia,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult:
+        await self._require_execution(target)
+        sender = getattr(self._provider, "send_video", None)
+        if not callable(sender):
+            raise RuntimeError("channel outbound provider does not support video")
+        return await sender(target, media, options)
 
     async def send_file(
         self,

@@ -20,6 +20,33 @@ _MAX_CHARS = 4000
 _TRUNCATE_SUFFIX = "\u2026"  # single-char ellipsis
 _PII_PLACEHOLDER_RE = re.compile(r"<PII:[^>]+>")
 _LEAKED_REPLACEMENT = "[敏感信息]"
+_WEB_SEARCH_CITATION_SOURCES = frozenset({"openai_web_search", "grok_web_search"})
+_WEB_SEARCH_CITATION_SOURCES_LOWER = frozenset(
+    source.lower() for source in _WEB_SEARCH_CITATION_SOURCES
+)
+_INLINE_WEB_CITATION_RE = re.compile(
+    r"(?:\[\[\s*\d+\s*\]\]|【\s*\d+\s*】|\[\s*\d+\s*\])"
+    r"(?:\([^\n)]*\))?"
+)
+_INLINE_WEB_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(https?://[^)\s]+\)")
+_INLINE_WEB_URL_RE = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
+_WEB_SEARCH_REFERENCE_HEADING_RE = re.compile(
+    r"^\s*(?:参考资料|参考来源|来源列表|sources?|references?)\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
+_WEB_SEARCH_SOURCE_LINE_RE = re.compile(
+    r"^\s*(?:来源|source|sources?|reference|references?)\s*[:：]\s*.+$",
+    re.IGNORECASE,
+)
+_WEB_SEARCH_URL_LINE_RE = re.compile(
+    r"^\s*(?:\[\s*\d+\s*\]\s*)?(?:[^\n]{0,160}\s+-\s+)?https?://\S+\s*$",
+    re.IGNORECASE,
+)
+_WEB_SEARCH_TOOL_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*)?(?:web_search|grok_web_search|openai_web_search|"
+    r"web_search_call|x_search)(?:\*\*)?\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _restore_pii(text: str, pii_map: dict[str, str]) -> str:
@@ -35,6 +62,30 @@ def _restore_pii(text: str, pii_map: dict[str, str]) -> str:
 
 def _strip_leaked_placeholders(text: str) -> str:
     return _PII_PLACEHOLDER_RE.sub(_LEAKED_REPLACEMENT, text)
+
+
+def _is_web_search_citation(citation: object) -> bool:
+    return (
+        str(getattr(citation, "source", "") or "").strip().lower()
+        in _WEB_SEARCH_CITATION_SOURCES_LOWER
+    )
+
+
+def _strip_web_search_artifacts(text: str) -> str:
+    """Keep the answer while hiding raw search/citation scaffolding."""
+
+    compact = _INLINE_WEB_CITATION_RE.sub("", str(text or ""))
+    compact = _INLINE_WEB_MARKDOWN_LINK_RE.sub(r"\1", compact)
+    kept_lines: list[str] = []
+    for line in compact.splitlines():
+        if _WEB_SEARCH_TOOL_LABEL_RE.match(line):
+            continue
+        if _WEB_SEARCH_REFERENCE_HEADING_RE.match(line):
+            break
+        if _WEB_SEARCH_SOURCE_LINE_RE.match(line) or _WEB_SEARCH_URL_LINE_RE.match(line):
+            continue
+        kept_lines.append(_INLINE_WEB_URL_RE.sub("", line).rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines)).strip()
 
 
 def _format_citations(citations: list) -> str:
@@ -62,10 +113,15 @@ def _build_segments(
     result: CapabilityResult,
     session: Session,
     citations: list,
+    *,
+    hide_web_search_artifacts: bool = False,
 ) -> tuple[list[ReplySegment], ReplyType]:
     raw_segments = result.metadata.get("reply_segments")
     if not isinstance(raw_segments, list) or not raw_segments:
-        text = _normalize_text(result.reply_text or "", session.pii_map or {})
+        raw_text = result.reply_text or ""
+        if hide_web_search_artifacts:
+            raw_text = _strip_web_search_artifacts(raw_text)
+        text = _normalize_text(raw_text, session.pii_map or {})
         footer = _format_citations(citations)
         if footer:
             text = truncate(text + footer, _MAX_CHARS, suffix=_TRUNCATE_SUFFIX)
@@ -90,6 +146,8 @@ def _build_segments(
             metadata.get("wxbot_msg_type") or metadata.get("msg_type") or ""
         ).strip().lower()
         if wxbot_msg_type != "image":
+            if hide_web_search_artifacts:
+                content = _strip_web_search_artifacts(content)
             content = _normalize_text(content, session.pii_map or {})
             if first_text_idx is None:
                 first_text_idx = len(segments)
@@ -103,7 +161,10 @@ def _build_segments(
         )
 
     if not segments:
-        text = _normalize_text(result.reply_text or "", session.pii_map or {})
+        raw_text = result.reply_text or ""
+        if hide_web_search_artifacts:
+            raw_text = _strip_web_search_artifacts(raw_text)
+        text = _normalize_text(raw_text, session.pii_map or {})
         reply_type = ReplyType.MARKDOWN if citations else ReplyType.TEXT
         return [ReplySegment(type=reply_type, content=text)], reply_type
 
@@ -128,7 +189,16 @@ def _build_segments(
 class Postprocessor:
     async def run(self, result: CapabilityResult, session: Session) -> OutboundReply:
         citations = list(result.citations or [])
-        segments, reply_type = _build_segments(result, session, citations)
+        hide_web_search_artifacts = any(_is_web_search_citation(citation) for citation in citations)
+        display_citations = [
+            citation for citation in citations if not _is_web_search_citation(citation)
+        ]
+        segments, reply_type = _build_segments(
+            result,
+            session,
+            display_citations,
+            hide_web_search_artifacts=hide_web_search_artifacts,
+        )
 
         metadata: dict = {
             "route": result.route.value,

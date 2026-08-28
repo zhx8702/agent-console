@@ -20,6 +20,7 @@ import httpx
 from app.common.canned import HANDOFF_PENDING
 from app.common.config import Settings, get_settings
 from app.common.context import get_trace_id
+from app.common.context_budget import select_recent_turns
 from app.common.conversation import (
     is_group_session,
 )
@@ -54,6 +55,7 @@ from app.common.types import (
     SessionState,
     Turn,
 )
+from app.common.web_search import live_web_search_requested
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.infra.metrics import LLM_IMAGE_ATTACHMENT_EVENTS
 from app.llm.service import LLMService
@@ -455,7 +457,15 @@ class LLMCapabilityEngine:
         session: Session,
         hints: dict[str, Any] | None = None,
     ) -> CapabilityResult:
-        system_prompt = self._compose_system_prompt(session)
+        request_metadata = dict((hints or {}).get("request_metadata") or {})
+        query = str(pre.cleaned_text or pre.original_text or "").strip()
+        web_search_requested = live_web_search_requested(query, request_metadata)
+        prompt_trace: dict[str, Any] = {}
+        system_prompt = self._compose_system_prompt(
+            session,
+            web_search_enabled=web_search_requested,
+            prompt_trace=prompt_trace,
+        )
         messages: list[ChatMessage] = []
         current_trace_id = get_trace_id()
         history_turns = (
@@ -463,7 +473,13 @@ class LLMCapabilityEngine:
             if is_group_session(session)
             else self._history_turns
         )
-        recent = session.turns[-history_turns:]
+        context_window = select_recent_turns(
+            session.turns,
+            max_turns=history_turns,
+            max_chars=getattr(self._settings, "llm_context_budget_chars", 12_000),
+            render=lambda turn: self._render_turn_content(session, turn, current=False),
+        )
+        recent = context_window.turns
         current_turn = next(
             (
                 turn
@@ -505,6 +521,28 @@ class LLMCapabilityEngine:
             )
         )
 
+        request_metadata.update(
+            {
+                "route": "llm",
+                "openai_web_search": web_search_requested,
+                "openai_web_search_required": web_search_requested,
+                "web_search_requested": web_search_requested,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "prompt_section_chars": prompt_trace.get("section_chars", {}),
+                "context_window": {
+                    "source_turns": context_window.source_turns,
+                    "selected_turns": len(context_window.turns),
+                    "dropped_turns": context_window.dropped_turns,
+                    "source_chars": context_window.source_chars,
+                    "selected_chars": context_window.selected_chars,
+                },
+                **(
+                    {"image_attachment_observation": image_observation}
+                    if image_observation
+                    else {}
+                ),
+            }
+        )
         request = ChatRequest(
             tenant_id=session.tenant_id,
             trace_id=get_trace_id() or new_trace_id(),
@@ -514,11 +552,7 @@ class LLMCapabilityEngine:
             max_tokens=self._max_tokens,
             temperature=self._temperature,
             cache_system=True,
-            metadata=(
-                {"image_attachment_observation": image_observation}
-                if image_observation
-                else {}
-            ),
+            metadata=request_metadata,
         )
         response = await self._llm.chat(request)
         return CapabilityResult(
@@ -530,11 +564,20 @@ class LLMCapabilityEngine:
             metadata={
                 "model": response.model,
                 "latency_ms": response.latency_ms,
+                "web_search_requested": web_search_requested,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "context_window": request_metadata.get("context_window", {}),
                 "persona_profile": session.variables.get("persona_profile"),
             },
         )
 
-    def _compose_system_prompt(self, session: Session) -> str:
+    def _compose_system_prompt(
+        self,
+        session: Session,
+        *,
+        web_search_enabled: bool = False,
+        prompt_trace: dict[str, Any] | None = None,
+    ) -> str:
         base_system = chat_system_prompt(self._settings.customer_service_prompt_enabled)
         return augment_prompt_with_persona_and_memory(
             base_system,
@@ -543,6 +586,8 @@ class LLMCapabilityEngine:
                 "以下是当前用户的历史记忆，请把它当作个性化上下文使用。"
                 "涉及商品规则、售后政策、价格和知识库事实时，以系统规则和知识库为准："
             ),
+            web_search_enabled=web_search_enabled,
+            prompt_trace=prompt_trace,
         )
 
     def _render_turn_content(self, session: Session, turn: Turn, *, current: bool) -> str:

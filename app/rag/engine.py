@@ -38,6 +38,7 @@ from app.common.types import (
     RouteType,
     Session,
 )
+from app.common.web_search import live_web_search_requested
 from app.infra.metrics import (
     RAG_CITATION_VALIDATION,
     RAG_RETRIEVAL_LATENCY,
@@ -48,7 +49,13 @@ from app.rag.citations import validate_cited_answer
 from app.rag.retriever import HybridRetriever, RetrievalHit
 
 
-def _compose_rag_system_prompt(session: Session, settings: Settings) -> str:
+def _compose_rag_system_prompt(
+    session: Session,
+    settings: Settings,
+    *,
+    web_search_enabled: bool = False,
+    prompt_trace: dict[str, Any] | None = None,
+) -> str:
     base_system = rag_system_prompt(settings.customer_service_prompt_enabled)
     return augment_prompt_with_persona_and_memory(
         base_system,
@@ -57,6 +64,8 @@ def _compose_rag_system_prompt(session: Session, settings: Settings) -> str:
             "以下是当前用户的历史记忆，只用于个性化表达和上下文承接。"
             "当记忆与参考资料冲突时，必须以参考资料为准："
         ),
+        web_search_enabled=web_search_enabled,
+        prompt_trace=prompt_trace,
     )
 
 
@@ -178,6 +187,7 @@ class RAGEngine:
         start = time.monotonic()
         try:
             request_metadata = dict((hints or {}).get("request_metadata") or {})
+            web_search_requested = live_web_search_requested(query, request_metadata)
             search_query = retrieval_query(query, request_metadata)
             hits = await self._retriever.retrieve(
                 tenant_id,
@@ -208,13 +218,32 @@ class RAGEngine:
             context=conversation,
             request_metadata=request_metadata,
         )
+        prompt_trace: dict[str, Any] = {}
+        request_metadata.update(
+            {
+                "route": "rag",
+                "openai_web_search": web_search_requested,
+                "openai_web_search_required": web_search_requested,
+                "web_search_requested": web_search_requested,
+            }
+        )
         req = ChatRequest(
             tenant_id=tenant_id,
             trace_id=trace_id,
             model_tier="tier-2",
             messages=[ChatMessage(role=Role.USER, content=user_content)],
-            system=_compose_rag_system_prompt(session, self._settings),
+            system=_compose_rag_system_prompt(
+                session,
+                self._settings,
+                web_search_enabled=web_search_requested,
+                prompt_trace=prompt_trace,
+            ),
             max_tokens=self._max_tokens,
+            metadata={
+                **request_metadata,
+                "prompt_sections": prompt_trace.get("section_names", []),
+                "prompt_section_chars": prompt_trace.get("section_chars", {}),
+            },
         )
         try:
             resp = await self._llm.chat(req)
@@ -279,5 +308,7 @@ class RAGEngine:
                 "scopes": sorted({hit.scope for hit in hits}),
                 "scope_session_id": hits[0].session_id if hits else None,
                 "persona_profile": session.variables.get("persona_profile"),
+                "web_search_requested": web_search_requested,
+                "prompt_sections": prompt_trace.get("section_names", []),
             },
         )

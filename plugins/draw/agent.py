@@ -11,6 +11,7 @@ from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, Chann
 from app.common.context import get_trace_id
 from app.common.ids import new_trace_id
 from app.common.logging import get_logger
+from app.common.prompting import persona_response_language
 from app.common.types import Role, Session
 from plugins.draw.avatar import resolve_prompt_avatar_reference
 from plugins.draw.hooks import (
@@ -47,7 +48,7 @@ def build_draw_agent_tools(service: DrawAgentToolService) -> list[AgentToolDefin
         AgentToolDefinition(
             scope=GROUP_DRAW_GENERATION_SCOPE,
             name="generate_group_image",
-            description="为当前群聊或频道生成一张图片；微信渠道下如果提示词提到群成员头像，例如“基于群里千羽头像”，工具会自动把对应头像作为参考图。",
+            description="为当前会话生成一张图片；微信渠道下如果提示词提到群成员头像，例如“基于群里千羽头像”，工具会自动把对应头像作为参考图。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -65,7 +66,7 @@ def build_draw_agent_tools(service: DrawAgentToolService) -> list[AgentToolDefin
                 "additionalProperties": False,
             },
             handler=service.generate_group_image,
-            metadata={"session_kinds": ["group"]},
+            metadata={"session_kinds": ["group", "private"]},
         )
     ]
 
@@ -94,8 +95,6 @@ class DrawAgentToolService:
         session_id = target.session_id
         if not target.channel:
             raise ValueError("generate_group_image 缺少渠道信息")
-        if target.session_kind != "group" and not session_id.endswith("@chatroom"):
-            raise ValueError("generate_group_image 仅支持群聊或频道会话")
         if (
             self._channel_registry is None
             or self._channel_registry.outbound_for(target.channel) is None
@@ -225,6 +224,18 @@ class DrawAgentToolService:
                 public_path=result.public_path,
                 source_url=result.source_url,
             )
+            delivery_image_path = ""
+            delivery_image_url = image_url
+            target = self._target(session)
+            stage_for_delivery = getattr(
+                self._store, "stage_for_wxbot_delivery", None
+            )
+            if target.channel == "wechat" and callable(stage_for_delivery):
+                delivery_image_path = stage_for_delivery(
+                    result.local_path,
+                    result.image_id,
+                )
+                delivery_image_url = ""
             async def _capture_and_deliver() -> None:
                 await self._require_scope(session)
                 if self._billing is not None and reservation is not None:
@@ -233,8 +244,8 @@ class DrawAgentToolService:
                 await self._enqueue_messages(
                     session,
                     text=_draw_success_text(result.image_id),
-                    image_path=result.local_path,
-                    image_url=image_url,
+                    image_path=delivery_image_path,
+                    image_url=delivery_image_url,
                     trace_id=trace_id,
                 )
 
@@ -499,6 +510,8 @@ class DrawAgentToolService:
 
     def _target(self, session: Session) -> ChannelTarget:
         metadata = self._latest_user_metadata(session)
+        if persona_response_language(session) == "en":
+            metadata["persona_response_language"] = "en"
         session_contract = getattr(session, "metadata", {}).get(
             _DELIVERY_CONTRACT_METADATA_KEY
         )
@@ -514,6 +527,25 @@ class DrawAgentToolService:
             tenant_id=str(getattr(session, "tenant_id", "") or "default"),
             channel=channel,
             session_id=session_id,
+            adapter_id=str(
+                getattr(session, "adapter_id", "") or metadata.get("adapter_id") or ""
+            ),
+            connection_id=str(
+                getattr(session, "connection_id", "")
+                or metadata.get("connection_id")
+                or ""
+            ),
+            external_conversation_id=str(
+                getattr(session, "external_conversation_id", "")
+                or metadata.get("external_conversation_id")
+                or session_id
+            ),
+            canonical_conversation_id=str(
+                getattr(session, "canonical_conversation_id", "")
+                or getattr(session, "conversation_id", "")
+                or metadata.get("canonical_conversation_id")
+                or session_id
+            ),
             session_name=self._session_name(session),
             session_kind=str(
                 metadata.get("session_kind")

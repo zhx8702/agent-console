@@ -5,7 +5,7 @@ consumers can integrate via HTTP without touching WeChat internals.
 
 Endpoints:
   GET  /messages           - Pull inbound messages (cursor-based pagination)
-  POST /send               - Queue a single outbound message (text or image)
+  POST /send               - Queue a single outbound message (text, image, or video)
   POST /send/batch         - Queue multiple outbound messages
   GET  /sessions           - List active sessions from WeChat DB
   GET  /status             - SDK health / auth status
@@ -360,6 +360,8 @@ def create_app():
             "msg_type",
             "image_path",
             "image_url",
+            "video_path",
+            "video_url",
             "source_message",
             "delivery",
             "command_id",
@@ -376,11 +378,13 @@ def create_app():
         session_kind = data.get("session_kind")
         reply_to_msg_svr_id = data.get("reply_to_msg_svr_id")
         image_url = data.get("image_url")
+        video_url = data.get("video_url")
         for label, value in {
             "sender_wxid": sender_wxid,
             "session_kind": session_kind,
             "reply_to_msg_svr_id": reply_to_msg_svr_id,
             "image_url": image_url,
+            "video_url": video_url,
         }.items():
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"{label}_must_be_string")
@@ -390,6 +394,8 @@ def create_app():
             raise ValueError("reply_reference_too_long")
         if len(str(image_url or "")) > 2048:
             raise ValueError("image_url_too_long")
+        if len(str(video_url or "")) > 2048:
+            raise ValueError("video_url_too_long")
         if str(session_kind or "") not in {"", "group", "private"}:
             raise ValueError("invalid_session_kind")
         for label in ("source_message", "delivery"):
@@ -400,14 +406,24 @@ def create_app():
         if not isinstance(mention_sender, bool):
             raise ValueError("mention_sender_must_be_boolean")
         msg_type = str(data.get("msg_type") or "text").strip().lower()
-        if msg_type not in {"text", "image"}:
-            raise ValueError("msg_type_must_be_text_or_image")
+        if msg_type not in {"text", "image", "video"}:
+            raise ValueError("msg_type_must_be_text_image_or_video")
         reply_text = data.get("text")
         if reply_text is None:
             reply_text = data.get("reply_text")
         if reply_text is not None and not isinstance(reply_text, str):
             raise ValueError("text_must_be_string")
         image_path = data.get("image_path")
+        video_path = data.get("video_path")
+        if video_path is not None and not isinstance(video_path, str):
+            raise ValueError("video_path_must_be_string")
+        if msg_type == "video":
+            image_path = video_path if video_path is not None else image_path
+            image_url = data.get("video_url", image_url)
+            if not str(image_path or "").strip() and str(image_url or "").strip():
+                # Keep the legacy SQLite queue schema while allowing the new
+                # SDK sender to receive a remote video URL.
+                image_path = image_url
         if image_path is not None and not isinstance(image_path, str):
             raise ValueError("image_path_must_be_string")
         if isinstance(reply_text, str) and len(reply_text) > 8000:
@@ -416,6 +432,8 @@ def create_app():
             raise ValueError("image_path_too_long")
         if msg_type == "image" and not str(image_path or "").strip():
             raise ValueError("image_path_required_for_image_messages")
+        if msg_type == "video" and not str(image_path or "").strip():
+            raise ValueError("video_path_or_url_required_for_video_messages")
         if msg_type == "text" and not str(reply_text or "").strip():
             raise ValueError("text_required_for_text_messages")
         return {
@@ -481,7 +499,14 @@ def create_app():
         _reject_unknown_fields(sender, {"name", "wxid"}, "sender")
         _reject_unknown_fields(
             content,
-            {"text", "msg_type", "image_path", "image_url"},
+            {
+                "text",
+                "msg_type",
+                "image_path",
+                "image_url",
+                "video_path",
+                "video_url",
+            },
             "content",
         )
         _reject_unknown_fields(
@@ -506,6 +531,8 @@ def create_app():
             "msg_type": content.get("msg_type", "text"),
             "image_path": content.get("image_path"),
             "image_url": content.get("image_url"),
+            "video_path": content.get("video_path"),
+            "video_url": content.get("video_url"),
             "source_message": source_message,
             "delivery": delivery,
             "command_id": data.get("command_id", ""),

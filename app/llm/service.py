@@ -12,6 +12,8 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from app.infra.metrics import LLM_COST_USD, LLM_LATENCY, LLM_REQUESTS, LLM_TOKEN
 from app.llm.base import EmbedRequest, EmbedResponse, LLMProvider
 from app.llm.pricing import compute_cost
 from app.llm.providers.fake_provider import FakeProvider
+from app.llm.providers.openai_provider import is_grok_compatible_settings
 from app.llm.quota import QuotaTracker
 
 logger = get_logger(__name__)
@@ -61,12 +64,15 @@ def validate_llm_settings(settings: Settings) -> list[str]:
             errors.append("OPENAI_WEB_SEARCH_ENABLED requires LLM_PROVIDER=openai")
         if settings.openai_api_mode != "responses":
             errors.append("OPENAI_WEB_SEARCH_ENABLED requires OPENAI_API_MODE=responses")
-        if settings.openai_web_search_tool not in {
-            "web_search",
-            "web_search_preview",
-        }:
+        allowed_search_tools = (
+            {"web_search", "x_search"}
+            if is_grok_compatible_settings(settings)
+            else {"web_search", "web_search_preview"}
+        )
+        if settings.openai_web_search_tool not in allowed_search_tools:
             errors.append(
-                "OPENAI_WEB_SEARCH_TOOL must be one of: web_search, web_search_preview"
+                "OPENAI_WEB_SEARCH_TOOL must be one of: "
+                + ", ".join(sorted(allowed_search_tools))
             )
 
     if settings.llm_embed_provider not in _SUPPORTED_EMBED_PROVIDERS:
@@ -103,6 +109,79 @@ def _estimate_input_tokens(req: ChatRequest) -> int:
 
 def _estimate_embed_tokens(req: EmbedRequest) -> int:
     return max(1, sum(max(1, len(t) // 4) for t in req.texts))
+
+
+def _normalized_chat_metadata(request: ChatRequest) -> dict[str, Any]:
+    """Make expensive capabilities explicit at the shared service boundary."""
+
+    metadata = dict(request.metadata or {})
+    if not any(
+        key in metadata
+        for key in (
+            "openai_web_search",
+            "web_search",
+            "openai_web_search_required",
+            "web_search_required",
+        )
+    ):
+        # ``OPENAI_WEB_SEARCH_ENABLED`` enables the capability; it must not
+        # silently attach a hosted tool to every internal request.
+        metadata["openai_web_search"] = False
+        metadata["web_search_decision"] = "not_requested"
+    metadata.setdefault("route", "unknown")
+    return metadata
+
+
+def _chat_audit_context(request: ChatRequest, *, model: str, provider: str) -> dict[str, Any]:
+    metadata = request.metadata or {}
+    messages = list(request.messages or [])
+    payload = {
+        "system": request.system or "",
+        "messages": [
+            {
+                "role": str(getattr(item.role, "value", item.role)),
+                "content": item.content or "",
+                "tool_call_id": item.tool_call_id or "",
+            }
+            for item in messages
+        ],
+        "tools": [item.name for item in request.tools or []],
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    return {
+        "trace_id": str(request.trace_id or "")[:128],
+        "tenant_id": str(request.tenant_id or "")[:64],
+        "route": str(metadata.get("route") or "unknown")[:64],
+        "provider": provider[:64],
+        "model": model[:128],
+        "request_hash": request_hash,
+        "message_count": len(messages),
+        "input_chars": sum(len(item.content or "") for item in messages),
+        "system_chars": len(request.system or ""),
+        "tool_names": [str(item.name or "")[:80] for item in (request.tools or [])[:32]],
+        "web_search": bool(
+            metadata.get("openai_web_search")
+            or metadata.get("web_search")
+            or metadata.get("openai_web_search_required")
+            or metadata.get("web_search_required")
+        ),
+        "web_search_required": bool(
+            metadata.get("openai_web_search_required")
+            or metadata.get("web_search_required")
+        ),
+        "prompt_sections": [
+            str(item)[:80]
+            for item in list(metadata.get("prompt_sections") or [])[:32]
+            if str(item).strip()
+        ],
+        "context_window": dict(metadata.get("context_window") or {})
+        if isinstance(metadata.get("context_window"), dict)
+        else {},
+    }
 
 
 @dataclass
@@ -160,36 +239,44 @@ class LLMService:
     async def chat(self, request: ChatRequest) -> ChatResponse:
         model = _resolve_model(request, self._settings)
         provider_name = getattr(self._chat, "name", "unknown")
+        metadata = _normalized_chat_metadata(request)
+        effective_req = request.model_copy(update={"model": model, "metadata": metadata})
+        audit = _chat_audit_context(
+            effective_req,
+            model=model,
+            provider=provider_name,
+        )
+        logger.info("llm.request", **audit, max_tokens=effective_req.max_tokens)
 
         if not self._chat_breaker.allow():
             LLM_REQUESTS.labels(provider=provider_name, model=model, result="breaker_open").inc()
+            logger.warning("llm.response", **audit, status="breaker_open")
             raise UpstreamUnavailable("llm chat circuit breaker is open")
 
-        estimate = _estimate_input_tokens(request)
-        await self._quota.reserve_tokens(request.tenant_id, estimate)
-
-        effective_req = (
-            request.model_copy(update={"model": model}) if request.model is None else request
-        )
+        estimate = _estimate_input_tokens(effective_req)
+        await self._quota.reserve_tokens(effective_req.tenant_id, estimate)
         started = time.monotonic()
         try:
             resp = await self._chat.chat(effective_req)
         except asyncio.CancelledError:
             LLM_REQUESTS.labels(provider=provider_name, model=model, result="cancelled").inc()
+            logger.warning("llm.response", **audit, status="cancelled")
             await asyncio.shield(
-                self._quota.commit(request.tenant_id, actual=0, estimate=estimate)
+                self._quota.commit(effective_req.tenant_id, actual=0, estimate=estimate)
             )
             raise
         except UpstreamUnavailable:
             self._chat_breaker.record_failure()
             LLM_REQUESTS.labels(provider=provider_name, model=model, result="error").inc()
+            logger.warning("llm.response", **audit, status="error")
             # Refund the reservation since the call did not land.
-            await self._quota.commit(request.tenant_id, actual=0, estimate=estimate)
+            await self._quota.commit(effective_req.tenant_id, actual=0, estimate=estimate)
             raise
         except Exception:
             self._chat_breaker.record_failure()
             LLM_REQUESTS.labels(provider=provider_name, model=model, result="error").inc()
-            await self._quota.commit(request.tenant_id, actual=0, estimate=estimate)
+            logger.warning("llm.response", **audit, status="error")
+            await self._quota.commit(effective_req.tenant_id, actual=0, estimate=estimate)
             raise
         finally:
             LLM_LATENCY.labels(provider=provider_name, model=model).observe(
@@ -200,13 +287,13 @@ class LLMService:
 
         # Reconcile quota using actual total tokens.
         actual = int(resp.usage.input_tokens or 0) + int(resp.usage.output_tokens or 0)
-        await self._quota.commit(request.tenant_id, actual=actual, estimate=estimate)
+        await self._quota.commit(effective_req.tenant_id, actual=actual, estimate=estimate)
 
         # Cost accounting.
         cost = compute_cost(resp.model or model, resp.usage.input_tokens, resp.usage.output_tokens)
         resp.usage.cost_usd = cost
         if cost > 0:
-            LLM_COST_USD.labels(tenant=request.tenant_id, model=resp.model or model).inc(cost)
+            LLM_COST_USD.labels(tenant=effective_req.tenant_id, model=resp.model or model).inc(cost)
 
         # Metrics.
         LLM_REQUESTS.labels(provider=provider_name, model=resp.model or model, result="ok").inc()
@@ -226,6 +313,19 @@ class LLMService:
             LLM_TOKENS.labels(
                 provider=provider_name, model=resp.model or model, kind="cache_write"
             ).inc(resp.usage.cache_write_tokens)
+
+        logger.info(
+            "llm.response",
+            **audit,
+            status="ok",
+            response_model=resp.model or model,
+            latency_ms=resp.latency_ms,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+            citations=len(resp.citations or []),
+            tool_calls=len(resp.tool_calls or []),
+            output_chars=len(resp.content or ""),
+        )
 
         return resp
 
