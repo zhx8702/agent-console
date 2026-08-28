@@ -78,16 +78,21 @@ def test_server_overlay_replaces_writer_volume_with_shared_host_bind() -> None:
     )
     services = overlay["services"]
 
-    for service_name in ("api", "inbound-worker", "scheduler"):
-        mounts = services[service_name]["volumes"]
-        assert mounts == [
-            {
-                "type": "bind",
-                "source": (f"${{WXBOT_OUTBOUND_FILE_HOST_DIR:-{DEFAULT_HOST_DIR}}}"),
-                "target": (f"${{WXBOT_OUTBOUND_FILE_DIR:-{DEFAULT_CONTAINER_DIR}}}"),
-                "bind": {"create_host_path": True},
-            }
-        ]
+    outbound_bind = {
+        "type": "bind",
+        "source": (f"${{WXBOT_OUTBOUND_FILE_HOST_DIR:-{DEFAULT_HOST_DIR}}}"),
+        "target": (f"${{WXBOT_OUTBOUND_FILE_DIR:-{DEFAULT_CONTAINER_DIR}}}"),
+        "bind": {"create_host_path": True},
+    }
+    portrait_bind = {
+        "type": "bind",
+        "source": "${SPEAKER_PORTRAIT_HOST_DIR:-/opt/agent-console-portraits}",
+        "target": "${SPEAKER_PORTRAIT_DATA_DIR:-/data/portraits}",
+        "bind": {"create_host_path": True},
+    }
+    assert services["api"]["volumes"] == [outbound_bind, portrait_bind]
+    assert services["inbound-worker"]["volumes"] == [outbound_bind]
+    assert services["scheduler"]["volumes"] == [outbound_bind, portrait_bind]
 
     for forwarding_service in ("outbound-worker", "wxbot-bridge-worker"):
         assert "volumes" not in services[forwarding_service]

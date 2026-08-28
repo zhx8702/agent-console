@@ -48,7 +48,9 @@ def test_core_compose_profile_has_no_wxbot_worker_or_secret_injection() -> None:
         str(name) for name in core_env if str(name).startswith("WXBOT_")
     } == {
         "WXBOT_DAILY_REPORT_FOOTER",
+        "WXBOT_REPORT_LLM_BACKEND",
         "WXBOT_REPORT_MAX_CHARS_PER_CHUNK",
+        "WXBOT_SELF_REVIEW_LLM_BACKEND",
         "WXBOT_FILE_DOWNLOAD_MAX_BYTES",
         "WXBOT_OUTBOUND_FILE_CLEANUP_GRACE_SECONDS",
         "WXBOT_OUTBOUND_FILE_DIR",

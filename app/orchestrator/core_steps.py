@@ -6,7 +6,6 @@ compatibility path that can be expanded behind tests.
 """
 from __future__ import annotations
 
-import asyncio
 import math
 from dataclasses import dataclass
 from numbers import Real
@@ -655,31 +654,9 @@ class CapabilityDispatchStep(_BaseCoreStep):
                     metadata={"degradation_reason": reason},
                 )
         else:
-            result = None
-            last_exc: Exception | None = None
-            for attempt in range(1, 4):
-                try:
-                    result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
-                    last_exc = None
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    last_exc = exc
-                    miss_reason = self._recall_miss_reason(exc)
-                    if miss_reason:
-                        break
-                    logger.warning(
-                        "capability.dispatch_retry",
-                        attempt=attempt,
-                        attempts=3,
-                        route=ctx.route.type.value,
-                        error_class=exc.__class__.__name__,
-                    )
-                    if attempt < 3:
-                        await asyncio.sleep(0.4 * attempt)
-            if result is None and last_exc is not None:
-                exc = last_exc
+            try:
+                result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
+            except Exception as exc:
                 miss_reason = self._recall_miss_reason(exc)
                 if miss_reason:
                     result = await self._fallback_to_llm(
@@ -691,7 +668,7 @@ class CapabilityDispatchStep(_BaseCoreStep):
                         ctx.result = result
                         return StepResult(result=result, route_label=result.route.value)
                 if ctx.route.type != RouteType.LLM:
-                    raise exc
+                    raise
                 reason = f"capability_failed:{ctx.route.type.value}"
                 ctx.signals["capability"] = {
                     "failed": True,

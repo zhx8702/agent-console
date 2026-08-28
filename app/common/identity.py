@@ -61,6 +61,7 @@ _BOT_SELF_IDENTITY_RE = re.compile(
     r"|自我介绍|介绍一下你自己|介绍下你自己|介绍一下你|介绍下你",
     re.IGNORECASE,
 )
+_FOLLOWUP_INTRODUCE_RE = re.compile(r"^(?:介绍下|介绍一下|介绍)$")
 
 
 def is_bot_self_identity_question(text: str) -> bool:
@@ -96,12 +97,19 @@ def classify_group_human_intent(
             "group_handoff_unavailable",
             normalized,
         )
-    if decision.domain is IntentDomain.IDENTITY and is_bot_self_identity_question(normalized):
-        return GroupHumanIntent(
-            GroupHumanIntentType.IDENTITY_INQUIRY,
-            "group_identity_disclosure",
-            normalized,
-        )
+    if decision.domain is IntentDomain.IDENTITY:
+        if _FOLLOWUP_INTRODUCE_RE.fullmatch(normalized):
+            return GroupHumanIntent(
+                GroupHumanIntentType.NONE,
+                "group_human_intent_none",
+                normalized,
+            )
+        if decision.action == "inquiry" or is_bot_self_identity_question(normalized):
+            return GroupHumanIntent(
+                GroupHumanIntentType.IDENTITY_INQUIRY,
+                "group_identity_disclosure",
+                normalized,
+            )
     return GroupHumanIntent(
         GroupHumanIntentType.NONE,
         "group_human_intent_none",
