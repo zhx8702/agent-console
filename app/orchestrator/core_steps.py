@@ -13,7 +13,7 @@ from numbers import Real
 from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
-from app.common.exceptions import CapabilityError, UpstreamRejected
+from app.common.exceptions import CapabilityError, UpstreamUnavailable
 from app.common.intent_classify import classify_context_from_event
 from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
@@ -63,12 +63,13 @@ _DISPATCH_ATTEMPTS = 3
 def _dispatch_retryable(exc: Exception) -> bool:
     """Whether a capability failure is worth another dispatch attempt.
 
-    ``UpstreamRejected`` (4xx) is deterministic: replaying the identical
-    request cannot succeed, and the provider layer has already applied its
-    own retry policy for transient failures.
+    Only known-transient upstream failures are replayed. Everything else is
+    either deterministic (e.g. ``UpstreamRejected``: HTTP 4xx, bugs), retried
+    at the right layer already (worker redelivery), or unsafe to replay
+    because the engine may have performed side effects before failing.
     """
 
-    return not isinstance(exc, UpstreamRejected)
+    return isinstance(exc, (UpstreamUnavailable, TimeoutError))
 
 
 _CONSECUTIVE_FALLBACKS_KEY = "consecutive_fallbacks"
