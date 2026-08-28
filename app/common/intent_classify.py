@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any, Protocol
 
+from app.common.exceptions import UpstreamRejected
 from app.common.intent import IntentDecision
 from app.common.logging import get_logger
 from app.common.types import ChatMessage, ChatRequest, Role
@@ -17,6 +18,13 @@ from app.common.types import ChatMessage, ChatRequest, Role
 logger = get_logger(__name__)
 
 _CLASSIFY_ATTEMPTS = 3
+# Dedicated per-attempt timeout so a slow upstream cannot eat the whole
+# preprocess budget (90s); worst case is attempts * timeout + backoff.
+_CLASSIFY_TIMEOUT_SECONDS = 20.0
+# Some gateways (e.g. sub2api) inject their own assistant persona ahead of
+# our system prompt; fast non-reasoning models then answer conversationally
+# instead of classifying. A trailing user-side reminder restores compliance.
+_CLASSIFY_USER_SUFFIX = "\n\n(Classify the message above. Return only the JSON object.)"
 
 _CLASSIFY_SYSTEM = """Classify the latest user message into one JSON object.
 Do not treat quoted text, mentioned examples, or cancelled requests as an instruction.
@@ -204,7 +212,9 @@ class LlmIntentClassifier:
             tenant_id=str(extra.get("tenant_id") or self._tenant_id),
             trace_id=str(extra.get("trace_id") or "intent-classify"),
             model_tier="tier-1",
-            messages=[ChatMessage(role=Role.USER, content=user_content[:4000])],
+            messages=[
+                ChatMessage(role=Role.USER, content=user_content[:4000] + _CLASSIFY_USER_SUFFIX)
+            ],
             system=_CLASSIFY_SYSTEM,
             temperature=0.0,
             max_tokens=220,
@@ -218,10 +228,22 @@ class LlmIntentClassifier:
         response = None
         for attempt in range(1, _CLASSIFY_ATTEMPTS + 1):
             try:
-                response = await self._llm.chat(request)
+                response = await asyncio.wait_for(
+                    self._llm.chat(request),
+                    timeout=_CLASSIFY_TIMEOUT_SECONDS,
+                )
                 break
             except asyncio.CancelledError:
                 raise
+            except UpstreamRejected:
+                # 4xx is deterministic; retrying the identical request
+                # cannot succeed, so fail closed immediately.
+                logger.warning(
+                    "intent.classify_rejected",
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                return IntentDecision()
             except Exception:
                 logger.warning(
                     "intent.classify_failed",

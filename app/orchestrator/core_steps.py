@@ -6,13 +6,14 @@ compatibility path that can be expanded behind tests.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
-from app.common.exceptions import CapabilityError
+from app.common.exceptions import CapabilityError, UpstreamRejected
 from app.common.intent_classify import classify_context_from_event
 from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
@@ -55,6 +56,20 @@ from app.plugin.hooks import (
 from app.postprocessing.response_guards import apply_response_guards
 
 logger = get_logger(__name__)
+
+_DISPATCH_ATTEMPTS = 3
+
+
+def _dispatch_retryable(exc: Exception) -> bool:
+    """Whether a capability failure is worth another dispatch attempt.
+
+    ``UpstreamRejected`` (4xx) is deterministic: replaying the identical
+    request cannot succeed, and the provider layer has already applied its
+    own retry policy for transient failures.
+    """
+
+    return not isinstance(exc, UpstreamRejected)
+
 
 _CONSECUTIVE_FALLBACKS_KEY = "consecutive_fallbacks"
 _SUCCESSFUL_ANSWER_ROUTES = frozenset(
@@ -654,9 +669,39 @@ class CapabilityDispatchStep(_BaseCoreStep):
                     metadata={"degradation_reason": reason},
                 )
         else:
-            try:
-                result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
-            except Exception as exc:
+            result = None
+            last_exc: Exception | None = None
+            for attempt in range(1, _DISPATCH_ATTEMPTS + 1):
+                try:
+                    result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
+                    last_exc = None
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    miss_reason = self._recall_miss_reason(exc)
+                    if miss_reason:
+                        break
+                    if not _dispatch_retryable(exc):
+                        logger.warning(
+                            "capability.dispatch_not_retryable",
+                            attempt=attempt,
+                            route=ctx.route.type.value,
+                            error_class=exc.__class__.__name__,
+                        )
+                        break
+                    logger.warning(
+                        "capability.dispatch_retry",
+                        attempt=attempt,
+                        attempts=_DISPATCH_ATTEMPTS,
+                        route=ctx.route.type.value,
+                        error_class=exc.__class__.__name__,
+                    )
+                    if attempt < _DISPATCH_ATTEMPTS:
+                        await asyncio.sleep(0.4 * attempt)
+            if result is None and last_exc is not None:
+                exc = last_exc
                 miss_reason = self._recall_miss_reason(exc)
                 if miss_reason:
                     result = await self._fallback_to_llm(
@@ -668,7 +713,7 @@ class CapabilityDispatchStep(_BaseCoreStep):
                         ctx.result = result
                         return StepResult(result=result, route_label=result.route.value)
                 if ctx.route.type != RouteType.LLM:
-                    raise
+                    raise exc
                 reason = f"capability_failed:{ctx.route.type.value}"
                 ctx.signals["capability"] = {
                     "failed": True,

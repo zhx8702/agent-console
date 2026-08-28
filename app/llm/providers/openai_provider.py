@@ -25,7 +25,7 @@ from tenacity import (
 )
 
 from app.common.config import Settings
-from app.common.exceptions import UpstreamUnavailable
+from app.common.exceptions import CSError, UpstreamRejected, UpstreamUnavailable
 from app.common.intent import (
     IntentArtifact,
     IntentDecision,
@@ -603,6 +603,21 @@ def _extract_responses_payload(
     )
 
 
+def _wrap_upstream_error(exc: Exception, operation: str) -> CSError:
+    """Map a provider exception to a breaker-relevant error type.
+
+    HTTP 4xx responses (except 429, which the retry policy already treats
+    as transient) mean the request itself was rejected — retrying cannot
+    succeed, and such failures must not open the circuit breaker that
+    guards against real provider outages.
+    """
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 429:
+        return UpstreamRejected(f"{operation} rejected ({status_code}): {exc}")
+    return UpstreamUnavailable(f"{operation} unavailable: {exc}")
+
+
 class OpenAIProvider:
     name = "openai"
 
@@ -827,7 +842,9 @@ class OpenAIProvider:
                 return await self._chat_via_responses(request)
             try:
                 return await self._chat_via_responses(request)
-            except UpstreamUnavailable as exc:
+            except (UpstreamUnavailable, UpstreamRejected) as exc:
+                # 4xx also falls back: gateways such as sub2api may reject
+                # Responses-API-only parameters while supporting plain chat.
                 logger.warning(
                     "llm.openai.responses_fallback_to_chat",
                     api_mode="responses",
@@ -882,7 +899,7 @@ class OpenAIProvider:
                 fallback=_fallback_label(fallback_from),
                 error_class=exc.__class__.__name__,
             )
-            raise UpstreamUnavailable(f"openai chat unavailable: {exc}") from exc
+            raise _wrap_upstream_error(exc, "openai chat") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
 
         content, tool_calls, citations, resolved_model, finish_reason, usage = (
@@ -948,7 +965,7 @@ class OpenAIProvider:
                 fallback="none",
                 error_class=exc.__class__.__name__,
             )
-            raise UpstreamUnavailable(f"openai responses unavailable: {exc}") from exc
+            raise _wrap_upstream_error(exc, "openai responses") from exc
 
         latency_ms = int((time.monotonic() - started) * 1000)
         content, tool_calls, citations, resolved_model, finish_reason, usage = (
@@ -1012,7 +1029,7 @@ class OpenAIProvider:
                 error=exc.__class__.__name__,
                 model=model,
             )
-            raise UpstreamUnavailable(f"openai embeddings unavailable: {exc}") from exc
+            raise _wrap_upstream_error(exc, "openai embeddings") from exc
 
         data = getattr(raw, "data", None) or []
         vectors = [list(item.embedding) for item in data]
@@ -1080,7 +1097,7 @@ async def _openai_stream(
             fallback=_fallback_label(fallback_from),
             error_class=exc.__class__.__name__,
         )
-        raise UpstreamUnavailable(f"openai stream unavailable: {exc}") from exc
+        raise _wrap_upstream_error(exc, "openai stream") from exc
     _record_api_attempt(
         api_mode="chat",
         result="success",
@@ -1118,7 +1135,7 @@ async def _openai_responses_stream(
             fallback="none",
             error_class=exc.__class__.__name__,
         )
-        raise UpstreamUnavailable(f"openai responses stream unavailable: {exc}") from exc
+        raise _wrap_upstream_error(exc, "openai responses stream") from exc
     _record_api_attempt(api_mode="responses", result="success")
 
 

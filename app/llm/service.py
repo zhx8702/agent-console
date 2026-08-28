@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.common.config import Settings, get_settings
-from app.common.exceptions import UpstreamUnavailable
+from app.common.exceptions import UpstreamRejected, UpstreamUnavailable
 from app.common.logging import get_logger
 from app.common.types import ChatRequest, ChatResponse
 from app.infra.metrics import LLM_COST_USD, LLM_LATENCY, LLM_REQUESTS, LLM_TOKENS
@@ -272,6 +272,13 @@ class LLMService:
                 self._quota.commit(effective_req.tenant_id, actual=0, estimate=estimate)
             )
             raise
+        except UpstreamRejected:
+            # Client errors (4xx) are not provider outages: refund the
+            # reservation but keep the circuit breaker closed.
+            LLM_REQUESTS.labels(provider=provider_name, model=model, result="rejected").inc()
+            logger.warning("llm.response", **audit, status="rejected")
+            await self._quota.commit(effective_req.tenant_id, actual=0, estimate=estimate)
+            raise
         except UpstreamUnavailable:
             self._chat_breaker.record_failure()
             LLM_REQUESTS.labels(provider=provider_name, model=model, result="error").inc()
@@ -378,6 +385,10 @@ class LLMService:
             await asyncio.shield(
                 self._quota.commit(request.tenant_id, actual=0, estimate=estimate)
             )
+            raise
+        except UpstreamRejected:
+            LLM_REQUESTS.labels(provider=provider_name, model=model, result="rejected").inc()
+            await self._quota.commit(request.tenant_id, actual=0, estimate=estimate)
             raise
         except Exception:
             self._embed_breaker.record_failure()
