@@ -51,7 +51,7 @@
   gap: var(--space-2-5);
   align-items: center;
   padding: var(--space-3);
-  border: 1px solid var(--color-custom-dbe4f0);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.76);
 }
@@ -63,8 +63,8 @@
   height: 30px;
   place-items: center;
   border-radius: 50%;
-  color: var(--color-indigo-700);
-  background: var(--color-indigo-50);
+  color: var(--tone-accent-text);
+  background: var(--tone-accent-bg);
   font-size: var(--font-size-2xs);
   font-weight: 800;
   letter-spacing: 0.04em;
@@ -166,7 +166,7 @@
 .connection-detail-skeleton > span {
   overflow: hidden;
   border-radius: var(--radius);
-  background: linear-gradient(100deg, var(--color-custom-edf1f6) 20%, var(--color-slate-50) 45%, var(--color-custom-edf1f6) 70%);
+  background: linear-gradient(100deg, var(--color-paper-dim) 20%, var(--color-paper-bright) 45%, var(--color-paper-dim) 70%);
   background-size: 220% 100%;
   animation: connection-shimmer 1.5s ease-in-out infinite;
 }
@@ -318,13 +318,13 @@
 }
 
 .connection-instance-card:hover {
-  border-color: var(--color-indigo-200);
-  background: var(--color-custom-fafaff);
+  border-color: var(--tone-accent-border);
+  background: var(--panel);
 }
 
 .connection-instance-card.is-selected {
   border-color: var(--accent);
-  background: var(--color-custom-f7f7ff);
+  background: var(--tone-accent-bg);
   box-shadow: 0 0 0 2px var(--accent-light);
 }
 
@@ -474,15 +474,15 @@
 }
 
 .connection-health-cell.is-muted {
-  border-top-color: var(--color-slate-400);
+  border-top-color: var(--accent);
 }
 
 .connection-probe-results {
   margin: var(--space-4-5) 0;
   padding: var(--space-3-5);
-  border: 1px solid var(--color-indigo-200);
+  border: 1px solid var(--tone-accent-border);
   border-radius: var(--radius);
-  background: var(--color-custom-fafaff);
+  background: var(--panel);
 }
 
 .connection-probe-results h3,
