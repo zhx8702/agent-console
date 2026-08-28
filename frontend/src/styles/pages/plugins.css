@@ -1010,18 +1010,11 @@
   position: relative;
   max-height: none;
   overflow: visible;
+  border-color: var(--line-strong);
   background:
-    radial-gradient(circle at 12% 4%, rgba(15, 118, 110, 0.08), transparent 26%),
-    radial-gradient(circle at 88% 12%, rgba(20, 184, 166, 0.08), transparent 28%),
+    radial-gradient(130% 44% at 50% 0%, rgba(15, 118, 110, 0.07), transparent 62%),
+    radial-gradient(circle at 88% 12%, rgba(20, 184, 166, 0.06), transparent 28%),
     linear-gradient(180deg, var(--color-white) 0%, var(--panel) 100%);
-}
-
-.plugins-flow-panel::before {
-  content: "";
-  position: absolute;
-  inset: 0 0 auto;
-  height: 4px;
-  background: linear-gradient(90deg, var(--color-pine-700), var(--color-pine-400));
 }
 
 .plugins-flow-panel > * {

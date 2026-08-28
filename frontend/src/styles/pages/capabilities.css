@@ -185,15 +185,36 @@
   min-height: 218px;
   padding: var(--space-3-5) var(--space-3) var(--space-3);
   border: 1px solid rgba(167, 179, 169, 0.18);
-  border-top: 3px solid rgba(167, 179, 169, 0.45);
-  border-radius: 8px;
-  background: rgba(16, 25, 21, 0.66);
+  border-radius: 10px;
+  background:
+    radial-gradient(130% 56% at 50% 0%, var(--launch-step-glow, transparent), transparent 64%),
+    rgba(16, 25, 21, 0.66);
 }
 
-.launch-step.is-ready { border-top-color: var(--color-emerald-400); }
-.launch-step.is-action_required { border-top-color: var(--color-amber-300); }
-.launch-step.is-blocked { border-top-color: var(--color-rose-400); }
-.launch-step.is-degraded { border-top-color: var(--color-pine-400); }
+.launch-step.is-ready { --launch-step-glow: rgba(52, 211, 153, 0.12); }
+.launch-step.is-action_required { --launch-step-glow: rgba(252, 211, 77, 0.12); }
+.launch-step.is-blocked { --launch-step-glow: rgba(251, 113, 133, 0.13); }
+.launch-step.is-degraded { --launch-step-glow: rgba(45, 212, 191, 0.12); }
+
+.launch-step.is-ready .launch-state-badge {
+  --badge-text: var(--color-emerald-300);
+  --badge-border: 1px solid rgba(52, 211, 153, 0.4);
+}
+
+.launch-step.is-action_required .launch-state-badge {
+  --badge-text: var(--color-amber-300);
+  --badge-border: 1px solid rgba(252, 211, 77, 0.4);
+}
+
+.launch-step.is-blocked .launch-state-badge {
+  --badge-text: var(--color-rose-300);
+  --badge-border: 1px solid rgba(251, 113, 133, 0.42);
+}
+
+.launch-step.is-degraded .launch-state-badge {
+  --badge-text: var(--color-pine-300);
+  --badge-border: 1px solid rgba(45, 212, 191, 0.4);
+}
 
 .launch-step-index {
   position: absolute;

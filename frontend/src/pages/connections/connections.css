@@ -441,9 +441,9 @@
   gap: var(--space-0-5);
   padding: var(--space-2-5);
   border: 1px solid var(--line);
-  border-top-width: 3px;
   border-radius: var(--radius);
   background: var(--panel-alt);
+  box-shadow: inset 3px 0 0 var(--line-strong);
 }
 
 .connection-health-cell > span {
@@ -462,19 +462,19 @@
 }
 
 .connection-health-cell.is-ok {
-  border-top-color: var(--success);
+  box-shadow: inset 3px 0 0 var(--success);
 }
 
 .connection-health-cell.is-warning {
-  border-top-color: var(--color-amber-600);
+  box-shadow: inset 3px 0 0 var(--color-amber-600);
 }
 
 .connection-health-cell.is-danger {
-  border-top-color: var(--danger);
+  box-shadow: inset 3px 0 0 var(--danger);
 }
 
 .connection-health-cell.is-muted {
-  border-top-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .connection-probe-results {
