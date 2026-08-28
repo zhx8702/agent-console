@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -11,6 +10,8 @@ from app.agent.scopes import (
     GROUP_VIDEO_GENERATION_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
+from app.common.intent import IntentDomain
+from app.common.intent_runtime import decision_from_pre, is_confident
 from app.common.logging import get_logger
 from app.common.types import Channel, Role
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
@@ -48,36 +49,14 @@ _OUTBOUND_FILE_TOOLS = {
     (FILE_ANALYSIS_SCOPE, "generate"): "generate_text_file",
 }
 
-_EXPLICIT_LIVE_WEB_SEARCH_RE = re.compile(
-    r"(?:联网|上网|网上|网络).{0,6}(?:搜|搜索|查|查询|检索)"
-    r"|(?:搜|搜索|查|查询|检索).{0,10}(?:今天|今日|最新|实时|刚刚|热点)"
-    r"|(?:今天|今日|最新|实时|刚刚|热点).{0,10}(?:搜|搜索|查|查询|检索)"
-)
-_WEB_SEARCH_CLAUSE_SPLIT_RE = re.compile(
-    r"[,，。！？!?；;\n]|(?:但是|但|不过|然而|而是|改成|改为|然后|请(?!勿))"
-)
-_WEB_SEARCH_NEGATION_PREFIX_RE = re.compile(
-    r"(?:不要|别|无需|无须|不用|不必|不需要|禁止|请勿|切勿|"
-    r"不准|不允许|不想|没必要|避免).{0,12}$"
-)
-_LOCAL_DATA_SEARCH_RE = re.compile(
-    r"(?:群|聊天|会话|历史).{0,4}(?:消息|记录)|知识库|本地(?:文件|数据)|模型记忆"
-)
-
-
-def _explicit_live_web_search_requested(text: str) -> bool:
-    value = str(text or "").strip()
-    if not value:
-        return False
-    for clause in _WEB_SEARCH_CLAUSE_SPLIT_RE.split(value):
-        for match in _EXPLICIT_LIVE_WEB_SEARCH_RE.finditer(clause):
-            if _LOCAL_DATA_SEARCH_RE.search(clause) and not re.search(
-                r"(?:联网|上网|网上|网络)", match.group(0)
-            ):
-                continue
-            if not _WEB_SEARCH_NEGATION_PREFIX_RE.search(clause[: match.start()]):
-                return True
-    return False
+def _explicit_live_web_search_requested(decision) -> bool:
+    return bool(
+        is_confident(decision)
+        and (
+            decision.domain is IntentDomain.WEB_SEARCH
+            or decision.source.value in {"web", "x"}
+        )
+    )
 
 
 def _complete_async_delivery_contract(contract: dict[str, object]) -> bool:
@@ -202,17 +181,19 @@ class WxbotAgentIntentHook:
             return
         is_group = _event_is_group(ctx)
         text = _agent_query_text(ctx)
+        decision = decision_from_pre(ctx.pre)
         file_available = _event_has_file_attachment(ctx) or _session_has_file_attachment(ctx)
         file_intent = _file_intent_requested(
             text,
             has_attachment=file_available,
+            decision=decision,
         )
         if file_intent.file_requested:
             ctx.extras["wxbot_file_intent"] = file_intent.as_dict()
         if is_group:
             if not _event_mentioned_me(ctx):
                 return
-            scope = _resolve_group_agent_scope(text)
+            scope = _resolve_group_agent_scope(text, decision=decision)
             if (
                 scope is None
                 and file_intent.operation in {"inspect_incoming", "convert"}
@@ -231,14 +212,14 @@ class WxbotAgentIntentHook:
             # narrowly defined file-delivery intents and explicit media
             # generation may activate tools. Group-only query scopes remain
             # unavailable in private sessions.
-            detected_scope = _resolve_group_agent_scope(text)
+            detected_scope = _resolve_group_agent_scope(text, decision=decision)
             scope = (
                 GROUP_DRAW_GENERATION_SCOPE
                 if detected_scope == GROUP_DRAW_GENERATION_SCOPE
                 else GROUP_VIDEO_GENERATION_SCOPE
                 if detected_scope == GROUP_VIDEO_GENERATION_SCOPE
                 else MESSAGE_EXPORT_SCOPE
-                if _message_export_requested(text)
+                if _message_export_requested(text, decision=decision)
                 else FILE_ANALYSIS_SCOPE
                 if (
                     file_intent.operation in {"inspect_incoming", "convert"}
@@ -318,12 +299,15 @@ class WxbotAgentIntentHook:
             ):
                 ctx.extras["agent_required_effect"]["recent_minutes"] = file_intent.recent_minutes
             if required_file_tool == "generate_text_file" and _explicit_live_web_search_requested(
-                text
+                decision
             ):
                 ctx.extras["agent_required_effect"]["web_search_required"] = True
         if is_group:
             self._capture_async_delivery_contract(ctx)
-        if scope == GROUP_PERSONAL_MAP_SCOPE and _explicit_map_generation_requested(text):
+        if scope == GROUP_PERSONAL_MAP_SCOPE and _explicit_map_generation_requested(
+            text,
+            decision=decision,
+        ):
             await self._enqueue_map_progress(
                 ctx,
                 effect_only=(

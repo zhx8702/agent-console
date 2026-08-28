@@ -1282,6 +1282,26 @@ class WxbotReportService:
         return payload
 
     async def _call_llm(self, *, trace_id: str, system: str, user: str, max_tokens: int) -> str:
+        _ = max_tokens
+        timeout = float(getattr(self._store.settings, "wxbot_report_stage_timeout_seconds", 240.0) or 240.0)
+        backend = str(getattr(self._store.settings, "wxbot_report_llm_backend", "http") or "http")
+        from plugins.local_agent.complete import complete_chat, resolve_local_backend
+
+        if resolve_local_backend(backend):
+            result = await complete_chat(
+                self._store.settings,
+                backend=backend,
+                system=system,
+                user=user,
+                timeout_seconds=timeout,
+            )
+            self._last_llm_metadata = {
+                "provider": "local_agent",
+                "model": result.model,
+                "api_mode": result.backend,
+                "trace_id": trace_id,
+            }
+            return result.content
         llm_service = getattr(self._container, "llm_service", None)
         if llm_service is None:
             raise RuntimeError("LLM service not available")
@@ -1295,7 +1315,6 @@ class WxbotReportService:
             temperature=0.3,
             metadata=report_llm_metadata(),
         )
-        timeout = float(getattr(self._store.settings, "wxbot_report_stage_timeout_seconds", 240.0) or 240.0)
         response = await asyncio.wait_for(llm_service.chat(request), timeout=timeout)
         self._last_llm_metadata = _report_model_metadata(self._container, response)
         return str(response.content or "").strip()

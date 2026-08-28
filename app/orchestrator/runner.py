@@ -224,6 +224,10 @@ class FlowRunner:
                     error=apply_error.error,
                 )
             if result.finalize:
+                metadata = dict(getattr(result.result, "metadata", None) or {})
+                if metadata.get("degradation_reason"):
+                    ctx.extras["wxbot_force_send"] = True
+                    ctx.extras["degraded_reply_pending"] = True
                 return await self._run_finalize_steps(
                     flow,
                     ctx,

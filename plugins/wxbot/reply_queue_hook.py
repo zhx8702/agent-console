@@ -552,7 +552,14 @@ class WxbotReplyQueueHook:
                 delivery["segment_sequence"] = index + 1
                 delivery["segment_count"] = len(messages)
                 delivery["staggered"] = True
-            if self.effect_only:
+            persist_inline = (not self.effect_only) or bool(
+                ctx.extras.get("degraded_reply_pending")
+            )
+            if bool(ctx.extras.get("degraded_reply_pending")):
+                delivery["speech_budget_enabled"] = False
+                delivery["speech_class"] = "obligation"
+                delivery["wxbot_force_send"] = True
+            if not persist_inline:
                 effect_item: dict[str, object] = {
                     "tenant_id": ctx.event.tenant_id,
                     "channel": "wechat",
@@ -679,9 +686,20 @@ class WxbotReplyQueueHook:
         ctx.extras["wxbot_reply_queued_count"] = enqueued_count
         if self.effect_only:
             ctx.extras["wxbot_reply_effect_items"] = effect_items
-        logger.info(
-            "wxbot.reply_queue.enqueued",
-            session_id=ctx.event.session_id,
-            trace_id=ctx.trace_id,
-            count=enqueued_count,
-        )
+        if enqueued_count > 0:
+            logger.info(
+                "wxbot.reply_queue.enqueued",
+                session_id=ctx.event.session_id,
+                trace_id=ctx.trace_id,
+                count=enqueued_count,
+                persisted=bool(
+                    (not self.effect_only) or ctx.extras.get("degraded_reply_pending")
+                ),
+            )
+        else:
+            logger.info(
+                "wxbot.reply_queue.not_enqueued",
+                session_id=ctx.event.session_id,
+                trace_id=ctx.trace_id,
+                degraded=bool(ctx.extras.get("degraded_reply_pending")),
+            )

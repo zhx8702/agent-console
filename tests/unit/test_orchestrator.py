@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.commands import CommandDefinition, CommandRegistryService
 from app.common.config import Settings
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -98,7 +100,7 @@ class FakePreprocessor:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def run(self, message: Message) -> PreprocessedMessage:
+    async def run(self, message: Message, **_kwargs) -> PreprocessedMessage:
         self.calls += 1
         return PreprocessedMessage(
             original_text=message.content,
@@ -1656,6 +1658,22 @@ async def test_flow_runtime_degrades_capability_exception_once(
     assert payload["segments"][0]["content"] != "answer"
 
 
+class _RememberPreprocessor(FakePreprocessor):
+    async def run(self, message: Message, **kwargs: Any) -> PreprocessedMessage:
+        pre = await super().run(message, **kwargs)
+        persist_decision(
+            IntentDecision(
+                domain=IntentDomain.MEMORY,
+                action="remember",
+                confidence=0.95,
+                query="我默认要中文回复",
+                slots={"content": "我默认要中文回复"},
+            ),
+            pre=pre,
+        )
+        return pre
+
+
 async def test_target_flow_memory_control_preempts_command_and_faq(
     session_manager,
     settings,
@@ -1666,6 +1684,7 @@ async def test_target_flow_memory_control_preempts_command_and_faq(
     flow, flow_bus, flow_cap = _build(
         session_manager,
         _target_flow_settings(settings),
+        preprocessor=_RememberPreprocessor(),
         flow_step_registry=flow_registry,
         flow_owner_permissions=owner_permissions,
         flow_step_executors={

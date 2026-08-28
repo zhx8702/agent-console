@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.common.intent import IntentDecision, IntentDomain
 from plugins.wxbot.file_artifacts import (
     FileArtifactTooLarge,
     convert_file_bytes,
@@ -13,22 +14,40 @@ from plugins.wxbot.file_artifacts import (
 from plugins.wxbot.file_intent import classify_file_intent
 
 
+def _file_decision(action: str, **slots: object) -> IntentDecision:
+    return IntentDecision(
+        domain=IntentDomain.FILE,
+        action=action,
+        confidence=0.95,
+        slots=slots,
+    )
+
+
 @pytest.mark.parametrize(
-    ("text", "operation", "delivery"),
+    ("text", "operation", "delivery", "has_attachment"),
     [
-        ("总结这个附件内容", "inspect_incoming", False),
-        ("看一下这个文件", "inspect_incoming", False),
-        ("把这个文件转成 csv 发我", "convert", True),
-        ("把聊天记录整理成 json 文件发给我", "export_history", True),
-        ("把聊天记录整理成文件但不要发给我", "export_history", False),
+        ("总结这个附件内容", "inspect_incoming", False, True),
+        ("看一下这个文件", "inspect_incoming", False, True),
+        ("把这个文件转成 csv 发我", "convert", True, True),
+        ("把聊天记录整理成 json 文件发给我", "export_history", True, False),
+        ("把聊天记录整理成文件但不要发给我", "export_history", False, False),
     ],
 )
 def test_file_intent_distinguishes_inspection_conversion_and_delivery(
     text: str,
     operation: str,
     delivery: bool,
+    has_attachment: bool,
 ) -> None:
-    result = classify_file_intent(text, has_attachment="附件" in text or "这个文件" in text)
+    result = classify_file_intent(
+        text,
+        has_attachment=has_attachment,
+        decision=_file_decision(
+            operation,
+            delivery_required=delivery,
+            format="csv" if operation == "convert" else "json" if "json" in text else "",
+        ),
+    )
     assert result.operation == operation
     assert result.delivery_required is delivery
 
@@ -45,6 +64,7 @@ def test_inbound_file_caption_is_not_mistaken_for_outbound_delivery() -> None:
     received_with_task = classify_file_intent(
         "我发个文件给你，帮我看看",
         has_attachment=True,
+        decision=_file_decision("inspect_incoming"),
     )
     assert received.operation == "none"
     assert received_without_subject.operation == "none"
@@ -52,8 +72,16 @@ def test_inbound_file_caption_is_not_mistaken_for_outbound_delivery() -> None:
 
 
 def test_analysis_can_be_packaged_as_a_new_file() -> None:
-    result = classify_file_intent("分析成文件发我", has_attachment=True)
-    ambiguous = classify_file_intent("分析这个文件发我", has_attachment=True)
+    result = classify_file_intent(
+        "分析成文件发我",
+        has_attachment=True,
+        decision=_file_decision("generate", delivery_required=True, source="incoming_attachment"),
+    )
+    ambiguous = classify_file_intent(
+        "分析这个文件发我",
+        has_attachment=True,
+        decision=_file_decision("inspect_incoming"),
+    )
     ordinary_report = classify_file_intent("生成一份报告")
     assert result.operation == "generate"
     assert result.source == "incoming_attachment"
@@ -62,13 +90,16 @@ def test_analysis_can_be_packaged_as_a_new_file() -> None:
     assert ordinary_report.operation == "none"
 
 
-
-
 def test_file_delivery_negation_is_clause_scoped() -> None:
-    denied = classify_file_intent("把文件转成 csv 但不要发送", has_attachment=True)
+    denied = classify_file_intent(
+        "把文件转成 csv 但不要发送",
+        has_attachment=True,
+        decision=_file_decision("convert", delivery_required=False, format="csv"),
+    )
     later_affirmative = classify_file_intent(
         "把文件转成 csv 但不要发送，然后发我原文件",
         has_attachment=True,
+        decision=_file_decision("convert", delivery_required=True, format="csv"),
     )
     assert denied.delivery_required is False
     assert denied.needs_confirmation is True

@@ -5,11 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     CapabilityResult,
     Channel,
     InboundEvent,
     Message,
+    PreprocessedMessage,
     RouteDecision,
     RouteType,
     Session,
@@ -341,6 +344,8 @@ def _make_ctx(
     external_conversation_id: str = "",
     content: str = "hello",
     metadata: dict[str, object] | None = None,
+    credit_action: str | None = None,
+    credit_slots: dict[str, object] | None = None,
 ) -> PipelineContext:
     event = InboundEvent(
         message_id="m-1",
@@ -360,7 +365,18 @@ def _make_ctx(
         channel=channel,
         external_conversation_id=external_conversation_id,
     )
-    return PipelineContext(event=event, trace_id="trace-1", session=session)
+    pre = PreprocessedMessage(original_text=content, cleaned_text=content)
+    if credit_action:
+        persist_decision(
+            IntentDecision(
+                domain=IntentDomain.CREDITS,
+                action=credit_action,
+                confidence=0.95,
+                slots=dict(credit_slots or {}),
+            ),
+            pre=pre,
+        )
+    return PipelineContext(event=event, trace_id="trace-1", session=session, pre=pre)
 
 
 def _make_amap_ctx(content: str) -> PipelineContext:
@@ -388,6 +404,7 @@ async def test_credit_query_command_step_returns_canned_balance_result() -> None
     ctx = _make_ctx(
         content="我还有多少积分",
         metadata={"wxbot_normalized_content": "我还有多少积分"},
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -414,6 +431,7 @@ async def test_credit_query_command_step_handles_bare_my_credits_phrase() -> Non
             "mentioned_me": True,
             "wxbot_normalized_content": "我的积分",
         },
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -440,6 +458,7 @@ async def test_credit_query_command_step_uses_external_managed_group_scope() -> 
             "wxbot_normalized_content": "我多少积分了",
             "sender_wxid": "u1",
         },
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -474,6 +493,7 @@ async def test_credit_query_command_step_routes_rank_phrases_to_leaderboard(
             "mentioned_me": content.startswith("@"),
             "wxbot_normalized_content": normalized,
         },
+        credit_action="rank",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -494,6 +514,7 @@ async def test_credit_query_command_step_routes_rank_phrase_before_faq() -> None
     ctx = _make_ctx(
         content="积分排名",
         metadata={"wxbot_normalized_content": "积分排名"},
+        credit_action="rank",
     )
     ctx.route = RouteDecision(type=RouteType.FAQ)
 
@@ -530,6 +551,7 @@ async def test_credit_query_command_step_routes_balance_phrases(
             "mentioned_me": content.startswith("@"),
             "wxbot_normalized_content": normalized,
         },
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -550,6 +572,7 @@ async def test_credit_query_command_step_routes_raw_mentioned_balance_phrases(co
     ctx = _make_ctx(
         content=content,
         metadata={"mentioned_me": True},
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1149,6 +1172,7 @@ async def test_credit_natural_language_balance_query_runs_silent_checkin_first()
             "mentioned_me": True,
             "wxbot_normalized_content": "我有多少积分",
         },
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1175,6 +1199,7 @@ async def test_credit_natural_language_self_balance_queries_still_work(normalize
             "mentioned_me": True,
             "wxbot_normalized_content": normalized,
         },
+        credit_action="balance_self",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1200,6 +1225,8 @@ async def test_credit_natural_language_can_query_other_member_by_display_name() 
             "mentioned_me": True,
             "wxbot_normalized_content": "鲸落有多少积分",
         },
+        credit_action="balance_other",
+        credit_slots={"target": "鲸落"},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1232,6 +1259,8 @@ async def test_credit_natural_language_other_member_explicit_queries_still_work(
             "mentioned_me": True,
             "wxbot_normalized_content": normalized,
         },
+        credit_action="balance_other",
+        credit_slots={"target": "老叶"},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1287,6 +1316,8 @@ async def test_credit_natural_language_rejects_reverse_transfer_without_member_l
             "mentioned_me": True,
             "wxbot_normalized_content": "帮我划走千羽10积分到我账户",
         },
+        credit_action="transfer_reverse_unauthorized",
+        credit_slots={"amount": 10},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1314,6 +1345,8 @@ async def test_credit_natural_language_rejects_self_transfer_without_balance_loo
             "mentioned_me": True,
             "wxbot_normalized_content": normalized,
         },
+        credit_action="transfer_self_to_other_unsupported",
+        credit_slots={"amount": 10},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1339,6 +1372,8 @@ async def test_credit_natural_language_can_query_other_member_by_extra_mention()
             "at_wxids": ["wxid_bot", "wxid_jingluo"],
             "wxbot_normalized_content": "@鲸落 有多少积分",
         },
+        credit_action="balance_other",
+        credit_slots={"target": "鲸落"},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1363,6 +1398,8 @@ async def test_credit_natural_language_raw_extra_mention_still_queries_other_mem
             "mentioned_me": True,
             "at_wxids": ["wxid_bot", "wxid_jingluo"],
         },
+        credit_action="balance_other",
+        credit_slots={"target": "鲸落", "target_user_id": "wxid_jingluo"},
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1385,6 +1422,7 @@ async def test_credit_natural_language_direct_checkin_uses_silent_checkin_result
             "mentioned_me": True,
             "wxbot_normalized_content": "签到",
         },
+        credit_action="checkin_action",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1411,6 +1449,7 @@ async def test_credit_direct_checkin_repeat_returns_no_repeat_tip() -> None:
             "mentioned_me": True,
             "wxbot_normalized_content": "签到",
         },
+        credit_action="checkin_action",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 
@@ -1438,6 +1477,7 @@ async def test_credit_natural_language_direct_checkin_in_silent_any_mode_returns
             "mentioned_me": False,
             "wxbot_normalized_content": "签到",
         },
+        credit_action="checkin_action",
     )
     ctx.route = RouteDecision(type=RouteType.LLM)
 

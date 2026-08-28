@@ -66,7 +66,7 @@ class _SessionManager:
 
 
 class _Preprocessor:
-    async def run(self, message: Message) -> PreprocessedMessage:
+    async def run(self, message: Message, **_kwargs) -> PreprocessedMessage:
         return PreprocessedMessage(
             original_text=message.content,
             cleaned_text=message.content.strip(),
@@ -406,6 +406,12 @@ def _finalizable_flow():
             ("commit", "core.commit_turns_and_publish"),
         ]
     )
+
+
+def test_preprocess_registry_timeout_covers_classify_retries() -> None:
+    definition = build_default_flow_registry().get("core.preprocess")
+    assert definition is not None
+    assert definition.timeout_seconds == 90.0
 
 
 def test_capability_dispatch_executor_uses_extended_timeout() -> None:
@@ -999,6 +1005,8 @@ async def test_core_capability_degrade_finalizes_busy_reply() -> None:
     assert result.status == FLOW_RUN_STOPPED
     assert result.stop_reason == "capability_degraded"
     assert bus.messages
+    assert ctx.extras.get("wxbot_force_send") is True
+    assert ctx.extras.get("degraded_reply_pending") is True
     assert ctx.result is not None
     assert ctx.result.route == RouteType.CANNED
     assert ctx.result.metadata["degradation_reason"] == "core.capability_dispatch_failed"

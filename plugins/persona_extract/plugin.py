@@ -262,7 +262,12 @@ class PersonaExtractPlugin(Plugin):
                     raise PersonaJobLeaseLost("persona job lease was lost")
             if not messages:
                 raise ValueError("no messages found")
-            if self._ctx.container.llm_service is None:
+            from plugins.local_agent.complete import resolve_local_backend
+
+            local_backend = resolve_local_backend(
+                str(getattr(self._ctx.settings, "persona_extract_llm_backend", "http") or "http")
+            )
+            if self._ctx.container.llm_service is None and not local_backend:
                 raise RuntimeError("persona_extract_llm_unavailable")
             await self._store.run_extraction(
                 job_id,
@@ -480,7 +485,7 @@ class PersonaExtractPlugin(Plugin):
                 owner=self.meta.name,
                 name="Persona skill enrich",
                 permissions=["storage:shared"],
-                inputs={"event", "session", "pre", "route"},
+                inputs={"event", "session", "pre"},
                 outputs={"signals.persona.skill"},
                 timeout_seconds=1.5,
                 error_policy="fail_open",

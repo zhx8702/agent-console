@@ -16,6 +16,7 @@ from plugins.memory.plugin import plugin as memory_plugin
 from plugins.moderation.plugin import plugin as moderation_plugin
 from plugins.persona_extract.plugin import plugin as persona_extract_plugin
 from plugins.repeater.plugin import plugin as repeater_plugin
+from plugins.speaker_portrait.plugin import plugin as speaker_portrait_plugin
 from plugins.tibo_reset.plugin import plugin as tibo_reset_plugin
 from plugins.wxbot.plugin import plugin as wxbot_plugin
 
@@ -31,6 +32,7 @@ def _all_plugin_flow_steps() -> list[FlowStepDefinition]:
             moderation_plugin,
             persona_extract_plugin,
             repeater_plugin,
+            speaker_portrait_plugin,
             tibo_reset_plugin,
             wxbot_plugin,
         )
@@ -82,6 +84,7 @@ def test_target_group_flows_compile_with_current_plugin_catalog() -> None:
         moderation_plugin,
         persona_extract_plugin,
         repeater_plugin,
+        speaker_portrait_plugin,
         tibo_reset_plugin,
         wxbot_plugin,
     )
@@ -132,6 +135,9 @@ def test_target_group_flows_compile_with_current_plugin_catalog() -> None:
         "plugin.tibo_reset.intent"
     )
     assert wechat_kinds.index("plugin.tibo_reset.intent") < wechat_kinds.index(
+        "plugin.persona_extract.skill_enrich"
+    )
+    assert wechat_kinds.index("plugin.persona_extract.skill_enrich") < wechat_kinds.index(
         "plugin.wxbot.reply_policy"
     )
     assert wechat_kinds.index("plugin.wxbot.user_ban_gate") < wechat_kinds.index(
@@ -178,6 +184,7 @@ def test_wechat_flow_remains_runnable_without_optional_tibo_plugin() -> None:
         moderation_plugin,
         persona_extract_plugin,
         repeater_plugin,
+        speaker_portrait_plugin,
         wxbot_plugin,
     )
     registry.register_many([step for plugin in plugins for step in plugin.get_flow_steps()])

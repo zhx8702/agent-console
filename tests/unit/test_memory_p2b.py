@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -194,6 +196,10 @@ def _ctx(
     session_id: str = "room@chatroom",
     channel: Channel = Channel.WECHAT,
     session_kind: str = "",
+    action: str = "",
+    query: str = "",
+    memory_content: str = "",
+    item_id: int | None = None,
 ) -> PipelineContext:
     metadata = {"source": "wxbot" if channel == Channel.WECHAT else channel.value}
     if session_kind:
@@ -214,11 +220,30 @@ def _ctx(
         user_id=session_id,
         channel=channel,
     )
+    pre = PreprocessedMessage(original_text=content, cleaned_text=content.strip())
+    if action:
+        slots: dict[str, Any] = {}
+        if memory_content:
+            slots["content"] = memory_content
+        if query:
+            slots["query"] = query
+        if item_id is not None:
+            slots["item_id"] = item_id
+        persist_decision(
+            IntentDecision(
+                domain=IntentDomain.MEMORY,
+                action=action,
+                confidence=0.95,
+                query=query or memory_content,
+                slots=slots,
+            ),
+            pre=pre,
+        )
     return PipelineContext(
         event=event,
         trace_id=event.trace_id,
         session=session,
-        pre=PreprocessedMessage(original_text=content, cleaned_text=content.strip()),
+        pre=pre,
     )
 
 
@@ -232,7 +257,7 @@ async def _run_hook(store: _Store, ctx: PipelineContext) -> str | None:
 @pytest.mark.asyncio
 async def test_group_remember_intent_is_blocked_without_member_memory_opt_in() -> None:
     store = _Store()
-    ctx = _ctx("帮我记一下 我喜欢 Adidas")
+    ctx = _ctx("帮我记一下 我喜欢 Adidas", action="remember", memory_content="我喜欢 Adidas")
     reply = await _run_hook(store, ctx)
 
     assert reply == "当前群未开启成员记忆，未保存。"
@@ -256,7 +281,7 @@ async def test_group_remember_intent_uses_session_audience_after_opt_in() -> Non
             retention_days=30,
         )
     )
-    reply = await _run_hook(store, _ctx("帮我记一下 我喜欢 Adidas"))
+    reply = await _run_hook(store, _ctx("帮我记一下 我喜欢 Adidas", action="remember", memory_content="我喜欢 Adidas"))
 
     assert reply == "已记住：我喜欢 Adidas"
     assert store.created[0]["user_id"] == "user-a"
@@ -278,7 +303,7 @@ async def test_group_remember_intent_uses_session_audience_after_opt_in() -> Non
 @pytest.mark.asyncio
 async def test_group_remember_intent_fails_closed_when_privacy_policy_load_fails() -> None:
     store = _Store(privacy_error=RuntimeError("policy unavailable"))
-    ctx = _ctx("记住 我默认要中文回复")
+    ctx = _ctx("记住 我默认要中文回复", action="remember", memory_content="我默认要中文回复")
 
     reply = await _run_hook(store, ctx)
 
@@ -297,7 +322,7 @@ async def test_group_remember_intent_fails_closed_without_privacy_loader() -> No
         )
     )
     store.get_group_member_privacy_policy = None  # type: ignore[method-assign]
-    ctx = _ctx("记住 我默认要中文回复")
+    ctx = _ctx("记住 我默认要中文回复", action="remember", memory_content="我默认要中文回复")
 
     reply = await _run_hook(store, ctx)
 
@@ -315,6 +340,8 @@ async def test_non_wechat_group_remember_uses_same_member_privacy_boundary() -> 
         session_id="feishu-group-1",
         channel=Channel.FEISHU,
         session_kind="group",
+        action="remember",
+        memory_content="我默认要中文回复",
     )
 
     reply = await _run_hook(store, ctx)
@@ -340,7 +367,7 @@ async def test_group_remember_intent_rejects_explicit_audience_without_current_g
         )
     )
 
-    reply = await _run_hook(store, _ctx("记住 我默认要中文回复"))
+    reply = await _run_hook(store, _ctx("记住 我默认要中文回复", action="remember", memory_content="我默认要中文回复"))
 
     assert reply == "当前群未开启成员记忆，未保存。"
     assert store.created == []
@@ -351,7 +378,12 @@ async def test_private_remember_intent_preserves_identity_scope() -> None:
     store = _Store()
     reply = await _run_hook(
         store,
-        _ctx("帮我记一下 我喜欢 Adidas", session_id="user-a"),
+        _ctx(
+        "帮我记一下 我喜欢 Adidas",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢 Adidas",
+    ),
     )
 
     assert reply == "已记住：我喜欢 Adidas"
@@ -365,7 +397,12 @@ async def test_private_remember_intent_preserves_identity_scope() -> None:
 @pytest.mark.asyncio
 async def test_private_remember_intent_respects_member_opt_out_or_deletion_pending() -> None:
     store = _Store(member_write_blocked=True)
-    ctx = _ctx("帮我记一下 我喜欢 Adidas", session_id="user-a")
+    ctx = _ctx(
+        "帮我记一下 我喜欢 Adidas",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢 Adidas",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -388,7 +425,12 @@ async def test_private_remember_preflight_prefers_public_member_write_check() ->
     private_check = AsyncMock(return_value=False)
     store.member_memory_write_blocked = public_check  # type: ignore[attr-defined]
     store._member_memory_write_blocked = private_check  # type: ignore[method-assign]
-    ctx = _ctx("帮我记一下 我喜欢 Adidas", session_id="user-a")
+    ctx = _ctx(
+        "帮我记一下 我喜欢 Adidas",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢 Adidas",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -406,7 +448,12 @@ async def test_private_remember_handles_member_opt_out_race_during_create() -> N
             status_code=409,
         )
     )
-    ctx = _ctx("帮我记一下 我喜欢 Adidas", session_id="user-a")
+    ctx = _ctx(
+        "帮我记一下 我喜欢 Adidas",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢 Adidas",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -429,7 +476,12 @@ async def test_private_remember_handles_member_opt_out_race_during_create() -> N
 @pytest.mark.asyncio
 async def test_private_remember_intent_fails_closed_when_member_control_load_fails() -> None:
     store = _Store(member_write_error=RuntimeError("member control unavailable"))
-    ctx = _ctx("帮我记一下 我喜欢 Adidas", session_id="user-a")
+    ctx = _ctx(
+        "帮我记一下 我喜欢 Adidas",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢 Adidas",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -455,7 +507,12 @@ async def test_private_list_and_search_are_blocked_after_member_opt_out(
         [_item(id=7, content="不应重新召回的个人记忆")],
         member_write_blocked=True,
     )
-    ctx = _ctx(command, session_id="user-a")
+    ctx = _ctx(
+        command,
+        session_id="user-a",
+        action=intent,
+        query="Adidas" if intent == "search" else "",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -478,7 +535,7 @@ async def test_private_exact_forget_remains_available_after_member_opt_out() -> 
         [_item(id=7, content="退出后仍应允许删除的个人记忆")],
         member_write_blocked=True,
     )
-    ctx = _ctx("忘记 #7", session_id="user-a")
+    ctx = _ctx("忘记 #7", session_id="user-a", action="forget", item_id=7)
 
     reply = await _run_hook(store, ctx)
 
@@ -493,7 +550,7 @@ async def test_private_exact_forget_remains_available_after_member_opt_out() -> 
 async def test_private_query_forget_after_opt_out_deletes_without_disclosing_content() -> None:
     secret = "退出后不应回显的个人秘密"
     store = _Store([_item(id=7, content=secret, match_count=1)], member_write_blocked=True)
-    ctx = _ctx("忘记 个人秘密", session_id="user-a")
+    ctx = _ctx("忘记 个人秘密", session_id="user-a", action="forget", query="个人秘密")
 
     reply = await _run_hook(store, ctx)
 
@@ -535,7 +592,15 @@ async def test_bilingual_remember_variants_are_explicit_and_anchored(
 ) -> None:
     store = _Store()
 
-    reply = await _run_hook(store, _ctx(command, session_id="user-a"))
+    reply = await _run_hook(
+        store,
+        _ctx(
+            command,
+            session_id="user-a",
+            action="remember",
+            memory_content=expected_content,
+        ),
+    )
 
     assert reply == f"已记住：{expected_content}"
     assert store.created[0]["content"] == expected_content
@@ -561,7 +626,12 @@ async def test_bilingual_list_and_search_variants_use_memory_only_scope(
     expected_query: str,
 ) -> None:
     store = _Store([_item(id=7, content="用户喜欢 Adidas", match_count=1)])
-    ctx = _ctx(command, session_id="user-a")
+    ctx = _ctx(
+        command,
+        session_id="user-a",
+        action=intent,
+        query=expected_query,
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -599,7 +669,7 @@ async def test_bilingual_full_forget_clears_current_member_even_after_opt_out(
         ],
         member_write_blocked=True,
     )
-    ctx = _ctx(command, session_id="user-a")
+    ctx = _ctx(command, session_id="user-a", action="forget_all")
 
     reply = await _run_hook(store, ctx)
 
@@ -641,7 +711,7 @@ async def test_group_full_forget_only_erases_current_member_not_other_members_or
             audience_scope="session",
         ),
     )
-    ctx = _ctx("清空我的全部记忆", user_id="user-a")
+    ctx = _ctx("清空我的全部记忆", user_id="user-a", action="forget_all")
 
     reply = await _run_hook(store, ctx)
 
@@ -671,7 +741,7 @@ async def test_full_forget_structured_partial_result_reports_residual_truthfully
             },
         }
     )
-    ctx = _ctx("delete all my memories", session_id="user-a")
+    ctx = _ctx("delete all my memories", session_id="user-a", action="forget_all")
 
     reply = await _run_hook(store, ctx)
 
@@ -690,7 +760,7 @@ async def test_full_forget_structured_partial_result_reports_residual_truthfully
 @pytest.mark.asyncio
 async def test_full_forget_structured_result_requires_explicit_complete_confirmation() -> None:
     store = _Store(full_forget_result={"count": 2})
-    ctx = _ctx("清空我的所有记忆", session_id="user-a")
+    ctx = _ctx("清空我的所有记忆", session_id="user-a", action="forget_all")
 
     reply = await _run_hook(store, ctx)
 
@@ -723,7 +793,7 @@ async def test_full_forget_falls_back_to_legacy_int_api_without_channel_keyword(
 
     store.forget_member_detailed = None  # type: ignore[method-assign]
     store.forget_member = legacy_forget_member  # type: ignore[method-assign]
-    ctx = _ctx("清空我的所有记忆", session_id="user-a")
+    ctx = _ctx("清空我的所有记忆", session_id="user-a", action="forget_all")
 
     reply = await _run_hook(store, ctx)
 
@@ -750,6 +820,7 @@ async def test_full_forget_passes_non_wechat_channel_scope() -> None:
         "delete all my memories",
         session_id="discord-channel",
         channel=Channel.DISCORD,
+        action="forget_all",
     )
 
     reply = await _run_hook(store, ctx)
@@ -775,7 +846,16 @@ async def test_full_forget_passes_non_wechat_channel_scope() -> None:
 async def test_bilingual_forget_variants_delete_only_one_confirmed_match(command: str) -> None:
     store = _Store([_item(id=7, content="用户喜欢 Adidas")])
 
-    reply = await _run_hook(store, _ctx(command, session_id="user-a"))
+    reply = await _run_hook(
+        store,
+        _ctx(
+            command,
+            session_id="user-a",
+            action="forget",
+            query="" if "#7" in command else "Adidas",
+            item_id=7 if "#7" in command else None,
+        ),
+    )
 
     assert str(reply).startswith("已删除 1 条匹配记忆记录")
     expected_call_count = 2 if "#7" in command else 1
@@ -851,7 +931,12 @@ async def test_remember_feedback_reflects_confirmed_store_outcome(
     outcome: str,
 ) -> None:
     store = _Store(create_result=create_result)
-    ctx = _ctx("记住 我喜欢绿茶", session_id="user-a")
+    ctx = _ctx(
+        "记住 我喜欢绿茶",
+        session_id="user-a",
+        action="remember",
+        memory_content="我喜欢绿茶",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -873,7 +958,7 @@ async def test_forget_partial_result_reports_residual_without_claiming_full_forg
             "residual_count": 2,
         },
     )
-    ctx = _ctx("忘记 #7", session_id="user-a")
+    ctx = _ctx("忘记 #7", session_id="user-a", action="forget", item_id=7)
 
     reply = await _run_hook(store, ctx)
 
@@ -892,7 +977,7 @@ async def test_forget_single_match_soft_deletes() -> None:
         [_item(id=7, content="用户喜欢 Adidas")],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("忘记 Adidas"))
+    reply = await _run_hook(store, _ctx("忘记 Adidas", action="forget", query="Adidas"))
 
     assert reply == "已删除 1 条匹配记忆记录。相关摘要或派生信息可能需要稍后完成清理。"
     assert store.forget_calls == [
@@ -920,7 +1005,7 @@ async def test_forget_query_ignores_visible_fallback_and_deletes_only_real_match
         ],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("忘记 Adidas"))
+    reply = await _run_hook(store, _ctx("忘记 Adidas", action="forget", query="Adidas"))
 
     assert reply == "已删除 1 条匹配记忆记录。相关摘要或派生信息可能需要稍后完成清理。"
     assert store.forget_calls == [
@@ -949,7 +1034,7 @@ async def test_forget_multi_candidates_does_not_delete_and_returns_candidates() 
         ],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("忘记 Adidas"))
+    reply = await _run_hook(store, _ctx("忘记 Adidas", action="forget", query="Adidas"))
 
     assert reply is not None
     assert "找到多条匹配记忆" in reply
@@ -965,7 +1050,7 @@ async def test_forget_pinned_or_manual_does_not_auto_delete() -> None:
         [_item(id=3, content="用户是 VIP", source_type="manual", pinned=True)],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("忘记 VIP"))
+    reply = await _run_hook(store, _ctx("忘记 VIP", action="forget", query="VIP"))
 
     assert reply is not None
     assert "受保护记忆" in reply
@@ -986,7 +1071,7 @@ async def test_search_excludes_pending_deleted_invalidated_sensitive() -> None:
         ],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("我有哪些记忆"))
+    reply = await _run_hook(store, _ctx("我有哪些记忆", action="list"))
 
     assert reply == "找到 1 条记忆：\n- #1 可见记忆"
 
@@ -1000,7 +1085,7 @@ async def test_search_query_excludes_visible_fallback_rows() -> None:
         ],
         privacy_policy=_group_recall_policy(),
     )
-    reply = await _run_hook(store, _ctx("搜索记忆 Adidas"))
+    reply = await _run_hook(store, _ctx("搜索记忆 Adidas", action="search", query="Adidas"))
 
     assert reply == "找到 1 条记忆：\n- #1 用户喜欢 Adidas"
 
@@ -1015,8 +1100,12 @@ async def test_group_user_a_b_isolation() -> None:
         privacy_policy=_group_recall_policy(),
     )
 
-    reply_a = await _run_hook(store, _ctx("查一下我的记忆", user_id="user-a"))
-    reply_b = await _run_hook(store, _ctx("查一下我的记忆", user_id="user-b"))
+    reply_a = await _run_hook(
+        store, _ctx("查一下我的记忆", user_id="user-a", action="list")
+    )
+    reply_b = await _run_hook(
+        store, _ctx("查一下我的记忆", user_id="user-b", action="list")
+    )
 
     assert "A 的记忆" in str(reply_a)
     assert "B 的记忆" not in str(reply_a)
@@ -1045,7 +1134,11 @@ async def test_group_list_and_search_are_blocked_without_recall_consent(
             audience_scope="session",
         ),
     )
-    ctx = _ctx(command)
+    ctx = _ctx(
+        command,
+        action=intent,
+        query="秘密" if intent == "search" else "",
+    )
 
     reply = await _run_hook(store, ctx)
 
@@ -1081,7 +1174,7 @@ async def test_group_exact_forget_remains_available_without_recall_consent() -> 
             audience_scope="session",
         ),
     )
-    ctx = _ctx("忘记 #7")
+    ctx = _ctx("忘记 #7", action="forget", item_id=7)
 
     reply = await _run_hook(store, ctx)
 
@@ -1111,7 +1204,7 @@ async def test_group_query_forget_without_recall_consent_deletes_single_match_pr
             audience_scope="session",
         ),
     )
-    ctx = _ctx("忘记 配送偏好")
+    ctx = _ctx("忘记 配送偏好", action="forget", query="配送偏好")
 
     reply = await _run_hook(store, ctx)
 
@@ -1141,7 +1234,7 @@ async def test_group_query_forget_without_recall_consent_redacts_ambiguous_candi
             audience_scope="session",
         ),
     )
-    ctx = _ctx("忘记 秘密偏好")
+    ctx = _ctx("忘记 秘密偏好", action="forget", query="秘密偏好")
 
     reply = await _run_hook(store, ctx)
 
@@ -1171,7 +1264,7 @@ async def test_faq_ordinary_message_not_intercepted() -> None:
 async def test_memory_control_step_stops_before_ordinary_route() -> None:
     store = _Store()
     step = MemoryControlStep(store)  # type: ignore[arg-type]
-    result = await step.run(_ctx("记住 我默认要中文回复"))
+    result = await step.run(_ctx("记住 我默认要中文回复", action="remember", memory_content="我默认要中文回复"))
 
     assert result.action == "stop"
     assert result.reason == "memory_control_intent"

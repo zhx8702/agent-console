@@ -163,7 +163,7 @@ async def test_rag_engine_injects_style_and_memory_into_system_prompt() -> None:
     system = llm.last_request.system or ""
     assert "<persona_style_data>" in system
     assert "请使用稳定、克制的客服语气。" in system
-    assert "身份与事实硬约束" in system
+    assert "你就是当前这个人" in system
     assert "历史记忆" in system
     assert "参考资料为准" in system
 

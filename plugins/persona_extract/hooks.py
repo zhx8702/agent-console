@@ -110,7 +110,7 @@ class PersonaSkillEnrichStep:
     owner: str = "persona_extract"
     name: str = "Persona skill enrich"
     permissions: list[str] = field(default_factory=lambda: ["storage:shared"])
-    inputs: set[str] = field(default_factory=lambda: {"event", "session", "pre", "route"})
+    inputs: set[str] = field(default_factory=lambda: {"event", "session", "pre"})
     outputs: set[str] = field(default_factory=lambda: {"signals.persona.skill"})
     timeout_seconds: float = 1.5
     error_policy: str = "fail_open"

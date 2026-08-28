@@ -38,6 +38,8 @@ from app.common.context import get_trace_id
 from app.common.context_budget import select_recent_turns
 from app.common.conversation import render_turn as render_conversation_turn
 from app.common.ids import new_trace_id
+from app.common.intent import IntentDomain
+from app.common.intent_runtime import decision_from_pre, is_confident, slot_int, slot_text
 from app.common.logging import get_logger
 from app.common.prompting import augment_prompt_with_persona_and_memory, chat_system_prompt
 from app.common.tool_projection import project_tool_result
@@ -887,7 +889,8 @@ class AgentCapabilityEngine:
                 arguments.get("line_title"),
             )
         )
-        return bool(re.search(r"(一日游|多日游|路线|行程|旅游|旅行|打卡|多点)", text))
+        _ = text
+        return False
 
     @staticmethod
     def _tool_call_result_ok(result: Any) -> bool:
@@ -1280,10 +1283,10 @@ class AgentCapabilityEngine:
         if any(item.name == "amap_create_personal_map" for item in executed_tool_calls):
             return None
         text = f"{pre.original_text or ''}\n{pre.cleaned_text or ''}"
-        if not self._explicit_map_generation_requested(text):
+        if not self._explicit_map_generation_requested(text, pre=pre):
             return None
         points = self._collect_personal_map_points(
-            executed_tool_calls, limit=self._requested_point_limit(text)
+            executed_tool_calls, limit=self._requested_point_limit(text, pre=pre)
         )
         if not points:
             return None
@@ -1302,25 +1305,23 @@ class AgentCapabilityEngine:
         return await self._execute_tool_call(session, tool_call, tools)
 
     @staticmethod
-    def _explicit_map_generation_requested(text: str) -> bool:
-        value = str(text or "")
+    @staticmethod
+    def _explicit_map_generation_requested(text: str, *, pre=None) -> bool:
+        _ = text
+        decision = decision_from_pre(pre)
         return bool(
-            re.search(r"(生成|创建|做成|标记到|整理成).{0,8}(高德)?地图", value)
-            or re.search(r"(高德)?地图.{0,8}(二维码|分享)", value)
-            or re.search(r"(打卡地图|路线地图|地图二维码|生成二维码)", value)
+            is_confident(decision)
+            and decision.domain is IntentDomain.MAP
+            and decision.action == "generate"
         )
 
     @staticmethod
-    def _requested_point_limit(text: str) -> int:
-        match = re.search(
-            r"(?:包含|含|找|选|规划)\s*(\d{1,2})\s*(?:个|家|处)?(?:点|地点|店|景点)?", text
-        )
-        if not match:
+    def _requested_point_limit(text: str, *, pre=None) -> int:
+        _ = text
+        limit = slot_int(decision_from_pre(pre), "point_limit")
+        if limit is None:
             return 5
-        try:
-            return max(1, min(16, int(match.group(1))))
-        except ValueError:
-            return 5
+        return max(1, min(16, limit))
 
     @staticmethod
     def _personal_map_name(pre: PreprocessedMessage) -> str:
@@ -1387,8 +1388,9 @@ class AgentCapabilityEngine:
 
     @staticmethod
     def _looks_like_non_route_poi(name: str) -> bool:
-        return bool(
-            re.search(r"(酒店|公寓|宾馆|地铁站|停车场|停车|入口|出口|公交站)$", str(name or ""))
+        value = str(name or "")
+        return value.endswith(
+            ("酒店", "公寓", "宾馆", "地铁站", "停车场", "停车", "入口", "出口", "公交站")
         )
 
     @classmethod
@@ -1407,13 +1409,13 @@ class AgentCapabilityEngine:
         if not cls._looks_like_amap_address_prompt(response_text):
             return None
         query_text = str(pre.cleaned_text or pre.original_text or "").strip()
-        if not cls._looks_like_amap_place_query(query_text):
+        if not cls._looks_like_amap_place_query(query_text, pre=pre):
             return None
-        keywords = cls._amap_fallback_keywords(query_text)
+        keywords = cls._amap_fallback_keywords(query_text, pre=pre)
         if not keywords:
             return None
         arguments: dict[str, Any] = {"keywords": keywords, "limit": 10}
-        city = cls._amap_fallback_city(query_text)
+        city = cls._amap_fallback_city(query_text, pre=pre)
         if city:
             arguments["city"] = city
         return ToolCall(
@@ -1424,74 +1426,27 @@ class AgentCapabilityEngine:
 
     @staticmethod
     def _looks_like_amap_address_prompt(text: str) -> bool:
-        value = str(text or "").strip()
-        if not value:
-            return False
-        return bool(
-            re.search(
-                r"(请|麻烦|需要|提供|告诉|补充).{0,12}(地址|位置|地点|起点|终点|目的地|当前位置)",
-                value,
-            )
-            or re.search(
-                r"(地址|位置|地点|起点|终点|目的地|当前位置).{0,12}(是什么|是哪里|在哪|提供|告诉)",
-                value,
-            )
-            or re.search(r"(要|想|准备).{0,8}(查|找|去).{0,8}(哪里|哪儿|哪个地方)", value)
-        )
+        _ = text
+        return False
 
     @staticmethod
-    def _looks_like_amap_place_query(text: str) -> bool:
-        return bool(
-            re.search(
-                r"(地点|附近|周边|餐厅|景点|咖啡|商场|导航|路线|旅游|打卡|地图|位置|地址|在哪|哪里|怎么走|怎么去|楼栋|公司|酒店|美食|店|公园|医院|学校|大厦|广场|机场|火车站|地铁站)",
-                str(text or ""),
-            )
-        )
+    def _looks_like_amap_place_query(text: str, *, pre=None) -> bool:
+        _ = text
+        decision = decision_from_pre(pre)
+        return bool(is_confident(decision) and decision.domain is IntentDomain.MAP)
 
     @classmethod
-    def _amap_fallback_keywords(cls, text: str) -> str:
-        value = _GROUP_MENTION_PREFIX_RE.sub("", str(text or "").strip(), count=1)
-        replacements = [
-            r"(@\S+)",
-            r"(帮我|帮忙|麻烦|请|查一下|查询|找一下|找找|搜索|看一下|问一下|告诉我)",
-            r"(高德地图|高德|地图二维码|二维码)",
-            r"(生成|创建|做成|分享)",
-            r"(的)?(具体)?(位置|地址)",
-            r"(精确到楼栋|精确到楼|在哪里|在哪儿|在哪|哪里|怎么走|怎么去|怎么到|如何去|导航|路线)",
-            r"(附近|周边|有几家|几家|多少家|有哪些|有什么)",
-        ]
-        for pattern in replacements:
-            value = re.sub(pattern, " ", value)
-        value = re.sub(r"[，,。！!？?；;：:\[\]【】]+", " ", value)
-        value = re.sub(r"\s+", " ", value).strip(" -_/,")
-        return value[:80]
+    def _amap_fallback_keywords(cls, text: str, *, pre=None) -> str:
+        decision = decision_from_pre(pre)
+        keywords = slot_text(decision, "keywords", "query")
+        if keywords:
+            return keywords[:80]
+        return str(text or "").strip()[:80]
 
     @staticmethod
-    def _amap_fallback_city(text: str) -> str:
-        value = str(text or "")
-        parenthesized = re.search(r"[（(]([一-鿿]{2,8})(?:市)?[）)]", value)
-        if parenthesized:
-            return parenthesized.group(1)
-        city_match = re.search(r"([一-鿿]{2,8}市)", value)
-        if city_match:
-            return city_match.group(1)
-        for city in (
-            "北京",
-            "上海",
-            "广州",
-            "深圳",
-            "武汉",
-            "长沙",
-            "杭州",
-            "南京",
-            "成都",
-            "重庆",
-            "西安",
-            "苏州",
-        ):
-            if city in value:
-                return city
-        return ""
+    def _amap_fallback_city(text: str, *, pre=None) -> str:
+        _ = text
+        return slot_text(decision_from_pre(pre), "city")
 
     def _generation_config(
         self,

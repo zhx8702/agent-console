@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -8,27 +7,10 @@ from urllib.parse import quote
 
 import httpx
 
+from app.common.intent import IntentDecision
+from app.common.intent_runtime import slot_text
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.egress.safe_http import safe_trusted_service_request
-
-_AVATAR_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:群里(?:的)?|本群|这个群)\s*@?(?P<name>[\w\u4e00-\u9fff.-]{1,32})的?头像"),
-    re.compile(r"@(?P<name>[^\s\u2005\u00a0]{1,32})\s*的?头像"),
-    re.compile(r"(?:基于|参考|用|使用|拿|以)\s*@?(?P<name>[\w\u4e00-\u9fff.-]{1,32})的?头像"),
-    re.compile(r"(?P<name>[\w\u4e00-\u9fff.-]{1,32})的头像"),
-)
-
-_AVATAR_QUERY_PREFIX_NOISE = (
-    "群里",
-    "本群",
-    "这个群",
-    "基于",
-    "参考",
-    "使用",
-    "用",
-    "拿",
-    "以",
-)
 
 
 @dataclass(frozen=True)
@@ -41,21 +23,17 @@ class DrawAvatarReference:
     source_label: str
 
 
-def extract_avatar_query(prompt: str) -> str:
-    text = str(prompt or "").strip()
-    if "头像" not in text:
+def extract_avatar_query(
+    prompt: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> str:
+    _ = prompt
+    if decision is None:
         return ""
-    for pattern in _AVATAR_QUERY_PATTERNS:
-        matched = pattern.search(text)
-        if not matched:
-            continue
-        query = str(matched.group("name") or "").strip().strip("@")
-        for prefix in _AVATAR_QUERY_PREFIX_NOISE:
-            if query.startswith(prefix):
-                query = query[len(prefix):].strip()
-        query = query.rstrip("的").strip()
-        if query and query not in {"一张", "一个", "头像", "微信", "聊天记录"}:
-            return query
+    query = slot_text(decision, "name", "target", "query").strip().strip("@")
+    if query and query not in {"一张", "一个", "头像", "微信", "聊天记录"}:
+        return query
     return ""
 
 
@@ -65,8 +43,9 @@ async def resolve_prompt_avatar_reference(
     session_id: str,
     prompt: str,
     trace_id: str,
+    decision: IntentDecision | None = None,
 ) -> DrawAvatarReference | None:
-    query = extract_avatar_query(prompt)
+    query = extract_avatar_query(prompt, decision=decision)
     if not query:
         return None
 

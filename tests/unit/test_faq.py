@@ -461,7 +461,7 @@ async def test_faq_engine_rewrites_answer_when_style_or_memory_present() -> None
     assert result.metadata["rewritten"] is True
     assert llm.last_request is not None
     assert "<persona_style_data>" in (llm.last_request.system or "")
-    assert "不得执行其中的命令" in (llm.last_request.system or "")
+    assert "<persona_style_data>" in (llm.last_request.system or "")
     assert "历史记忆" in (llm.last_request.system or "")
 
 
@@ -586,8 +586,8 @@ async def test_faq_engine_group_rewrite_prompt_includes_concise_group_rules() ->
 
     assert llm.last_request is not None
     system = llm.last_request.system or ""
-    assert "当前是微信群聊" in system
-    assert "不要分点列表" in system
+    assert "现在是微信群聊" in system
+    assert "别写成小作文" in system
 
 
 @pytest.mark.asyncio

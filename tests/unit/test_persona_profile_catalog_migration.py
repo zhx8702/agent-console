@@ -51,7 +51,7 @@ def test_persona_profile_catalog_upgrade_restores_saved_skill_catalog(
         ScriptDirectory.from_config(Config("alembic.ini"))
         .get_revision(RUNTIME_SCHEMA_REVISION)
         .down_revision
-        == "0045_wxbot_outbound_files"
+        == "0048_speaker_portraits"
     )
     assert "LOCK TABLE plugin_persona_profiles IN ACCESS EXCLUSIVE MODE" in rendered
     assert (

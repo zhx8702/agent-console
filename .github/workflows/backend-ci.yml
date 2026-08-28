@@ -60,6 +60,7 @@ jobs:
       COMPOSE_PROD_QDRANTDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-qdrantdata
       COMPOSE_PROD_CONFIGDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-configdata
       COMPOSE_PROD_DRAWDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-drawdata
+      COMPOSE_PROD_VIDEODATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-videodata
       COMPOSE_PROD_AMAPDATA_VOLUME: agent-console-prod-ci-${{ github.run_id }}-${{ github.run_attempt }}-amapdata
       COMPOSE_POSTGRES_PASSWORD: ci_prod_postgres_password
       COMPOSE_DB_DSN: postgresql+asyncpg://cs:ci_prod_postgres_password@postgres:5432/cs

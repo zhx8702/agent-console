@@ -10,6 +10,7 @@ from app.billing import BillingCoordinator, BillingReservation, BillingResource,
 from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, ChannelTarget
 from app.common.context import get_trace_id
 from app.common.ids import new_trace_id
+from app.common.intent_runtime import decision_from_session
 from app.common.logging import get_logger
 from app.common.prompting import persona_response_language
 from app.common.types import Role, Session
@@ -202,6 +203,7 @@ class DrawAgentToolService:
                 session_id=session_id,
                 prompt=prompt,
                 trace_id=trace_id,
+                decision=decision_from_session(session),
             )
             if avatar_ref is not None and (avatar_ref.image_path or avatar_ref.avatar_url):
                 result = await self._store.edit_reference_image(

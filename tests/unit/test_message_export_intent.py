@@ -6,6 +6,8 @@ from app.agent.engine import AgentCapabilityEngine
 from app.agent.registry import AgentToolDefinition, AgentToolRegistry
 from app.agent.scopes import MESSAGE_EXPORT_SCOPE, agent_scope_system_hint
 from app.common.config import Settings
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     Channel,
     ChatResponse,
@@ -52,6 +54,7 @@ def _pipeline_context(
     *,
     session_id: str,
     mentioned_me: bool = False,
+    export_intent: bool = True,
 ) -> PipelineContext:
     session = Session(
         session_id=session_id,
@@ -73,7 +76,18 @@ def _pipeline_context(
             "wxbot_normalized_content": text,
         },
     )
-    return PipelineContext(event=event, trace_id=event.trace_id, session=session)
+    pre = PreprocessedMessage(original_text=text, cleaned_text=text)
+    if export_intent:
+        persist_decision(
+            IntentDecision(
+                domain=IntentDomain.FILE,
+                action="export_history",
+                confidence=0.95,
+                slots={"delivery_required": True, "format": "txt"},
+            ),
+            pre=pre,
+        )
+    return PipelineContext(event=event, trace_id=event.trace_id, session=session, pre=pre)
 
 
 @pytest.mark.parametrize(
@@ -90,7 +104,13 @@ def _pipeline_context(
     ],
 )
 def test_message_export_intent_requires_explicit_combined_request(text: str) -> None:
-    assert _message_export_requested(text) is True
+    decision = IntentDecision(
+        domain=IntentDomain.FILE,
+        action="export_history",
+        confidence=0.95,
+        slots={"delivery_required": True},
+    )
+    assert _message_export_requested(text, decision=decision) is True
 
 
 @pytest.mark.parametrize(
@@ -107,12 +127,20 @@ def test_recent_message_export_minutes_are_parsed_deterministically(
     text: str,
     expected_minutes: int,
 ) -> None:
-    intent = classify_file_intent(text)
+    intent = classify_file_intent(
+        text,
+        decision=IntentDecision(
+            domain=IntentDomain.FILE,
+            action="export_history",
+            confidence=0.95,
+            slots={"delivery_required": True, "recent_minutes": expected_minutes},
+        ),
+    )
 
     assert intent.operation == "export_history"
     assert intent.delivery_required is True
     assert intent.recent_minutes == expected_minutes
-    assert parse_recent_message_minutes(text) == expected_minutes
+    assert parse_recent_message_minutes(text) is None
 
 
 @pytest.mark.parametrize(
@@ -138,7 +166,15 @@ def test_recent_message_export_rejects_future_or_effort_durations(text: str) -> 
     ],
 )
 def test_ambiguous_or_negated_recent_ranges_are_marked_invalid(text: str) -> None:
-    intent = classify_file_intent(text)
+    intent = classify_file_intent(
+        text,
+        decision=IntentDecision(
+            domain=IntentDomain.FILE,
+            action="export_history",
+            confidence=0.95,
+            slots={"delivery_required": True, "recent_minutes_invalid": True},
+        ),
+    )
 
     assert intent.operation == "export_history"
     assert intent.recent_minutes is None
@@ -223,10 +259,12 @@ async def test_private_session_enables_only_combined_message_export_intent() -> 
     ordinary_summary = _pipeline_context(
         "帮我汇总今天的聊天记录",
         session_id="wxid_private",
+        export_intent=False,
     )
     group_query = _pipeline_context(
         "群里有哪些人",
         session_id="wxid_private",
+        export_intent=False,
     )
 
     await hook.run(ordinary_summary)

@@ -269,6 +269,7 @@ class PreprocessedMessage(_Base):
     sensitive: bool = False
     block_reason: str | None = None
     intent_coarse: IntentCoarse = IntentCoarse.UNKNOWN
+    semantic_intent: dict[str, Any] = Field(default_factory=dict)
     emotion: EmotionLabel = EmotionLabel.NEUTRAL
     entities: list[Entity] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
@@ -331,6 +332,11 @@ class ChatResponse(_Base):
     finish_reason: str = "stop"
     usage: ChatUsage = Field(default_factory=ChatUsage)
     latency_ms: int = 0
+    # Provider-neutral facts inferred from the model response, such as the
+    # hosted tool selected by a Responses API call.  Keep this separate from
+    # ``CapabilityResult.metadata`` so callers can audit the actual provider
+    # decision without parsing provider-specific response objects.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Egress ------------------------------------------------------------------

@@ -175,7 +175,7 @@ COMPOSE_LLM_EMBED_PROVIDER=fake
 
 如果使用已有 Grok 网关，也可以直接设置 `GROK_MODELS_BASE_URL` 和 `XAI_API_KEY`；这两个变量会映射到同一套 OpenAI-compatible 配置，并覆盖对应的 `OPENAI_*` 值。
 
-原生 xAI 地址会自动使用 xAI 的工具格式：Responses 函数工具不发送不兼容的 `strict=false`，Chat 工具结果不附加网关专用的 `call_id`，并将 `web_search_preview` 兼容为 `web_search`。如果启用联网搜索，可将 `COMPOSE_OPENAI_WEB_SEARCH_ENABLED=true`，工具名使用 `web_search` 或 `x_search`。xAI 不提供本项目所需的 Embedding 接口时，知识库保持 `fake` embedding，或另行配置支持 Embedding 的 provider。
+原生 xAI 地址会自动使用 xAI 的工具格式：Responses 函数工具不发送不兼容的 `strict=false`，Chat 工具结果不附加网关专用的 `call_id`，并将 `web_search_preview` 兼容为 `web_search`。如果启用联网搜索，可将 `COMPOSE_OPENAI_WEB_SEARCH_ENABLED=true`，工具名使用 `web_search` 或 `x_search`。普通 LLM 对话会把 `web_search`/`x_search` 作为可选原生工具，由模型按语义选择，不再依赖本地关键词正则；实际工具调用会记录为结构化意图。xAI 不提供本项目所需的 Embedding 接口时，知识库保持 `fake` embedding，或另行配置支持 Embedding 的 provider。
 
 ### 知识库与 Qdrant
 

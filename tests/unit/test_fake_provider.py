@@ -19,6 +19,21 @@ def _req(text: str, *, tools: list[ToolSchema] | None = None) -> ChatRequest:
 
 
 @pytest.mark.asyncio
+async def test_fake_chat_classifies_handoff_for_intent_route() -> None:
+    provider = FakeProvider()
+    resp = await provider.chat(
+        ChatRequest(
+            tenant_id="demo",
+            trace_id="trace-classify",
+            messages=[ChatMessage(role=Role.USER, content="转人工")],
+            metadata={"route": "intent_classify"},
+        )
+    )
+    assert '"domain": "handoff"' in resp.content
+    assert '"action": "request"' in resp.content
+
+
+@pytest.mark.asyncio
 async def test_fake_chat_canned_reply() -> None:
     provider = FakeProvider()
     resp = await provider.chat(_req("你好"))

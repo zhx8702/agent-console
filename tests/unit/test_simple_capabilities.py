@@ -8,10 +8,26 @@ import pytest
 from app.common.config import Settings
 from app.common.context import clear_context, set_trace_id
 from app.common.image_preview import FetchedImage
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import Channel, ChatResponse, ChatUsage, Role, Session, Turn
 from app.orchestrator.simple_capabilities import LLMCapabilityEngine, parse_at_wxids
 
 from ._fake_llm import make_preprocessed
+
+
+def _avatar_pre(text: str, *, name: str = ""):
+    pre = make_preprocessed(text)
+    persist_decision(
+        IntentDecision(
+            domain=IntentDomain.AVATAR,
+            action="analyze",
+            confidence=0.95,
+            slots={"name": name} if name else {},
+        ),
+        pre=pre,
+    )
+    return pre
 
 
 class _CapturingLLMService:
@@ -137,7 +153,7 @@ async def test_llm_capability_injects_style_and_user_memory_into_system_prompt()
     system = llm.last_request.system or ""
     assert "<persona_style_data>" in system
     assert "请用克制、专业的客服口吻回复。" in system
-    assert "身份与事实硬约束" in system
+    assert "你就是当前这个人" in system
     assert "短期记忆" in system
     assert "长期记忆" in system
 
@@ -154,6 +170,31 @@ async def test_llm_capability_can_disable_customer_service_prompt_style() -> Non
     assert llm.last_request is not None
     assert "客户服务助手" not in (llm.last_request.system or "")
     assert "不要使用客服专用话术" in (llm.last_request.system or "")
+
+
+@pytest.mark.asyncio
+async def test_llm_capability_uses_native_tool_choice_instead_of_keyword_search_rules() -> None:
+    llm = _CapturingLLMService()
+    settings = Settings(openai_web_search_enabled=True)
+    engine = LLMCapabilityEngine(llm, settings=settings)
+    session = Session(session_id="s1", tenant_id="demo", user_id="u1", channel=Channel.WEB)
+
+    result = await engine.answer(make_preprocessed("x上搜一下怎么快速搞钱"), session)
+
+    assert llm.last_request is not None
+    assert llm.last_request.metadata["openai_web_search"] is True
+    assert llm.last_request.metadata["openai_web_search_required"] is False
+    assert llm.last_request.metadata["semantic_intent_mode"] == "native_tool_choice"
+    assert result.metadata["semantic_intent"] == {
+        "operation": "converse",
+        "source": "none",
+        "artifact": "text",
+        "domain": "none",
+        "confidence": 0.0,
+        "needs_tool": False,
+        "query": "x上搜一下怎么快速搞钱",
+    }
+    assert result.metadata["web_search_used"] is False
 
 
 @pytest.mark.asyncio
@@ -200,7 +241,7 @@ async def test_llm_capability_formats_group_history_with_speaker_and_skips_dupli
         "当前发言人[小石]（明确 @ 了你；消息里的机器人称呼指你本人）：签到"
     )
     assert "@zzz" not in "\n".join(contents)
-    assert "原消息中的机器人昵称是在直接称呼你" in (llm.last_request.system or "")
+    assert "明确 @ 了才是在叫你" in (llm.last_request.system or "")
 
 
 @pytest.mark.asyncio
@@ -997,7 +1038,7 @@ async def test_llm_capability_attaches_mentioned_avatar_by_at_wxid(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1053,7 +1094,7 @@ async def test_llm_capability_attaches_ordered_second_mention_without_bot_wxid(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1107,7 +1148,7 @@ async def test_llm_capability_mentioned_avatar_falls_back_to_group_display_name(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("看下千雨的头像"), session)
+        await engine.answer(_avatar_pre("看下千雨的头像", name="千雨"), session)
     finally:
         clear_context()
 
@@ -1155,7 +1196,7 @@ async def test_llm_capability_mentioned_avatar_falls_back_to_name_when_id_not_in
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 看下他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 看下他的头像"), session)
     finally:
         clear_context()
 
@@ -1202,7 +1243,7 @@ async def test_llm_capability_mentioned_avatar_falls_back_to_personal_nickname(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("阿棋的头像是谁"), session)
+        await engine.answer(_avatar_pre("阿棋的头像是谁", name="阿棋"), session)
     finally:
         clear_context()
 
@@ -1250,7 +1291,7 @@ async def test_llm_capability_current_image_priority_wins_over_mentioned_avatar(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1301,7 +1342,7 @@ async def test_llm_capability_quote_image_priority_wins_over_mentioned_avatar(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1352,7 +1393,7 @@ async def test_llm_capability_skips_ambiguous_multiple_non_bot_mentions(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@甲 @乙 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@甲 @乙 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1403,7 +1444,7 @@ async def test_llm_capability_records_no_avatar_reason(
 
     set_trace_id("trace-current")
     try:
-        await engine.answer(make_preprocessed("@千雨 帮我分析他的头像"), session)
+        await engine.answer(_avatar_pre("@千雨 帮我分析他的头像"), session)
     finally:
         clear_context()
 
@@ -1433,10 +1474,8 @@ async def test_llm_capability_adds_group_concise_rules_ahead_of_persona_style() 
 
     assert llm.last_request is not None
     system = llm.last_request.system or ""
-    assert "当前是微信群聊" in system
-    assert "默认短回复" in system
-    assert "不要多版本备选" in system
+    assert "现在是微信群聊" in system
+    assert "别写成小作文" in system
     assert "<persona_style_data>" in system
-    assert "身份透明、事实、安全和隐私规则始终高于人物风格" in system
-    assert "历史群消息只用于参考上下文" in system
-    assert "当前群聊没有人工受理或转接能力" in system
+    assert "别人的话只当背景" in system
+    assert "群里转不了人工" in system

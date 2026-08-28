@@ -13,6 +13,8 @@ from app.channel.identity import (
     canonical_message_id,
 )
 from app.common.config import Settings
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import Channel, InboundEvent, Message, Role, Session, Turn
 from app.orchestrator.effects import EFFECT_STATUS_DUPLICATE, InMemoryEffectCommitter
 from app.orchestrator.flow import MessageEffect
@@ -151,6 +153,19 @@ def _settings(tmp_path: Path) -> Settings:
         wxbot_outbound_file_dir=str(tmp_path),
         wxbot_outbound_file_max_bytes=1024 * 1024,
     )
+
+
+def _persist_file_intent(session: Session, action: str, **slots: object) -> Session:
+    persist_decision(
+        IntentDecision(
+            domain=IntentDomain.FILE,
+            action=action,
+            confidence=0.95,
+            slots=dict(slots),
+        ),
+        session=session,
+    )
+    return session
 
 
 def _session(
@@ -359,6 +374,7 @@ async def test_legacy_group_recent_export_uses_user_window_and_filters_daily_pay
         source_message_id="msg-recent-legacy",
     )
     session.turns[0].content = "整理十分钟群里话题 以文件方式发给我"
+    _persist_file_intent(session, "export_history", recent_minutes=10)
     session.turns[0].created_at = datetime(2026, 7, 29, 1, 0, tzinfo=UTC)
     session.turns[0].metadata["occurred_ts"] = int(
         datetime(2026, 7, 29, 2, 0, tzinfo=UTC).timestamp()
@@ -425,6 +441,7 @@ async def test_legacy_group_recent_export_fetches_both_dates_across_midnight(
         source_message_id="msg-recent-midnight",
     )
     session.turns[0].content = "整理十分钟群里话题，以文件方式发给我"
+    _persist_file_intent(session, "export_history", recent_minutes=10)
     session.turns[0].created_at = datetime(2026, 7, 29, 16, 5, tzinfo=UTC)
 
     result = await service.export_current_messages_file(
@@ -466,6 +483,7 @@ async def test_legacy_group_recent_export_fails_closed_on_missing_timestamp(
         source_message_id="msg-recent-invalid-ts",
     )
     session.turns[0].content = "整理十分钟群里话题，以文件方式发给我"
+    _persist_file_intent(session, "export_history", recent_minutes=10)
     session.turns[0].created_at = datetime(2026, 7, 29, 2, 0, tzinfo=UTC)
 
     with pytest.raises(RuntimeError, match="valid timestamp"):
@@ -521,6 +539,12 @@ async def test_generate_text_file_requires_explicit_file_request_and_queues_arti
         source_message_id="msg-generate-1",
     )
     session.turns[0].content = "把上面的内容整理成 md 文件发我"
+    _persist_file_intent(
+        session,
+        "generate",
+        format="md",
+        delivery_required=True,
+    )
 
     result = await service.generate_text_file(
         session,
@@ -550,6 +574,7 @@ async def test_generated_file_retry_keeps_one_delivery_identity(tmp_path: Path) 
         source_message_id="msg-generate-retry-1",
     )
     session.turns[0].content = "把热点新闻整理成文件发我"
+    _persist_file_intent(session, "generate", delivery_required=True)
 
     first = await service.generate_text_file(
         session,
@@ -619,6 +644,7 @@ async def test_generated_file_fallback_identity_uses_stable_trace(tmp_path: Path
     for session in (first_session, second_session):
         session.turns[0].content = "把热点新闻整理成文件发我"
         session.turns[0].trace_id = "trace-stable-file-request"
+        _persist_file_intent(session, "generate", delivery_required=True)
 
     first = await service.generate_text_file(
         first_session,
@@ -704,6 +730,7 @@ async def test_managed_private_file_generation_canonicalizes_source_and_target(
     session.turns[0].metadata.pop("_wxbot_delivery_contract")
     session.turns[0].metadata["external_message_id"] = external_source_message_id
     session.turns[0].content = "把上面的内容整理成 txt 文件发我"
+    _persist_file_intent(session, "generate", format="txt", delivery_required=True)
 
     result = await service.generate_text_file(
         session,
@@ -734,6 +761,7 @@ async def test_generate_json_file_preserves_structured_content(tmp_path: Path) -
         source_message_id="msg-generate-json-1",
     )
     session.turns[0].content = "把上面的内容整理成 json 文件发我"
+    _persist_file_intent(session, "generate", format="json", delivery_required=True)
 
     result = await service.generate_text_file(
         session,
@@ -891,6 +919,7 @@ async def test_managed_group_recent_export_queries_exact_occurred_ts_window(
     session.session_id = canonical_session_id
     session.canonical_conversation_id = canonical_session_id
     session.turns[0].content = "把最近10分钟群消息汇总成文件发给我"
+    _persist_file_intent(session, "export_history", recent_minutes=10)
     session.turns[0].created_at = anchor
 
     result = await service.export_current_messages_file(
@@ -1108,6 +1137,7 @@ async def test_private_recent_export_filters_turns_before_command_anchor(
             metadata={"msg_svr_id": "msg-private-recent"},
         ),
     ]
+    _persist_file_intent(session, "export_history", recent_minutes=10)
 
     result = await service.export_current_messages_file(
         session,
@@ -1140,8 +1170,9 @@ async def test_recent_export_rejects_out_of_bounds_minutes_before_read_or_send(
         source_message_id=f"msg-invalid-recent-{minutes}",
     )
     session.turns[0].content = f"汇总最近{minutes}分钟群消息并导出文件给我"
+    _persist_file_intent(session, "export_history", recent_minutes=minutes)
 
-    with pytest.raises(ValueError, match="1 到 1440 分钟"):
+    with pytest.raises(ValueError, match="无效或不明确"):
         await service.export_current_messages_file(
             session,
             {"report_type": "recent", "minutes": minutes},
@@ -1165,6 +1196,7 @@ async def test_recent_export_rejects_ambiguous_user_range_before_read_or_send(
         source_message_id="msg-ambiguous-recent",
     )
     session.turns[0].content = "汇总最近10分钟还是20分钟群消息并输出文件给我"
+    _persist_file_intent(session, "export_history", recent_minutes_invalid=True)
 
     with pytest.raises(ValueError, match="无效或不明确"):
         await service.export_current_messages_file(

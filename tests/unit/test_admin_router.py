@@ -1047,7 +1047,7 @@ async def test_admin_router_exposes_message_flows() -> None:
     flows = {item["name"]: item for item in payload["items"]}
     flow = flows["default_compatible_flow"]
     assert flow["name"] == "default_compatible_flow"
-    assert flow["status"] == "active"
+    assert flow["status"] == "degraded"
     assert flow["bindings"][0]["channel"] == "*"
     assert [step["id"] for step in flow["steps"]][:3] == [
         "load_session",
@@ -1057,7 +1057,7 @@ async def test_admin_router_exposes_message_flows() -> None:
     assert flow["steps"][-1]["id"] == "commit"
     assert flow["steps"][-1]["effectful"] is True
     assert flow["steps"][-1]["effects"] == ["effects.commit"]
-    assert flows["default_private_channel_flow"]["status"] == "active"
+    assert flows["default_private_channel_flow"]["status"] == "degraded"
     assert flows["default_private_channel_flow"]["bindings"][0]["session_kind"] == "private"
     assert flows["default_group_channel_flow"]["status"] == "invalid"
     assert flows["default_wechat_group_flow"]["bindings"][0]["channel"] == "wechat"

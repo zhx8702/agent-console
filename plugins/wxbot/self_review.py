@@ -266,6 +266,23 @@ class WxbotSelfReviewService:
         )
 
     async def _call_llm(self, *, trace_id: str, system: str, user: str, max_tokens: int) -> str:
+        timeout = float(getattr(self._store.settings, "wxbot_report_stage_timeout_seconds", 240.0) or 240.0)
+        backend = str(
+            getattr(self._store.settings, "wxbot_self_review_llm_backend", "")
+            or getattr(self._store.settings, "wxbot_report_llm_backend", "http")
+            or "http"
+        )
+        from plugins.local_agent.complete import complete_chat, resolve_local_backend
+
+        if resolve_local_backend(backend):
+            result = await complete_chat(
+                self._store.settings,
+                backend=backend,
+                system=system,
+                user=user,
+                timeout_seconds=timeout,
+            )
+            return result.content
         llm_service = getattr(self._container, "llm_service", None)
         if llm_service is None:
             raise RuntimeError("LLM service not available")
@@ -279,7 +296,6 @@ class WxbotSelfReviewService:
             temperature=0.2,
             metadata={"disable_openai_fallback": True, "wxbot_self_review_job": True},
         )
-        timeout = float(getattr(self._store.settings, "wxbot_report_stage_timeout_seconds", 240.0) or 240.0)
         response = await asyncio.wait_for(llm_service.chat(request), timeout=timeout)
         return str(response.content or "").strip()
 

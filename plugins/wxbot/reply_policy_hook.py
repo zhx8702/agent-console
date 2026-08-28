@@ -12,7 +12,9 @@ from app.common.identity import (
     GroupHumanIntentType,
     classify_group_human_intent,
 )
+from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
+from app.common.prompting import persona_cos_active
 from app.common.types import Channel, IntentCoarse
 from app.orchestrator.pipeline import PipelineContext
 from app.plugin.hooks import HookAbort, HookPoint
@@ -696,7 +698,10 @@ class WxbotReplyPolicyHook:
             is_group=is_group,
         )
         human_intent = (
-            classify_group_human_intent(content)
+            classify_group_human_intent(
+                content,
+                decision=decision_from_pre(ctx.pre),
+            )
             if is_group
             else GroupHumanIntent(
                 GroupHumanIntentType.NONE,
@@ -743,7 +748,14 @@ class WxbotReplyPolicyHook:
             or explicit_question_candidate
             or _explicitly_addresses_bot(ctx, content)
         )
-        safety_response_required = bool(human_intent.should_short_circuit and intent_is_addressed)
+        safety_response_required = bool(
+            human_intent.should_short_circuit
+            and intent_is_addressed
+            and not (
+                human_intent.type == GroupHumanIntentType.IDENTITY_INQUIRY
+                and persona_cos_active(ctx.session)
+            )
+        )
         hard_addressed = bool(
             directly_addressed or replied_to_bot or explicit_command or safety_response_required
         )

@@ -579,7 +579,6 @@ async def test_repeater_allows_adjacent_matching_messages_after_long_gap() -> No
     [
         ("手机号 13800138000", "pii_or_secret_content"),
         ("看看 https://example.com/x", "link_content"),
-        ("你是真人吗?", "identity_or_handoff_content"),
         ("/ban wxid_a", "command_content"),
         ("a" * 121, "content_too_long"),
     ],
@@ -595,6 +594,25 @@ async def test_repeater_blocks_sensitive_or_high_risk_content(
 
     assert store.recorded == []
     assert ctx.extras["repeater"]["reason"] == reason
+    assert ctx.extras["repeater"]["content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_repeater_blocks_identity_content() -> None:
+    from app.common.intent import IntentDecision, IntentDomain
+    from app.common.intent_runtime import persist_decision
+
+    store = _FakeRepeaterStore(enabled=True, should_trigger=True)
+    ctx = _ctx("你是真人吗?", "你是真人吗?")
+    persist_decision(
+        IntentDecision(domain=IntentDomain.IDENTITY, action="inquiry", confidence=0.95),
+        pre=ctx.pre,
+    )
+
+    await RepeaterHook(store).run(ctx)
+
+    assert store.recorded == []
+    assert ctx.extras["repeater"]["reason"] == "identity_or_handoff_content"
     assert ctx.extras["repeater"]["content"] == ""
 
 

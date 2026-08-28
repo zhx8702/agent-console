@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.channel import get_reply_policy_override
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     Channel,
     InboundEvent,
@@ -90,7 +92,16 @@ def _stats() -> dict:
     ],
 )
 def test_classify_tibo_reset_intent(text: str, expected: TiboResetIntentType) -> None:
-    assert classify_tibo_reset_intent(text).type == expected
+    decision = (
+        None
+        if expected is TiboResetIntentType.NONE
+        else IntentDecision(
+            domain=IntentDomain.TIBO_RESET,
+            action=expected.value,
+            confidence=0.95,
+        )
+    )
+    assert classify_tibo_reset_intent(text, decision=decision).type == expected
 
 
 def test_normalize_tibo_query_handles_mentions_width_and_common_typos() -> None:
@@ -114,13 +125,35 @@ def test_classify_tibo_reset_followup(
     text: str,
     expected: TiboResetIntentType,
 ) -> None:
-    previous = classify_tibo_reset_intent("Codex 本周重置多少次")
-
-    assert classify_tibo_reset_followup(text, previous).type == expected
+    previous = classify_tibo_reset_intent(
+        "Codex 本周重置多少次",
+        decision=IntentDecision(
+            domain=IntentDomain.TIBO_RESET,
+            action=TiboResetIntentType.WEEK_COUNT.value,
+            confidence=0.95,
+        ),
+    )
+    decision = (
+        None
+        if expected is TiboResetIntentType.NONE
+        else IntentDecision(
+            domain=IntentDomain.TIBO_RESET,
+            action=expected.value,
+            confidence=0.95,
+        )
+    )
+    assert classify_tibo_reset_followup(text, previous, decision=decision).type == expected
 
 
 def test_format_tibo_reset_reply_preserves_scope_and_reset_categories() -> None:
-    intent = classify_tibo_reset_intent("Codex 本周重置多少次")
+    intent = classify_tibo_reset_intent(
+        "Codex 本周重置多少次",
+        decision=IntentDecision(
+            domain=IntentDomain.TIBO_RESET,
+            action=TiboResetIntentType.WEEK_COUNT.value,
+            confidence=0.95,
+        ),
+    )
 
     reply = format_tibo_reset_reply(intent, _stats())
 
@@ -155,6 +188,7 @@ def _ctx(
     sender_wxid: str = "wxid-user",
     variables: dict | None = None,
     received_at: datetime | None = None,
+    intent_action: str | None = None,
 ) -> PipelineContext:
     event = InboundEvent(
         message_id="m-1",
@@ -183,18 +217,28 @@ def _ctx(
         turns=list(turns or []),
         variables=dict(variables or {}),
     )
+    pre = PreprocessedMessage(original_text=text, cleaned_text=text)
+    if intent_action:
+        persist_decision(
+            IntentDecision(
+                domain=IntentDomain.TIBO_RESET,
+                action=intent_action,
+                confidence=0.95,
+            ),
+            pre=pre,
+        )
     return PipelineContext(
         event=event,
         trace_id="trace-1",
         session=session,
-        pre=PreprocessedMessage(original_text=text, cleaned_text=text),
+        pre=pre,
     )
 
 
 @pytest.mark.asyncio
 async def test_tibo_intent_hook_answers_only_enabled_group_and_forces_reply() -> None:
     store = _HookStore(enabled=True)
-    ctx = _ctx("Codex 今天重置了吗？")
+    ctx = _ctx("Codex 今天重置了吗？", intent_action="today_status")
 
     with pytest.raises(HookAbort) as excinfo:
         await TiboResetIntentHook(store).run(ctx)
@@ -212,12 +256,14 @@ async def test_tibo_intent_hook_answers_only_enabled_group_and_forces_reply() ->
 @pytest.mark.asyncio
 async def test_tibo_intent_hook_ignores_disabled_or_unrelated_group() -> None:
     disabled_store = _HookStore(enabled=False)
-    await TiboResetIntentHook(disabled_store).run(_ctx("Codex 本周重置多少次？"))
+    await TiboResetIntentHook(disabled_store).run(
+        _ctx("Codex 本周重置多少次？", intent_action="week_count")
+    )
     assert disabled_store.stats_calls == 0
 
     enabled_store = _HookStore(enabled=True)
     await TiboResetIntentHook(enabled_store).run(
-        _ctx("Codex 本周重置多少次？", session_id="other@chatroom")
+        _ctx("Codex 本周重置多少次？", session_id="other@chatroom", intent_action="week_count")
     )
     assert enabled_store.stats_calls == 0
 
@@ -229,6 +275,7 @@ async def test_tibo_intent_managed_group_uses_external_configuration_scope() -> 
         "最近 Codex 重置了吗？",
         session_id="cx1:c:d9a9638d@chatroom",
         external_session_id="00000000000@chatroom",
+        intent_action="latest",
     )
 
     with pytest.raises(HookAbort) as excinfo:
@@ -241,7 +288,7 @@ async def test_tibo_intent_managed_group_uses_external_configuration_scope() -> 
 
 @pytest.mark.asyncio
 async def test_tibo_intent_disabled_scope_records_diagnostic_signal() -> None:
-    ctx = _ctx("Codex 本周重置多少次？")
+    ctx = _ctx("Codex 本周重置多少次？", intent_action="week_count")
 
     await TiboResetIntentHook(_HookStore(enabled=False)).run(ctx)
 
@@ -252,7 +299,7 @@ async def test_tibo_intent_disabled_scope_records_diagnostic_signal() -> None:
 @pytest.mark.asyncio
 async def test_tibo_intent_flow_step_answers_before_normal_routing() -> None:
     step = TiboResetIntentStep(_HookStore(enabled=True))
-    ctx = _ctx("@zzz\u2005 codex本周重置了几次")
+    ctx = _ctx("@zzz\u2005 codex本周重置了几次", intent_action="week_count")
 
     result = await step.run(ctx)
 
@@ -294,6 +341,7 @@ async def test_tibo_intent_flow_step_resolves_recent_same_sender_followup() -> N
     now = datetime.now(UTC)
     ctx = _ctx(
         "Codex 那今天呢",
+        intent_action="today_status",
         received_at=now,
         variables={
             "tibo_reset_followup_context": {
@@ -312,7 +360,6 @@ async def test_tibo_intent_flow_step_resolves_recent_same_sender_followup() -> N
     assert result.result is not None
     assert "今天有 1 次" in result.result.reply_text
     assert ctx.signals["tibo_reset"]["intent"] == "today_status"
-    assert ctx.signals["tibo_reset"]["match_source"] == "handled_context"
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,6 @@ import pytest
 from app.common.types import Channel, InboundEvent, Message
 from app.orchestrator.flow import (
     CAPABILITY_DISPATCH_TIMEOUT_SECONDS,
-    FLOW_STATUS_ACTIVE,
     FLOW_STATUS_DEGRADED,
     FLOW_STATUS_INVALID,
     FlowCompiler,
@@ -37,7 +36,7 @@ def test_flow_compiler_compiles_active_linear_flow() -> None:
         required_step_kinds={"core.load_session", "core.commit_turns_and_publish"},
     )
 
-    assert flow.status == FLOW_STATUS_ACTIVE
+    assert flow.status == FLOW_STATUS_DEGRADED
     assert flow.errors == []
     assert [step.id for step in flow.steps] == [
         "load_session",
@@ -65,7 +64,7 @@ def test_flow_compiler_compiles_active_linear_flow() -> None:
 def test_compile_default_compatible_flow_is_active() -> None:
     flow = compile_default_compatible_flow()
 
-    assert flow.status == FLOW_STATUS_ACTIVE
+    assert flow.status == FLOW_STATUS_DEGRADED
     assert flow.name == "default_compatible_flow"
     assert flow.version == 1
     assert flow.steps[0].kind == "core.load_session"
@@ -231,8 +230,8 @@ def test_normalize_flow_session_kind_uses_metadata_then_wechat_fallback() -> Non
 def test_compile_builtin_flows_marks_target_flows_invalid_without_plugins() -> None:
     compiled = {flow.name: flow for _profile, flow in compile_builtin_flows()}
 
-    assert compiled["default_compatible_flow"].status == FLOW_STATUS_ACTIVE
-    assert compiled["default_private_channel_flow"].status == FLOW_STATUS_ACTIVE
+    assert compiled["default_compatible_flow"].status == FLOW_STATUS_DEGRADED
+    assert compiled["default_private_channel_flow"].status == FLOW_STATUS_DEGRADED
     assert compiled["default_group_channel_flow"].status == FLOW_STATUS_INVALID
     assert compiled["default_wechat_group_flow"].status == FLOW_STATUS_INVALID
     assert any(

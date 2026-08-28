@@ -13,6 +13,8 @@ from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
 from app.common.exceptions import CapabilityError
+from app.common.intent_classify import classify_context_from_event
+from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -179,6 +181,13 @@ def _assistant_turn_metadata(
         if isinstance(rule, str) and rule.strip():
             metadata["route_rule"] = rule.strip()
 
+    semantic_intent = result.metadata.get("semantic_intent")
+    if isinstance(semantic_intent, dict):
+        metadata["semantic_intent"] = dict(semantic_intent)
+        method = result.metadata.get("semantic_intent_method")
+        if isinstance(method, str) and method.strip():
+            metadata["semantic_intent_method"] = method.strip()
+
     fallback_from = result.metadata.get("fallback_from")
     fallback_reason = (
         result.metadata.get("fallback_reason")
@@ -304,12 +313,26 @@ class LoadSessionStep(_BaseCoreStep):
 class PreprocessStep(_BaseCoreStep):
     kind = "core.preprocess"
     name = "Preprocess"
+    timeout_seconds = 90.0
 
     async def run(self, ctx: PipelineContext) -> StepResult:
         if ctx.session is None:
             raise RuntimeError("session_required")
-        pre = await self.deps.preprocessor.run(ctx.event.message)
+        pre = await self.deps.preprocessor.run(
+            ctx.event.message,
+            context=classify_context_from_event(
+                ctx.event,
+                has_attachment=bool(getattr(ctx.event.message, "attachments", None)),
+            ),
+        )
         ctx.pre = pre
+        if pre.semantic_intent:
+            persist_decision(
+                decision_from_pre(pre),
+                pre=pre,
+                session=ctx.session,
+                extras=ctx.extras,
+            )
         if pre.pii_map:
             if self.deps.side_effects_enabled:
                 ctx.session.pii_map.update(pre.pii_map)

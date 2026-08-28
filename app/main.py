@@ -44,6 +44,7 @@ from app.channel.adapters import ChannelAdapterCatalog
 from app.channel.connections import ChannelConnectionStore
 from app.channel.router import build_channel_admin_router
 from app.common.config import Settings, get_settings
+from app.common.intent_classify import LlmIntentClassifier
 from app.common.logging import configure_logging, get_logger
 from app.common.runtime_llm_config import (
     load_runtime_llm_config,
@@ -848,7 +849,7 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         ingest.set_cache_invalidator(retriever.invalidate)
 
     # Core modules
-    preprocessor = build_preprocessor()
+    preprocessor = build_preprocessor(LlmIntentClassifier(llm_service))
     rule_router = build_rule_router(s)
     safety_raw = build_safety(s)
     postprocessor = build_postprocessor()

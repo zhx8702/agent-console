@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from app.channel import set_reply_policy_override
 from app.common.identity import GroupHumanIntentType, classify_group_human_intent
+from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
 from app.common.types import CapabilityResult, MessageType, Role, RouteType, Turn
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
@@ -92,7 +93,10 @@ def _ignored_repeat_reason(ctx: PipelineContext, text: str) -> str:
         return "pii_or_secret_content"
     if ctx.pre is not None and (ctx.pre.sensitive or ctx.pre.block_reason):
         return "sensitive_content"
-    human_intent = classify_group_human_intent(normalized)
+    human_intent = classify_group_human_intent(
+        normalized,
+        decision=decision_from_pre(ctx.pre),
+    )
     if human_intent.type != GroupHumanIntentType.NONE:
         return "identity_or_handoff_content"
     return ""
