@@ -8,6 +8,7 @@ Deterministic offline LLM provider used for tests and local development.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import struct
@@ -31,6 +32,46 @@ def _last_user_content(req: ChatRequest) -> str:
 
 def _canned_reply(user_text: str) -> str:
     return f"[fake] 你说了: {user_text[:120]}"
+
+
+def _classify_query(user_text: str) -> str:
+    text = str(user_text or "").strip()
+    if "\n\nContext:\n" in text:
+        text = text.split("\n\nContext:\n", 1)[0].strip()
+    return text
+
+
+def _classify_reply(user_text: str) -> str:
+    """Return a parseable IntentDecision for hermetic classify calls."""
+
+    query = _classify_query(user_text)
+    if "转人工" in query:
+        decision = {
+            "operation": "handoff",
+            "source": "none",
+            "artifact": "text",
+            "domain": "handoff",
+            "action": "request",
+            "query": query,
+            "confidence": 0.95,
+            "needs_tool": False,
+            "tool_name": None,
+            "slots": {},
+        }
+    else:
+        decision = {
+            "operation": "converse",
+            "source": "none",
+            "artifact": "text",
+            "domain": "none",
+            "action": "",
+            "query": query,
+            "confidence": 0.0,
+            "needs_tool": False,
+            "tool_name": None,
+            "slots": {},
+        }
+    return json.dumps(decision, ensure_ascii=False)
 
 
 def _maybe_tool_call(req: ChatRequest, user_text: str) -> list[ToolCall]:
@@ -90,7 +131,11 @@ class FakeProvider:
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         user_text = _last_user_content(request)
-        content = _canned_reply(user_text)
+        metadata = request.metadata or {}
+        if str(metadata.get("route") or "") == "intent_classify":
+            content = _classify_reply(user_text)
+        else:
+            content = _canned_reply(user_text)
         tool_calls = _maybe_tool_call(request, user_text)
         model = request.model or self._chat_model
         usage = ChatUsage(
