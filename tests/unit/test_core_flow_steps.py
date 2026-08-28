@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from app.common.config import Settings
-from app.common.exceptions import CapabilityError
+from app.common.exceptions import CapabilityError, UpstreamRejected, UpstreamUnavailable
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -1049,3 +1049,57 @@ async def test_core_non_llm_capability_failure_uses_step_degrade() -> None:
     assert result.stop_reason == "capability_degraded"
     assert ctx.result is not None
     assert ctx.result.metadata["degradation_reason"] == "core.capability_dispatch_failed"
+
+
+class _CountingFailingCapability:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def answer(
+        self,
+        pre: PreprocessedMessage,
+        session: Session,
+        hints: dict[str, Any] | None = None,
+    ) -> CapabilityResult:
+        _ = pre, session, hints
+        self.calls += 1
+        raise self.exc
+
+
+@pytest.mark.asyncio
+async def test_core_dispatch_retries_transient_upstream_failures() -> None:
+    capability = _CountingFailingCapability(UpstreamUnavailable("upstream down"))
+    deps, _sessions, _router, _capability, _bus = _deps(
+        capability=capability,  # type: ignore[arg-type]
+        route=RouteType.LLM,
+    )
+    ctx = PipelineContext(event=_event("hello"), trace_id="trace")
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(_happy_flow(), ctx)
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert capability.calls == 3
+    assert ctx.result is not None
+    assert ctx.result.route == RouteType.CANNED
+    assert ctx.result.metadata["degradation_reason"] == "capability_failed:llm"
+    assert ctx.result.metadata["error_class"] == "UpstreamUnavailable"
+
+
+@pytest.mark.asyncio
+async def test_core_dispatch_does_not_retry_rejected_requests() -> None:
+    capability = _CountingFailingCapability(UpstreamRejected("bad request"))
+    deps, _sessions, _router, _capability, _bus = _deps(
+        capability=capability,  # type: ignore[arg-type]
+        route=RouteType.LLM,
+    )
+    ctx = PipelineContext(event=_event("hello"), trace_id="trace")
+
+    result = await FlowRunner(build_core_step_executors(deps)).run(_happy_flow(), ctx)
+
+    assert result.status == FLOW_RUN_COMPLETED
+    assert capability.calls == 1
+    assert ctx.result is not None
+    assert ctx.result.route == RouteType.CANNED
+    assert ctx.result.metadata["degradation_reason"] == "capability_failed:llm"
+    assert ctx.result.metadata["error_class"] == "UpstreamRejected"
