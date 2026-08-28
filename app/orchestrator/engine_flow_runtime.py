@@ -226,13 +226,29 @@ class FlowRuntimeCoordinator:
             trace_id=event.trace_id,
             session_id=event.session_id,
         )
+        stop_reason = str(result.stop_reason or "")
+        degraded = stop_reason.endswith("_degraded") or bool(
+            ctx.extras.get("degraded_reply_pending")
+        )
+        queued_count = int(ctx.extras.get("wxbot_reply_queued_count") or 0)
+        if degraded and queued_count <= 0:
+            return ProcessingOutcome.retryable_failure(
+                route_label=route_label,
+                reason="degraded_reply_not_queued",
+                error_type="DegradedReplyNotQueued",
+            )
+        if degraded and queued_count > 0:
+            return ProcessingOutcome.completed(
+                route_label=route_label,
+                reason=stop_reason or "degraded_reply_queued",
+            )
         if bool(ctx.extras.get("suppress_outbound")) or result.status in {
             "stopped",
             "deferred",
         }:
             return ProcessingOutcome.intentionally_suppressed(
                 route_label=route_label,
-                reason=result.stop_reason or self._suppression_reason(ctx),
+                reason=stop_reason or self._suppression_reason(ctx),
             )
         return ProcessingOutcome.completed(route_label=route_label)
 

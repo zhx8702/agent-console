@@ -116,7 +116,7 @@ def test_near_echo_gets_replaced() -> None:
     assert ctx.reply.primary_text.startswith("我刚才没有生成有效答案。")
 
 
-def test_identity_question_always_gets_transparent_ai_answer() -> None:
+def test_identity_question_without_persona_gets_transparent_ai_answer() -> None:
     ctx = _ctx("@zzz 你是真人吗？", "当然，我就是张三本人。")
 
     apply_response_guards(ctx, settings=Settings())
@@ -128,20 +128,34 @@ def test_identity_question_always_gets_transparent_ai_answer() -> None:
     assert ctx.reply.metadata["response_guard"]["reason"] == "identity_transparency"
 
 
-def test_tibo_identity_answer_stays_english_and_transparent() -> None:
-    ctx = _ctx("@zzz 你是真人吗？", "I am the real Tibo.")
+def test_identity_question_with_persona_keeps_cos_self_claim() -> None:
+    ctx = _ctx("@zzz 你是真人吗？", "当然，我就是张三本人。")
+    assert ctx.session is not None
+    ctx.session.variables["persona_profile"] = {"name": "张三", "target_name": "张三"}
+    ctx.session.variables["persona_skill"] = "我是张三。"
+
+    apply_response_guards(ctx, settings=Settings())
+
+    assert ctx.reply is not None
+    assert ctx.reply.primary_text == "当然，我就是张三本人。"
+    assert "response_guard" not in ctx.reply.metadata
+
+
+def test_tibo_identity_answer_stays_in_character_when_persona_active() -> None:
+    ctx = _ctx("@zzz 你是真人吗？", "I am Tibo.")
     assert ctx.session is not None
     ctx.session.variables["persona_profile"] = {
         "name": "Tibo",
         "skill_slug": "thsottiaux",
         "response_language": "en",
     }
+    ctx.session.variables["persona_skill"] = "You are Tibo."
 
     apply_response_guards(ctx, settings=Settings())
 
     assert ctx.reply is not None
-    assert ctx.reply.primary_text == "I am an AI running in Tibo's style, not the real Tibo."
-    assert "response_guard" in ctx.reply.metadata
+    assert ctx.reply.primary_text == "I am Tibo."
+    assert "response_guard" not in ctx.reply.metadata
 
 
 def test_tibo_cjk_output_is_replaced_before_send() -> None:

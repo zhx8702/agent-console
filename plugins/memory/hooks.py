@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_runtime import decision_from_pre, is_confident, slot_int, slot_text
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -41,128 +43,6 @@ logger = get_logger(__name__)
 
 
 MEMORY_CONTROL_CANDIDATE_LIMIT = 5
-_REMEMBER_PATTERNS = (
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:帮我\s*)?(?:(?:以后|长期)\s*)?"
-        r"(?:记住|记一下)(?:这(?:件)?事)?[：:\s]+(?P<content>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)(?:帮我)?|帮我|以后|长期)"
-        r"(?:记住|记一下)(?P<content>[\u4e00-\u9fffA-Za-z0-9].+)$"
-    ),
-    re.compile(
-        r"^(?:please\s+)?remember(?:\s+that|[\s:,-]+)(?P<content>.+)$",
-        re.I,
-    ),
-    re.compile(
-        r"^(?:please\s+)?(?:save|store)\s+(?:this\s+)?(?:in|to)\s+"
-        r"(?:my\s+)?memor(?:y|ies)\s*[:,-]?\s+(?P<content>.+)$",
-        re.I,
-    ),
-    re.compile(
-        r"^(?:please\s+)?(?:add|save|store)\s+(?P<content>.+?)\s+"
-        r"(?:to|in)\s+(?:my\s+)?memor(?:y|ies)$",
-        re.I,
-    ),
-)
-_FORGET_PATTERNS = (
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:帮我\s*)?(?:忘记|忘掉)[：:\s]+(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)(?:帮我)?|帮我)(?:忘记|忘掉)(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:删除|移除|清除)(?:这条|该条|我的)?"
-        r"记忆(?:记录)?[：:\s]*(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:从|在)(?:我的)?记忆(?:里|中)?"
-        r"(?:删除|移除|清除)[：:\s]*(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:别|不要)(?:再)?记(?:住)?[：:\s]+(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:please\s+)?forget(?:\s+(?:the\s+)?memory\s+(?:about\s+)?)?"
-        r"[:,-]?\s+(?P<query>.+)$",
-        re.I,
-    ),
-    re.compile(
-        r"^(?:please\s+)?(?:delete|remove|clear)\s+(?:the\s+)?memor(?:y|ies)"
-        r"(?:\s+(?:about|for))?\s*[:,-]?\s+(?P<query>.+)$",
-        re.I,
-    ),
-    re.compile(
-        r"^(?:please\s+)?(?:delete|remove)\s+(?P<query>.+?)\s+from\s+"
-        r"(?:my\s+)?memor(?:y|ies)$",
-        re.I,
-    ),
-)
-_FULL_FORGET_PATTERNS = (
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:帮我\s*)?"
-        r"(?:清空|清除|删除|忘记|忘掉)(?:关于)?我(?:的)?"
-        r"(?:全部|所有)(?:的)?记忆(?:数据|记录)?$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:帮我\s*)?"
-        r"(?:清空|清除|删除|忘记|忘掉)我(?:的)?记忆(?:数据|记录)?(?:的)?(?:全部|所有)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:把)?我(?:的)?(?:全部|所有)(?:的)?记忆(?:数据|记录)?"
-        r"(?:都)?(?:清空|清除|删除|删掉|忘记|忘掉)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|麻烦)\s*)?(?:帮我\s*)?"
-        r"(?:清空|清除|删除|忘记|忘掉)(?:全部|所有)(?:关于)?我(?:的)?记忆(?:数据|记录)?$"
-    ),
-    re.compile(
-        r"^(?:please\s+)?(?:forget|delete|remove|clear)\s+all\s+"
-        r"(?:of\s+)?my\s+memor(?:y|ies)$",
-        re.I,
-    ),
-    re.compile(
-        r"^(?:please\s+)?forget\s+everything\s+you\s+remember\s+about\s+me$",
-        re.I,
-    ),
-)
-_LIST_PATTERNS = (
-    re.compile(r"^(?:请)?(?:列出|显示|查看|看看)(?:一下)?(?:我的)?记忆(?:列表)?[？?]?$"),
-    re.compile(r"^(?:我有哪些记忆|查一下我的记忆|记忆列表)[？?]?$"),
-    re.compile(r"^(?:你记得我什么|你记住了我什么)[？?]?$"),
-    re.compile(
-        r"^(?:please\s+)?(?:list|show)(?:\s+me)?\s+(?:my\s+)?memor(?:y|ies)[?]?$",
-        re.I,
-    ),
-    re.compile(r"^what\s+do\s+you\s+remember\s+about\s+me[?]?$", re.I),
-    re.compile(r"^(?:my\s+)?memory\s+list[?]?$", re.I),
-)
-_SEARCH_PATTERNS = (
-    re.compile(
-        r"^(?:(?:请|帮我|请帮我)\s*)?(?:搜索|查找|查询)(?:一下)?"
-        r"(?:我的)?记忆(?:里|中)?[：:\s]+(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|帮我|请帮我)\s*)?查(?:一下)?(?:我的)?记忆(?:里|中)?"
-        r"[：:\s]+(?P<query>.+)$"
-    ),
-    re.compile(
-        r"^(?:(?:请|帮我|请帮我)\s*)?(?:在|从)(?:我的)?记忆(?:里|中)?"
-        r"(?:搜索|查找|查询)[：:\s]+(?P<query>.+)$"
-    ),
-    re.compile(r"^(?:请)?查(?:一下)?关于[：:\s]*(?P<query>.+?)的记忆[？?]?$"),
-    re.compile(
-        r"^(?:please\s+)?(?:search|find|look\s+up)\s+(?:my\s+)?memor(?:y|ies)"
-        r"(?:\s+(?:for|about))?\s*[:,-]?\s+(?P<query>.+)$",
-        re.I,
-    ),
-    re.compile(
-        r"^what\s+do\s+you\s+remember\s+about\s+(?P<query>(?!me[?]?$).+?)[?]?$",
-        re.I,
-    ),
-)
-_ID_RE = re.compile(r"^(?:(?:memory|记忆)\s*)?(?:#|id[:：]?)\s*(?P<id>\d+)$", re.I)
 _GENERIC_MEMORY_REFERENCES = frozenset(
     {
         "it",
@@ -770,73 +650,78 @@ def _is_meaningful_memory_operand(value: str) -> bool:
     return bool(normalized and normalized.lower() not in _GENERIC_MEMORY_REFERENCES)
 
 
-def _parse_remember_intent(text: str) -> str | None:
-    text_value = _normalize_memory_control_text(text)
-    lowered = text_value.lower()
-    if text_value.startswith(("我记得", "你记得", "记得")) or lowered.startswith(
-        ("i remember", "do you remember", "did you remember")
-    ):
+def _memory_decision(decision: IntentDecision | None) -> IntentDecision | None:
+    if decision is None or decision.domain is not IntentDomain.MEMORY:
         return None
-    for pattern in _REMEMBER_PATTERNS:
-        match = pattern.match(text_value)
-        if match:
-            content = _trim_memory_text(match.group("content"))
-            if not _is_meaningful_memory_operand(content):
-                return None
-            if _is_question_shaped_memory_command(text_value, content):
-                return None
-            return content
-    return None
-
-
-def _parse_forget_intent(text: str) -> tuple[str, int | None] | None:
-    text_value = _normalize_memory_control_text(text)
-    lowered = text_value.lower()
-    if text_value.startswith(("我忘记", "我忘了", "忘记了", "忘了")) or lowered.startswith(
-        ("i forgot", "i forget", "forgot ")
-    ):
+    if not is_confident(decision):
         return None
-    for pattern in _FORGET_PATTERNS:
-        match = pattern.match(text_value)
-        if not match:
-            continue
-        query = _trim_memory_text(match.group("query"))
-        if not _is_meaningful_memory_operand(query):
-            return None
-        if _is_question_shaped_memory_command(text_value, query):
-            return None
-        if query.endswith(("了", "啦", "呢", "嘛", "吗", "么", "吧", "怎么办", "怎么找回")):
-            return None
-        if query.lower().startswith("to "):
-            return None
-        item_id: int | None = None
-        id_match = _ID_RE.match(query)
-        if id_match:
-            item_id = int(id_match.group("id"))
-        return query, item_id
-    return None
+    return decision
 
 
-def _parse_full_forget_intent(text: str) -> bool:
-    text_value = _normalize_memory_control_text(text)
-    if text_value.endswith(("?", "？")):
-        return False
-    return any(pattern.fullmatch(text_value) is not None for pattern in _FULL_FORGET_PATTERNS)
+def _parse_remember_intent(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> str | None:
+    _ = text
+    parsed = _memory_decision(decision)
+    if parsed is None or parsed.action != "remember":
+        return None
+    content = _trim_memory_text(slot_text(parsed, "content", "query") or parsed.query)
+    if not _is_meaningful_memory_operand(content):
+        return None
+    return content
 
 
-def _parse_list_intent(text: str) -> bool:
-    text_value = _normalize_memory_control_text(text)
-    return any(pattern.match(text_value) is not None for pattern in _LIST_PATTERNS)
+def _parse_forget_intent(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> tuple[str, int | None] | None:
+    _ = text
+    parsed = _memory_decision(decision)
+    if parsed is None or parsed.action != "forget":
+        return None
+    query = _trim_memory_text(slot_text(parsed, "query", "content") or parsed.query)
+    item_id = slot_int(parsed, "item_id")
+    if item_id is None and query.isdigit():
+        item_id = int(query)
+    if item_id is None and not _is_meaningful_memory_operand(query):
+        return None
+    return query, item_id
 
 
-def _parse_search_intent(text: str) -> str | None:
-    text_value = _normalize_memory_control_text(text)
-    for pattern in _SEARCH_PATTERNS:
-        match = pattern.match(text_value)
-        if match:
-            query = _trim_memory_text(match.groupdict().get("query") or "", limit=120)
-            return query if _is_meaningful_memory_operand(query) else None
-    return None
+def _parse_full_forget_intent(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> bool:
+    _ = text
+    parsed = _memory_decision(decision)
+    return parsed is not None and parsed.action == "forget_all"
+
+
+def _parse_list_intent(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> bool:
+    _ = text
+    parsed = _memory_decision(decision)
+    return parsed is not None and parsed.action == "list"
+
+
+def _parse_search_intent(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> str | None:
+    _ = text
+    parsed = _memory_decision(decision)
+    if parsed is None or parsed.action != "search":
+        return None
+    query = _trim_memory_text(slot_text(parsed, "query") or parsed.query, limit=120)
+    return query if _is_meaningful_memory_operand(query) else None
 
 
 def _is_visible_memory_item(item: dict) -> bool:
@@ -1138,8 +1023,9 @@ async def handle_memory_control_intent(store: MemoryStore, ctx: PipelineContext)
     if not text:
         return None
     scope = _memory_control_scope(ctx)
+    decision = decision_from_pre(ctx.pre)
 
-    remember_content = _parse_remember_intent(text)
+    remember_content = _parse_remember_intent(text, decision=decision)
     if remember_content:
         is_group = _is_group_session(ctx)
         member_privacy = await _group_member_privacy(store, ctx)
@@ -1244,7 +1130,7 @@ async def handle_memory_control_intent(store: MemoryStore, ctx: PipelineContext)
         ctx.extras["memory_control_handled"] = True
         return reply
 
-    if _parse_full_forget_intent(text):
+    if _parse_full_forget_intent(text, decision=decision):
         forget_member = getattr(store, "forget_member_detailed", None)
         if not callable(forget_member):
             forget_member = getattr(store, "forget_member", None)
@@ -1308,7 +1194,7 @@ async def handle_memory_control_intent(store: MemoryStore, ctx: PipelineContext)
         ctx.extras["memory_control_handled"] = True
         return reply
 
-    forget_intent = _parse_forget_intent(text)
+    forget_intent = _parse_forget_intent(text, decision=decision)
     if forget_intent is not None:
         query, item_id = forget_intent
         if item_id is not None:
@@ -1441,8 +1327,8 @@ async def handle_memory_control_intent(store: MemoryStore, ctx: PipelineContext)
         ctx.extras["memory_control_handled"] = True
         return reply
 
-    list_intent = _parse_list_intent(text)
-    search_query = _parse_search_intent(text)
+    list_intent = _parse_list_intent(text, decision=decision)
+    search_query = _parse_search_intent(text, decision=decision)
     if list_intent or search_query is not None:
         query_intent = "list" if list_intent else "search"
         effective_query = "" if list_intent else str(search_query or "")

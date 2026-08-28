@@ -27,7 +27,7 @@ KERNEL_INPUTS = {
 
 DEFAULT_COMPATIBLE_FLOW_NAME = "default_compatible_flow"
 DEFAULT_COMPATIBLE_FLOW_VERSION = 1
-CAPABILITY_DISPATCH_TIMEOUT_SECONDS = 60.0
+CAPABILITY_DISPATCH_TIMEOUT_SECONDS = 90.0
 DEFAULT_REQUIRED_STEP_KINDS = {
     "core.load_session",
     "core.commit_turns_and_publish",
@@ -536,6 +536,7 @@ def build_default_flow_registry() -> FlowStepRegistry:
                 name="Preprocess",
                 inputs={"event"},
                 outputs={"pre"},
+                timeout_seconds=90.0,
                 error_policy="degrade",
             ),
             FlowStepDefinition(
@@ -683,6 +684,11 @@ def build_default_compatible_flow_specs() -> list[FlowStepSpec]:
             kind="core.legacy_hooks.after_preprocess",
         ),
         FlowStepSpec(id="append_user_turn", kind="core.append_user_turn"),
+        FlowStepSpec(
+            id="speaker_portrait_note",
+            kind="plugin.speaker_portrait.note",
+            optional=True,
+        ),
         FlowStepSpec(id="handoff_short_circuit", kind="core.handoff_short_circuit"),
         FlowStepSpec(id="input_safety", kind="core.input_safety"),
         FlowStepSpec(id="before_route_hooks", kind="core.legacy_hooks.before_route"),
@@ -719,6 +725,11 @@ def build_default_group_channel_flow_specs() -> list[FlowStepSpec]:
         FlowStepSpec(id="load_session", kind="core.load_session"),
         FlowStepSpec(id="preprocess", kind="core.preprocess"),
         FlowStepSpec(id="append_user_turn", kind="core.append_user_turn"),
+        FlowStepSpec(
+            id="speaker_portrait_note",
+            kind="plugin.speaker_portrait.note",
+            optional=True,
+        ),
         FlowStepSpec(id="handoff_short_circuit", kind="core.handoff_short_circuit"),
         FlowStepSpec(id="input_safety", kind="core.input_safety"),
         FlowStepSpec(id="memory_control_intents", kind="plugin.memory.control_intents"),
@@ -731,6 +742,11 @@ def build_default_group_channel_flow_specs() -> list[FlowStepSpec]:
             kind="plugin.persona_extract.skill_enrich",
         ),
         FlowStepSpec(id="memory_load", kind="plugin.memory.load"),
+        FlowStepSpec(
+            id="speaker_portrait_enrich",
+            kind="plugin.speaker_portrait.enrich",
+            optional=True,
+        ),
         FlowStepSpec(id="credits_query_command", kind="plugin.credits.query_command"),
         FlowStepSpec(
             id="moderation_enforce",
@@ -771,6 +787,11 @@ def build_default_wechat_group_flow_specs() -> list[FlowStepSpec]:
         FlowStepSpec(id="wxbot_normalize", kind="plugin.wxbot.normalize_event"),
         FlowStepSpec(id="preprocess", kind="core.preprocess"),
         FlowStepSpec(id="append_user_turn", kind="core.append_user_turn"),
+        FlowStepSpec(
+            id="speaker_portrait_note",
+            kind="plugin.speaker_portrait.note",
+            optional=True,
+        ),
         FlowStepSpec(id="handoff_short_circuit", kind="core.handoff_short_circuit"),
         FlowStepSpec(id="input_safety", kind="core.input_safety"),
         FlowStepSpec(id="wxbot_user_ban_pre_command", kind="plugin.wxbot.user_ban_pre_command"),
@@ -782,6 +803,10 @@ def build_default_wechat_group_flow_specs() -> list[FlowStepSpec]:
             kind="plugin.tibo_reset.intent",
             optional=True,
         ),
+        FlowStepSpec(
+            id="persona_skill_enrich",
+            kind="plugin.persona_extract.skill_enrich",
+        ),
         FlowStepSpec(id="wxbot_reply_policy", kind="plugin.wxbot.reply_policy"),
         FlowStepSpec(id="memory_control_intents", kind="plugin.memory.control_intents"),
         FlowStepSpec(id="moderation_inspect", kind="plugin.moderation.inspect_input"),
@@ -791,14 +816,15 @@ def build_default_wechat_group_flow_specs() -> list[FlowStepSpec]:
         ),
         FlowStepSpec(id="route", kind="core.route"),
         FlowStepSpec(
-            id="persona_skill_enrich",
-            kind="plugin.persona_extract.skill_enrich",
-        ),
-        FlowStepSpec(
             id="wxbot_voice_profile_enrich",
             kind="plugin.wxbot.voice_profile_enrich",
         ),
         FlowStepSpec(id="memory_load", kind="plugin.memory.load"),
+        FlowStepSpec(
+            id="speaker_portrait_enrich",
+            kind="plugin.speaker_portrait.enrich",
+            optional=True,
+        ),
         FlowStepSpec(
             id="wxbot_group_context_load",
             kind="plugin.wxbot.group_context_load",

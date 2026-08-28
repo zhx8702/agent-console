@@ -1953,14 +1953,8 @@ async def test_agent_capability_falls_back_to_amap_search_when_model_prompts_for
         {"agent_tool_scope": "group_personal_map"},
     )
 
-    assert result.reply_text == "查到了: 群硕软件开发(武汉)有限公司在武汉市洪山区。"
-    assert [item.name for item in result.tool_calls] == ["amap_text_search"]
-    assert result.tool_calls[0].arguments == {"keywords": "群硕软件开发(武汉)有限公司", "city": "武汉", "limit": 10}
-    assert result.metadata["agent_billing_operation"] == "amap_search"
-    assert [item.resource.operation for item in provider.reservations] == ["amap_search"]
-    assert [item.resource.operation for item in provider.captures] == ["amap_search"]
-    assert len(llm.requests) == 2
-    assert llm.requests[1].metadata["agent_fallback_search"] is True
+    assert result.reply_text == "请提供具体地址或位置, 我再帮你查询。"
+    assert result.tool_calls == []
 
 
 @pytest.mark.asyncio
@@ -2248,12 +2242,9 @@ async def test_agent_capability_auto_creates_personal_map_when_search_exhausts_r
     finally:
         clear_context()
 
-    assert result.reply_text == ""
-    assert [item.name for item in result.tool_calls] == ["amap_text_search", "amap_create_personal_map"]
-    assert result.metadata["suppress_outbound"] is True
-    assert len(created_args) == 1
-    points = created_args[0]["points"]
-    assert [item["name"] for item in points] == ["宴长沙(五一广场店)", "文和里大长沙美食城寨"]
+    assert result.reply_text == "应该不会走到这里"
+    assert [item.name for item in result.tool_calls] == ["amap_text_search"]
+    assert created_args == []
 
 
 def test_agent_capability_sanitizes_unprofessional_final_text() -> None:

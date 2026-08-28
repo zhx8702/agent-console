@@ -98,6 +98,7 @@ from app.plugin.manager import PluginManager
 from app.plugin.registry import PluginRegistry
 from app.plugin.state import PluginStateStore
 from app.postprocessing.processor import build_postprocessor
+from app.common.intent_classify import LlmIntentClassifier
 from app.preprocessing.processor import build_preprocessor
 from app.rag.engine import RAGEngine
 from app.rag.retriever import HybridRetriever
@@ -848,7 +849,7 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         ingest.set_cache_invalidator(retriever.invalidate)
 
     # Core modules
-    preprocessor = build_preprocessor()
+    preprocessor = build_preprocessor(LlmIntentClassifier(llm_service))
     rule_router = build_rule_router(s)
     safety_raw = build_safety(s)
     postprocessor = build_postprocessor()

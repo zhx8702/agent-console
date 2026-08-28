@@ -6,6 +6,7 @@ compatibility path that can be expanded behind tests.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from numbers import Real
@@ -13,6 +14,8 @@ from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
 from app.common.exceptions import CapabilityError
+from app.common.intent_classify import classify_context_from_event
+from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -179,6 +182,13 @@ def _assistant_turn_metadata(
         if isinstance(rule, str) and rule.strip():
             metadata["route_rule"] = rule.strip()
 
+    semantic_intent = result.metadata.get("semantic_intent")
+    if isinstance(semantic_intent, dict):
+        metadata["semantic_intent"] = dict(semantic_intent)
+        method = result.metadata.get("semantic_intent_method")
+        if isinstance(method, str) and method.strip():
+            metadata["semantic_intent_method"] = method.strip()
+
     fallback_from = result.metadata.get("fallback_from")
     fallback_reason = (
         result.metadata.get("fallback_reason")
@@ -304,12 +314,26 @@ class LoadSessionStep(_BaseCoreStep):
 class PreprocessStep(_BaseCoreStep):
     kind = "core.preprocess"
     name = "Preprocess"
+    timeout_seconds = 90.0
 
     async def run(self, ctx: PipelineContext) -> StepResult:
         if ctx.session is None:
             raise RuntimeError("session_required")
-        pre = await self.deps.preprocessor.run(ctx.event.message)
+        pre = await self.deps.preprocessor.run(
+            ctx.event.message,
+            context=classify_context_from_event(
+                ctx.event,
+                has_attachment=bool(getattr(ctx.event.message, "attachments", None)),
+            ),
+        )
         ctx.pre = pre
+        if pre.semantic_intent:
+            persist_decision(
+                decision_from_pre(pre),
+                pre=pre,
+                session=ctx.session,
+                extras=ctx.extras,
+            )
         if pre.pii_map:
             if self.deps.side_effects_enabled:
                 ctx.session.pii_map.update(pre.pii_map)
@@ -631,9 +655,31 @@ class CapabilityDispatchStep(_BaseCoreStep):
                     metadata={"degradation_reason": reason},
                 )
         else:
-            try:
-                result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
-            except Exception as exc:
+            result = None
+            last_exc: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
+                    last_exc = None
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    miss_reason = self._recall_miss_reason(exc)
+                    if miss_reason:
+                        break
+                    logger.warning(
+                        "capability.dispatch_retry",
+                        attempt=attempt,
+                        attempts=3,
+                        route=ctx.route.type.value,
+                        error_class=exc.__class__.__name__,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(0.4 * attempt)
+            if result is None and last_exc is not None:
+                exc = last_exc
                 miss_reason = self._recall_miss_reason(exc)
                 if miss_reason:
                     result = await self._fallback_to_llm(
@@ -645,7 +691,7 @@ class CapabilityDispatchStep(_BaseCoreStep):
                         ctx.result = result
                         return StepResult(result=result, route_label=result.route.value)
                 if ctx.route.type != RouteType.LLM:
-                    raise
+                    raise exc
                 reason = f"capability_failed:{ctx.route.type.value}"
                 ctx.signals["capability"] = {
                     "failed": True,

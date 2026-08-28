@@ -52,6 +52,7 @@ from plugins.wxbot.file_artifacts import (
     normalize_file_format,
     stage_outbound_artifact,
 )
+from app.common.intent_runtime import decision_from_session
 from plugins.wxbot.file_intent import (
     MAX_RECENT_MESSAGE_EXPORT_MINUTES,
     classify_file_intent,
@@ -172,6 +173,7 @@ class WxbotAgentToolService:
         export_format = normalize_file_format(arguments.get("format") or "txt")
         request_intent = classify_file_intent(
             str(getattr(latest_turn, "content", "") or ""),
+            decision=decision_from_session(session),
         )
         if request_intent.recent_minutes_invalid:
             raise ValueError("最近消息时间范围无效或不明确，请只指定一个分钟数")
@@ -437,6 +439,7 @@ class WxbotAgentToolService:
         intent = classify_file_intent(
             str(getattr(latest_turn, "content", "") or ""),
             has_attachment=True,
+            decision=decision_from_session(session),
         )
         if intent.operation != "convert":
             raise ValueError("未检测到明确的文件转换意图")
@@ -614,7 +617,10 @@ class WxbotAgentToolService:
         latest_turn, latest_metadata = self._latest_user_context(session)
         if latest_turn is None:
             raise ValueError("当前轮次没有可生成文件的请求")
-        intent = classify_file_intent(str(getattr(latest_turn, "content", "") or ""))
+        intent = classify_file_intent(
+            str(getattr(latest_turn, "content", "") or ""),
+            decision=decision_from_session(session),
+        )
         if intent.operation != "generate":
             raise ValueError("未检测到明确的文件生成意图")
         if not intent.delivery_required:

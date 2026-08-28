@@ -12,6 +12,7 @@ from uuid import uuid4
 from app.billing import BillingCoordinator, BillingReservation
 from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, ChannelTarget
 from app.commands import CommandDefinition
+from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
 from app.common.quote_images import quote_image_source_from_metadata
 from app.common.types import Channel, MessageType, ReplyType, channel_id_value
@@ -1557,6 +1558,7 @@ async def _handle_draw_command(
             session_id=str(event.session_id or ""),
             prompt=prompt,
             trace_id=ctx.trace_id,
+            decision=decision_from_pre(ctx.pre),
         )
     except asyncio.CancelledError:
         await _release_draw_reservation_after_cancel(billing, ctx)

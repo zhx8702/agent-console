@@ -278,6 +278,9 @@ READ GET /plugins/draw/tasks/{task_id}
 READ GET /plugins/group_activity/config/{tenant_id}/{session_id:path}
 READ GET /plugins/group_activity/configs/{tenant_id}
 READ GET /plugins/group_activity/events/{tenant_id}
+READ GET /plugins/local_agent/backends
+READ GET /plugins/local_agent/tasks
+READ GET /plugins/local_agent/tasks/{job_id}
 READ GET /plugins/memory/events
 READ GET /plugins/memory/extraction-jobs
 READ GET /plugins/memory/extraction-jobs/stats
@@ -312,6 +315,11 @@ READ GET /plugins/persona_extract/profiles
 READ GET /plugins/persona_extract/profiles/{profile_id}
 READ GET /plugins/repeater/config/{tenant_id}/{session_id:path}
 READ GET /plugins/repeater/events/{tenant_id}
+READ GET /plugins/speaker_portrait/jobs
+READ GET /plugins/speaker_portrait/jobs/{job_id}
+READ GET /plugins/speaker_portrait/portraits
+READ GET /plugins/speaker_portrait/portraits/{speaker_id:path}
+READ GET /plugins/speaker_portrait/portraits/{speaker_id}/style
 READ GET /plugins/tibo_reset/deliveries
 READ GET /plugins/tibo_reset/feed
 READ GET /plugins/tibo_reset/stats
@@ -400,6 +408,8 @@ WRITE POST /plugins/persona_extract/jobs/{job_id}/cancel
 WRITE POST /plugins/persona_extract/jobs/{job_id}/run
 WRITE POST /plugins/persona_extract/profiles
 DANGER POST /plugins/persona_extract/profiles/{profile_id}/activate
+WRITE POST /plugins/speaker_portrait/jobs
+WRITE POST /plugins/speaker_portrait/portraits/{speaker_id}/apply-style
 WRITE POST /plugins/wxbot/admin/reply-policy/global/{tenant_id}
 WRITE POST /plugins/wxbot/admin/reply-policy/{tenant_id}/{session_id:path}
 WRITE POST /plugins/wxbot/admin/reports/subscriptions
@@ -432,6 +442,8 @@ DANGER POST /plugins/draw/tasks/{task_id}/resend-callback
 DANGER POST /plugins/draw/tasks/{task_id}/retry
 DANGER POST /plugins/group_activity/scheduler/run-once
 DANGER POST /plugins/group_activity/trigger/{tenant_id}/{session_id:path}
+DANGER POST /plugins/local_agent/probe
+DANGER POST /plugins/local_agent/tasks
 DANGER POST /plugins/memory/backfill
 DANGER POST /plugins/memory/extraction-jobs/maintenance
 DANGER POST /plugins/memory/forget

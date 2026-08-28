@@ -9,6 +9,8 @@ from app.channel.identity import (
     canonical_conversation_id,
     canonical_message_id,
 )
+from app.common.intent import IntentDecision
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -401,6 +403,8 @@ def _group_reply_policy_ctx(
     *,
     mentioned_me: bool = True,
     pre_intent: IntentCoarse = IntentCoarse.HANDOFF_REQUEST,
+    human_domain: str = "",
+    human_action: str = "",
 ) -> PipelineContext:
     session = Session(
         session_id="wx-session-1@chatroom",
@@ -426,12 +430,35 @@ def _group_reply_policy_ctx(
         cleaned_text=content,
         intent_coarse=pre_intent,
     )
+    domain = human_domain
+    action = human_action
+    if domain:
+        persist_decision(
+            IntentDecision(domain=domain, action=action, confidence=0.95),
+            pre=pre,
+        )
     return PipelineContext(
         event=event,
         trace_id="trace-group-policy-1",
         session=session,
         pre=pre,
     )
+
+
+def _with_semantic_intent(
+    ctx: PipelineContext,
+    domain: str,
+    action: str = "query",
+    **slots: object,
+) -> PipelineContext:
+    text = str(ctx.event.message.content or "")
+    if ctx.pre is None:
+        ctx.pre = PreprocessedMessage(original_text=text, cleaned_text=text)
+    persist_decision(
+        IntentDecision(domain=domain, action=action, confidence=0.95, slots=dict(slots)),
+        pre=ctx.pre,
+    )
+    return ctx
 
 
 def _public_group_policy(
@@ -503,7 +530,7 @@ async def test_voice_profile_merges_after_persona_without_overriding_safety() ->
     assert "语气=轻松克制" in prompt
     assert "接着聊聊" in prompt
     assert "不得改变事实、工具结果、安全决定、权限或记忆受众" in prompt
-    assert "普通的“你是谁/你叫什么”按当前已启用人格自然回答" in prompt
+    assert "当前若已启用蒸馏 COS，问你是谁、是不是真人、真实身份，都按这个人自己来答" in prompt
     assert "不要固定复读“我是 AI 助手”" in prompt
     assert ctx.session.variables["voice_profile"]["version"] == 4
     assert "authorized_sample_session_ids" not in ctx.session.variables["voice_profile"]
@@ -2204,7 +2231,13 @@ async def test_unaddressed_identity_or_handoff_group_talk_stays_silent(
 ) -> None:
     store = _FakeStore()
     store.policy["effective_mode"] = "off"
-    pipeline_ctx = _group_reply_policy_ctx(content, mentioned_me=False)
+    pipeline_ctx = _group_reply_policy_ctx(
+        content,
+        mentioned_me=False,
+        human_domain="identity" if intent_type == "identity_inquiry" else "handoff",
+        human_action="inquiry" if intent_type == "identity_inquiry" else "request",
+        pre_intent=IntentCoarse.UNKNOWN if intent_type == "identity_inquiry" else IntentCoarse.HANDOFF_REQUEST,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await WxbotReplyPolicyHook(store).run(pipeline_ctx)
@@ -2240,7 +2273,13 @@ async def test_explicit_bot_vocative_keeps_identity_and_handoff_short_circuit(
 ) -> None:
     store = _FakeStore()
     store.policy["effective_mode"] = "off"
-    pipeline_ctx = _group_reply_policy_ctx(content, mentioned_me=False)
+    pipeline_ctx = _group_reply_policy_ctx(
+        content,
+        mentioned_me=False,
+        human_domain="identity" if "identity" in reason else "handoff",
+        human_action="inquiry" if "identity" in reason else "request",
+        pre_intent=IntentCoarse.UNKNOWN if "identity" in reason else IntentCoarse.HANDOFF_REQUEST,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await WxbotReplyPolicyHook(store).run(pipeline_ctx)
@@ -2263,7 +2302,12 @@ async def test_wxbot_reply_policy_hook_discloses_ai_identity_even_when_mode_is_o
         "effective_mode": "off",
         "trigger_keywords": [],
     }
-    pipeline_ctx = _group_reply_policy_ctx("@bot 你是真人吗")
+    pipeline_ctx = _group_reply_policy_ctx(
+        "@bot 你是真人吗",
+        human_domain="identity",
+        human_action="inquiry",
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await hook.run(pipeline_ctx)
@@ -2311,6 +2355,34 @@ async def test_wxbot_reply_policy_hook_discloses_ai_identity_even_when_mode_is_o
 
 
 @pytest.mark.asyncio
+async def test_wxbot_reply_policy_does_not_canned_identity_when_persona_cos_active() -> None:
+    store = _FakeStore()
+    hook = WxbotReplyPolicyHook(store)
+    store.policy = {
+        "tenant_id": "demo",
+        "session_id": "wx-session-1@chatroom",
+        "reply_mode": "all",
+        "default_mode": "all",
+        "effective_mode": "all",
+        "trigger_keywords": [],
+    }
+    pipeline_ctx = _group_reply_policy_ctx(
+        "@bot 你是真人吗",
+        human_domain="identity",
+        human_action="inquiry",
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
+    assert pipeline_ctx.session is not None
+    pipeline_ctx.session.variables["persona_skill"] = "我是小海。"
+    pipeline_ctx.session.variables["persona_profile"] = {"name": "小海"}
+
+    await hook.run(pipeline_ctx)
+
+    assert pipeline_ctx.extras["wxbot_reply_policy"]["allowed"] is True
+    assert pipeline_ctx.extras.get("wxbot_force_send") is not True
+
+
+@pytest.mark.asyncio
 async def test_wxbot_identity_disclosure_survives_outbound_reply_mode_guard() -> None:
     store = _FakeStore()
     store.policy = {
@@ -2322,7 +2394,12 @@ async def test_wxbot_identity_disclosure_survives_outbound_reply_mode_guard() ->
         "effective_mention_sender": True,
         "trigger_keywords": [],
     }
-    pipeline_ctx = _group_reply_policy_ctx("@bot 你是真人吗")
+    pipeline_ctx = _group_reply_policy_ctx(
+        "@bot 你是真人吗",
+        human_domain="identity",
+        human_action="inquiry",
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await WxbotReplyPolicyHook(store).run(pipeline_ctx)
@@ -2348,7 +2425,11 @@ async def test_wxbot_identity_disclosure_survives_outbound_reply_mode_guard() ->
 async def test_wxbot_reply_policy_step_returns_honest_group_handoff_unavailable() -> None:
     store = _FakeStore()
     step = WxbotReplyPolicyStep(store)
-    pipeline_ctx = _group_reply_policy_ctx("@bot 我要投诉，找真人")
+    pipeline_ctx = _group_reply_policy_ctx(
+        "@bot 我要投诉，找真人",
+        human_domain="handoff",
+        human_action="request",
+    )
 
     result = await step.run(pipeline_ctx)
 
@@ -2387,7 +2468,14 @@ async def test_wxbot_reply_policy_hook_does_not_escalate_negation_or_reference(
 ) -> None:
     store = _FakeStore()
     hook = WxbotReplyPolicyHook(store)
-    pipeline_ctx = _group_reply_policy_ctx(content)
+    pipeline_ctx = _group_reply_policy_ctx(
+        content,
+        human_domain="handoff",
+        human_action="non_request",
+        pre_intent=IntentCoarse.HANDOFF_REQUEST,
+    )
+    assert pipeline_ctx.pre is not None
+    pipeline_ctx.pre.intent_coarse = IntentCoarse.HANDOFF_REQUEST
 
     await hook.run(pipeline_ctx)
 
@@ -2435,7 +2523,12 @@ async def test_wxbot_reply_policy_prompt_text_cannot_bypass_identity_or_handoff_
 ) -> None:
     store = _FakeStore()
     hook = WxbotReplyPolicyHook(store)
-    pipeline_ctx = _group_reply_policy_ctx(content)
+    pipeline_ctx = _group_reply_policy_ctx(
+        content,
+        human_domain="identity" if "identity" in reason else "handoff",
+        human_action="inquiry" if "identity" in reason else "request",
+        pre_intent=IntentCoarse.UNKNOWN if "identity" in reason else IntentCoarse.HANDOFF_REQUEST,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await hook.run(pipeline_ctx)
@@ -2450,7 +2543,12 @@ async def test_wxbot_reply_policy_prompt_text_cannot_bypass_identity_or_handoff_
 @pytest.mark.asyncio
 async def test_wxbot_reply_policy_fails_closed_when_policy_cannot_be_loaded() -> None:
     hook = WxbotReplyPolicyHook(_FailingPolicyStore())
-    pipeline_ctx = _group_reply_policy_ctx("@bot 你是真人吗")
+    pipeline_ctx = _group_reply_policy_ctx(
+        "@bot 你是真人吗",
+        human_domain="identity",
+        human_action="inquiry",
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
 
     with pytest.raises(HookAbort) as caught:
         await hook.run(pipeline_ctx)
@@ -2618,6 +2716,7 @@ async def test_wxbot_agent_intent_hook_marks_group_info_queries_as_tools_availab
         trace_id="trace-agent-1",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_info")
 
     await hook.run(pipeline_ctx)
 
@@ -2649,6 +2748,7 @@ async def test_wxbot_agent_scope_enrich_step_sets_signals() -> None:
         trace_id="trace-agent-1",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_info")
 
     result = await step.run(pipeline_ctx)
 
@@ -2714,6 +2814,7 @@ async def test_wxbot_agent_intent_hook_marks_group_member_count_queries() -> Non
         trace_id="trace-agent-1b",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_info")
 
     await hook.run(pipeline_ctx)
 
@@ -2745,6 +2846,7 @@ async def test_wxbot_agent_intent_hook_marks_member_avatar_queries() -> None:
         trace_id="trace-agent-avatar-1",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "avatar")
 
     await hook.run(pipeline_ctx)
 
@@ -2806,6 +2908,7 @@ async def test_wxbot_agent_intent_hook_marks_recent_message_queries() -> None:
         trace_id="trace-agent-3",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_info")
 
     await hook.run(pipeline_ctx)
 
@@ -2837,6 +2940,7 @@ async def test_wxbot_agent_intent_hook_marks_draw_queries() -> None:
         trace_id="trace-agent-draw-1",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "draw", "generate")
 
     await hook.run(pipeline_ctx)
 
@@ -2868,6 +2972,7 @@ async def test_wxbot_agent_intent_hook_marks_multiline_draw_queries() -> None:
         trace_id="trace-agent-draw-2",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "draw", "generate")
 
     await hook.run(pipeline_ctx)
 
@@ -2902,6 +3007,7 @@ async def test_wxbot_agent_intent_hook_marks_personal_map_queries() -> None:
         trace_id="trace-agent-map-1",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "map", "generate")
 
     await hook.run(pipeline_ctx)
 
@@ -2936,6 +3042,7 @@ async def test_wxbot_agent_intent_hook_marks_address_precision_queries_as_map() 
         trace_id="trace-agent-map-address",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "map", "search")
 
     await hook.run(pipeline_ctx)
 
@@ -2983,6 +3090,7 @@ async def test_wxbot_agent_intent_hook_enqueues_map_generation_progress() -> Non
         "humanization_stage": "contextual",
         "humanization_cohort": "contextual",
     }
+    _with_semantic_intent(pipeline_ctx, "map", "generate")
 
     started = datetime.now(UTC)
     await hook.run(pipeline_ctx)
@@ -3064,6 +3172,7 @@ async def test_managed_wxbot_map_progress_preserves_delivery_identity() -> None:
         "participation_policy_version": 11,
         "send_revalidation_enabled": True,
     }
+    _with_semantic_intent(pipeline_ctx, "map", "generate")
 
     await hook.run(pipeline_ctx)
 
@@ -3124,6 +3233,8 @@ async def test_wxbot_agent_intent_hook_never_enqueues_negated_map_generation(
         "participation_policy_version": 11,
         "send_revalidation_enabled": True,
     }
+    if expected_scope:
+        _with_semantic_intent(pipeline_ctx, "map", "search")
 
     await hook.run(pipeline_ctx)
 
@@ -3223,6 +3334,7 @@ async def test_wxbot_agent_scope_step_emits_map_progress_effect_when_opted_in() 
         "humanization_stage": "contextual",
         "humanization_cohort": "contextual",
     }
+    _with_semantic_intent(pipeline_ctx, "map", "generate")
 
     result = await step.run(pipeline_ctx)
 
@@ -3286,6 +3398,7 @@ async def test_wxbot_agent_scope_step_emits_no_effect_for_negated_map_generation
         "participation_policy_version": 12,
         "send_revalidation_enabled": True,
     }
+    _with_semantic_intent(pipeline_ctx, "map", "search")
 
     result = await step.run(pipeline_ctx)
 
@@ -3326,6 +3439,7 @@ async def test_wxbot_agent_intent_hook_does_not_enqueue_progress_for_plain_map_s
         trace_id="trace-agent-map-progress-2",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "map", "search")
 
     await hook.run(pipeline_ctx)
 
@@ -3358,6 +3472,7 @@ async def test_wxbot_agent_intent_hook_marks_route_plan_queries() -> None:
         trace_id="trace-agent-map-2",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "map", "search")
 
     await hook.run(pipeline_ctx)
 
@@ -3389,6 +3504,7 @@ async def test_wxbot_agent_intent_hook_marks_group_feature_queries() -> None:
         trace_id="trace-agent-4",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_info")
 
     await hook.run(pipeline_ctx)
 
@@ -3420,6 +3536,7 @@ async def test_wxbot_agent_intent_hook_marks_group_plugin_config_queries() -> No
         trace_id="trace-agent-5",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_plugin_status")
 
     await hook.run(pipeline_ctx)
 
@@ -3451,6 +3568,7 @@ async def test_wxbot_agent_intent_hook_marks_group_credits_queries() -> None:
         trace_id="trace-agent-6",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_plugin_status")
 
     await hook.run(pipeline_ctx)
 
@@ -3482,6 +3600,7 @@ async def test_wxbot_agent_intent_hook_marks_moderation_event_queries() -> None:
         trace_id="trace-agent-7",
         session=session,
     )
+    _with_semantic_intent(pipeline_ctx, "group_plugin_status")
 
     await hook.run(pipeline_ctx)
 

@@ -26,6 +26,13 @@ from tenacity import (
 
 from app.common.config import Settings
 from app.common.exceptions import UpstreamUnavailable
+from app.common.intent import (
+    IntentArtifact,
+    IntentDecision,
+    IntentDomain,
+    IntentOperation,
+    IntentSource,
+)
 from app.common.logging import get_logger
 from app.common.types import (
     ChatMessage,
@@ -50,6 +57,7 @@ _TIER_ATTR = {
 
 _SUPPORTED_API_MODES = {"chat", "responses"}
 _MAX_WEB_SEARCH_SOURCE_CITATIONS = 20
+_SUPPORTED_WEB_SEARCH_TOOLS = {"web_search", "web_search_preview", "x_search"}
 
 
 def _fallback_label(fallback_from: str | None) -> str:
@@ -427,6 +435,77 @@ def _extract_web_search_source_urls(
     return urls
 
 
+def _request_query(request: ChatRequest) -> str:
+    """Return the latest user text for compact intent audit metadata."""
+
+    for message in reversed(request.messages or []):
+        if message.role == Role.USER and str(message.content or "").strip():
+            return str(message.content or "").strip()[:4000]
+    return ""
+
+
+def _intent_from_tool_name(
+    tool_name: str,
+    *,
+    query: str = "",
+    search_call: bool = False,
+) -> dict[str, Any]:
+    """Project a provider tool selection into the shared intent contract."""
+
+    normalized = str(tool_name or "").strip().lower()
+    if normalized in {"web_search", "web_search_preview", "web_search_call"}:
+        return IntentDecision(
+            operation=IntentOperation.RETRIEVE,
+            source=IntentSource.WEB,
+            artifact=IntentArtifact.TEXT,
+            domain=IntentDomain.WEB_SEARCH,
+            query=query,
+            confidence=1.0 if search_call else 0.9,
+            needs_tool=True,
+            tool_name="web_search" if normalized != "web_search_preview" else normalized,
+        ).to_minimal_dict()
+    if normalized in {"x_search", "x_search_call"}:
+        return IntentDecision(
+            operation=IntentOperation.RETRIEVE,
+            source=IntentSource.X,
+            artifact=IntentArtifact.TEXT,
+            domain=IntentDomain.WEB_SEARCH,
+            query=query,
+            confidence=1.0 if search_call else 0.9,
+            needs_tool=True,
+            tool_name="x_search",
+        ).to_minimal_dict()
+    return IntentDecision(
+        operation=IntentOperation.EXECUTE,
+        source=IntentSource.NONE,
+        artifact=IntentArtifact.STRUCTURED_DATA,
+        query=query,
+        confidence=0.9 if search_call else 0.8,
+        needs_tool=True,
+        tool_name=normalized or None,
+    ).to_minimal_dict()
+
+
+def _extract_responses_semantic_intent(
+    raw: Any,
+    *,
+    query: str = "",
+) -> dict[str, Any]:
+    """Read the model's actual native tool choice without another LLM call."""
+
+    for item in _field(raw, "output", None) or []:
+        item_type = str(_field(item, "type", "") or "").strip().lower()
+        if item_type in {"web_search_call", "x_search_call"}:
+            return _intent_from_tool_name(item_type, query=query, search_call=True)
+        if item_type == "function_call":
+            return _intent_from_tool_name(
+                str(_field(item, "name", "") or ""),
+                query=query,
+                search_call=False,
+            )
+    return {}
+
+
 def _extract_responses_payload(
     raw: Any,
     *,
@@ -606,16 +685,66 @@ class OpenAIProvider:
             return bool(metadata.get("web_search"))
         return bool(self._settings.openai_web_search_enabled)
 
-    def _build_web_search_tool(self, req: ChatRequest) -> dict[str, Any]:
+    def _search_tool_types(self, req: ChatRequest) -> list[str]:
+        """Resolve the hosted search choices exposed to the model.
+
+        Ordinary LLM turns use native tool choice instead of a local keyword
+        classifier.  Grok can therefore choose between the public web and X
+        without us guessing from the wording of a multilingual request.
+        Required-search callers still pass a single configured tool and keep
+        their deterministic contract.
+        """
+
         metadata = req.metadata or {}
-        tool_type = (
-            str(
-                metadata.get("openai_web_search_tool")
-                or self._settings.openai_web_search_tool
-                or "web_search"
-            ).strip()
-            or "web_search"
-        )
+        raw_types = metadata.get("openai_web_search_tools")
+        if raw_types is None:
+            if (
+                metadata.get("semantic_intent_mode") == "native_tool_choice"
+                and self._grok_compatible
+            ):
+                raw_types = ["web_search", "x_search"]
+            else:
+                raw_types = [
+                    metadata.get("openai_web_search_tool")
+                    or self._settings.openai_web_search_tool
+                    or "web_search"
+                ]
+        elif isinstance(raw_types, str):
+            raw_types = [raw_types]
+        elif not isinstance(raw_types, (list, tuple, set)):
+            raw_types = []
+
+        resolved: list[str] = []
+        for raw_type in raw_types:
+            tool_type = str(raw_type or "").strip().lower()
+            if tool_type not in _SUPPORTED_WEB_SEARCH_TOOLS:
+                continue
+            if self._grok_compatible and tool_type == "web_search_preview":
+                tool_type = "web_search"
+            if not self._grok_compatible and tool_type == "x_search":
+                continue
+            if tool_type not in resolved:
+                resolved.append(tool_type)
+
+        if resolved:
+            return resolved
+        # A malformed optional override should not silently disable a search
+        # capability that was explicitly enabled.
+        fallback = str(self._settings.openai_web_search_tool or "web_search").strip().lower()
+        if fallback == "web_search_preview" and self._grok_compatible:
+            fallback = "web_search"
+        if fallback == "x_search" and not self._grok_compatible:
+            fallback = "web_search"
+        return [fallback if fallback in _SUPPORTED_WEB_SEARCH_TOOLS else "web_search"]
+
+    def _build_web_search_tool(
+        self,
+        req: ChatRequest,
+        *,
+        tool_type: str | None = None,
+    ) -> dict[str, Any]:
+        metadata = req.metadata or {}
+        tool_type = str(tool_type or self._search_tool_types(req)[0]).strip().lower()
         if self._grok_compatible and tool_type == "web_search_preview":
             # Grok exposes live web search as `web_search`; the OpenAI preview
             # alias is not part of the Grok tool vocabulary.
@@ -636,6 +765,12 @@ class OpenAIProvider:
             tool["external_web_access"] = bool(self._settings.openai_web_search_live_enabled)
         return tool
 
+    def _build_web_search_tools(self, req: ChatRequest) -> list[dict[str, Any]]:
+        return [
+            self._build_web_search_tool(req, tool_type=tool_type)
+            for tool_type in self._search_tool_types(req)
+        ]
+
     def _build_responses_kwargs(self, req: ChatRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self._resolve_model(req),
@@ -649,7 +784,7 @@ class OpenAIProvider:
             # Required search is a separate hosted-tool phase. Ignore custom
             # functions defensively so generic tool_choice="required" cannot
             # be satisfied by a local function instead of web search.
-            tools = [self._build_web_search_tool(req)]
+            tools = [self._build_web_search_tools(req)[0]]
         else:
             tools = []
             if req.tools:
@@ -660,7 +795,7 @@ class OpenAIProvider:
                     )
                 )
             if self._should_use_web_search(req):
-                tools.append(self._build_web_search_tool(req))
+                tools.extend(self._build_web_search_tools(req))
         if tools:
             kwargs["tools"] = tools
         if web_search_required:
@@ -677,7 +812,7 @@ class OpenAIProvider:
                     == "api.openai.com"
                 )
             if bool(include_sources):
-                search_tool = self._build_web_search_tool(req).get("type")
+                search_tool = tools[0].get("type")
                 call_type = "x_search_call" if search_tool == "x_search" else "web_search_call"
                 kwargs["include"] = [f"{call_type}.action.sources"]
         return kwargs
@@ -766,6 +901,18 @@ class OpenAIProvider:
             finish_reason=finish_reason,
             usage=usage,
             latency_ms=latency_ms,
+            metadata=(
+                {
+                    "semantic_intent": _intent_from_tool_name(
+                        tool_calls[0].name,
+                        query=_request_query(request),
+                        search_call=False,
+                    ),
+                    "semantic_intent_method": "native_tool_call",
+                }
+                if tool_calls
+                else {}
+            ),
         )
 
     async def _chat_via_responses(self, request: ChatRequest) -> ChatResponse:
@@ -820,6 +967,17 @@ class OpenAIProvider:
             finish_reason=finish_reason,
             usage=usage,
             latency_ms=latency_ms,
+            metadata=(
+                {
+                    "semantic_intent": semantic_intent,
+                    "semantic_intent_method": "native_tool_call",
+                }
+                if (semantic_intent := _extract_responses_semantic_intent(
+                    raw,
+                    query=_request_query(request),
+                ))
+                else {}
+            ),
         )
 
     def stream_chat(self, request: ChatRequest) -> AsyncIterator[str]:

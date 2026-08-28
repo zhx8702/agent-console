@@ -264,6 +264,7 @@ class Settings(BaseSettings):
     rag_citation_validation_enabled: bool = True
     rag_citation_repair_enabled: bool = True
     rag_citation_support_threshold: float = Field(default=0.08, ge=0.0, le=1.0)
+    persona_extract_llm_backend: str = "http"
     persona_extract_stage_timeout_seconds: float = Field(default=120.0, gt=0)
     # Provider implementations own immediate network retries. Persona jobs
     # retry durably with a new lease, so the stage wrapper must not multiply
@@ -306,6 +307,8 @@ class Settings(BaseSettings):
         ge=3_600,
         le=30 * 24 * 60 * 60,
     )
+    wxbot_report_llm_backend: str = "http"
+    wxbot_self_review_llm_backend: str = ""
     wxbot_report_stage_timeout_seconds: float = 240.0
     wxbot_report_max_chars_per_chunk: int = Field(default=12_000, ge=1000)
     wxbot_report_transient_backoff_seconds: float = Field(default=900.0, gt=0)
@@ -589,6 +592,30 @@ class Settings(BaseSettings):
     video_api_key_prefix: str = "Bearer "
     video_api_extra_body: str = ""
     video_storage_dir: str = "/mnt/c/Users/Public/agent-console-video"
+    local_agent_base_url: str = ""
+    local_agent_token: str = ""
+    local_agent_probe_timeout_seconds: float = Field(default=5.0, gt=0)
+    local_agent_probe_cache_seconds: float = Field(default=15.0, gt=0)
+    local_agent_task_timeout_seconds: float = Field(default=600.0, gt=0)
+    local_agent_worker_roles: str = "scheduler"
+    local_agent_job_poll_interval_seconds: float = Field(default=2.0, gt=0)
+    local_agent_job_lock_ttl_seconds: float = Field(default=120.0, gt=0)
+    local_agent_job_batch_size: int = Field(default=3, ge=1)
+    local_agent_overflow_enabled: bool = True
+    local_agent_overflow_min_chars: int = Field(default=24000, ge=1000, le=200000)
+    local_agent_overflow_backend: str = "auto"
+    speaker_portrait_llm_backend: str = "grok"
+    speaker_portrait_timeout_seconds: float = Field(default=900.0, gt=0)
+    speaker_portrait_max_chars: int = Field(default=80000, ge=4000, le=200000)
+    speaker_portrait_full_max_chars: int = Field(default=80000, ge=4000, le=200000)
+    speaker_portrait_worker_roles: str = "scheduler"
+    speaker_portrait_hot_update_enabled: bool = True
+    speaker_portrait_hot_update_min_messages: int = Field(default=40, ge=1)
+    speaker_portrait_hot_update_min_seconds: float = Field(default=3600.0, ge=60)
+    speaker_portrait_data_dir: str = "/data/portraits"
+    speaker_portrait_host_dir: str = "/opt/agent-console-portraits"
+    speaker_portrait_inline_max_messages: int = Field(default=400, ge=50)
+    speaker_portrait_max_turns: int = Field(default=40, ge=8, le=80)
     draw_task_stale_seconds: float = Field(default=3600.0, gt=0)
     draw_task_recovery_enabled: bool = True
     draw_task_recovery_interval_seconds: float = Field(default=60.0, gt=0)

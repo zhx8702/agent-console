@@ -173,6 +173,13 @@ def _chat_audit_context(request: ChatRequest, *, model: str, provider: str) -> d
             metadata.get("openai_web_search_required")
             or metadata.get("web_search_required")
         ),
+        "semantic_intent_mode": str(metadata.get("semantic_intent_mode") or "")[:64],
+        "search_tool_candidates": [
+            str(item)[:64]
+            for item in list(metadata.get("openai_web_search_tools") or [])[:8]
+        ]
+        if isinstance(metadata.get("openai_web_search_tools"), (list, tuple, set))
+        else [],
         "prompt_sections": [
             str(item)[:80]
             for item in list(metadata.get("prompt_sections") or [])[:32]
@@ -325,6 +332,14 @@ class LLMService:
             citations=len(resp.citations or []),
             tool_calls=len(resp.tool_calls or []),
             output_chars=len(resp.content or ""),
+            semantic_intent_method=str(
+                (resp.metadata or {}).get("semantic_intent_method") or ""
+            )[:64],
+            semantic_intent_source=str(
+                ((resp.metadata or {}).get("semantic_intent") or {}).get("source") or ""
+            )[:64]
+            if isinstance((resp.metadata or {}).get("semantic_intent"), dict)
+            else "",
         )
 
         return resp

@@ -15,6 +15,7 @@ from app.common.types import (
     Channel,
     InboundEvent,
     Message,
+    PreprocessedMessage,
     Role,
     RouteType,
     Session,
@@ -26,9 +27,27 @@ from app.social.contracts import (
     KillSwitches,
     ParticipationPolicyValues,
 )
+from app.common.intent import IntentDecision, IntentDomain, IntentSource
+from app.common.intent_runtime import persist_decision
 from plugins.wxbot.agent_intent_hook import WxbotAgentIntentHook
 from plugins.wxbot.hook_context import _resolve_group_agent_scope
 from plugins.wxbot.hooks import WxbotAgentScopeEnrichStep
+
+
+def _decision(
+    domain: IntentDomain,
+    action: str = "query",
+    *,
+    source: IntentSource = IntentSource.NONE,
+    **slots: object,
+) -> IntentDecision:
+    return IntentDecision(
+        domain=domain,
+        action=action,
+        source=source,
+        confidence=0.95,
+        slots=slots,
+    )
 
 
 class _FilePolicyStore:
@@ -50,7 +69,11 @@ class _FilePolicyStore:
         )
 
 
-def _group_context(text: str) -> PipelineContext:
+def _group_context(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> PipelineContext:
     session = Session(
         session_id="scope-test@chatroom",
         tenant_id="demo",
@@ -70,10 +93,17 @@ def _group_context(text: str) -> PipelineContext:
             "wxbot_normalized_content": text,
         },
     )
-    return PipelineContext(event=event, trace_id=event.trace_id, session=session)
+    pre = PreprocessedMessage(original_text=text, cleaned_text=text)
+    if decision is not None:
+        persist_decision(decision, pre=pre)
+    return PipelineContext(event=event, trace_id=event.trace_id, session=session, pre=pre)
 
 
-def _private_context(text: str) -> PipelineContext:
+def _private_context(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> PipelineContext:
     session = Session(
         session_id="wxid_private",
         tenant_id="demo",
@@ -94,7 +124,10 @@ def _private_context(text: str) -> PipelineContext:
             "wxbot_normalized_content": text,
         },
     )
-    return PipelineContext(event=event, trace_id=event.trace_id, session=session)
+    pre = PreprocessedMessage(original_text=text, cleaned_text=text)
+    if decision is not None:
+        persist_decision(decision, pre=pre)
+    return PipelineContext(event=event, trace_id=event.trace_id, session=session, pre=pre)
 
 
 @pytest.mark.parametrize(
@@ -116,6 +149,7 @@ def _private_context(text: str) -> PipelineContext:
 )
 def test_map_scope_rejects_hard_negative_phrases(text: str) -> None:
     assert _resolve_group_agent_scope(text) is None
+    assert _resolve_group_agent_scope(text, decision=_decision(IntentDomain.NONE)) is None
 
 
 @pytest.mark.parametrize(
@@ -147,7 +181,10 @@ def test_agent_tool_scopes_reject_negated_actions(text: str) -> None:
     ],
 )
 def test_map_scope_keeps_explicit_location_queries(text: str) -> None:
-    assert _resolve_group_agent_scope(text) == GROUP_PERSONAL_MAP_SCOPE
+    assert (
+        _resolve_group_agent_scope(text, decision=_decision(IntentDomain.MAP, "search"))
+        == GROUP_PERSONAL_MAP_SCOPE
+    )
 
 
 @pytest.mark.parametrize(
@@ -160,7 +197,10 @@ def test_map_scope_keeps_explicit_location_queries(text: str) -> None:
 def test_map_scope_keeps_later_affirmative_query_after_negated_tool_action(
     text: str,
 ) -> None:
-    assert _resolve_group_agent_scope(text) == GROUP_PERSONAL_MAP_SCOPE
+    assert (
+        _resolve_group_agent_scope(text, decision=_decision(IntentDomain.MAP, "search"))
+        == GROUP_PERSONAL_MAP_SCOPE
+    )
 
 
 @pytest.mark.parametrize(
@@ -178,7 +218,12 @@ def test_group_scope_conflicts_use_specific_primary_intent(
     text: str,
     expected_scope: str,
 ) -> None:
-    assert _resolve_group_agent_scope(text) == expected_scope
+    decision = {
+        MESSAGE_EXPORT_SCOPE: _decision(IntentDomain.FILE, "export_history"),
+        GROUP_DRAW_GENERATION_SCOPE: _decision(IntentDomain.DRAW, "generate"),
+        DEFAULT_AGENT_SCOPE: _decision(IntentDomain.GROUP_INFO, "query"),
+    }[expected_scope]
+    assert _resolve_group_agent_scope(text, decision=decision) == expected_scope
 
 
 @pytest.mark.parametrize(
@@ -191,7 +236,10 @@ def test_group_scope_conflicts_use_specific_primary_intent(
     ],
 )
 def test_video_generation_scope_precedes_draw_scope(text: str) -> None:
-    assert _resolve_group_agent_scope(text) == GROUP_VIDEO_GENERATION_SCOPE
+    assert (
+        _resolve_group_agent_scope(text, decision=_decision(IntentDomain.VIDEO, "generate"))
+        == GROUP_VIDEO_GENERATION_SCOPE
+    )
 
 
 @pytest.mark.parametrize(
@@ -207,12 +255,18 @@ def test_video_generation_scope_precedes_draw_scope(text: str) -> None:
     ],
 )
 def test_video_questions_do_not_activate_video_generation_scope(text: str) -> None:
-    assert _resolve_group_agent_scope(text) is None
+    assert _resolve_group_agent_scope(
+        text,
+        decision=_decision(IntentDomain.VIDEO, "question"),
+    ) is None
 
 
 @pytest.mark.asyncio
 async def test_agent_intent_hook_emits_new_and_legacy_router_signals() -> None:
-    ctx = _group_context("帮我查一下公司的详细地址")
+    ctx = _group_context(
+        "帮我查一下公司的详细地址",
+        decision=_decision(IntentDomain.MAP, "search"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -225,7 +279,10 @@ async def test_agent_intent_hook_emits_new_and_legacy_router_signals() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_scope_step_syncs_new_and_legacy_router_signals() -> None:
-    ctx = _group_context("帮我查一下公司的详细地址")
+    ctx = _group_context(
+        "帮我查一下公司的详细地址",
+        decision=_decision(IntentDomain.MAP, "search"),
+    )
 
     result = await WxbotAgentScopeEnrichStep().run(ctx)
 
@@ -240,8 +297,14 @@ async def test_agent_scope_step_syncs_new_and_legacy_router_signals() -> None:
 
 @pytest.mark.asyncio
 async def test_generate_file_scope_requires_explicit_delivery() -> None:
-    requested = _group_context("把上面的内容整理成文件发我")
-    denied = _group_context("把上面的内容整理成文件但不要发")
+    requested = _group_context(
+        "把上面的内容整理成文件发我",
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=True, format="txt"),
+    )
+    denied = _group_context(
+        "把上面的内容整理成文件但不要发",
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=False),
+    )
 
     await WxbotAgentIntentHook(
         social_policy_store=_FilePolicyStore(enabled=True),
@@ -261,7 +324,16 @@ async def test_generate_file_scope_requires_explicit_delivery() -> None:
 
 @pytest.mark.asyncio
 async def test_recent_group_topic_file_request_requires_bounded_history_export() -> None:
-    ctx = _group_context("整理十分钟群里话题 以文件方式发给我")
+    ctx = _group_context(
+        "整理十分钟群里话题 以文件方式发给我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "export_history",
+            delivery_required=True,
+            format="txt",
+            recent_minutes=10,
+        ),
+    )
 
     await WxbotAgentIntentHook(
         social_policy_store=_FilePolicyStore(enabled=True),
@@ -282,7 +354,16 @@ async def test_recent_group_topic_file_request_requires_bounded_history_export()
 
 @pytest.mark.asyncio
 async def test_private_news_file_request_requires_generated_file_delivery() -> None:
-    ctx = _private_context("联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我")
+    ctx = _private_context(
+        "联网搜索今天热点新闻，按标题、摘要、来源链接整理成 TXT 文件发给我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "generate",
+            source=IntentSource.WEB,
+            delivery_required=True,
+            format="txt",
+        ),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -301,7 +382,10 @@ async def test_private_news_file_request_requires_generated_file_delivery() -> N
 
 @pytest.mark.asyncio
 async def test_private_video_request_activates_video_scope_without_mention() -> None:
-    ctx = _private_context("帮我生成一段海边日落视频")
+    ctx = _private_context(
+        "帮我生成一段海边日落视频",
+        decision=_decision(IntentDomain.VIDEO, "generate"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -314,7 +398,10 @@ async def test_private_video_request_activates_video_scope_without_mention() -> 
 
 @pytest.mark.asyncio
 async def test_private_draw_request_activates_draw_scope_without_mention() -> None:
-    ctx = _private_context("画个海边日落的图片")
+    ctx = _private_context(
+        "画个海边日落的图片",
+        decision=_decision(IntentDomain.DRAW, "generate"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -327,7 +414,10 @@ async def test_private_draw_request_activates_draw_scope_without_mention() -> No
 
 @pytest.mark.asyncio
 async def test_private_file_request_does_not_require_negated_web_search() -> None:
-    ctx = _private_context("不要联网搜索，把我给你的内容整理成 TXT 文件发给我")
+    ctx = _private_context(
+        "不要联网搜索，把我给你的内容整理成 TXT 文件发给我",
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=True, format="txt"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -337,7 +427,16 @@ async def test_private_file_request_does_not_require_negated_web_search() -> Non
 
 @pytest.mark.asyncio
 async def test_model_memory_negation_does_not_cancel_explicit_live_search() -> None:
-    ctx = _private_context("不要用模型记忆，请联网搜索今天热点新闻，整理成 TXT 文件发给我")
+    ctx = _private_context(
+        "不要用模型记忆，请联网搜索今天热点新闻，整理成 TXT 文件发给我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "generate",
+            source=IntentSource.WEB,
+            delivery_required=True,
+            format="txt",
+        ),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -357,7 +456,10 @@ async def test_model_memory_negation_does_not_cancel_explicit_live_search() -> N
     ],
 )
 async def test_web_search_negation_accepts_common_modifiers(text: str) -> None:
-    ctx = _private_context(text)
+    ctx = _private_context(
+        text,
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=True, format="txt"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -366,7 +468,16 @@ async def test_web_search_negation_accepts_common_modifiers(text: str) -> None:
 
 @pytest.mark.asyncio
 async def test_later_positive_clause_overrides_earlier_search_negation() -> None:
-    ctx = _private_context("不要联网搜索旧新闻，但请联网搜索今天热点，整理成 TXT 文件发我")
+    ctx = _private_context(
+        "不要联网搜索旧新闻，但请联网搜索今天热点，整理成 TXT 文件发我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "generate",
+            source=IntentSource.WEB,
+            delivery_required=True,
+            format="txt",
+        ),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -375,7 +486,16 @@ async def test_later_positive_clause_overrides_earlier_search_negation() -> None
 
 @pytest.mark.asyncio
 async def test_fresh_non_news_search_requires_live_web_access() -> None:
-    ctx = _private_context("搜索最新天气，整理成 TXT 文件发我")
+    ctx = _private_context(
+        "搜索最新天气，整理成 TXT 文件发我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "generate",
+            source=IntentSource.WEB,
+            delivery_required=True,
+            format="txt",
+        ),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -384,7 +504,10 @@ async def test_fresh_non_news_search_requires_live_web_access() -> None:
 
 @pytest.mark.asyncio
 async def test_local_knowledge_search_does_not_require_live_web_access() -> None:
-    ctx = _private_context("搜索知识库最新内容，整理成 TXT 文件发我")
+    ctx = _private_context(
+        "搜索知识库最新内容，整理成 TXT 文件发我",
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=True, format="txt"),
+    )
 
     await WxbotAgentIntentHook().run(ctx)
 
@@ -393,7 +516,10 @@ async def test_local_knowledge_search_does_not_require_live_web_access() -> None
 
 @pytest.mark.asyncio
 async def test_group_file_send_scope_fails_closed_when_master_switch_is_off() -> None:
-    ctx = _group_context("把上面的内容整理成文件发我")
+    ctx = _group_context(
+        "把上面的内容整理成文件发我",
+        decision=_decision(IntentDomain.FILE, "generate", delivery_required=True, format="txt"),
+    )
 
     await WxbotAgentIntentHook(
         social_policy_store=_FilePolicyStore(enabled=False),
@@ -408,7 +534,15 @@ async def test_group_file_send_scope_fails_closed_when_master_switch_is_off() ->
 
 @pytest.mark.asyncio
 async def test_group_file_send_denial_finalizes_with_actionable_web_setting_reply() -> None:
-    ctx = _group_context("把今天的群消息汇总成 TXT 文件发给我")
+    ctx = _group_context(
+        "把今天的群消息汇总成 TXT 文件发给我",
+        decision=_decision(
+            IntentDomain.FILE,
+            "export_history",
+            delivery_required=True,
+            format="txt",
+        ),
+    )
 
     result = await WxbotAgentScopeEnrichStep(
         social_policy_store=_FilePolicyStore(enabled=False),
@@ -470,7 +604,10 @@ async def test_group_file_followup_does_not_cross_sender_boundary() -> None:
 
 @pytest.mark.asyncio
 async def test_managed_group_identity_still_requires_group_mention_for_file_scope() -> None:
-    ctx = _group_context("分析刚才这个文件")
+    ctx = _group_context(
+        "分析刚才这个文件",
+        decision=_decision(IntentDomain.FILE, "inspect_incoming"),
+    )
     ctx.event.session_id = "cx1:managed-room"
     ctx.event.external_conversation_id = "room@chatroom"
     ctx.event.metadata.update(

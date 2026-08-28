@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0046_memory_event_provenance_expiry"
+RUNTIME_SCHEMA_REVISION = "0049_speaker_portrait_hot_update"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
 # 0046 adds durable memory-event provenance, evidence, and physical expiry.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
@@ -29,6 +29,7 @@ RUNTIME_SCHEMA_TABLES = frozenset(
         "plugin_credits_ledger",
         "plugin_credits_reservation",
         "plugin_draw_task",
+        "plugin_local_agent_job",
         "plugin_events",
         "plugin_group_activity_config",
         "plugin_group_activity_event",
@@ -48,6 +49,9 @@ RUNTIME_SCHEMA_TABLES = frozenset(
         "plugin_persona_jobs",
         "plugin_persona_job_chunks",
         "plugin_persona_profiles",
+        "plugin_speaker_portrait_jobs",
+        "plugin_speaker_portrait_revisions",
+        "plugin_speaker_portraits",
         "plugin_repeater_config",
         "plugin_repeater_event",
         "plugin_scope_state",
@@ -102,6 +106,12 @@ RUNTIME_SCHEMA_INDEXES = frozenset(
         "ix_channel_connection_tenant_state",
         "idx_draw_task_tenant_created",
         "idx_draw_task_queue_due",
+        "idx_local_agent_job_queue_due",
+        "idx_local_agent_job_tenant_created",
+        "idx_speaker_portrait_job_queue",
+        "idx_speaker_portrait_revision_portrait",
+        "idx_speaker_portrait_hot_update",
+        "ux_speaker_portrait_identity",
         "idx_group_activity_event_scope_created",
         "idx_group_activity_event_status_updated",
         "ix_plugin_lifecycle_in_progress_created",

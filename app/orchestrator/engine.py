@@ -35,6 +35,8 @@ from app.common.capability import CapabilityEngine
 from app.common.config import Settings
 from app.common.context import set_session_id, set_tenant_id, set_trace_id
 from app.common.exceptions import SessionLockLost
+from app.common.intent_classify import classify_context_from_event
+from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -208,6 +210,13 @@ def _assistant_turn_metadata(
         rule = ctx.route.hints.get("rule") if isinstance(ctx.route.hints, dict) else None
         if isinstance(rule, str) and rule.strip():
             metadata["route_rule"] = rule.strip()
+
+    semantic_intent = result.metadata.get("semantic_intent")
+    if isinstance(semantic_intent, dict):
+        metadata["semantic_intent"] = dict(semantic_intent)
+        method = result.metadata.get("semantic_intent_method")
+        if isinstance(method, str) and method.strip():
+            metadata["semantic_intent_method"] = method.strip()
 
     fallback_from = result.metadata.get("fallback_from")
     fallback_reason = (
@@ -598,7 +607,13 @@ class DialogOrchestrator:
             try:
                 await self.hooks.run(HookPoint.BEFORE_PREPROCESS, ctx)
                 with tracer.start_as_current_span("preprocess"):
-                    pre = await self.preprocessor.run(event.message)
+                    pre = await self.preprocessor.run(
+                        event.message,
+                        context=classify_context_from_event(
+                            event,
+                            has_attachment=bool(getattr(event.message, "attachments", None)),
+                        ),
+                    )
             except HookAbort as ha:
                 result = CapabilityResult(route=RouteType.CANNED, reply_text=ha.reply_text)
                 return await self._finalize(ctx, result, skip_output_safety=True)
@@ -610,6 +625,13 @@ class DialogOrchestrator:
                 result = self._degrade("preprocess_failed")
                 return await self._finalize(ctx, result, skip_output_safety=False)
             ctx.pre = pre
+            if pre.semantic_intent:
+                persist_decision(
+                    decision_from_pre(pre),
+                    pre=pre,
+                    session=session,
+                    extras=ctx.extras,
+                )
             if pre.pii_map:
                 session.pii_map.update(pre.pii_map)
             await self.hooks.run(HookPoint.AFTER_PREPROCESS, ctx)

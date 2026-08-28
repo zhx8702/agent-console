@@ -333,6 +333,98 @@ def test_extract_responses_payload_accepts_x_search_call_sources() -> None:
     assert [citation.url for citation in citations] == ["https://x.com/example"]
 
 
+def test_openai_provider_exposes_web_and_x_search_to_grok_native_tool_choice() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://sub2api.example.test/v1",
+            "grok_models_base_url": "https://sub2api.example.test/v1",
+            "xai_api_key": "xai-test",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "web_search",
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={
+            "metadata": {
+                "openai_web_search": True,
+                "semantic_intent_mode": "native_tool_choice",
+            }
+        }
+    )
+
+    kwargs = provider._build_responses_kwargs(request)
+
+    assert kwargs["tools"] == [{"type": "web_search"}, {"type": "x_search"}]
+    assert "tool_choice" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_projects_native_x_search_into_structured_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    created_clients: list[_FakeClient] = []
+    raw = SimpleNamespace(
+        model="grok-4.6",
+        status="completed",
+        output=[
+            SimpleNamespace(type="x_search_call", status="completed"),
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(text="我综合了 X 上的结果。", annotations=[])],
+            ),
+        ],
+        output_text="我综合了 X 上的结果。",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        assert max_retries == 0
+        client = _FakeClient(base_url=base_url, responses_result=raw)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+
+    settings = get_settings().model_copy(
+        update={
+            "openai_base_url": "https://api.x.ai/v1",
+            "openai_api_mode": "responses",
+            "openai_web_search_enabled": True,
+            "openai_web_search_tool": "web_search",
+        }
+    )
+    provider = OpenAIProvider(api_key="xai-test", settings=settings)
+    request = _make_request().model_copy(
+        update={
+            "metadata": {
+                "openai_web_search": True,
+                "semantic_intent_mode": "native_tool_choice",
+            },
+            "messages": [ChatMessage(role=Role.USER, content="x上搜一下怎么快速搞钱")],
+        }
+    )
+
+    response = await provider.chat(request)
+
+    assert len(created_clients[0].responses_calls) == 1
+    assert response.metadata["semantic_intent"] == {
+        "operation": "retrieve",
+        "source": "x",
+        "artifact": "text",
+        "domain": "web_search",
+        "confidence": 1.0,
+        "needs_tool": True,
+        "query": "x上搜一下怎么快速搞钱",
+        "tool_name": "x_search",
+    }
+    assert response.metadata["semantic_intent_method"] == "native_tool_call"
+
+
 def test_extract_responses_payload_prefers_annotation_metadata_over_action_source() -> None:
     duplicated_url = "https://example.com/richer-annotation"
     raw = SimpleNamespace(

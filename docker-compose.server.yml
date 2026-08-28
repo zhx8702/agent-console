@@ -27,6 +27,11 @@ services:
         target: ${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
         bind:
           create_host_path: true
+      - type: bind
+        source: ${SPEAKER_PORTRAIT_HOST_DIR:-/opt/agent-console-portraits}
+        target: ${SPEAKER_PORTRAIT_DATA_DIR:-/data/portraits}
+        bind:
+          create_host_path: true
   inbound-worker:
     restart: unless-stopped
     networks: [default, wxbot-sdk]
@@ -46,6 +51,11 @@ services:
       - type: bind
         source: ${WXBOT_OUTBOUND_FILE_HOST_DIR:-/opt/wxbot-shared/outbox}
         target: ${WXBOT_OUTBOUND_FILE_DIR:-/data/wxbot-outbound}
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ${SPEAKER_PORTRAIT_HOST_DIR:-/opt/agent-console-portraits}
+        target: ${SPEAKER_PORTRAIT_DATA_DIR:-/data/portraits}
         bind:
           create_host_path: true
   wxbot-bridge-worker:

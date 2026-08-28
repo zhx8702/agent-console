@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from app.channel import set_reply_policy_override
 from app.channel.models import configuration_session_id
+from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -102,7 +103,11 @@ def _contextual_intent(
     except ValueError:
         return TiboResetIntent(TiboResetIntentType.NONE, 0.0, current_text)
     previous_intent = TiboResetIntent(previous_type, 1.0, "")
-    return classify_tibo_reset_followup(current_text, previous_intent)
+    return classify_tibo_reset_followup(
+        current_text,
+        previous_intent,
+        decision=decision_from_pre(ctx.pre),
+    )
 
 
 def _remember_handled_intent(
@@ -157,7 +162,10 @@ class TiboResetIntentHook:
             return
 
         query_text = _query_text(ctx)
-        intent = classify_tibo_reset_intent(query_text)
+        intent = classify_tibo_reset_intent(
+            query_text,
+            decision=decision_from_pre(ctx.pre),
+        )
         match_source = "direct_rule"
         followup_window_seconds = max(
             60.0,

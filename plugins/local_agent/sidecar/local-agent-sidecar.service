@@ -1,0 +1,18 @@
+[Unit]
+Description=Local grok/Codex sidecar for agent-console
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/agent-console
+Environment=LOCAL_AGENT_SIDECAR_HOST=127.0.0.1
+Environment=LOCAL_AGENT_SIDECAR_PORT=8787
+Environment=LOCAL_AGENT_TOKEN=
+Environment=PATH=/home/ubuntu/.grok/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/python3 -m plugins.local_agent.sidecar
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

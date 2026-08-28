@@ -98,7 +98,7 @@ class FakePreprocessor:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def run(self, message: Message) -> PreprocessedMessage:
+    async def run(self, message: Message, **_kwargs) -> PreprocessedMessage:
         self.calls += 1
         return PreprocessedMessage(
             original_text=message.content,

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from app.agent.scopes import GROUP_PERSONAL_MAP_SCOPE, normalize_agent_scope
 from app.channel.models import configuration_session_id
 from app.commands import CommandDefinition
+from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
 from app.common.types import CapabilityResult, Channel, RouteType
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
@@ -24,9 +25,6 @@ from plugins.credits.intent import (
     CreditIntent,
     CreditIntentType,
     classify_credit_intent,
-    contains_credit_term,
-    extract_other_credit_query_target,
-    is_self_query,
 )
 from plugins.credits.store import (
     CHECKIN_MODE_COMMAND,
@@ -163,14 +161,11 @@ async def _resolve_other_credit_member(
 ) -> dict[str, str] | None:
     if target_user_id:
         return {"user_id": target_user_id, "display_name": target_display_name}
-    if not contains_credit_term(text, credit_name):
-        return None
-
     mentioned_user_id = _mentioned_credit_target_user_id(ctx)
     if mentioned_user_id:
         return {"user_id": mentioned_user_id, "display_name": ""}
 
-    target = target_display_name or extract_other_credit_query_target(text, credit_name)
+    target = target_display_name
     if not target:
         return None
 
@@ -741,6 +736,7 @@ class CreditNaturalLanguageHook:
             balance_text=balance_text,
             credit_name=credit_name,
             mentioned_target_user_id=_mentioned_credit_target_user_id(ctx),
+            decision=decision_from_pre(ctx.pre),
         )
         _sync_credit_intent_signal(ctx, intent)
 
@@ -794,7 +790,7 @@ class CreditNaturalLanguageHook:
                 reason="credit_member_query",
             )
 
-        if intent.type == CreditIntentType.RANK and not is_self_query(text):
+        if intent.type == CreditIntentType.RANK:
             raise HookAbort(await _cmd_top(self.store, ctx, cfg), reason="credits_command")
 
         detail = await self.store.get_member_detail(

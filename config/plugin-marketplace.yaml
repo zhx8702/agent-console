@@ -172,6 +172,65 @@ items:
       commands: [/draw, /redraw, /画图, /重绘]
     restart_policy: required_after_install
 
+  - name: local_agent
+    display_name: 本机 CLI Agent
+    version: 0.1.0
+    description: Probe host grok / Codex CLIs, run /grok /codex, and overflow long prompts locally
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/local_agent
+    capability_digest: sha256:4af5c212cf499104839811bb640f92542b1a3da142e9a8f0566510acb7f66b8a
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: commands
+        version: ">=0.1.0"
+        required: false
+    permissions:
+      - id: commands
+        level: runtime
+        description: 注册 /grok /codex 命令
+      - id: hooks:pipeline
+        level: runtime
+        description: 超长或上下文溢出时转入本机 CLI
+      - id: admin_api
+        level: local
+        description: 暴露本机 Agent 探针和任务接口
+      - id: network:local_agent
+        level: external
+        description: 访问宿主机 local-agent sidecar
+      - id: storage:plugin
+        level: local
+        description: 写入本机 Agent 任务记录
+    capabilities:
+      routes: ["/plugins/local_agent"]
+      hooks: ["after_capability", "before_capability"]
+      agent_tools: []
+      commands: [/c, /codex, /g, /grok]
+    config_schema:
+      type: object
+      properties:
+        overflow_enabled:
+          type: boolean
+          default: true
+          description: 超长文本或上下文溢出时自动转本机 grok/Codex
+        overflow_min_chars:
+          type: integer
+          minimum: 1000
+          maximum: 200000
+          default: 24000
+          description: 自动溢出的最小拼装提示词字符数
+        overflow_backend:
+          type: string
+          enum: [auto, codex, grok]
+          default: auto
+          description: auto 优先 Codex，不可用再走 grok
+      additionalProperties: false
+    restart_policy: required_after_install
+
   - name: video
     display_name: 视频生成插件
     version: 0.1.0
@@ -308,6 +367,46 @@ items:
     capabilities:
       routes: ["/plugins/persona_extract"]
       hooks: ["before_capability"]
+      agent_tools: []
+      commands: []
+    restart_policy: required_after_install
+
+  - name: speaker_portrait
+    display_name: 人物画像
+    version: 0.1.0
+    description: Build speaker portraits from chat history via local CLI
+    author: builtin
+    source: builtin
+    package:
+      type: builtin
+      uri: plugins/speaker_portrait
+    capability_digest: sha256:aef6d2995fe36c88dcfe286dc4faec3010f802c2c397fb5eea62a0ae6809495d
+    compatibility:
+      core_api: ">=0.1.0 <0.2.0"
+      python: ">=3.11"
+    dependencies:
+      - name: wxbot
+        version: ">=0.2.0"
+        required: false
+      - name: local_agent
+        version: ">=0.1.0"
+        required: false
+    permissions:
+      - id: network:wxbot
+        level: external
+        description: 读取发言人历史消息
+      - id: storage:shared
+        level: local
+        description: 写入人物画像和生成任务
+      - id: hooks:pipeline
+        level: runtime
+        description: 回复时注入当前发言人画像
+      - id: admin_api
+        level: local
+        description: 暴露画像管理接口
+    capabilities:
+      routes: ["/plugins/speaker_portrait"]
+      hooks: []
       agent_tools: []
       commands: []
     restart_policy: required_after_install

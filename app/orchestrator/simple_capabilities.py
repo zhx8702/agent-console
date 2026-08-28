@@ -34,6 +34,8 @@ from app.common.image_preview import (
     preview_url_from_thumbnail,
     wait_for_image,
 )
+from app.common.intent import IntentArtifact, IntentDecision, IntentDomain, IntentOperation
+from app.common.intent_runtime import decision_from_pre, decision_from_session, is_confident, persist_decision
 from app.common.logging import get_logger
 from app.common.prompting import (
     augment_prompt_with_persona_and_memory,
@@ -55,7 +57,6 @@ from app.common.types import (
     SessionState,
     Turn,
 )
-from app.common.web_search import live_web_search_requested
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.infra.metrics import LLM_IMAGE_ATTACHMENT_EVENTS
 from app.llm.service import LLMService
@@ -65,8 +66,7 @@ from plugins.draw.avatar import extract_avatar_query, resolve_group_avatar_refer
 log = get_logger(__name__)
 _GROUP_MENTION_PREFIX_RE = re.compile(r"^\s*(?:@\S+[\s\u2005\u00a0]+)+")
 _MENTION_NAME_RE = re.compile(r"@([^\s\u2005\u00a0]+)")
-_AVATAR_INTENT_RE = re.compile(r"(分析|看看|看下|看一看|什么|是谁|谁|他的|她的|这个人|这人)")
-_EXPLICIT_MENTION_AVATAR_RE = re.compile(r"@[^\s\u2005\u00a0]{1,32}\s*的?头像")
+
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _WXBOT_CONTAINER_LOCAL_HOSTS = {"127.0.0.1", "localhost", "host.docker.internal"}
 
@@ -271,12 +271,16 @@ def _metadata_text_variants(metadata: dict[str, Any], content: str) -> list[str]
     )
 
 
-def _avatar_intent_detected(text: str) -> bool:
-    value = str(text or "").strip()
+def _avatar_intent_detected(
+    text: str,
+    *,
+    decision: IntentDecision | None = None,
+) -> bool:
+    _ = text
     return bool(
-        value
-        and "头像" in value
-        and (_AVATAR_INTENT_RE.search(value) or _EXPLICIT_MENTION_AVATAR_RE.search(value))
+        decision is not None
+        and is_confident(decision)
+        and decision.domain is IntentDomain.AVATAR
     )
 
 
@@ -357,13 +361,14 @@ def _mentioned_avatar_candidate(
     if metadata.get("session_kind") and str(metadata.get("session_kind")) != "group":
         return _MentionedAvatarCandidate(reason="not_group")
     text = _metadata_text(metadata, turn.content)
-    if not _avatar_intent_detected(text):
+    decision = decision_from_session(session)
+    if not _avatar_intent_detected(text, decision=decision):
         return _MentionedAvatarCandidate(reason="no_avatar_intent")
 
     text_variants = _metadata_text_variants(metadata, turn.content)
     at_wxids = parse_at_wxids(metadata.get("at_wxids"))
     bot_wxids = _bot_wxid_candidates(metadata, session)
-    query = extract_avatar_query(text)
+    query = extract_avatar_query(text, decision=decision)
     query_names = _mentioned_names(text)
     ordered_names = _best_mentioned_names(text_variants)
     if query_names:
@@ -430,7 +435,14 @@ def _mentioned_avatar_candidate(
 
 
 class LLMCapabilityEngine:
-    """Plain LLM chat: no retrieval, no tools. Uses recent turns as context."""
+    """Plain LLM chat with provider-native semantic tool selection.
+
+    The route still receives the cheap coarse intent from preprocessing for
+    compatibility, but actionable search intent is no longer guessed from
+    message keywords.  When search is enabled, the Responses provider exposes
+    hosted tools and the model's actual tool choice becomes the structured
+    intent evidence.
+    """
 
     name = "llm"
 
@@ -458,12 +470,39 @@ class LLMCapabilityEngine:
         hints: dict[str, Any] | None = None,
     ) -> CapabilityResult:
         request_metadata = dict((hints or {}).get("request_metadata") or {})
+        persist_decision(decision_from_pre(pre), pre=pre, session=session)
         query = str(pre.cleaned_text or pre.original_text or "").strip()
-        web_search_requested = live_web_search_requested(query, request_metadata)
+        search_required = request_metadata.get("openai_web_search_required") is True
+        explicit_search_request = any(
+            request_metadata.get(key) is True
+            for key in ("openai_web_search", "web_search", "web_search_requested")
+        )
+        search_override_present = any(
+            key in request_metadata
+            for key in ("openai_web_search", "web_search", "web_search_requested")
+        )
+        search_capability_enabled = (
+            True
+            if search_required
+            else (
+                bool(
+                    request_metadata.get("openai_web_search")
+                    or request_metadata.get("web_search")
+                    or request_metadata.get("web_search_requested")
+                )
+                if search_override_present
+                else bool(self._settings.openai_web_search_enabled)
+            )
+        )
+        semantic_intent_mode = (
+            "required_hosted_tool"
+            if search_required
+            else ("native_tool_choice" if search_capability_enabled else "disabled")
+        )
         prompt_trace: dict[str, Any] = {}
         system_prompt = self._compose_system_prompt(
             session,
-            web_search_enabled=web_search_requested,
+            web_search_enabled=search_capability_enabled,
             prompt_trace=prompt_trace,
         )
         messages: list[ChatMessage] = []
@@ -524,9 +563,13 @@ class LLMCapabilityEngine:
         request_metadata.update(
             {
                 "route": "llm",
-                "openai_web_search": web_search_requested,
-                "openai_web_search_required": web_search_requested,
-                "web_search_requested": web_search_requested,
+                "openai_web_search": search_capability_enabled,
+                "openai_web_search_required": search_required,
+                # Compatibility field: this now means the caller explicitly
+                # requested search, while the provider may still choose a
+                # search tool semantically when the capability is enabled.
+                "web_search_requested": explicit_search_request or search_required,
+                "semantic_intent_mode": semantic_intent_mode,
                 "prompt_sections": prompt_trace.get("section_names", []),
                 "prompt_section_chars": prompt_trace.get("section_chars", {}),
                 "context_window": {
@@ -555,6 +598,25 @@ class LLMCapabilityEngine:
             metadata=request_metadata,
         )
         response = await self._llm.chat(request)
+        response_metadata = getattr(response, "metadata", {}) or {}
+        if not isinstance(response_metadata, dict):
+            response_metadata = {}
+        raw_intent = response_metadata.get("semantic_intent")
+        intent = (
+            IntentDecision.from_dict(raw_intent)
+            if raw_intent is not None
+            else IntentDecision(
+                operation=IntentOperation.CONVERSE,
+                artifact=IntentArtifact.TEXT,
+                query=query,
+                confidence=0.0,
+                needs_tool=False,
+            )
+        )
+        if not intent.query:
+            intent = intent.model_copy(update={"query": query})
+        semantic_intent = intent.to_minimal_dict()
+        web_search_used = intent.source.value in {"web", "x"} and intent.needs_tool
         return CapabilityResult(
             route=RouteType.LLM,
             reply_text=response.content,
@@ -564,7 +626,13 @@ class LLMCapabilityEngine:
             metadata={
                 "model": response.model,
                 "latency_ms": response.latency_ms,
-                "web_search_requested": web_search_requested,
+                "web_search_requested": explicit_search_request or search_required,
+                "web_search_capability_enabled": search_capability_enabled,
+                "web_search_used": web_search_used,
+                "semantic_intent": semantic_intent,
+                "semantic_intent_method": response_metadata.get(
+                    "semantic_intent_method", "default_conversation"
+                ),
                 "prompt_sections": prompt_trace.get("section_names", []),
                 "context_window": request_metadata.get("context_window", {}),
                 "persona_profile": session.variables.get("persona_profile"),

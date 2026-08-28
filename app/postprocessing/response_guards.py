@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
-from app.common.prompting import persona_response_language
+from app.common.prompting import persona_cos_active, persona_response_language
 from app.common.types import OutboundReply, ReplySegment, ReplyType, RouteType
 
 _DEFAULT_BOT_ALIASES = ("zzz",)
@@ -96,7 +96,9 @@ def apply_response_guards(ctx: Any, *, settings: Any | None = None) -> None:
         if not verified and not _SAFE_UNCERTAINTY_RE.search(reply_text):
             replacement = _HIGH_RISK_FACT_FALLBACK_EN if english_only else _HIGH_RISK_FACT_FALLBACK
             reason = "high_risk_fact_unverified"
-    if _IDENTITY_QUESTION_RE.search(user_text):
+    if _IDENTITY_QUESTION_RE.search(user_text) and not persona_cos_active(
+        getattr(ctx, "session", None)
+    ):
         replacement = _identity_transparency_reply(english_only)
         reason = "identity_transparency"
     if replacement is None:

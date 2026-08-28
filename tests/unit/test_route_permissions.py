@@ -30,10 +30,12 @@ from plugins.commands.router import build_commands_router
 from plugins.credits.router import build_credits_router
 from plugins.draw.router import build_draw_router
 from plugins.group_activity.router import build_group_activity_router
+from plugins.local_agent.router import build_local_agent_router
 from plugins.memory.router import build_memory_router
 from plugins.moderation.router import build_moderation_router
 from plugins.persona_extract.router import build_persona_extract_router
 from plugins.repeater.router import build_repeater_router
+from plugins.speaker_portrait.router import build_speaker_portrait_router
 from plugins.tibo_reset.router import build_tibo_reset_router
 from plugins.wxbot.router import build_wxbot_router
 
@@ -151,10 +153,12 @@ def _shipped_control_plane_app() -> FastAPI:
         "credits": build_credits_router(mock),
         "draw": build_draw_router(mock),
         "group_activity": build_group_activity_router(mock, mock),
+        "local_agent": build_local_agent_router(mock, mock),
         "memory": build_memory_router(mock),
         "moderation": build_moderation_router(mock),
         "persona_extract": build_persona_extract_router(mock, mock),
         "repeater": build_repeater_router(mock),
+        "speaker_portrait": build_speaker_portrait_router(mock),
         "tibo_reset": build_tibo_reset_router(mock, mock, settings),
         "wxbot": build_wxbot_router(
             mock,
