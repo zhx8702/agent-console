@@ -10,7 +10,7 @@ from pydantic import Field
 from app.admin.auth_router import authenticate_admin_request
 from app.common.request_models import StrictRequestModel
 from plugins.persona_extract.store import PersonaExtractStore
-from plugins.speaker_portrait.pipeline import compile_reply_style
+from plugins.speaker_portrait.pipeline import compile_reply_style, portrait_style_slug
 from plugins.speaker_portrait.store import SpeakerPortraitStore
 
 
@@ -150,7 +150,7 @@ def build_speaker_portrait_router(
             raise HTTPException(404, "portrait_not_found")
         payload = _style_payload(record)
         persona_store = PersonaExtractStore(store.settings)
-        slug = f"portrait-{speaker_id.replace('_', '-')}"[:128]
+        slug = portrait_style_slug(speaker_id)
         profile = await persona_store.upsert_profile(
             tenant_id=body.tenant_id,
             session_id=body.session_id,

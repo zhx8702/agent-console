@@ -612,6 +612,7 @@ class Settings(BaseSettings):
     speaker_portrait_hot_update_enabled: bool = True
     speaker_portrait_hot_update_min_messages: int = Field(default=40, ge=1)
     speaker_portrait_hot_update_min_seconds: float = Field(default=3600.0, ge=60)
+    speaker_portrait_style_sync_enabled: bool = True
     speaker_portrait_data_dir: str = "/data/portraits"
     speaker_portrait_host_dir: str = "/opt/agent-console-portraits"
     speaker_portrait_inline_max_messages: int = Field(default=400, ge=50)

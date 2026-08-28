@@ -12,11 +12,14 @@ from app.common.logging import get_logger
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.egress.safe_http import safe_trusted_service_request
 from plugins.local_agent.complete import complete_chat, resolve_local_backend
+from plugins.persona_extract.store import PersonaExtractStore
 from plugins.speaker_portrait.pipeline import (
     apply_coverage,
     build_portrait_prompt,
+    compile_reply_style,
     merge_portrait,
     parse_portrait_payload,
+    portrait_style_slug,
 )
 from plugins.speaker_portrait.store import SpeakerPortraitStore
 from plugins.speaker_portrait.workspace import (
@@ -100,6 +103,52 @@ async def collect_speaker_messages(store: SpeakerPortraitStore, job: dict[str, A
     if since:
         cleaned = [item for item in cleaned if str(item.get("timestamp") or "") > since]
     return cleaned
+
+
+async def sync_applied_styles(
+    settings: Any,
+    *,
+    tenant_id: str,
+    speaker_id: str,
+    speaker_name: str,
+    portrait: dict[str, Any],
+    persona_store: PersonaExtractStore | None = None,
+) -> int:
+    """Recompile reply styles derived from this portrait after it changes.
+
+    Applied styles live in persona profiles (the runtime injection surface);
+    without this sync a hot update refreshes the portrait JSON but group
+    replies keep using the stale compiled prompt.
+    """
+
+    persona_store = persona_store or PersonaExtractStore(settings)
+    slug = portrait_style_slug(speaker_id)
+    profiles = await persona_store.list_profiles_by_slug(tenant_id, slug)
+    synced = 0
+    for profile in profiles:
+        name = str(
+            profile.get("target_name")
+            or profile.get("profile_name")
+            or speaker_name
+            or speaker_id
+        )
+        prompt = compile_reply_style(portrait, name=name)
+        await persona_store.upsert_profile(
+            tenant_id=tenant_id,
+            session_id=str(profile.get("session_id") or ""),
+            channel=str(profile.get("channel") or "wechat"),
+            source_key=str(profile.get("source_key") or "wxbot"),
+            source_label=str(profile.get("source_label") or name),
+            profile_name=str(profile.get("profile_name") or name),
+            prompt_text=prompt,
+            enabled=bool(profile.get("enabled")),
+            profile_id=int(profile["id"]),
+            target_user_id=str(profile.get("target_user_id") or speaker_id),
+            target_name=name,
+            skill_slug=slug,
+        )
+        synced += 1
+    return synced
 
 
 async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> dict[str, Any]:
@@ -204,6 +253,27 @@ async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> 
         last_message_at=str((stats.get("time_span") or "").split(" ~ ")[-1] if stats.get("time_span") else ""),
         mode=mode,
     )
+    if bool(getattr(settings, "speaker_portrait_style_sync_enabled", True)):
+        try:
+            synced = await sync_applied_styles(
+                settings,
+                tenant_id=str(job.get("tenant_id") or ""),
+                speaker_id=str(job.get("speaker_id") or ""),
+                speaker_name=str(job.get("speaker_name") or ""),
+                portrait=portrait,
+            )
+            if synced:
+                logger.info(
+                    "speaker_portrait.style_synced",
+                    job_id=job.get("id"),
+                    profiles=synced,
+                )
+        except Exception:
+            logger.warning(
+                "speaker_portrait.style_sync_failed",
+                job_id=job.get("id"),
+                exc_info=True,
+            )
     try:
         cleanup_workspaces(
             str(getattr(settings, "speaker_portrait_data_dir", "/data/portraits") or "/data/portraits"),
