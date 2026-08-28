@@ -112,8 +112,12 @@ summary:focus-visible {
   background: var(--panel-alt);
 }
 
-.danger-action-dialog {
-  border-top: 4px solid var(--danger);
+.danger-action-dialog .dialog-header {
+  background: radial-gradient(130% 90% at 50% 0%, rgba(220, 38, 38, 0.07), transparent 70%);
+}
+
+.danger-action-dialog .dialog-header h2 {
+  color: var(--color-red-800);
 }
 
 .danger-action-impact {
