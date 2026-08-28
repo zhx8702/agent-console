@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from app.common.prompting import augment_prompt_with_persona_and_memory
 from app.common.types import Channel, Session
+from plugins.speaker_portrait.jobs import sync_applied_styles
 from plugins.speaker_portrait.pipeline import (
     apply_coverage,
     build_portrait_prompt,
@@ -188,6 +191,71 @@ def test_compile_reply_style_uses_first_person_and_examples() -> None:
     assert "带带我" in prompt
     assert "烤鱼" in prompt
     assert "按自己平时怎么过、最近在忙什么来答" in prompt
+
+
+class _FakePersonaStore:
+    def __init__(self, profiles: list[dict]) -> None:
+        self.profiles = profiles
+        self.slug_queries: list[tuple[str, str]] = []
+        self.upserts: list[dict] = []
+
+    async def list_profiles_by_slug(self, tenant_id: str, skill_slug: str) -> list[dict]:
+        self.slug_queries.append((tenant_id, skill_slug))
+        return list(self.profiles)
+
+    async def upsert_profile(self, **kwargs) -> dict:
+        self.upserts.append(kwargs)
+        return {"id": kwargs.get("profile_id"), **kwargs}
+
+
+@pytest.mark.asyncio
+async def test_style_sync_recompiles_applied_profiles() -> None:
+    store = _FakePersonaStore(
+        [
+            {
+                "id": 7,
+                "session_id": "room@chatroom",
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "source_label": "小海",
+                "profile_name": "小海",
+                "target_name": "小海",
+                "target_user_id": "wxid_hai",
+                "enabled": True,
+            }
+        ]
+    )
+    synced = await sync_applied_styles(
+        object(),
+        tenant_id="demo",
+        speaker_id="wxid_hai",
+        speaker_name="小海",
+        portrait={"summary": "爱吃烤鱼的打工人", "likes": [{"text": "烤鱼", "count": 9}]},
+        persona_store=store,  # type: ignore[arg-type]
+    )
+    assert synced == 1
+    assert store.slug_queries == [("demo", "portrait-wxid-hai")]
+    upsert = store.upserts[0]
+    assert upsert["profile_id"] == 7
+    assert upsert["enabled"] is True
+    assert upsert["skill_slug"] == "portrait-wxid-hai"
+    assert "你就是小海" in upsert["prompt_text"]
+    assert "烤鱼" in upsert["prompt_text"]
+
+
+@pytest.mark.asyncio
+async def test_style_sync_without_applied_profiles_is_noop() -> None:
+    store = _FakePersonaStore([])
+    synced = await sync_applied_styles(
+        object(),
+        tenant_id="demo",
+        speaker_id="wxid_hai",
+        speaker_name="小海",
+        portrait={"summary": "x"},
+        persona_store=store,  # type: ignore[arg-type]
+    )
+    assert synced == 0
+    assert store.upserts == []
 
 
 def test_prompt_includes_speaker_portrait_without_imitation() -> None:

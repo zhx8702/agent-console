@@ -476,6 +476,12 @@ def _style_bullets(items: Any, *, limit: int = 8) -> list[str]:
     return lines
 
 
+def portrait_style_slug(speaker_id: str) -> str:
+    """Stable persona-profile slug for styles derived from this portrait."""
+
+    return f"portrait-{str(speaker_id).replace('_', '-')}"[:128]
+
+
 def compile_reply_style(portrait: dict[str, Any], *, name: str) -> str:
     """Turn a speaker portrait into a first-person COS skill prompt."""
 
