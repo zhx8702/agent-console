@@ -9,8 +9,8 @@ from app.agent.scopes import GROUP_DRAW_GENERATION_SCOPE
 from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
 from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, ChannelTarget
 from app.common.context import get_trace_id
-from app.common.intent_runtime import decision_from_session
 from app.common.ids import new_trace_id
+from app.common.intent_runtime import decision_from_session
 from app.common.logging import get_logger
 from app.common.prompting import persona_response_language
 from app.common.types import Role, Session

@@ -7,9 +7,9 @@ import pytest
 
 from app.common.config import Settings
 from app.common.context import clear_context, set_trace_id
+from app.common.image_preview import FetchedImage
 from app.common.intent import IntentDecision, IntentDomain
 from app.common.intent_runtime import persist_decision
-from app.common.image_preview import FetchedImage
 from app.common.types import Channel, ChatResponse, ChatUsage, Role, Session, Turn
 from app.orchestrator.simple_capabilities import LLMCapabilityEngine, parse_at_wxids
 

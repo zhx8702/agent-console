@@ -10,6 +10,8 @@ from app.agent.scopes import (
     GROUP_VIDEO_GENERATION_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
+from app.common.intent import IntentDecision, IntentDomain, IntentSource
+from app.common.intent_runtime import persist_decision
 from app.common.types import (
     CapabilityResult,
     Channel,
@@ -27,8 +29,6 @@ from app.social.contracts import (
     KillSwitches,
     ParticipationPolicyValues,
 )
-from app.common.intent import IntentDecision, IntentDomain, IntentSource
-from app.common.intent_runtime import persist_decision
 from plugins.wxbot.agent_intent_hook import WxbotAgentIntentHook
 from plugins.wxbot.hook_context import _resolve_group_agent_scope
 from plugins.wxbot.hooks import WxbotAgentScopeEnrichStep

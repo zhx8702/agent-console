@@ -1938,7 +1938,7 @@ async def test_agent_capability_falls_back_to_amap_search_when_model_prompts_for
             ]
         },
     )
-    billing, provider = _fake_billing()
+    billing, _provider = _fake_billing()
     engine = AgentCapabilityEngine(
         llm,
         settings=settings,

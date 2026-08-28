@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
-from typing import Any
 
 from app.channel import ChannelRegistry, ChannelTarget
 from app.commands import CommandDefinition

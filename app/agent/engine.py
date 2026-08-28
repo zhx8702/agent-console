@@ -34,12 +34,12 @@ from app.agent.tools.group import (
 )
 from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
 from app.common.config import Settings, get_settings
-from app.common.intent import IntentDomain
-from app.common.intent_runtime import decision_from_pre, is_confident, slot_int, slot_text
 from app.common.context import get_trace_id
 from app.common.context_budget import select_recent_turns
 from app.common.conversation import render_turn as render_conversation_turn
 from app.common.ids import new_trace_id
+from app.common.intent import IntentDomain
+from app.common.intent_runtime import decision_from_pre, is_confident, slot_int, slot_text
 from app.common.logging import get_logger
 from app.common.prompting import augment_prompt_with_persona_and_memory, chat_system_prompt
 from app.common.tool_projection import project_tool_result

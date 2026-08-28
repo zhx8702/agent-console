@@ -44,6 +44,7 @@ from app.channel.adapters import ChannelAdapterCatalog
 from app.channel.connections import ChannelConnectionStore
 from app.channel.router import build_channel_admin_router
 from app.common.config import Settings, get_settings
+from app.common.intent_classify import LlmIntentClassifier
 from app.common.logging import configure_logging, get_logger
 from app.common.runtime_llm_config import (
     load_runtime_llm_config,
@@ -98,7 +99,6 @@ from app.plugin.manager import PluginManager
 from app.plugin.registry import PluginRegistry
 from app.plugin.state import PluginStateStore
 from app.postprocessing.processor import build_postprocessor
-from app.common.intent_classify import LlmIntentClassifier
 from app.preprocessing.processor import build_preprocessor
 from app.rag.engine import RAGEngine
 from app.rag.retriever import HybridRetriever

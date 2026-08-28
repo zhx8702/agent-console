@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from app.common.intent import IntentDecision, IntentDomain
 from plugins.wxbot.file_artifacts import (
     FileArtifactTooLarge,
     convert_file_bytes,
     stage_outbound_artifact,
 )
-from app.common.intent import IntentDecision, IntentDomain
 from plugins.wxbot.file_intent import classify_file_intent
 
 

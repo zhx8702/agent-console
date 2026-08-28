@@ -35,7 +35,12 @@ from app.common.image_preview import (
     wait_for_image,
 )
 from app.common.intent import IntentArtifact, IntentDecision, IntentDomain, IntentOperation
-from app.common.intent_runtime import decision_from_pre, decision_from_session, is_confident, persist_decision
+from app.common.intent_runtime import (
+    decision_from_pre,
+    decision_from_session,
+    is_confident,
+    persist_decision,
+)
 from app.common.logging import get_logger
 from app.common.prompting import (
     augment_prompt_with_persona_and_memory,

@@ -6,8 +6,8 @@ import pytest
 
 from plugins.local_agent.client import LocalAgentClientError
 from plugins.local_agent.complete import (
-    compose_completion_prompt,
     complete_chat,
+    compose_completion_prompt,
     resolve_local_backend,
 )
 

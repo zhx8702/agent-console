@@ -21,6 +21,7 @@ from app.channel.identity import (
     require_legacy_wxbot_history_scope,
 )
 from app.common.config import Settings
+from app.common.intent_runtime import decision_from_session
 from app.common.logging import get_logger
 from app.common.safe_url import configure_http_client, safe_get
 from app.common.wxbot_auth import wxbot_sdk_headers
@@ -52,7 +53,6 @@ from plugins.wxbot.file_artifacts import (
     normalize_file_format,
     stage_outbound_artifact,
 )
-from app.common.intent_runtime import decision_from_session
 from plugins.wxbot.file_intent import (
     MAX_RECENT_MESSAGE_EXPORT_MINUTES,
     classify_file_intent,

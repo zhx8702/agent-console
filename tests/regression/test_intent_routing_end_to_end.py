@@ -6,6 +6,8 @@ from typing import Any
 import pytest
 import yaml
 
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_classify import StaticIntentClassifier
 from app.common.types import (
     Channel,
     IntentCoarse,
@@ -14,8 +16,6 @@ from app.common.types import (
     Session,
     SessionState,
 )
-from app.common.intent import IntentDecision, IntentDomain
-from app.common.intent_classify import StaticIntentClassifier
 from app.preprocessing.processor import build_preprocessor
 from app.router.engine import Router
 from app.router.rules import load_rules

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from app.channel import ChannelSendOptions, ChannelTarget, ChannelRegistry
+from app.channel import ChannelRegistry, ChannelSendOptions, ChannelTarget
 from app.common.logging import get_logger
 from plugins.local_agent.client import LocalAgentClient, LocalAgentClientError
 from plugins.local_agent.store import LocalAgentJob, LocalAgentStore
