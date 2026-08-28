@@ -59,6 +59,22 @@ def test_group_identity_questions() -> None:
     assert intent.should_short_circuit is True
 
 
+def test_group_identity_domain_alone_is_sufficient() -> None:
+    """identity has a single action in the contract; a missing/odd action
+    string from the model must not drop the disclosure."""
+
+    intent = classify_group_human_intent(
+        "你是谁做的",
+        decision=IntentDecision(
+            domain=IntentDomain.IDENTITY,
+            action="",
+            confidence=0.9,
+        ),
+    )
+    assert intent.type == GroupHumanIntentType.IDENTITY_INQUIRY
+    assert intent.should_short_circuit is True
+
+
 def test_followup_introduce_is_not_bot_identity_short_circuit() -> None:
     intent = classify_group_human_intent(
         "介绍下",
