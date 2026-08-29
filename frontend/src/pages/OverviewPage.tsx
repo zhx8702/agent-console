@@ -79,6 +79,28 @@ const CAPABILITY_STATE_LABELS: Record<CapabilityHealth, string> = {
   degraded: "已降级",
 };
 
+const CAPABILITY_REASON_LABELS: Record<string, string> = {
+  plugin_not_active: "插件未启用",
+  plugin_not_loaded: "插件未加载",
+  plugin_not_configured: "未配置",
+  plugin_disabled_for_tenant: "当前租户已停用",
+  plugin_active_for_tenant: "当前租户已启用",
+  tenant_scope_state_unavailable: "租户插件状态暂时不可用",
+  required_plugin_dependency_unavailable: "必需依赖不可用",
+  adapter_connection_verified: "连接已验证",
+  adapter_connection_configured_unverified: "连接已配置，尚未验证",
+  adapter_available_connection_unverified: "适配器可用，连接尚未验证",
+  connection_required: "需要完成平台连接",
+  service_registered: "服务已注册",
+};
+
+function capabilityReasonLabel(reason: string) {
+  const exact = CAPABILITY_REASON_LABELS[reason];
+  if (exact) return exact;
+  if (reason.startsWith("plugin_initialization_failed")) return "插件初始化失败";
+  return "";
+}
+
 type OverviewPageProps = {
   capabilityState?: CapabilityLoadState;
   accessScope?: "tenant" | "group";
@@ -88,21 +110,28 @@ type OverviewPageProps = {
 function RecoveryActionLink({
   action,
   onRetry,
+  surface = "dark",
 }: {
   action: CapabilityRecoveryAction;
   onRetry: () => void;
+  surface?: "dark" | "paper";
 }) {
+  const className = surface === "paper" ? "button button-secondary button-compact" : "launch-action";
+  const adminMark = action.requires_admin ? (
+    <span className={surface === "paper" ? "pill pill-muted" : "admin-chip"}>管理员</span>
+  ) : null;
   if (action.type === "retry") {
     return (
-      <button className="launch-action" type="button" onClick={onRetry}>
+      <button className={className} type="button" onClick={onRetry}>
         {action.label}
+        {adminMark}
       </button>
     );
   }
   return (
-    <Link className="launch-action" to={action.target}>
+    <Link className={className} to={action.target}>
       {action.label}
-      {action.requires_admin && <span>管理员</span>}
+      {adminMark}
     </Link>
   );
 }
@@ -164,12 +193,13 @@ function CapabilityDiagnostic({
   onRetry: () => void;
 }) {
   const dependencyIssues = capability.dependencies.filter((item) => item.state !== "ready");
+  const reasonLabel = capabilityReasonLabel(capability.status_reason);
   return (
     <article className={`capability-diagnostic is-${capability.health}`}>
       <div>
         <span className="capability-diagnostic-source">能力检查</span>
         <h3>{capability.label}</h3>
-        <p>{capability.status_reason}</p>
+        {reasonLabel ? <p>{reasonLabel}</p> : null}
       </div>
       <div className="capability-diagnostic-state">
         <span>{CAPABILITY_STATE_LABELS[capability.health]}</span>
@@ -182,7 +212,9 @@ function CapabilityDiagnostic({
           {dependencyIssues.map((dependency) => (
             <li key={dependency.id}>
               <strong>{dependency.required ? "必需" : "可选"}</strong>
-              <span>{dependency.reason}</span>
+              {capabilityReasonLabel(dependency.reason) ? (
+                <span>{capabilityReasonLabel(dependency.reason)}</span>
+              ) : null}
               <TechnicalDetails summary="查看依赖标识" value={dependency.id} />
             </li>
           ))}
@@ -195,6 +227,7 @@ function CapabilityDiagnostic({
               key={`${action.type}-${action.target}`}
               action={action}
               onRetry={onRetry}
+              surface="paper"
             />
           ))}
         </div>
@@ -240,8 +273,18 @@ export function OverviewPage({
   const checklistStorageKey = `agent-console:launch-checklist:v1:${config.tenantId || "default"}`;
 
   useEffect(() => {
-    setChecklistDismissed(window.localStorage.getItem(checklistStorageKey) === "dismissed");
-  }, [checklistStorageKey]);
+    const stored = window.localStorage.getItem(checklistStorageKey);
+    if (stored === "dismissed") {
+      setChecklistDismissed(true);
+      return;
+    }
+    if (stored === "open") {
+      setChecklistDismissed(false);
+      return;
+    }
+    const steps = capabilityState.data?.onboarding?.steps || [];
+    setChecklistDismissed(steps.length > 0 && steps.every((step) => step.state === "ready"));
+  }, [capabilityState.data?.onboarding, checklistStorageKey]);
 
   const loadOverview = async () => {
     setLoading(true);
@@ -339,13 +382,12 @@ export function OverviewPage({
           <div>
             <p className="section-kicker">上线顺序</p>
             <strong>上线清单已收起</strong>
-            <span>系统仍会按租户能力过滤入口，不会把不可用功能伪装成可用。</span>
           </div>
           <button
             className="button button-secondary"
             type="button"
             onClick={() => {
-              window.localStorage.removeItem(checklistStorageKey);
+              window.localStorage.setItem(checklistStorageKey, "open");
               setChecklistDismissed(false);
             }}
           >
@@ -362,7 +404,6 @@ export function OverviewPage({
             <div>
               <p className="section-kicker">上线顺序</p>
               <h2>正在读取租户能力</h2>
-              <p>导航与首启步骤会以服务端能力注册表为准。</p>
             </div>
             <span className="launch-orbit" aria-hidden="true" />
           </div>
@@ -389,11 +430,11 @@ export function OverviewPage({
               <h2 id="launch-checklist-title">
                 {groupScoped ? "从授权群到安全参与" : "从依赖检查到正式参与"}
               </h2>
-              <p>
-                {groupScoped
-                  ? "这里只展示当前身份可管理的群聊能力，不暴露租户级运行配置。"
-                  : <>这是租户 <code>{capabilityState.data?.tenant_id}</code> 的服务端状态，按顺序完成后再让机器人加入真实群聊。</>}
-              </p>
+              {!groupScoped ? (
+                <p>
+                  这是租户 <code>{capabilityState.data?.tenant_id}</code> 的当前状态，按顺序完成后再让机器人加入真实群聊。
+                </p>
+              ) : null}
             </div>
             <div
               className={`launch-readiness is-${checklist.steps.length ? checklist.state : "empty"}`}
@@ -426,11 +467,10 @@ export function OverviewPage({
           ) : (
             <div className="launch-checklist-empty" role="status">
               <strong>暂无上线步骤</strong>
-              <p>服务端未返回可执行的上线清单；这不表示所有能力已就绪，请刷新能力检查或联系管理员确认能力注册。</p>
+              <p>当前没有可执行的上线步骤。</p>
             </div>
           )}
           <div className="launch-checklist-footer">
-            <span>状态由服务端计算；收起清单不会改变任何运行配置。</span>
             <button
               type="button"
               onClick={() => {
@@ -449,7 +489,7 @@ export function OverviewPage({
           <PageHeader
             eyebrow="群聊工作区"
             title="授权群工作台"
-            description="从已授权群进入参与策略、消息演练和成员知识；平台配置、依赖拓扑与全局运维入口不会出现在此身份下。"
+            description="从已授权群进入参与策略、消息演练和成员知识。"
           />
           <h2 id="group-workspace-title" className="sr-only">授权群工作台入口</h2>
           <div className="status-grid">
@@ -476,6 +516,20 @@ export function OverviewPage({
           eyebrow="系统"
           title="后端运行概览"
           description="查看服务接口、插件路由和关键依赖状态，确认控制台与服务端连接是否正常。"
+          actions={
+            <div className="action-row">
+              <button
+                className="button button-primary"
+                onClick={() => void loadOverview()}
+                disabled={loading}
+              >
+                {loading ? "刷新中..." : "刷新状态"}
+              </button>
+              <a className="button button-secondary" href={apiDocumentUrl(config, "/docs")} target="_blank" rel="noreferrer">
+                接口文档
+              </a>
+            </div>
+          }
         />
         {errorEntries.length > 0 && (
           <div className="overview-degraded-notice" role="status">
@@ -493,21 +547,6 @@ export function OverviewPage({
             </ul>
           </div>
         )}
-        <div className="action-row">
-          <button
-            className="button button-primary"
-            onClick={() => void loadOverview()}
-            disabled={loading}
-          >
-            {loading ? "刷新中..." : "刷新状态"}
-          </button>
-          <a className="button button-secondary" href={apiDocumentUrl(config, "/docs")} target="_blank" rel="noreferrer">
-            交互式接口文档
-          </a>
-          <a className="button button-secondary" href={apiDocumentUrl(config, "/redoc")} target="_blank" rel="noreferrer">
-            备用接口文档
-          </a>
-        </div>
         <div className="status-grid">
           <StatusTile label="运行健康" value={serviceStateLabel(data?.health?.status, Boolean(errors.health))} />
           <StatusTile label="启动就绪" value={serviceStateLabel(data?.ready?.status, Boolean(errors.ready))} />
@@ -527,7 +566,9 @@ export function OverviewPage({
             }
           />
         </div>
-        <ul className="overview-check-meta" aria-label="检查更新时间与恢复动作">
+        <details className="overview-check-meta-wrap">
+          <summary>检查记录</summary>
+          <ul className="overview-check-meta" aria-label="检查更新时间与恢复动作">
           {(Object.keys(OVERVIEW_CHECK_LABELS) as OverviewCheckKey[]).map((key) => (
             <li key={key}>
               <span>{OVERVIEW_CHECK_LABELS[key]}</span>
@@ -544,6 +585,7 @@ export function OverviewPage({
             </li>
           ))}
         </ul>
+        </details>
       </section>
 
       <section className="panel panel-scroll">
@@ -553,10 +595,10 @@ export function OverviewPage({
             <h2>插件与适配器摘要</h2>
           </div>
         </div>
-        <p>
+        <p className="muted-copy">
           {pluginInformationUnavailable
             ? "插件信息暂不可用，请查看上方原因。"
-            : `已发现 ${data?.pluginSummary?.plugins?.length || 0} 个插件、${data?.pluginSummary?.channels?.length || 0} 个已声明通道；已声明不代表已经建立平台连接。`}
+            : `已发现 ${data?.pluginSummary?.plugins?.length || 0} 个插件，已声明 ${data?.pluginSummary?.channels?.length || 0} 个通道。`}
         </p>
         <TechnicalDetails
           summary="查看插件与适配器技术清单"
@@ -580,15 +622,12 @@ export function OverviewPage({
                 <span className="section-kicker">能力诊断</span>
                 <strong id="capability-diagnostics-title">能力与依赖诊断</strong>
               </span>
-              <span className="capability-attention-count">
+              <span className={`capability-attention-count${attentionCapabilities.length > 0 ? "" : " is-clear"}`}>
                 {attentionCapabilities.length > 0
                   ? `${attentionCapabilities.length} 项需处理`
                   : "全部就绪"}
               </span>
             </summary>
-            <p className="capability-diagnostics-copy">
-              导航只显示已启用且可用的能力；被隐藏的能力仍保留在这里，并给出明确依赖和恢复入口。
-            </p>
             <div className="capability-diagnostic-grid">
               {(attentionCapabilities.length > 0
                 ? attentionCapabilities
@@ -606,7 +645,7 @@ export function OverviewPage({
       )}
 
       <div className="span-3">
-        <OutputPanel title="系统响应" value={output} />
+        <OutputPanel flush title="系统响应" value={output} />
       </div>
         </>
       )}

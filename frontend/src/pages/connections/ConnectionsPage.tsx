@@ -63,21 +63,21 @@ export function ConnectionsPage() {
   return (
     <div className="page-grid connections-page">
       <section className="panel panel-hero span-3 connections-hero">
-        <div className="connections-hero-heading">
-          <PageHeader
-            eyebrow="消息接入"
-            title="消息平台连接中心"
-            description="统一管理平台适配器、租户连接实例，以及每条连接的配置校验、生命周期和主动探测状态。"
-          />
-          <div className="action-row connections-hero-actions">
-            <button type="button" className="button button-primary" onClick={() => openCreate()} disabled={globallyReadOnly}>
-              添加连接
-            </button>
-            <button type="button" className="button button-secondary" onClick={() => void refreshAll()} disabled={refreshing}>
-              {refreshing ? "刷新中…" : "刷新全部状态"}
-            </button>
-          </div>
-        </div>
+        <PageHeader
+          eyebrow="消息接入"
+          title="消息平台连接中心"
+          description="统一管理平台适配器、租户连接实例，以及每条连接的配置校验、生命周期和主动探测状态。"
+          actions={
+            <div className="action-row connections-hero-actions">
+              <button type="button" className="button button-primary" onClick={() => openCreate()} disabled={globallyReadOnly}>
+                添加连接
+              </button>
+              <button type="button" className="button button-secondary" onClick={() => void refreshAll()} disabled={refreshing}>
+                {refreshing ? "刷新中…" : "刷新全部状态"}
+              </button>
+            </div>
+          }
+        />
 
         <ol className="connection-domain-model" aria-label="消息平台连接的四个管理环节">
           <li>
@@ -97,10 +97,6 @@ export function ConnectionsPage() {
             <div><strong>主动探测</strong><small>仅在适配器支持时验证真实连接能力</small></div>
           </li>
         </ol>
-        <p className="connection-model-note">
-          <strong>边界说明：</strong>插件声明适配能力；创建并校验配置、按需启用，再完成适配器支持的主动探测后，才算真正接入。
-        </p>
-
         <div className="status-grid connections-status-grid" aria-label="连接状态摘要">
           <StatusTile label="健康连接" value={String(stats.healthy)} />
           <StatusTile label="待处理" value={String(stats.attention)} />

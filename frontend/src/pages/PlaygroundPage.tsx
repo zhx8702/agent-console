@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { Alert } from "../components/Alert";
+import { GroupScopeEmpty } from "../components/GroupScopeEmpty";
 import { OutputPanel } from "../components/OutputPanel";
 import { PageHeader } from "../components/PageHeader";
 import { apiRequest, formatJson } from "../lib/api";
@@ -92,24 +92,29 @@ export function PlaygroundPage() {
     }
   };
 
-  return (
+  return !selectedGroupIsVerified ? (
+    <GroupScopeEmpty
+      eyebrow="消息测试"
+      title="群消息入口模拟器"
+      description="从已验证群聊发起一条服务端模拟消息，走真实消息总线、参与决策和回复链路。浏览器不会接触租户签名密钥。"
+    />
+  ) : (
     <div className="page-grid">
-      <section className="panel span-2">
+      <section className="panel span-3">
         <PageHeader
           eyebrow="消息测试"
           title="群消息入口模拟器"
           description="从已验证群聊发起一条服务端模拟消息，走真实消息总线、参与决策和回复链路。浏览器不会接触租户签名密钥。"
         />
-        {!selectedGroupIsVerified && (
-          <Alert variant="warning" title="尚未选择目标群">
-            请先使用页面顶部的群选择器，从后端已同步列表中选择一个群聊。
-          </Alert>
-        )}
-        <div className="form-grid">
+        <p className="page-meta-line">
+          <span>处理方式 <strong>真实异步队列</strong></span>
+          <span>发送身份 <strong>服务端模拟群成员</strong></span>
+        </p>
+        <div className="form-grid page-compose">
           <label className="field span-2">
             <span>模拟群消息</span>
             <textarea
-              rows={7}
+              rows={5}
               value={message}
               onChange={(event) => setMessage(event.target.value)}
               placeholder="例如：@机器人 帮我总结一下刚才的讨论"
@@ -128,38 +133,8 @@ export function PlaygroundPage() {
             {sending ? "正在进入队列…" : "发送模拟消息"}
           </button>
         </div>
+        <OutputPanel flush title="处理结果（技术详情）" value={output} />
       </section>
-
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">当前范围</p>
-            <h3>投递上下文</h3>
-          </div>
-        </div>
-        <dl className="context-list">
-          <div>
-            <dt>当前租户</dt>
-            <dd>{config.tenantId || "未认证"}</dd>
-          </div>
-          <div>
-            <dt>目标群聊</dt>
-            <dd>{selectedGroupIsVerified ? config.sessionId : "未选择"}</dd>
-          </div>
-          <div>
-            <dt>处理方式</dt>
-            <dd>真实异步队列</dd>
-          </div>
-          <div>
-            <dt>发送身份</dt>
-            <dd>服务端模拟群成员</dd>
-          </div>
-        </dl>
-      </section>
-
-      <div className="span-3">
-        <OutputPanel title="处理结果（技术详情）" value={output} />
-      </div>
     </div>
   );
 }

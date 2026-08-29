@@ -152,37 +152,39 @@ export function AmapPage() {
   return (
     <div className="page-grid">
       <UnsavedChangesGuard when={dirty} />
-      <section className="panel panel-hero span-2">
+      <section className="panel panel-hero span-3">
         <PageHeader
           eyebrow="高德地图"
           title="高德个人地图插件"
-          description="查看由外部密钥提供方注入的高德 Web 服务凭据状态，配置二维码保存目录和超时参数，并检查智能体工具注册状态。控制台永不接收或回显接口密钥。"
+          description="查看密钥注入状态，配置二维码目录和超时；控制台永不接收或回显接口密钥。"
+          actions={
+            <div className="action-row">
+              <button
+                className="button button-primary"
+                onClick={() => void saveConfig()}
+                disabled={
+                  saving ||
+                  !config.adminToken ||
+                  !data?.runtime_config_mutable ||
+                  !etag ||
+                  !Number.isFinite(Number(timeoutSeconds)) ||
+                  Number(timeoutSeconds) <= 0 ||
+                  !dirty
+                }
+              >
+                {saving ? "保存中..." : "保存配置"}
+              </button>
+              <button className="button button-secondary" onClick={() => void loadConfig()} disabled={loading || !config.adminToken}>
+                {loading ? "刷新中..." : "重新读取"}
+              </button>
+              <Link className="button button-secondary" to="/wxbot">
+                智能体工具白名单
+              </Link>
+              {dirty ? <span className="pill pill-muted">有未保存修改</span> : null}
+            </div>
+          }
         />
-        <div className="action-row">
-          <button
-            className="button button-primary"
-            onClick={() => void saveConfig()}
-            disabled={
-              saving ||
-              !config.adminToken ||
-              !data?.runtime_config_mutable ||
-              !etag ||
-              !Number.isFinite(Number(timeoutSeconds)) ||
-              Number(timeoutSeconds) <= 0 ||
-              !dirty
-            }
-          >
-            {saving ? "保存中..." : "保存配置"}
-          </button>
-          <button className="button button-secondary" onClick={() => void loadConfig()} disabled={loading || !config.adminToken}>
-            {loading ? "刷新中..." : "重新读取"}
-          </button>
-          <Link className="button button-secondary" to="/wxbot">
-            智能体工具白名单
-          </Link>
-          {dirty ? <span className="pill pill-muted">有未保存修改</span> : null}
-        </div>
-        <div className="status-grid">
+        <div className="status-grid page-hero-metrics">
           <StatusTile label="接口密钥" value={data?.api_key_configured ? "已配置" : "缺失"} />
           <StatusTile label="作用范围" value={data?.agent_scope || "群个人地图"} />
           <StatusTile label="工具数量" value={`${data?.tools?.length ?? 0}`} />
@@ -196,34 +198,7 @@ export function AmapPage() {
               : "当前部署为只读配置；请通过部署系统变更非密钥参数。"}
         </p>
         {error ? <Alert variant="danger">{error}</Alert> : null}
-      </section>
 
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">运行状态</p>
-            <h2>当前状态</h2>
-          </div>
-          <span className={`pill ${data?.api_key_configured ? "pill-ok" : "pill-danger"}`}>
-            {data?.api_key_configured ? "可调用" : "缺少接口密钥"}
-          </span>
-        </div>
-        <ul className="route-list">
-          <li>高德接口密钥：<span>{data?.api_key_configured ? "已配置" : "未配置"}</span></li>
-          <li>请求超时：<span>{data?.timeout_seconds ?? "-"} 秒</span></li>
-          <li>二维码目录：<span className="mono">{data?.storage_dir || "-"}</span></li>
-          <li>目录存在：<span>{data?.storage_dir_exists ? "是" : "否"}</span></li>
-          <li>目录可写：<span>{data?.storage_dir_writable ? "是" : "否"}</span></li>
-        </ul>
-      </section>
-
-      <section className="panel span-2">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">配置</p>
-            <h2>插件配置</h2>
-          </div>
-        </div>
         <div className="form-grid">
           <div className="span-2 admin-notice">
             <strong>AMAP_API_KEY 由外部密钥提供方管理</strong>
@@ -242,7 +217,7 @@ export function AmapPage() {
               disabled={!data?.runtime_config_mutable}
             />
           </label>
-          <label className="field span-2">
+          <label className="field">
             <span>二维码保存目录</span>
             <input
               value={storageDir}
@@ -251,28 +226,21 @@ export function AmapPage() {
               disabled={!data?.runtime_config_mutable}
             />
           </label>
+          <div className="field span-2">
+            <span>智能体工具</span>
+            <div className="token-chips">
+              {(data?.tools || []).map((tool) => (
+                <span key={tool}>{tool}</span>
+              ))}
+              {!data?.tools?.length && <span>尚未读取到工具目录</span>}
+            </div>
+          </div>
         </div>
         <p className="muted-copy">
           如果微信机器人 SDK 在 Windows 侧发送图片，二维码目录要配置成 Windows 与 WSL 都能访问的共享路径。
         </p>
+        <OutputPanel flush title="高德插件配置响应" value={output} />
       </section>
-
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">工具目录</p>
-            <h2>智能体工具</h2>
-          </div>
-        </div>
-        <ul className="route-list">
-          {(data?.tools || []).map((tool) => (
-            <li key={tool}><span className="mono">{tool}</span></li>
-          ))}
-          {!data?.tools?.length && <li>尚未读取到工具目录</li>}
-        </ul>
-      </section>
-
-      <OutputPanel title="高德插件配置响应" value={output} />
     </div>
   );
 }

@@ -66,7 +66,9 @@ export function KnowledgePage() {
       ) : (
         <ImportWorkspace importer={importer} currentScopeText={scope.currentScopeText} />
       )}
-      <OutputPanel title="知识运营响应" value={output} />
+      <section className="panel span-3">
+        <OutputPanel flush title="知识运营响应" value={output} />
+      </section>
     </div>
   );
 }

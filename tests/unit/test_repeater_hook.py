@@ -240,6 +240,23 @@ async def test_repeater_hook_repeats_on_two_identical_user_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeater_hook_skips_when_group_scope_is_disabled() -> None:
+    store = _FakeRepeaterStore(enabled=True, should_trigger=True)
+
+    async def deny_scope(_tenant_id: str, _session_id: str) -> bool:
+        return False
+
+    hook = RepeaterHook(store, scope_execution_allowed=deny_scope)
+    ctx = _ctx("复读测试", "复读测试")
+
+    await hook.run(ctx)
+
+    assert store.recorded == []
+    assert store.config_session_ids == []
+    assert ctx.extras["repeater"]["reason"] == "scope_disabled"
+
+
+@pytest.mark.asyncio
 async def test_repeater_uses_external_group_id_after_managed_identity_migration() -> None:
     store = _FakeRepeaterStore(enabled=True, should_trigger=True)
     ctx = _ctx("复读测试", "复读测试")

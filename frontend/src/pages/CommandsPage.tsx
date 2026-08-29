@@ -43,7 +43,28 @@ type CommandDraft = {
 type ConfigStatus = "idle" | "loading" | "loaded" | "saving" | "error" | "conflict";
 
 function countItems(value: string) {
-  return value.split(/\n|,/).map((item) => item.trim()).filter(Boolean).length;
+  return parseListItems(value).length;
+}
+
+function parseListItems(value: string) {
+  return value.split(/\n|,/).map((item) => item.trim()).filter(Boolean);
+}
+
+function TokenPreview({ value }: { value: string }) {
+  const items = parseListItems(value);
+  if (!items.length) {
+    return null;
+  }
+  const visible = items.slice(0, 6);
+  const rest = items.length - visible.length;
+  return (
+    <div className="token-chips" aria-hidden="true">
+      {visible.map((item) => (
+        <span key={item}>{item}</span>
+      ))}
+      {rest > 0 ? <span>+{rest}</span> : null}
+    </div>
+  );
 }
 
 const CONFIG_STATUS_LABELS: Record<ConfigStatus, string> = {
@@ -184,16 +205,35 @@ export function CommandsPage() {
   return (
     <div className="page-grid">
       <UnsavedChangesGuard when={configDirty} />
-      <section className="panel span-2">
+      <section className="panel span-3">
         <PageHeader
           eyebrow="命令中心"
           title="全局命令中心"
-          description="统一管理聊天命令、管理员成员标识和普通 / 管理员命令清单。积分与绘图能力已接入这里，避免继续分散在各插件中。"
+          description="统一管理聊天命令、管理员成员标识和普通 / 管理员命令清单。"
+          actions={
+            <div className="action-row">
+              <button
+                className="button button-secondary"
+                onClick={() => void loadConfig()}
+                disabled={configDirty || configStatus === "loading" || configStatus === "saving"}
+              >
+                {configStatus === "loading" ? "读取中…" : "读取配置"}
+              </button>
+              {configDirty ? (
+                <button className="button button-secondary" onClick={discardDraft}>
+                  放弃未保存修改
+                </button>
+              ) : null}
+              <button
+                className="button button-primary"
+                onClick={() => void saveConfig()}
+                disabled={!configLoadedForScope || !configDirty || configStatus === "saving" || configStatus === "loading"}
+              >
+                {configStatus === "saving" ? "保存中…" : "保存配置"}
+              </button>
+            </div>
+          }
         />
-
-        <p className="muted-copy">
-          当前为租户级配置，会影响该租户下所有接入命令中心的会话。
-        </p>
 
         <div className="summary-grid">
           <div className="summary-card">
@@ -215,65 +255,53 @@ export function CommandsPage() {
         </div>
       </section>
 
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
             <p className="section-kicker">配置</p>
             <h3>租户级命令权限</h3>
           </div>
         </div>
-        <div className="form-grid">
-          <label className="field span-2">
+        <div className="commands-lists">
+          <label className="field">
             <span>管理员成员标识</span>
-            <textarea
-              rows={5}
-              value={adminUserIdsText}
-              onChange={(event) => setAdminUserIdsText(event.target.value)}
-              disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
-              placeholder={"每行一个成员微信标识\n例如：wxid_xxx"}
-            />
+            <div className="token-field">
+              <TokenPreview value={adminUserIdsText} />
+              <textarea
+                rows={4}
+                value={adminUserIdsText}
+                onChange={(event) => setAdminUserIdsText(event.target.value)}
+                disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
+                placeholder={"每行一个成员微信标识\n例如：wxid_xxx"}
+              />
+            </div>
           </label>
-          <label className="field span-2">
+          <label className="field">
             <span>普通用户可用命令</span>
-            <textarea
-              rows={7}
-              value={userCommandsText}
-              onChange={(event) => setUserCommandsText(event.target.value)}
-              disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
-              placeholder={"/签到\n/checkin\n/余额\n/balance"}
-            />
+            <div className="token-field">
+              <TokenPreview value={userCommandsText} />
+              <textarea
+                rows={4}
+                value={userCommandsText}
+                onChange={(event) => setUserCommandsText(event.target.value)}
+                disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
+                placeholder={"/签到\n/checkin\n/余额\n/balance"}
+              />
+            </div>
           </label>
-          <label className="field span-2">
+          <label className="field">
             <span>管理员可用命令</span>
-            <textarea
-              rows={7}
-              value={adminCommandsText}
-              onChange={(event) => setAdminCommandsText(event.target.value)}
-              disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
-              placeholder={"/赠送\n/grant\n/sign-in\n/signin\n/签到模式"}
-            />
+            <div className="token-field">
+              <TokenPreview value={adminCommandsText} />
+              <textarea
+                rows={4}
+                value={adminCommandsText}
+                onChange={(event) => setAdminCommandsText(event.target.value)}
+                disabled={!configLoadedForScope || configStatus === "loading" || configStatus === "saving"}
+                placeholder={"/赠送\n/grant\n/sign-in\n/signin\n/签到模式"}
+              />
+            </div>
           </label>
-        </div>
-        <div className="action-row">
-          <button
-            className="button button-secondary"
-            onClick={() => void loadConfig()}
-            disabled={configDirty || configStatus === "loading" || configStatus === "saving"}
-          >
-            {configStatus === "loading" ? "读取中…" : "读取配置"}
-          </button>
-          {configDirty ? (
-            <button className="button button-secondary" onClick={discardDraft}>
-              放弃未保存修改
-            </button>
-          ) : null}
-          <button
-            className="button button-primary"
-            onClick={() => void saveConfig()}
-            disabled={!configLoadedForScope || !configDirty || configStatus === "saving" || configStatus === "loading"}
-          >
-            {configStatus === "saving" ? "保存中…" : "保存配置"}
-          </button>
         </div>
         <div className="route-list" aria-live="polite">
           <div>
@@ -308,7 +336,7 @@ export function CommandsPage() {
         </p>
       </section>
 
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
             <p className="section-kicker">命令目录</p>
@@ -320,32 +348,36 @@ export function CommandsPage() {
             <caption className="sr-only">已注册命令目录</caption>
             <thead>
               <tr>
-                <th scope="col">插件</th>
-                <th scope="col">主命令</th>
-                <th scope="col">别名</th>
+                <th scope="col">命令</th>
                 <th scope="col">权限</th>
                 <th scope="col">说明</th>
-                <th scope="col">用法</th>
               </tr>
             </thead>
             <tbody>
               {catalog.map((item) => (
                 <tr key={`${item.plugin_name}-${item.command}`}>
-                  <td><TechnicalDetails summary="查看提供方标识" value={item.plugin_name} /></td>
-                  <td className="mono">{item.command}</td>
-                  <td className="mono">{(item.aliases || []).join(", ") || "-"}</td>
+                  <td>
+                    <div className="command-catalog-cmd">
+                      <strong className="mono">{item.command}</strong>
+                      <small>{item.plugin_name}{(item.aliases || []).length ? ` · ${(item.aliases || []).join(", ")}` : ""}</small>
+                    </div>
+                  </td>
                   <td>
                     <span className={`pill ${item.admin_only ? "pill-danger" : "pill-ok"}`}>
                       {item.admin_only ? "仅管理员" : "所有成员"}
                     </span>
                   </td>
-                  <td>{item.description || "-"}</td>
-                  <td className="mono">{item.usage || "-"}</td>
+                  <td>
+                    <div className="command-catalog-help">
+                      <span>{item.description || "-"}</span>
+                      {item.usage ? <code>{item.usage}</code> : null}
+                    </div>
+                  </td>
                 </tr>
               ))}
               {!catalog.length && (
                 <tr>
-                  <td colSpan={6} className="empty-cell">
+                  <td colSpan={3} className="empty-cell">
                     当前还没有插件向命令中心注册命令。
                   </td>
                 </tr>
@@ -353,9 +385,8 @@ export function CommandsPage() {
             </tbody>
           </table>
         </div>
+        <OutputPanel flush title="命令中心接口结果" value={output} />
       </section>
-
-      <OutputPanel title="命令中心接口结果" value={output} />
     </div>
   );
 }

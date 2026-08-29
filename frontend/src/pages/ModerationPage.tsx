@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { DangerAction } from "../components/DangerAction";
+import { GroupScopeEmpty } from "../components/GroupScopeEmpty";
 import { OutputPanel } from "../components/OutputPanel";
 import { PageHeader } from "../components/PageHeader";
-import { SearchableSelect } from "../components/SearchableSelect";
 import { UnsavedChangesGuard } from "../components/UnsavedChangesGuard";
 import { TechnicalDetails } from "../components/TechnicalDetails";
 import {
@@ -120,16 +120,6 @@ function formatTimestamp(value?: string | null) {
   }).format(date);
 }
 
-function modeLabel(mode: string) {
-  if (mode === "append") {
-    return "追加提醒";
-  }
-  if (mode === "replace") {
-    return "直接拦截";
-  }
-  return "仅留痕";
-}
-
 const RESOURCE_STATUS_LABELS: Record<ResourceStatus, string> = {
   idle: "等待读取",
   loading: "正在读取",
@@ -153,10 +143,6 @@ function webhookStatusLabel(status?: string) {
     pending: "等待发送",
     "skipped:no_url": "未配置地址，已跳过",
   } as Record<string, string>)[status || ""] || (status ? "其他状态" : "-");
-}
-
-function buildSessionOptionLabel(session: ModerationSessionSummary) {
-  return `${session.session_name || session.session_id}（已验证群聊）`;
 }
 
 export function mergeSessions(
@@ -200,7 +186,6 @@ export function ModerationPage() {
     config,
     verifiedGroupIds,
     registerVerifiedGroups,
-    selectVerifiedGroup,
   } = useConsoleConfig();
   const { keyFor, clear } = useStableIdempotencyKeys();
   const basePath = "/plugins/moderation";
@@ -239,19 +224,6 @@ export function ModerationPage() {
   const selectedEvent = useMemo(
     () => events.find((item) => item.id === selectedEventId) || null,
     [events, selectedEventId],
-  );
-  const selectedSession = useMemo(
-    () => sessions.find((item) => item.session_id === effectiveSessionId) || null,
-    [effectiveSessionId, sessions],
-  );
-  const sessionOptions = useMemo(
-    () =>
-      sessions.map((item) => ({
-        value: item.session_id,
-        label: buildSessionOptionLabel(item),
-        keywords: [item.session_id, item.session_name || ""],
-      })),
-    [sessions],
   );
   const resourceScope = `${config.tenantId}\u0000${effectiveSessionId}`;
   const configLoadedForScope = Boolean(
@@ -770,17 +742,41 @@ export function ModerationPage() {
     void loadEvents();
   }, [loadEvents]);
 
+  if (!scopeReady) {
+    return (
+      <GroupScopeEmpty
+        eyebrow="内容审核"
+        title="审核配置与事件运营"
+        description="按当前已验证群聊配置审核开关、提醒和关键词。群聊请在顶部会话条切换。"
+      />
+    );
+  }
+
   return (
     <div className="page-grid moderation-page">
       <UnsavedChangesGuard when={hasUnsavedChanges} />
-      <section className="panel span-2 moderation-overview-panel">
+      <section className="panel span-3 moderation-overview-panel">
         <PageHeader
           eyebrow="内容审核"
           title="审核配置与事件运营"
-          description="页面按群维度组织审核插件：先选群，再配置命中动作和关键词，最后看最近事件。即使没有旧项目那套单页后台，也能在这里直接完成日常运营操作。"
+          description="按当前群配置审核开关、提醒和关键词。命中后可只留痕、追加提醒或拦截回复。"
+          actions={
+            <div className="action-row">
+              <button className="button button-secondary button-compact" onClick={() => void loadSessions()}>
+                刷新群列表
+              </button>
+              <button
+                className="button button-secondary button-compact"
+                onClick={() => void refreshSelected()}
+                disabled={!scopeReady || hasUnsavedChanges}
+              >
+                刷新当前群
+              </button>
+            </div>
+          }
         />
 
-        <div className="summary-grid moderation-summary-grid">
+        <div className="summary-grid page-hero-metrics">
           <div className="summary-card" data-status={sessions.length ? "ok" : "warning"}>
             <span>可管理群</span>
             <strong>{sessions.length}</strong>
@@ -798,98 +794,7 @@ export function ModerationPage() {
             <strong>{events.length}</strong>
           </div>
         </div>
-
-        <div className="moderation-session-toolbar">
-          <label className="field span-2">
-            <span>管理群选择</span>
-            <SearchableSelect
-              value={sessionId}
-              options={sessionOptions}
-              disabled={hasUnsavedChanges}
-              onChange={(value) => {
-                setSessionId(value);
-                if (value) {
-                  selectVerifiedGroup(value);
-                }
-              }}
-              placeholder="从已同步群聊中选择"
-              searchPlaceholder="输入群名搜索"
-              emptyText="暂无可管理群，请先在微信机器人页同步群聊"
-              noResultsText="没有匹配群会话"
-            />
-          </label>
-          <div className="moderation-toolbar-actions">
-            <button className="button button-secondary" onClick={() => void loadSessions()}>
-              刷新群列表
-            </button>
-            <button
-              className="button button-secondary"
-              onClick={() => void refreshSelected()}
-              disabled={!scopeReady || hasUnsavedChanges}
-            >
-              刷新当前群
-            </button>
-          </div>
-        </div>
-
-        <div className="data-flow-note moderation-flow-note">
-          <strong>现在这条线怎么工作</strong>
-          <span>审核会在消息预处理完成后做关键词包含匹配，命中后立即留存事件，再按配置决定只留痕、追加提醒，还是直接拦截回复。</span>
-          <span>外部回调当前发送结构化事件数据，不会自动转换成企业微信群消息模板。</span>
-        </div>
       </section>
-
-      <aside className="panel panel-sidebar moderation-side-stack">
-        <section className="panel moderation-side-card">
-          <div className="panel-header">
-            <div>
-              <p className="section-kicker">当前群聊</p>
-              <h3>当前群概况</h3>
-            </div>
-          </div>
-          <div className="moderation-meta-list">
-            <div>
-              <span>群名称</span>
-              <strong>{selectedSession?.session_name || "-"}</strong>
-            </div>
-            <details>
-              <summary>技术标识</summary>
-              <strong className="mono">{effectiveSessionId || "-"}</strong>
-            </details>
-            <div>
-              <span>审核状态</span>
-              <strong>{enabled === "true" ? "已开启" : "未开启"}</strong>
-            </div>
-            <div>
-              <span>提醒动作</span>
-              <strong>{modeLabel(reminderMode)}</strong>
-            </div>
-            <div>
-              <span>最后命中</span>
-              <strong>{formatTimestamp(events[0]?.created_at || selectedSession?.last_event_at)}</strong>
-            </div>
-          </div>
-        </section>
-
-        <section className="panel moderation-side-card">
-          <div className="panel-header">
-            <div>
-              <p className="section-kicker">操作说明</p>
-              <h3>配置说明</h3>
-            </div>
-          </div>
-          <ul className="moderation-guidance-list">
-            <li>先从群列表里选群，再改配置。页面里所有保存动作都只针对当前群。</li>
-            <li>关键词区以“每行一个词”的整体替换为主，适合运营同学直接维护群规则。</li>
-            <li>`追加提醒` 保留原回复并在末尾补警示，`直接拦截` 会用提醒文案替换原回复。</li>
-            <li>外部回调开启后，会发送群聊、触发成员、消息、命中词与追踪信息。</li>
-          </ul>
-          <TechnicalDetails
-            summary="查看外部回调字段"
-            value={["session_id", "user_id", "message_text", "matched_keywords", "trace_id"]}
-          />
-        </section>
-      </aside>
 
       <section className="panel span-2 moderation-config-panel">
         <div className="panel-header">
@@ -947,7 +852,7 @@ export function ModerationPage() {
               <option value="true">开启</option>
             </select>
           </label>
-          <label className="field span-2">
+          <label className="field">
             <span>外部回调地址</span>
             <input
               value={webhookUrl}
@@ -957,11 +862,10 @@ export function ModerationPage() {
             />
           </label>
         </div>
-
-        <div className="moderation-inline-note">
-          <strong>字段解释</strong>
-          <span>如果你只想“留痕并回看”，把动作设成 `只记事件` 即可；只有真的要干预回复时，才改成追加或拦截。</span>
-        </div>
+        <TechnicalDetails
+          summary="查看外部回调字段"
+          value={["session_id", "user_id", "message_text", "matched_keywords", "trace_id"]}
+        />
 
         <div className="action-row">
           <button
@@ -1279,9 +1183,11 @@ export function ModerationPage() {
         </div>
       </section>
 
-      <OutputPanel title="群列表与索引响应" value={sessionOutput} />
-      <OutputPanel title="审核配置响应" value={configOutput} />
-      <OutputPanel title={selectedEvent ? `审核事件 #${selectedEvent.id}` : "审核操作响应"} value={selectedEvent ? formatJson(selectedEvent) : opsOutput} />
+      <section className="panel span-3">
+        <OutputPanel flush title="群列表与索引响应" value={sessionOutput} />
+        <OutputPanel flush title="审核配置响应" value={configOutput} />
+        <OutputPanel flush title={selectedEvent ? `审核事件 #${selectedEvent.id}` : "审核操作响应"} value={selectedEvent ? formatJson(selectedEvent) : opsOutput} />
+      </section>
     </div>
   );
 }

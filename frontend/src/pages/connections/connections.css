@@ -8,7 +8,7 @@
 
 .connections-hero {
   display: grid;
-  gap: var(--space-5);
+  gap: var(--space-4);
   overflow: hidden;
 }
 
@@ -26,7 +26,11 @@
 }
 
 .connections-hero-heading .page-header {
-  max-width: 760px;
+  flex: 1;
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+  max-width: none;
 }
 
 .connections-hero-actions {
@@ -35,69 +39,60 @@
 }
 
 .connection-domain-model {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-2-5);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1-5) var(--space-4);
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: none;
 }
 
 .connection-domain-model li {
-  position: relative;
   display: flex;
   min-width: 0;
-  gap: var(--space-2-5);
-  align-items: center;
-  padding: var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.76);
+  gap: var(--space-2);
+  align-items: baseline;
+  padding: 0;
+  border: 0;
+  background: none;
 }
 
 .connection-domain-model li > span {
-  display: grid;
-  flex: 0 0 30px;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border-radius: 50%;
-  color: var(--tone-accent-text);
-  background: var(--tone-accent-bg);
+  display: inline;
+  flex: none;
+  width: auto;
+  height: auto;
+  color: var(--accent);
+  background: none;
+  font-family: var(--font-mono);
   font-size: var(--font-size-2xs);
-  font-weight: 800;
-  letter-spacing: 0.04em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }
 
 .connection-domain-model li > div {
-  display: grid;
+  display: flex;
   min-width: 0;
-  gap: var(--space-0-5);
+  gap: var(--space-1-5);
+  align-items: baseline;
 }
 
 .connection-domain-model strong {
   color: var(--text);
-  font-size: var(--font-size-base);
-}
-
-.connection-domain-model small {
-  color: var(--text-secondary);
-  font-size: var(--font-size-xs);
-  line-height: 1.4;
-}
-
-.connection-model-note {
-  margin: -6px 0 0;
-  padding: var(--space-2-5) var(--space-3);
-  border-left: 3px solid var(--accent);
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.54);
   font-size: var(--font-size-sm);
 }
 
-.connection-model-note strong {
-  color: var(--text);
+.connection-domain-model small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-size-2xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-model-note {
+  display: none;
 }
 
 .connections-page .connections-status-grid {
@@ -183,10 +178,10 @@
 .connection-adapter-card {
   display: flex;
   min-width: 0;
-  min-height: 176px;
+  min-height: 0;
   flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-3-5);
+  gap: var(--space-2-5);
+  padding: var(--space-3);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel-alt);
@@ -215,10 +210,14 @@
 }
 
 .connection-adapter-card > p {
-  flex: 1;
+  flex: none;
   margin: 0;
+  display: -webkit-box;
+  overflow: hidden;
   color: var(--text-secondary);
   font-size: var(--font-size-sm);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .connection-capability-list {
@@ -431,15 +430,15 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-2);
-  margin: var(--space-4-5) 0;
+  margin: var(--space-3) 0;
 }
 
 .connection-health-cell {
   display: grid;
   min-width: 0;
-  min-height: 92px;
-  gap: var(--space-0-5);
-  padding: var(--space-2-5);
+  min-height: 0;
+  gap: 2px;
+  padding: var(--space-2) var(--space-2-5);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel-alt);
@@ -456,9 +455,7 @@
 }
 
 .connection-health-cell > small {
-  color: var(--text-muted);
-  font-size: var(--font-size-2xs);
-  line-height: 1.35;
+  display: none;
 }
 
 .connection-health-cell.is-ok {
@@ -657,10 +654,6 @@
 }
 
 @media (max-width: 1120px) {
-  .connection-domain-model {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .connection-skeleton-grid,
   .connection-adapter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -710,7 +703,6 @@
 }
 
 @media (max-width: 680px) {
-  .connection-domain-model,
   .connections-page .connections-status-grid,
   .connection-skeleton-grid,
   .connection-adapter-grid,

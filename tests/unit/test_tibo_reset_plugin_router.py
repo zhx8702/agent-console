@@ -200,7 +200,6 @@ async def test_tibo_reset_plugin_only_schedules_in_scheduler_process(
     worker_plugin = module.TiboResetPlugin()
     worker_settings = SimpleNamespace(
         app_process_role="inbound",
-        tibo_reset_enabled=True,
         tibo_reset_api_url="https://tibo-reset.test/api/resets",
         tibo_reset_request_timeout_seconds=1,
         tibo_reset_poll_interval_seconds=30,
@@ -262,13 +261,13 @@ async def test_tibo_reset_plugin_only_schedules_in_scheduler_process(
 
 
 @pytest.mark.asyncio
-async def test_tibo_reset_plugin_is_inert_without_deployment_opt_in(
+async def test_tibo_reset_plugin_is_inert_without_api_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import plugins.tibo_reset.plugin as module
 
     def unexpected_dependency(*_args, **_kwargs):
-        raise AssertionError("disabled plugin must not initialize outbound dependencies")
+        raise AssertionError("unconfigured plugin must not initialize outbound dependencies")
 
     _PluginStore.ensured = 0
     monkeypatch.setattr(module, "TiboResetStore", _PluginStore)
@@ -283,7 +282,7 @@ async def test_tibo_reset_plugin_is_inert_without_deployment_opt_in(
             container=SimpleNamespace(),
             settings=SimpleNamespace(
                 app_process_role="scheduler",
-                tibo_reset_enabled=False,
+                tibo_reset_api_url="",
             ),
             db_ok=True,
             redis_ok=False,
@@ -292,6 +291,7 @@ async def test_tibo_reset_plugin_is_inert_without_deployment_opt_in(
 
     status = await disabled_plugin.get_runtime_status()
     assert status["configured_enabled"] is False
+    assert status["api_url_configured"] is False
     assert status["scheduler_enabled"] is False
     assert _PluginStore.ensured == 1
     assert disabled_plugin.get_api_router() is not None

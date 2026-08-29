@@ -92,10 +92,10 @@ export function PluginDiagnosticsSections({
       </section>
 
       <div className="plugins-output-panel span-3">
-        <OutputPanel title="插件摘要响应" value={output} />
+        <OutputPanel flush title="插件摘要响应" value={output} />
       </div>
       <div className="plugins-output-panel span-3">
-        <OutputPanel title="群级插件控制响应" value={groupOutput} />
+        <OutputPanel flush title="群级插件控制响应" value={groupOutput} />
       </div>
     </>
   );

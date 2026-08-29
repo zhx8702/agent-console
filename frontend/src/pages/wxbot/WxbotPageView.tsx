@@ -49,23 +49,29 @@ export function WxbotPageView() {
         <PageHeader
           eyebrow="微信机器人"
           title="微信机器人桥接"
-          description="统一管理桥接状态、会话回复策略、群成员事件、欢迎语和日报周报月报订阅。报表由本地微信解密数据库生成，不依赖平台留存对话轮次。"
+          description="桥接状态、回复策略、群成员事件和报表订阅；报表由本地微信解密库生成。"
+          actions={
+            <div className="action-row">
+              <button className="button button-primary" onClick={() => void refresh()} disabled={loading}>
+                {loading ? "刷新中..." : "刷新桥接状态"}
+              </button>
+            </div>
+          }
         />
-        <div className="action-row">
-          <button className="button button-primary" onClick={() => void refresh()} disabled={loading}>
-            {loading ? "刷新中..." : "刷新桥接状态"}
-          </button>
-          <button className="button button-secondary" onClick={() => void loadReplyPolicy()}>
-            读取回复策略
-          </button>
-          <button className="button button-secondary" onClick={() => void loadMemberEvents()}>
-            读取成员事件
-          </button>
-          <button className="button button-secondary" onClick={() => void loadReportSubscriptions()}>
-            读取日报周报月报
-          </button>
+        <div className="page-ops-bar">
+          <div className="action-row">
+            <button className="button button-secondary button-compact" onClick={() => void loadReplyPolicy()}>
+              读取回复策略
+            </button>
+            <button className="button button-secondary button-compact" onClick={() => void loadMemberEvents()}>
+              读取成员事件
+            </button>
+            <button className="button button-secondary button-compact" onClick={() => void loadReportSubscriptions()}>
+              读取日报周报月报
+            </button>
+          </div>
         </div>
-        <div className="summary-grid">
+        <div className="summary-grid page-hero-metrics">
           <div
             className="summary-card"
             data-status={bridgeStatus ? (bridgeStatus.running ? "ok" : "error") : error ? "error" : undefined}

@@ -14,7 +14,7 @@ export function KnowledgeHeader({ scope, faqCount, documentCount }: KnowledgeHea
       <PageHeader
         eyebrow="知识运营"
         title="FAQ / 知识库运营"
-        description="FAQ 做短问短答，知识库做长文本沉淀。当前界面按作用域管理，并支持 FAQ 命中测试。"
+        description="FAQ 做短问短答，知识库做长文本沉淀。按作用域管理，并支持 FAQ 命中测试。"
       />
       <div className="knowledge-scope-bar">
         <div className="knowledge-scope-controls">

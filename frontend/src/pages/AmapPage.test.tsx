@@ -67,7 +67,8 @@ describe("AmapPage secret and concurrency controls", () => {
     expect(screen.queryByRole("textbox", { name: "AMAP_API_KEY" })).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox", { name: /清空当前高德 API Key/ })).not.toBeInTheDocument();
 
-    const timeout = screen.getByRole("spinbutton", { name: "请求超时秒数" });
+    const timeout = await screen.findByRole("spinbutton", { name: "请求超时秒数" });
+    await waitFor(() => expect(timeout).toBeEnabled());
     await user.clear(timeout);
     await user.type(timeout, "45");
     expect(screen.getByText("有未保存修改")).toBeInTheDocument();

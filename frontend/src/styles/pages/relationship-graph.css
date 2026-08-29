@@ -2,18 +2,57 @@
 
 .relationship-graph-page {
   display: grid;
-  gap: var(--space-5);
+  gap: var(--space-4);
 }
 
 .relationship-graph-page :is(h1, h2, h3) {
   scroll-margin-top: 128px;
 }
 
+.relationship-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: 44px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.relationship-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.relationship-disclosure > summary h3 {
+  margin: 0;
+}
+
+.relationship-disclosure-hint {
+  flex: none;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.relationship-disclosure[open] > .relationship-disclosure-hint,
+.relationship-disclosure[open] > summary .relationship-disclosure-hint {
+  font-size: 0;
+}
+
+.relationship-disclosure[open] > summary .relationship-disclosure-hint::before {
+  font-size: var(--font-size-xs);
+  content: "收起";
+}
+
+.relationship-disclosure[open] > summary {
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--line);
+}
+
 .relationship-action-panel {
   display: grid;
   gap: var(--space-2-5);
-  border-color: rgba(15, 118, 110, 0.26);
-  box-shadow: 0 10px 24px rgba(16, 25, 21, 0.06);
 }
 
 .relationship-action-bar {

@@ -3,6 +3,7 @@ export { DangerAction } from "./DangerAction";
 export { DataTable, type DataTableColumn } from "./DataTable";
 export { Dialog } from "./Dialog";
 export { EmptyState } from "./EmptyState";
+export { GroupScopeEmpty } from "./GroupScopeEmpty";
 export { OutputPanel } from "./OutputPanel";
 export { PageHeader } from "./PageHeader";
 export { RouteAnnouncer } from "./RouteAnnouncer";

@@ -146,7 +146,7 @@ describe("OverviewPage degraded loading", () => {
 
     await user.click(screen.getByRole("button", { name: "重新打开清单" }));
     expect(screen.getByRole("heading", { name: "从依赖检查到正式参与" })).toBeInTheDocument();
-    expect(window.localStorage.getItem("agent-console:launch-checklist:v1:default")).toBeNull();
+    expect(window.localStorage.getItem("agent-console:launch-checklist:v1:default")).toBe("open");
   });
 
   it("renders an explicit empty launch state instead of claiming zero of zero steps are ready", () => {
@@ -165,7 +165,7 @@ describe("OverviewPage degraded loading", () => {
     expect(checklist).not.toBeNull();
     const scope = within(checklist as HTMLElement);
     expect(scope.getByText("暂无上线步骤")).toBeInTheDocument();
-    expect(scope.getByText(/这不表示所有能力已就绪/)).toBeInTheDocument();
+    expect(scope.getByText("当前没有可执行的上线步骤。")).toBeInTheDocument();
     expect(scope.getByLabelText("上线步骤尚未生成")).toHaveTextContent("暂无步骤尚未生成");
     expect(scope.queryByText("0/0")).not.toBeInTheDocument();
     expect(scope.queryByRole("list")).not.toBeInTheDocument();
@@ -214,10 +214,15 @@ describe("OverviewPage degraded loading", () => {
       </ConsoleConfigProvider>,
     );
 
-    expect(screen.getByRole("heading", { name: "从授权群到安全参与" })).toBeInTheDocument();
+    expect(screen.getByText("上线清单已收起")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "授权群工作台" })).toBeInTheDocument();
     expect(screen.queryByText("后端运行概览")).not.toBeInTheDocument();
     expect(screen.queryByText("插件与适配器摘要")).not.toBeInTheDocument();
+    expect(apiRequestMock).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "重新打开清单" }));
+    expect(screen.getByRole("heading", { name: "从授权群到安全参与" })).toBeInTheDocument();
+    expect(screen.queryByText("后端运行概览")).not.toBeInTheDocument();
     expect(apiRequestMock).not.toHaveBeenCalled();
   });
 });

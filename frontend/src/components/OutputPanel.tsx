@@ -4,12 +4,13 @@ type OutputPanelProps = {
   title: string;
   value: string;
   defaultOpen?: boolean;
+  flush?: boolean;
 };
 
-export function OutputPanel({ title, value, defaultOpen = false }: OutputPanelProps) {
+export function OutputPanel({ title, value, defaultOpen = false, flush = false }: OutputPanelProps) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="panel panel-output panel-scroll">
+    <section className={flush ? "panel-output panel-output-flush" : "panel panel-output panel-scroll"}>
       <details
         className="output-details"
         open={open}

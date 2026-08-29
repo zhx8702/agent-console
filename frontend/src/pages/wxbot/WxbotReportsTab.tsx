@@ -82,7 +82,7 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
 
   return (
         <>
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">质量复盘</p>
@@ -245,7 +245,7 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">定时计划</p>
@@ -399,7 +399,7 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">手动操作</p>
@@ -453,7 +453,7 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
             </pre>
           </section>
 
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">历史记录</p>
@@ -522,7 +522,7 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
             </div>
           </section>
 
-          <section className="panel span-2">
+          <section className="panel span-3">
             <details>
               <summary>技术详情：日报原始消息</summary>
               <div className="panel-header">
@@ -586,8 +586,8 @@ export function WxbotReportsTab({ controller }: { controller: WxbotPageControlle
             </details>
           </section>
 
-          <OutputPanel title="日报 / 周报 / 月报响应" value={reportOutput} />
-          <OutputPanel title="自我迭代响应" value={selfReviewOutput} />
+          <OutputPanel flush title="日报 / 周报 / 月报响应" value={reportOutput} />
+          <OutputPanel flush title="自我迭代响应" value={selfReviewOutput} />
         </>
       );
 }
