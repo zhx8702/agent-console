@@ -223,10 +223,10 @@ summary:focus-visible {
 
 .tabs-list {
   display: flex;
-  gap: var(--space-1);
+  gap: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: var(--space-1);
+  padding: 0;
   border-bottom: 1px solid var(--line);
   scrollbar-width: thin;
 }
@@ -240,33 +240,37 @@ summary:focus-visible {
 
 .tabs-trigger {
   position: relative;
-  min-height: 40px;
-  padding: var(--space-2) var(--space-3-5);
+  min-height: 42px;
+  padding: var(--space-2) var(--space-4);
   border: 0;
-  border-radius: 7px 7px 0 0;
+  border-radius: 0;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
   font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   white-space: nowrap;
 }
 
 .tabs-trigger:hover:not(:disabled) {
-  background: var(--line-light);
+  background: transparent;
   color: var(--text);
 }
 
 .tabs-trigger[aria-selected="true"] {
-  background: var(--accent-light);
-  color: var(--accent-hover);
+  background: transparent;
+  color: var(--text);
 }
 
 .tabs-trigger[aria-selected="true"]::after {
   position: absolute;
-  right: 10px;
-  bottom: -4px;
-  left: 10px;
-  height: 3px;
-  border-radius: 999px;
+  right: 12px;
+  bottom: -1px;
+  left: 12px;
+  height: 2px;
+  border-radius: 0;
   background: var(--accent);
   content: "";
 }
@@ -405,29 +409,30 @@ summary:focus-visible {
   justify-items: center;
   max-width: 620px;
   margin: 0 auto;
-  padding: clamp(var(--space-6), 6vw, 64px) var(--space-6);
+  padding: clamp(var(--space-8), 6vw, 72px) var(--space-6);
   color: var(--text-secondary);
   text-align: center;
 }
 
 .empty-state-icon {
   display: grid;
-  width: 54px;
-  height: 54px;
-  margin-bottom: var(--space-3-5);
+  width: 48px;
+  height: 48px;
+  margin-bottom: var(--space-4);
   place-items: center;
-  border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  background: linear-gradient(145deg, var(--color-white), var(--panel-alt));
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--accent-light);
   color: var(--accent-hover);
-  font-size: var(--font-size-3xl);
-  box-shadow: var(--shadow-sm);
+  font-size: var(--font-size-xl);
+  box-shadow: none;
 }
 
 .empty-state h2 {
   margin: 0;
   color: var(--text);
-  font-size: var(--font-size-xl);
+  font-size: var(--font-size-2xl);
+  letter-spacing: -0.03em;
 }
 
 .empty-state p {

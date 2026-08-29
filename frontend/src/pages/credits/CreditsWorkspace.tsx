@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { DangerAction } from "../../components/DangerAction";
 import { Alert } from "../../components/Alert";
+import { GroupScopeEmpty } from "../../components/GroupScopeEmpty";
 import { OutputPanel } from "../../components/OutputPanel";
 import { PageHeader } from "../../components/PageHeader";
 import { SearchableSelect } from "../../components/SearchableSelect";
@@ -35,7 +36,6 @@ import {
   formatDelta,
   getReasonLabel,
   getCheckinModeText,
-  getCheckinModeDescription,
   type CreditsConfigDraft,
   configFingerprint,
 } from "./model";
@@ -559,6 +559,16 @@ export function CreditsWorkspace() {
     }
   }, [rosterMembers, transferToUserId]);
 
+  if (!selectedSessionIsGroup) {
+    return (
+      <GroupScopeEmpty
+        eyebrow="积分运营"
+        title="按群积分配置与签到运营"
+        description="对齐旧 wx-bot 的核心体验：按群单独启用和配置积分、按成员查看积分与签到状态、查看排行榜与流水，并管理三种签到模式。"
+      />
+    );
+  }
+
   return (
     <div className="page-grid credits-page">
       <UnsavedChangesGuard when={configDirty} />
@@ -566,16 +576,10 @@ export function CreditsWorkspace() {
         <PageHeader
           eyebrow="积分运营"
           title="按群积分配置与签到运营"
-          description="对齐旧 wx-bot 的核心体验：按群单独启用和配置积分、按成员查看积分与签到状态、查看排行榜与流水，并管理三种签到模式。"
+          description="积分、签到和排行榜只作用于当前已验证群聊。"
         />
 
-        <div className="credits-hero">
-          <p className="muted-copy">
-            {selectedSessionIsGroup
-              ? <>当前已验证群聊：<strong>{effectiveSessionId}</strong>。积分配置、签到模式、排行榜和成员状态都只作用于该群。</>
-              : <>请先使用页面上方的群聊选择器，从后端已验证列表中选择目标群；本页不会接受手工群 ID，也不会回退到默认范围。</>}
-          </p>
-          <div className="summary-grid">
+        <div className="summary-grid page-hero-metrics">
             <div className="summary-card" data-status={enabled ? "ok" : "warning"}>
               <span>插件状态</span>
               <strong>{enabled ? "已启用" : "未启用"}</strong>
@@ -593,23 +597,13 @@ export function CreditsWorkspace() {
               <strong>{getCheckinModeText(checkinMode)}</strong>
             </div>
           </div>
-        </div>
-      </section>
-
-      <section className="panel span-2">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">积分配置</p>
-            <h3>群级积分配置</h3>
-          </div>
-        </div>
         <div className="credits-config-layout">
           <div className="form-grid">
             <label className="field">
               <span>启用</span>
               <select value={enabled ? "true" : "false"} onChange={(event) => setEnabled(event.target.value === "true")}>
-                <option value="true">true</option>
-                <option value="false">false</option>
+                <option value="true">开启</option>
+                <option value="false">关闭</option>
               </select>
             </label>
             <label className="field">
@@ -632,6 +626,24 @@ export function CreditsWorkspace() {
                 onChange={(event) => setInitialCredits(Number(event.target.value))}
               />
             </label>
+            <div className="field span-2">
+              <span>签到模式</span>
+              <div className="credits-mode-switch" role="radiogroup" aria-label="签到模式">
+                {CHECKIN_MODE_OPTIONS.map((item) => (
+                  <button
+                    key={item.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={checkinMode === item.value}
+                    className={checkinMode === item.value ? "is-active" : undefined}
+                    onClick={() => setCheckinMode(item.value)}
+                  >
+                    <strong>{item.label}</strong>
+                    <small>{item.description}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
             <label className="field">
               <span>签到基础奖励</span>
               <input
@@ -740,59 +752,19 @@ export function CreditsWorkspace() {
               </button>
             </Alert>
           )}
-          <p className="muted-copy">
-            命令权限已经迁到 <Link to="/commands">全局命令中心</Link>。这里仅管理积分与签到模式本身；
-            <code>/sign-in mode 1|2|3</code> 是否可用由命令中心里的管理员和命令清单决定。
-            普通 AI 回复继续走“每次对话扣费”，命令类交互可在“命令积分规则”里按 <code>/command=分值</code> 单独定价；
-            自然语言触发的高德 Agent 按实际工具结果走这三档计费，不需要映射成命令。
-          </p>
+          <details className="credits-help-disclosure">
+            <summary>命令权限与计费说明</summary>
+            <p className="muted-copy">
+              命令权限已经迁到 <Link to="/commands">全局命令中心</Link>。这里仅管理积分与签到模式本身；
+              <code>/sign-in mode 1|2|3</code> 是否可用由命令中心里的管理员和命令清单决定。
+              普通 AI 回复继续走“每次对话扣费”，命令类交互可在“命令积分规则”里按 <code>/command=分值</code> 单独定价；
+              自然语言触发的高德 Agent 按实际工具结果走这三档计费，不需要映射成命令。
+            </p>
+          </details>
         </div>
       </section>
 
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">签到</p>
-            <h3>签到模式</h3>
-          </div>
-        </div>
-        <div className="credits-mode-panel">
-          <div className="credits-mode-current">
-            <span>当前模式</span>
-            <strong>{getCheckinModeText(checkinMode)}</strong>
-            <p>{getCheckinModeDescription(checkinMode)}</p>
-          </div>
-          <div className="credits-mode-grid credits-mode-grid-compact">
-            {CHECKIN_MODE_OPTIONS.map((item) => (
-              <button
-                key={item.value}
-                type="button"
-                className={`credits-mode-card${checkinMode === item.value ? " active" : ""}`}
-                onClick={() => setCheckinMode(item.value)}
-              >
-                <strong>{item.label}</strong>
-                <p>{item.description}</p>
-              </button>
-            ))}
-          </div>
-          <div className="credits-meta-list">
-            <div>
-              <span>基础奖励</span>
-              <strong>{dailyCheckin} {creditName}</strong>
-            </div>
-            <div>
-              <span>连签加成</span>
-              <strong>每 7 天 +{streakBonus}</strong>
-            </div>
-            <div>
-              <span>加成上限</span>
-              <strong>最多 +{streakCap}</strong>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
             <p className="section-kicker">成员</p>
@@ -801,18 +773,7 @@ export function CreditsWorkspace() {
         </div>
         <div className="credits-member-layout">
           <div>
-            <div className="form-grid u-mb-3">
-              <label className="field span-2">
-                <span>选择成员</span>
-                <SearchableSelect
-                  value={selectedUserId}
-                  options={memberOptions}
-                  onChange={setSelectedUserId}
-                  placeholder="从当前群成员中选择"
-                  emptyText={selectedSessionIsGroup ? "当前群还没有加载到已验证成员" : "请先选择已验证群聊"}
-                  disabled={!selectedSessionIsGroup || !memberOptions.length}
-                />
-              </label>
+            <div className="member-filter-row">
               <label className="field">
                 <span>成员筛选</span>
                 <input
@@ -821,18 +782,17 @@ export function CreditsWorkspace() {
                   placeholder="按名称或 user_id 过滤下表"
                 />
               </label>
-            </div>
-
-            <div className="action-row">
-              <button className="button button-secondary" onClick={() => void runOps("refresh")} disabled={!selectedSessionIsGroup}>
-                刷新数据
-              </button>
-              <button className="button button-secondary" onClick={() => void loadRosterMembers()} disabled={!selectedSessionIsGroup}>
-                刷新群成员
-              </button>
-              <button className="button button-secondary" onClick={() => void loadCreditsCollections()} disabled={!selectedSessionIsGroup}>
-                刷新积分数据
-              </button>
+              <div className="action-row">
+                <button className="button button-secondary button-compact" onClick={() => void runOps("refresh")} disabled={!selectedSessionIsGroup}>
+                  刷新数据
+                </button>
+                <button className="button button-secondary button-compact" onClick={() => void loadRosterMembers()} disabled={!selectedSessionIsGroup}>
+                  刷新群成员
+                </button>
+                <button className="button button-secondary button-compact" onClick={() => void loadCreditsCollections()} disabled={!selectedSessionIsGroup}>
+                  刷新积分数据
+                </button>
+              </div>
             </div>
 
             <div className="table-scroll credits-table-scroll">
@@ -1193,7 +1153,7 @@ export function CreditsWorkspace() {
         </div>
       </section>
 
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
             <p className="section-kicker">选中流水</p>
@@ -1234,8 +1194,10 @@ export function CreditsWorkspace() {
         </div>
       </section>
 
-      <OutputPanel title="积分配置响应" value={configOutput} />
-      <OutputPanel title="积分操作响应" value={opsOutput} />
+      <section className="panel span-3">
+        <OutputPanel flush title="积分配置响应" value={configOutput} />
+        <OutputPanel flush title="积分操作响应" value={opsOutput} />
+      </section>
     </div>
   );
 }

@@ -13,6 +13,7 @@ export function PluginsPage() {
       <PluginOverviewSection
         data={page.data}
         pluginCards={page.pluginCards}
+        runtime={page.runtime}
         loading={page.loading}
         canRefresh={page.canManage}
         onRefresh={() => void page.refreshSummary()}
@@ -41,6 +42,8 @@ export function PluginsPage() {
       <InstalledPluginsSection
         pluginCards={page.pluginCards}
         runtime={page.runtime}
+        selectedPluginName={page.selectedPluginName}
+        restartRequired={page.restartRequired}
         canManage={page.canManage}
         onSetPluginEnabled={page.setPluginEnabled}
       />

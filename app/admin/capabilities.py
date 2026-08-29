@@ -32,6 +32,7 @@ _KNOWN_PLUGIN_ROUTES: dict[str, str] = {
     "persona_extract": "/persona",
     "repeater": "/repeater",
     "wxbot": "/channels?adapter=wechat-sdk",
+    "tibo_reset": "/plugins?plugin=tibo_reset",
 }
 
 _WECHAT_ADAPTER_ID = "wechat-sdk"
@@ -255,6 +256,7 @@ async def build_tenant_capabilities(
     capabilities.extend(
         _plugin_capabilities(
             tenant_id=tenant_id,
+            settings=settings,
             plugin_registry=plugin_registry,
             scope_states=scope_states,
             scope_error=scope_error,
@@ -742,9 +744,16 @@ async def _tenant_plugin_scope_states(
     return overrides, ""
 
 
+def _plugin_secret_missing(name: str, settings: Settings) -> bool:
+    if name == "tibo_reset":
+        return not str(getattr(settings, "tibo_reset_api_url", "") or "").strip()
+    return False
+
+
 def _plugin_capabilities(
     *,
     tenant_id: str,
+    settings: Settings,
     plugin_registry: Any | None,
     scope_states: Mapping[str, bool],
     scope_error: str,
@@ -779,6 +788,7 @@ def _plugin_capabilities(
             item["required"] and item["state"] == "blocked" for item in dependencies
         )
         failure = str(failures.get(name) or "").strip()
+        secret_missing = _plugin_secret_missing(name, settings)
         enabled = bool(metadata) and globally_active and tenant_enabled
         available = enabled and not failure and not required_blocked
         if metadata is None:
@@ -793,6 +803,9 @@ def _plugin_capabilities(
         elif not globally_active:
             health = "action_required"
             status_reason = "plugin_not_active"
+        elif secret_missing:
+            health = "action_required"
+            status_reason = "plugin_not_configured"
         elif not tenant_enabled:
             health = "action_required"
             status_reason = "plugin_disabled_for_tenant"
@@ -828,6 +841,7 @@ def _plugin_capabilities(
             globally_active=globally_active,
             tenant_enabled=tenant_enabled,
             failure=failure,
+            secret_missing=secret_missing,
             dependencies=dependencies,
             scope_error=scope_error,
         )
@@ -1002,6 +1016,7 @@ def _plugin_recovery_actions(
     globally_active: bool,
     tenant_enabled: bool,
     failure: str,
+    secret_missing: bool,
     dependencies: list[dict[str, Any]],
     scope_error: str,
 ) -> list[dict[str, Any]]:
@@ -1012,6 +1027,15 @@ def _plugin_recovery_actions(
                 "install",
                 f"安装 {_PLUGIN_LABELS.get(name, name)}",
                 f"/plugins/marketplace?plugin={name}",
+                requires_admin=True,
+            )
+        )
+    elif secret_missing and globally_active:
+        actions.append(
+            _action(
+                "configure",
+                f"配置 {_PLUGIN_LABELS.get(name, name)} 接口地址",
+                f"/plugins?plugin={name}",
                 requires_admin=True,
             )
         )

@@ -91,19 +91,16 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
 
   return (
         <>
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">快速配置</p>
                 <h3>简化回复配置</h3>
               </div>
             </div>
-            <div className="route-list">
-              <div>目标效果：私聊直接回复，群里只有 @机器人 才回复。</div>
-              <div>系统会在一个事务中校验并写入全局策略、当前群会话策略、复读策略与 SDK 入站门禁；任一版本冲突都不会部分生效。</div>
-              <div>当前群参与总开关是独立的最终闸门：新群默认开启，明确关闭过的群需在下方重新开启。</div>
-              <div>这样群聊侧是否回复，主要由 SDK 的“必须 @我才入站”开关决定；只要没有 @机器人，消息不会进入控制台。</div>
-            </div>
+            <p className="muted-copy">
+              目标效果：私聊直接回复，群里只有 @机器人 才回复。系统会在一个事务中校验并写入全局策略、当前群会话策略、复读策略与 SDK 入站门禁；任一版本冲突都不会部分生效。当前群参与总开关是独立的最终闸门：新群默认开启，明确关闭过的群需在下方重新开启。群聊侧是否回复，主要由 SDK 的“必须 @我才入站”开关决定；只要没有 @机器人，消息不会进入控制台。
+            </p>
             {policyConflict ? (
               <Alert variant="warning" title="策略版本冲突">
                 本地草稿仍在。请使用对应区域的“放弃草稿并重新读取”，核对服务端新版本后再保存。
@@ -130,7 +127,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">全局策略</p>
@@ -185,7 +182,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             </p>
           </section>
 
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">会话覆盖</p>
@@ -646,7 +643,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             )}
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">会话状态</p>
@@ -725,7 +722,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             </p>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">SDK 入站门禁</p>
@@ -762,7 +759,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             </p>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">策略说明</p>
@@ -789,7 +786,7 @@ export function WxbotPolicyTab({ controller }: { controller: WxbotPageController
             </ul>
           </section>
 
-          <OutputPanel title="回复策略响应" value={policyOutput} />
+          <OutputPanel flush title="回复策略响应" value={policyOutput} />
         </>
       );
 }

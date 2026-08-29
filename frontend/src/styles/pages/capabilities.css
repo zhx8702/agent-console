@@ -305,24 +305,23 @@ button.launch-action { cursor: pointer; }
   outline-offset: 2px;
 }
 
-.launch-action span {
+.admin-chip {
   padding: var(--space-0-5) var(--space-1);
   border-radius: 3px;
-  background: rgba(251, 191, 36, 0.16);
-  color: var(--color-amber-200);
+  background: rgba(233, 229, 216, 0.14);
+  color: var(--color-sage-100);
   font-size: var(--font-size-3xs);
+  font-weight: 700;
 }
 
 .launch-checklist-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: var(--space-4);
   margin-top: var(--space-4);
   padding-top: var(--space-3);
   border-top: 1px solid rgba(167, 179, 169, 0.14);
-  color: var(--color-sage-300);
-  font-size: var(--font-size-xs);
 }
 
 .launch-checklist-footer button {
@@ -347,13 +346,10 @@ button.launch-action { cursor: pointer; }
 
 .launch-checklist-collapsed > div {
   display: grid;
-  grid-template-columns: auto 1fr;
-  column-gap: var(--space-3);
   align-items: baseline;
 }
 
-.launch-checklist-collapsed .section-kicker { grid-column: 1 / -1; }
-.launch-checklist-collapsed span { color: var(--text-secondary); font-size: var(--font-size-sm); }
+.launch-checklist-collapsed .section-kicker { margin-bottom: 0; }
 
 .launch-checklist-error {
   display: flex;
@@ -427,17 +423,17 @@ button.launch-action { cursor: pointer; }
 .capability-attention-count {
   padding: var(--space-1) var(--space-2);
   border-radius: 999px;
-  background: var(--color-orange-50);
-  color: var(--color-orange-800);
+  border: 1px solid var(--tone-accent-border);
+  background: var(--tone-accent-bg);
+  color: var(--tone-accent-text);
   font-size: var(--font-size-xs);
   font-weight: 700;
 }
 
-.capability-diagnostics-copy {
-  margin: 0;
-  padding: 0 var(--space-5) var(--space-4);
-  color: var(--text-secondary);
-  font-size: var(--font-size-sm);
+.capability-attention-count.is-clear {
+  border-color: var(--tone-muted-border);
+  background: var(--tone-muted-bg);
+  color: var(--tone-muted-text);
 }
 
 .capability-diagnostic-grid {
@@ -457,7 +453,7 @@ button.launch-action { cursor: pointer; }
 }
 
 .capability-diagnostic.is-blocked { box-shadow: inset 3px 0 var(--color-rose-400); }
-.capability-diagnostic.is-action_required { box-shadow: inset 3px 0 var(--color-amber-300); }
+.capability-diagnostic.is-action_required { box-shadow: inset 3px 0 var(--color-pine-600); }
 .capability-diagnostic.is-degraded { box-shadow: inset 3px 0 var(--color-pine-400); }
 
 .capability-diagnostic-source {
@@ -509,14 +505,13 @@ button.launch-action { cursor: pointer; }
 
 .capability-actions {
   grid-column: 1 / -1;
+  align-items: center;
   justify-content: flex-start;
   margin-top: 0;
 }
 
-.capability-actions .launch-action {
-  border-color: var(--color-sage-300);
-  background: var(--color-sage-100);
-  color: var(--color-pine-800);
+.capability-actions .button {
+  gap: var(--space-1-5);
 }
 
 @media (max-width: 1120px) {

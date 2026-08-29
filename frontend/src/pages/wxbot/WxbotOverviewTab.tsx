@@ -13,7 +13,7 @@ export function WxbotOverviewTab({ controller }: { controller: WxbotPageControll
 
   return (
         <>
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">桥接服务</p>
@@ -88,24 +88,17 @@ export function WxbotOverviewTab({ controller }: { controller: WxbotPageControll
               </tbody>
             </table>
             </details>
+            <details>
+              <summary>当前接入说明</summary>
+              <ul className="route-list">
+                <li>群聊是否必须先 @机器人 才会进入系统，取决于 SDK 侧“群消息必须 @我 才入站”开关。</li>
+                <li>“包含触发词”模式既支持 @我，也支持关键词命中，并非只识别 @。</li>
+                <li>群聊默认关闭回复；如果会话设为“全部消息”或“包含触发词”，可能在没有 @ 的场景下触发回复。</li>
+                <li>日报/周报/月报数据直接来自本地微信解密数据库，适合按群做定时发送和人工预览发送。</li>
+              </ul>
+            </details>
+            <OutputPanel flush title="微信桥接响应" value={output} />
           </section>
-
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <p className="section-kicker">接入范围</p>
-                <h3>当前接入说明</h3>
-              </div>
-            </div>
-            <ul className="route-list">
-              <li>群聊是否必须先 @机器人 才会进入系统，取决于 SDK 侧“群消息必须 @我 才入站”开关。</li>
-              <li>“包含触发词”模式既支持 @我，也支持关键词命中，并非只识别 @。</li>
-              <li>群聊默认关闭回复；如果会话设为“全部消息”或“包含触发词”，可能在没有 @ 的场景下触发回复。</li>
-              <li>日报/周报/月报数据直接来自本地微信解密数据库，适合按群做定时发送和人工预览发送。</li>
-            </ul>
-          </section>
-
-          <OutputPanel title="微信桥接响应" value={output} />
         </>
       );
 }

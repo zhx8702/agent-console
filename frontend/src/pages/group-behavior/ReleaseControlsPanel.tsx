@@ -75,7 +75,7 @@ function ScopeCard({
     setReason("");
   };
   return (
-    <article className="panel panel-subtle release-control-card" aria-label={title}>
+        <article className="release-control-card" aria-label={title}>
       <div className="panel-header">
         <div>
           <p className="section-kicker">{scope === "global" ? "全局发布" : "租户发布"}</p>
@@ -215,7 +215,7 @@ export function ReleaseControlsPanel({
       <p className="muted-copy">
         全局、租户与单群是三个独立资源，各自使用版本令牌与审计记录；最终阶段取最保守值。
       </p>
-      <div className="form-grid">
+      <div className="release-control-grid">
         <ScopeCard
           title="全局发布控制"
           description="平台级紧急停止与最高灰度阶段。没有平台全局权限时保持只读不可用。"

@@ -75,17 +75,20 @@ export function WxbotAgentTab({ controller }: { controller: WxbotPageController 
                 <strong>{agentToolOwners.length || "-"}</strong>
               </div>
             </div>
-            <div className="route-list">
-              <div>当前智能体支持多个作用域；会根据群聊意图切到资料查询、插件状态或绘图生成，不替代普通回复策略。</div>
-              <div>工具白名单按群生效，沿用顶部“全局目标群 / 会话”或左侧群列表的当前选中群。</div>
-              <div>未配置过的群默认启用并继承当前作用域的全部工具；只有明确停用或保存手动白名单才会覆盖默认值。</div>
-              <div>文件处理与消息导出还受“群行为 → 允许群文件发送”总开关约束；总开关关闭时，管理员也不能绕过。</div>
-              <div>如果当前群关闭智能体，后端会直接返回“该群智能体能力已关闭”，不会再回落到普通模型工具调用。</div>
-              <div>工具目录会标明插件归属，后续继续拆分作用域和插件能力时，可直接看出工具来源。</div>
-            </div>
+            <details className="credits-help-disclosure">
+              <summary>工具白名单说明</summary>
+              <p className="muted-copy">
+                当前智能体支持多个作用域；会根据群聊意图切到资料查询、插件状态或绘图生成，不替代普通回复策略。
+                工具白名单按群生效，沿用顶部“全局目标群 / 会话”或左侧群列表的当前选中群。
+                未配置过的群默认启用并继承当前作用域的全部工具；只有明确停用或保存手动白名单才会覆盖默认值。
+                文件处理与消息导出还受“群行为 → 允许群文件发送”总开关约束；总开关关闭时，管理员也不能绕过。
+                如果当前群关闭智能体，后端会直接返回“该群智能体能力已关闭”，不会再回落到普通模型工具调用。
+                工具目录会标明插件归属，后续继续拆分作用域和插件能力时，可直接看出工具来源。
+              </p>
+            </details>
           </section>
 
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">工具策略</p>
@@ -213,7 +216,7 @@ export function WxbotAgentTab({ controller }: { controller: WxbotPageController 
             )}
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">策略快照</p>
@@ -352,7 +355,7 @@ export function WxbotAgentTab({ controller }: { controller: WxbotPageController 
             </div>
           </section>
 
-          <OutputPanel title="智能体策略 / 审计响应" value={agentOutput} />
+          <OutputPanel flush title="智能体策略 / 审计响应" value={agentOutput} />
         </>
       );
 }

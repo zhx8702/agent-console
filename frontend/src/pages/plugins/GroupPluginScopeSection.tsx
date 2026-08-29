@@ -87,7 +87,7 @@ export function GroupPluginScopeSection({
                   <strong>{plugin.name}</strong>
                   <span>{label}</span>
                 </div>
-                <span className={`plugin-badge ${enabled ? "" : "is-muted"}`}>{enabled ? "on" : "off"}</span>
+                <span className={`plugin-badge ${enabled ? "" : "is-muted"}`}>{enabled ? "已开启" : "已关闭"}</span>
               </div>
               <p className="muted-copy">{summary}</p>
               {plugin.name === "tibo_reset" && tiboStats && (

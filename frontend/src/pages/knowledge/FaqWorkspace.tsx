@@ -10,7 +10,7 @@ type FaqWorkspaceProps = {
 export function FaqWorkspace({ faq, currentScopeText }: FaqWorkspaceProps) {
   return (
     <>
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="knowledge-workbench">
           <aside className="knowledge-sidebar">
             <div className="panel-header"><div><p className="section-kicker">问答列表</p><h3>常见问答列表</h3></div></div>
@@ -98,21 +98,24 @@ export function FaqWorkspace({ faq, currentScopeText }: FaqWorkspaceProps) {
                 disabled={!faq.selected}
               />
             </div>
+            <FaqPreviewPanel faq={faq} />
           </div>
         </div>
       </section>
-      <FaqPreviewPanel faq={faq} />
     </>
   );
 }
 
 function FaqPreviewPanel({ faq }: { faq: FaqController }) {
   return (
-    <section className="panel">
-      <div className="panel-header"><div><p className="section-kicker">命中预览</p><h3>问答命中测试台</h3></div></div>
+    <details className="knowledge-preview-disclosure">
+      <summary>
+        <span className="section-kicker">命中预览</span>
+        <strong>问答命中测试台</strong>
+      </summary>
       <label className="field">
         <span>测试问题</span>
-        <textarea rows={5} value={faq.testQuery} onChange={(event) => faq.setTestQuery(event.target.value)} placeholder="输入一条真实用户问题，检查会命中哪条 FAQ" />
+        <textarea rows={4} value={faq.testQuery} onChange={(event) => faq.setTestQuery(event.target.value)} placeholder="输入一条真实用户问题，检查会命中哪条 FAQ" />
       </label>
       <div className="action-row"><button className="button button-primary" onClick={() => void faq.runPreview()}>执行测试</button></div>
       {faq.preview ? faq.preview.matched ? (
@@ -126,6 +129,6 @@ function FaqPreviewPanel({ faq }: { faq: FaqController }) {
         </div>
       ) : <div className="admin-notice">当前问题没有命中 FAQ，会继续走后续 FAQ miss 流程。</div>
         : <div className="admin-notice">这里会展示 FAQ 命中测试结果，包括命中的问题、范围和最终回复。</div>}
-    </section>
+    </details>
   );
 }

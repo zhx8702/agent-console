@@ -48,8 +48,8 @@ describe("PlaygroundPage", () => {
       </ConsoleConfigProvider>,
     );
 
-    expect(screen.getByText("尚未选择目标群")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "发送模拟消息" })).toBeDisabled();
+    expect(screen.getByRole("heading", { name: "先选择一个已验证群聊" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "发送模拟消息" })).not.toBeInTheDocument();
   });
 
   it("uses the server-side simulator without a browser tenant secret", async () => {

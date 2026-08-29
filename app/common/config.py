@@ -550,8 +550,8 @@ class Settings(BaseSettings):
     )
     wxbot_preview_wait_seconds: float = 30.0
     wxbot_preview_poll_interval_seconds: float = 0.7
-    # Organization-specific polling is inert until both the feature flag and
-    # an explicit feed endpoint are configured by the operator.
+    # Compatibility flag for existing env files. Runtime enablement is
+    # plugin_state; a missing API URL is reported as unconfigured.
     tibo_reset_enabled: bool = False
     tibo_reset_api_url: str = ""
     tibo_reset_poll_interval_seconds: float = Field(default=300.0, ge=30.0)

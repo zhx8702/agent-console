@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { DangerAction } from "../../components/DangerAction";
+import { GroupScopeEmpty } from "../../components/GroupScopeEmpty";
 import { OutputPanel } from "../../components/OutputPanel";
 import { PageHeader } from "../../components/PageHeader";
-import { SearchableSelect } from "../../components/SearchableSelect";
 import { apiRequest, formatJson } from "../../lib/api";
 import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { requireSelectedGroup, useConsoleConfig } from "../../state/console-config";
@@ -58,6 +58,7 @@ export function PersonaWorkspace() {
   const [jobMode, setJobMode] = useState<"full" | "incremental">("full");
   const [styleEnabled, setStyleEnabled] = useState(true);
   const [jobNotice, setJobNotice] = useState("");
+  const [memberQuery, setMemberQuery] = useState("");
 
   const [selectionOutput, setSelectionOutput] = useState('{\n  "status": "waiting"\n}');
   const [jobOutput, setJobOutput] = useState('{\n  "status": "waiting"\n}');
@@ -71,15 +72,24 @@ export function PersonaWorkspace() {
   const selectedSessionIsVerified = Boolean(
     effectiveSessionId && verifiedGroupIds.has(effectiveSessionId),
   );
-  const memberOptions = useMemo(
-    () =>
-      members.map((item) => ({
-        value: item.wxid,
-        label: `${getMemberDisplayName(item)} (${item.wxid})`,
-        keywords: [item.wxid, item.name || "", item.alias || "", item.remark || "", item.nick_name || ""],
-      })),
-    [members],
-  );
+  const visibleMembers = useMemo(() => {
+    const query = memberQuery.trim().toLowerCase();
+    if (!query) return members;
+    return members.filter((item) => {
+      const haystack = [
+        item.wxid,
+        item.name,
+        item.alias,
+        item.remark,
+        item.nick_name,
+        getMemberDisplayName(item),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [memberQuery, members]);
   const selectedMember = members.find((item) => item.wxid === selectedMemberWxid) || null;
   const selectedMemberName = selectedMember ? getMemberDisplayName(selectedMember) : "";
   const pollingJobId = useMemo(
@@ -527,6 +537,16 @@ export function PersonaWorkspace() {
     claims: Array.isArray(portraitPayload?.[key]) ? (portraitPayload?.[key] as Array<Record<string, unknown>>) : [],
   })).filter((section) => section.claims.length > 0);
 
+  if (!selectedSessionIsVerified) {
+    return (
+      <GroupScopeEmpty
+        eyebrow="回复风格"
+        title="人物画像 / 回复风格"
+        description="以说话人画像为唯一蒸馏管线：为群成员构建画像，画像编译成回复风格并应用到本群；画像热更新后，已应用的风格会自动同步。"
+      />
+    );
+  }
+
   return (
     <div className="page-grid persona-page">
       <section className="panel span-2">
@@ -534,49 +554,37 @@ export function PersonaWorkspace() {
           eyebrow="回复风格"
           title="人物画像 / 回复风格"
           description="以说话人画像为唯一蒸馏管线：为群成员构建画像，画像编译成回复风格并应用到本群；画像热更新后，已应用的风格会自动同步。"
+          actions={
+            <div className="action-row">
+              <button className="button button-secondary" onClick={() => void loadSessions()}>
+                刷新群列表
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={() => void loadMembers()}
+                disabled={!selectedSessionIsVerified}
+              >
+                加载群成员
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={() => void loadPortrait()}
+                disabled={!selectedMemberWxid}
+              >
+                读取画像
+              </button>
+            </div>
+          }
         />
-        <div className="form-grid">
-          <div className="field span-2">
-            <span>当前已验证群聊</span>
-            <strong>{selectedSessionIsVerified ? (sessionName || effectiveSessionId) : "尚未选择"}</strong>
-            <small>
-              {selectedSessionIsVerified
-                ? effectiveSessionId
-                : "请从页面上方的后端群聊名册选择；本页不接受手工群 ID。"}
-            </small>
-          </div>
-          <label className="field span-2">
-            <span>群成员候选</span>
-            <SearchableSelect
-              value={selectedMemberWxid}
-              onChange={setSelectedMemberWxid}
-              options={memberOptions}
-              placeholder="请选择群成员"
-              searchPlaceholder="搜索成员名或 WXID"
-              emptyText={selectedSessionIsVerified ? "暂无群成员" : "请先选择已验证群聊"}
-              noResultsText="没有匹配的群成员"
-              disabled={!selectedSessionIsVerified || !memberOptions.length}
+        <div className="member-filter-row">
+          <label className="field">
+            <span>筛选成员</span>
+            <input
+              value={memberQuery}
+              onChange={(event) => setMemberQuery(event.target.value)}
+              placeholder="按成员名或 WXID 筛选"
             />
           </label>
-        </div>
-        <div className="action-row">
-          <button className="button button-secondary" onClick={() => void loadSessions()}>
-            刷新群列表
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={() => void loadMembers()}
-            disabled={!selectedSessionIsVerified}
-          >
-            加载群成员
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={() => void loadPortrait()}
-            disabled={!selectedMemberWxid}
-          >
-            读取画像
-          </button>
         </div>
         <div className="table-scroll member-table-scroll">
           <table>
@@ -591,7 +599,7 @@ export function PersonaWorkspace() {
               </tr>
             </thead>
             <tbody>
-              {members.map((item) => (
+              {visibleMembers.map((item) => (
                 <tr
                   key={item.wxid}
                   className={item.wxid === selectedMemberWxid ? "table-row-active" : ""}
@@ -611,9 +619,11 @@ export function PersonaWorkspace() {
                   <td>{item.has_history ? "可提取" : "无历史"}</td>
                 </tr>
               ))}
-              {!members.length && (
+              {!visibleMembers.length && (
                 <tr>
-                  <td colSpan={5}>当前群还没有加载成员候选</td>
+                  <td colSpan={5}>
+                    {members.length ? "没有匹配的群成员" : "当前群还没有加载成员候选"}
+                  </td>
                 </tr>
               )}
             </tbody>
@@ -626,15 +636,10 @@ export function PersonaWorkspace() {
           <div className="panel-header">
             <div>
               <p className="section-kicker">画像蒸馏</p>
-              <h3>画像任务</h3>
+              <h3>{selectedMemberName ? `${selectedMemberName} 的画像任务` : "画像任务"}</h3>
             </div>
           </div>
           <div className="form-grid">
-            <label className="field">
-              <span>画像目标成员</span>
-              <strong>{selectedMemberName || "尚未选择"}</strong>
-              <small className="mono">{selectedMemberWxid || "仅可从当前群成员名册选择"}</small>
-            </label>
             <label className="field">
               <span>任务模式</span>
               <select
@@ -709,7 +714,6 @@ export function PersonaWorkspace() {
               </tbody>
             </table>
           </div>
-          <OutputPanel title="任务响应" value={jobOutput} />
         </section>
 
         <section className="panel panel-scroll">
@@ -774,11 +778,10 @@ export function PersonaWorkspace() {
               刷新档案
             </button>
           </div>
-          <OutputPanel title="档案响应" value={profileOutput} />
         </section>
       </div>
 
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
             <p className="section-kicker">画像结果</p>
@@ -844,58 +847,53 @@ export function PersonaWorkspace() {
               : "请先从上方名册选择群成员。"}
           </p>
         )}
-        <OutputPanel title="画像数据" value={portraitOutput} />
-      </section>
-
-      <section className="panel span-2">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">画像 → 回复风格</p>
-            <h3>编译并应用回复风格</h3>
+        <div className="persona-style-actions">
+          <p className="muted-copy">
+            风格由画像即时编译（第一人称 COS 提示词），应用后写入本群风格档案并参与群聊回复。
+            {appliedProfile
+              ? ` 当前成员已应用：${appliedProfile.profile_name || appliedProfile.skill_slug}（${appliedProfile.enabled ? "启用中" : "已停用"}）。`
+              : " 当前成员尚未应用回复风格。"}
+          </p>
+          <div className="action-row">
+            <button
+              className="button button-secondary"
+              onClick={() => void previewStyle()}
+              disabled={!selectedMemberWxid || !portrait}
+            >
+              预览风格提示词
+            </button>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={styleEnabled}
+                onChange={(event) => setStyleEnabled(event.target.checked)}
+              />
+              <strong>应用后立即启用</strong>
+            </label>
+            <button
+              className="button button-primary"
+              onClick={() => void applyStyle()}
+              disabled={!selectedSessionIsVerified || !selectedMemberWxid || !portrait}
+            >
+              应用为本群回复风格
+            </button>
           </div>
+          {stylePreview?.prompt ? (
+            <label className="field span-2">
+              <span>
+                风格提示词（{stylePreview.name || selectedMemberName || "-"} · {stylePreview.prompt_chars ?? stylePreview.prompt.length} 字）
+              </span>
+              <textarea rows={8} value={stylePreview.prompt} readOnly />
+            </label>
+          ) : null}
         </div>
-        <p className="muted-copy">
-          风格由画像即时编译（第一人称 COS 提示词），应用后写入本群风格档案并参与群聊回复。
-          {appliedProfile
-            ? ` 当前成员已应用：${appliedProfile.profile_name || appliedProfile.skill_slug}（${appliedProfile.enabled ? "启用中" : "已停用"}）。`
-            : " 当前成员尚未应用回复风格。"}
-        </p>
-        <div className="action-row">
-          <button
-            className="button button-secondary"
-            onClick={() => void previewStyle()}
-            disabled={!selectedMemberWxid || !portrait}
-          >
-            预览风格提示词
-          </button>
-          <label className="toggle-chip">
-            <input
-              type="checkbox"
-              checked={styleEnabled}
-              onChange={(event) => setStyleEnabled(event.target.checked)}
-            />
-            <strong>应用后立即启用</strong>
-          </label>
-          <button
-            className="button button-primary"
-            onClick={() => void applyStyle()}
-            disabled={!selectedSessionIsVerified || !selectedMemberWxid || !portrait}
-          >
-            应用为本群回复风格
-          </button>
-        </div>
-        {stylePreview?.prompt ? (
-          <label className="field span-2">
-            <span>
-              风格提示词（{stylePreview.name || selectedMemberName || "-"} · {stylePreview.prompt_chars ?? stylePreview.prompt.length} 字）
-            </span>
-            <textarea rows={12} value={stylePreview.prompt} readOnly />
-          </label>
-        ) : null}
       </section>
 
-      <section className="panel span-2">
-        <OutputPanel title="选择过程" value={selectionOutput} />
+      <section className="panel span-3">
+        <OutputPanel flush title="任务响应" value={jobOutput} />
+        <OutputPanel flush title="档案响应" value={profileOutput} />
+        <OutputPanel flush title="画像数据" value={portraitOutput} />
+        <OutputPanel flush title="选择过程" value={selectionOutput} />
       </section>
     </div>
   );

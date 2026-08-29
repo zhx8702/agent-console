@@ -95,13 +95,23 @@ export function DlqPage() {
 
   return (
     <div className="page-grid">
-      <section className="panel span-2">
+      <section className="panel span-3">
         <PageHeader
           eyebrow="失败消息队列"
           title="死信队列处置台"
-          description="这个页面独立出来后，后面你可以继续扩成重放审批、失败原因过滤和批量回放。"
+          description="按消息标识列出、查看、重放或删除死信记录。"
+          actions={
+            <div className="action-row">
+              <button className="button button-primary" onClick={() => void listMessages()}>
+                列出消息
+              </button>
+              <button className="button button-secondary" onClick={() => void getMessage()}>
+                查看单条
+              </button>
+            </div>
+          }
         />
-        <div className="form-grid">
+        <div className="page-ops-bar">
           <label className="field">
             <span>消息标识</span>
             <input value={entryId} onChange={(event) => setEntryId(event.target.value)} />
@@ -123,12 +133,6 @@ export function DlqPage() {
           </label>
         </div>
         <div className="action-row">
-          <button className="button button-secondary" onClick={() => void listMessages()}>
-            列出消息
-          </button>
-          <button className="button button-secondary" onClick={() => void getMessage()}>
-            查看单条
-          </button>
           <DangerAction
             label="重放消息"
             title="确认重放死信消息"
@@ -160,9 +164,8 @@ export function DlqPage() {
             onConfirm={deleteMessage}
           />
         </div>
+        <OutputPanel flush title="失败消息队列响应" value={output} />
       </section>
-
-      <OutputPanel title="失败消息队列响应" value={output} />
     </div>
   );
 }

@@ -12,7 +12,7 @@ export function ImportWorkspace({ importer, currentScopeText }: ImportWorkspaceP
   ).length;
   return (
     <>
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="knowledge-workbench">
           <ImportSource importer={importer} currentScopeText={currentScopeText} />
           <div className="knowledge-editor">

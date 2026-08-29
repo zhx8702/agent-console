@@ -1,12 +1,26 @@
 import { Link } from "react-router-dom";
 
+import { Alert } from "../../components/Alert";
 import { DangerAction } from "../../components/DangerAction";
 import type { InstalledPlugin, PluginRuntime } from "./models";
-import { PLUGIN_LINKS } from "./models";
+import { PLUGIN_LINKS, pluginEnablementLabel, pluginRuntimeFacts } from "./models";
+
+const HARDCODED_RUNTIME = new Set([
+  "amap",
+  "commands",
+  "credits",
+  "moderation",
+  "memory",
+  "persona_extract",
+  "wxbot",
+  "repeater",
+]);
 
 type InstalledPluginsSectionProps = {
   pluginCards: InstalledPlugin[];
   runtime: PluginRuntime;
+  selectedPluginName?: string;
+  restartRequired?: boolean;
   canManage: boolean;
   onSetPluginEnabled: (pluginName: string, enabled: boolean) => Promise<void>;
 };
@@ -14,10 +28,13 @@ type InstalledPluginsSectionProps = {
 export function InstalledPluginsSection({
   pluginCards,
   runtime,
+  selectedPluginName = "",
+  restartRequired = false,
   canManage,
   onSetPluginEnabled,
 }: InstalledPluginsSectionProps) {
   const setPluginEnabled = onSetPluginEnabled;
+  const pendingRestart = restartRequired || pluginCards.some((plugin) => plugin.restart_required);
   return (
       <section className="panel panel-scroll plugins-loaded-panel span-3">
         <div className="panel-header">
@@ -26,11 +43,17 @@ export function InstalledPluginsSection({
             <h3>已加载插件</h3>
           </div>
         </div>
+        {pendingRestart && (
+          <Alert variant="warning" title="待重启">
+            带路由或流程步骤的插件改动需要重启服务后才会完全卸下旧入口。禁用后的请求现在会被拒绝，不会被当成已经热卸载。
+          </Alert>
+        )}
         <div className="plugin-card-grid">
           {pluginCards.map((plugin) => (
             <article
               key={plugin.name}
-              className={`plugin-card plugin-plugin-card ${plugin.enabled ? "is-enabled" : "is-disabled"} ${plugin.restart_required ? "is-restart-required" : ""} ${plugin.last_error ? "has-error" : ""}`}
+              id={`plugin-card-${plugin.name}`}
+              className={`plugin-card plugin-plugin-card ${plugin.enabled ? "is-enabled" : "is-disabled"} ${plugin.restart_required ? "is-restart-required" : ""} ${plugin.last_error ? "has-error" : ""} ${selectedPluginName === plugin.name ? "is-selected" : ""}`}
             >
               <div className="plugin-card-header">
                 <div>
@@ -38,13 +61,7 @@ export function InstalledPluginsSection({
                   <span>v{plugin.version}</span>
                 </div>
                 <span className={`plugin-badge ${plugin.restart_required ? "is-warning" : plugin.last_error ? "is-danger" : plugin.enabled ? "" : "is-muted"}`}>
-                  {plugin.restart_required
-                    ? "待重启"
-                    : plugin.last_error
-                      ? "异常"
-                      : plugin.enabled
-                        ? "已启用"
-                        : "已停用"}
+                  {plugin.last_error ? "异常" : pluginEnablementLabel(plugin, runtime)}
                 </span>
               </div>
               <p className="plugin-card-copy">{plugin.description || "无描述"}</p>
@@ -123,6 +140,14 @@ export function InstalledPluginsSection({
                 <dl className="plugin-meta-list">
                   <div><dt>启用</dt><dd>{runtime.repeater?.enabled ? "是" : "否"}</dd></div>
                   <div><dt>冷却时间</dt><dd>{runtime.repeater?.cooldown_seconds ?? 300} 秒</dd></div>
+                </dl>
+              )}
+
+              {!HARDCODED_RUNTIME.has(plugin.name) && pluginRuntimeFacts(plugin.name, runtime).length > 0 && (
+                <dl className="plugin-meta-list">
+                  {pluginRuntimeFacts(plugin.name, runtime).map((fact) => (
+                    <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>
+                  ))}
                 </dl>
               )}
 

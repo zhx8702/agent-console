@@ -119,17 +119,16 @@ export function GlobalSessionBar() {
       <div className="global-session-summary">
         <div className="global-session-kicker">当前操作群聊</div>
         <div className="global-session-title-row">
-          <strong>{selectedGroup ? sessionDisplayName(selectedGroup) : "尚未选择群聊"}</strong>
+          <strong title={selectedGroup?.session_id || undefined}>
+            {selectedGroup ? sessionDisplayName(selectedGroup) : "尚未选择群聊"}
+          </strong>
           <span className={`global-session-kind${selectedGroup ? " is-group" : " is-global"}`}>
             {selectedGroup ? "已验证" : "需要选择"}
           </span>
-        </div>
-        <div className="global-session-meta">
-          <span className="mono">{selectedGroup?.session_id || "不会回退到全局或任意 sessionId"}</span>
-          <span>群聊 {groups.length}</span>
+          <span className="global-session-count">{loading ? "读取中" : `${groups.length} 个群`}</span>
         </div>
         <p
-          className={`global-session-status${error ? " is-error" : ""}`}
+          className={`global-session-status${error ? " is-error" : " sr-only"}`}
           role="status"
           aria-live="polite"
         >
@@ -139,7 +138,7 @@ export function GlobalSessionBar() {
 
       <div className="global-session-controls">
         <label className="field">
-          <span>选择已同步群聊</span>
+          <span className="sr-only">选择已同步群聊</span>
           <SearchableSelect
             value={config.sessionId}
             options={options}
@@ -155,7 +154,7 @@ export function GlobalSessionBar() {
         <div className="global-session-actions">
           <button
             type="button"
-            className="button button-secondary"
+            className="button button-secondary button-compact"
             onClick={() => setReloadKey((current) => current + 1)}
             disabled={loading}
           >
@@ -163,11 +162,11 @@ export function GlobalSessionBar() {
           </button>
           <button
             type="button"
-            className="button button-secondary"
+            className="button button-secondary button-compact"
             onClick={clearSelectedGroup}
             disabled={!config.sessionId}
           >
-            清除选择
+            清除
           </button>
         </div>
       </div>

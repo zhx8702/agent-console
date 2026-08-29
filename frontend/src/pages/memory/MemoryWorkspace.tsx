@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { GroupScopeEmpty } from "../../components/GroupScopeEmpty";
 import { PageHeader } from "../../components/PageHeader";
-import { SearchableSelect } from "../../components/SearchableSelect";
 import { TabList } from "../../components/Tabs";
 import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
 import { apiRequest, formatJson, type MemoryBackfillRequest } from "../../lib/api";
@@ -55,7 +55,6 @@ export function MemoryWorkspace() {
   const {
     config,
     verifiedGroupIds,
-    selectVerifiedGroup,
   } = useConsoleConfig();
   const { keyFor, clear } = useStableIdempotencyKeys();
   const [sessions, setSessions] = useState<WxbotSession[]>([]);
@@ -65,6 +64,7 @@ export function MemoryWorkspace() {
   const [events, setEvents] = useState<MemoryEvent[]>([]);
   const [sessionId, setSessionId] = useState(config.sessionId);
   const [selectedMemberWxid, setSelectedMemberWxid] = useState("");
+  const [memberQuery, setMemberQuery] = useState("");
   const [channel, setChannel] = useState("wechat");
   const [sourceKey, setSourceKey] = useState("wxbot");
   const [userId, setUserId] = useState(config.userId);
@@ -167,15 +167,24 @@ export function MemoryWorkspace() {
       sessions.filter((item) => item.session_id === sessionId && isGroupSession(item) && !backfillSessionSet.has(item.session_id)),
     [backfillSessionSet, sessionId, sessions],
   );
-  const memberOptions = useMemo(
-    () =>
-      members.map((item) => ({
-        value: item.wxid,
-        label: `${getMemberDisplayName(item)} (${item.wxid})`,
-        keywords: [item.wxid, item.name || "", item.alias || "", item.remark || "", item.nick_name || ""],
-      })),
-    [members],
-  );
+  const visibleMembers = useMemo(() => {
+    const query = memberQuery.trim().toLowerCase();
+    if (!query) return members;
+    return members.filter((item) => {
+      const haystack = [
+        item.wxid,
+        item.name,
+        item.alias,
+        item.remark,
+        item.nick_name,
+        getMemberDisplayName(item),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [memberQuery, members]);
   const applyIdentityProfile = useCallback((profile: IdentityProfile) => {
     if (!members.some((item) => item.wxid === profile.user_id)) {
       setIdentityOutput(formatJson({ error: "该档案不属于当前群的已验证成员，未切换记忆对象" }));
@@ -626,6 +635,19 @@ export function MemoryWorkspace() {
     });
   }, []);
 
+  const selectedGroupIsVerified = Boolean(
+    config.sessionId.trim() && verifiedGroupIds.has(config.sessionId.trim()),
+  );
+  if (!selectedGroupIsVerified) {
+    return (
+      <GroupScopeEmpty
+        eyebrow="记忆管理"
+        title="用户记忆管理"
+        description="当前记忆模型分为两层：全局身份记忆按用户 ID 聚合，会话记忆按会话 ID 与用户 ID 覆盖。实时对话继续通过流水线沉淀，历史记忆则通过 SDK 的 /ext/query/read 从微信解密库回填。"
+      />
+    );
+  }
+
   return (
     <div className="page-grid memory-page">
       <UnsavedChangesGuard when={hasUnsavedMemoryChanges} />
@@ -633,7 +655,45 @@ export function MemoryWorkspace() {
         <PageHeader
           eyebrow="记忆管理"
           title="用户记忆管理"
-          description="当前记忆模型分为两层：全局身份记忆按用户 ID 聚合，会话记忆按会话 ID 与用户 ID 覆盖。实时对话继续通过流水线沉淀，历史记忆则通过 SDK 的 /ext/query/read 从微信解密库回填。"
+          description="身份记忆按用户聚合，会话记忆按群与成员覆盖。点名册即可切换记忆对象；群聊请在顶部会话条切换。"
+          actions={
+            <div className="action-row">
+              <button className="button button-secondary button-compact" onClick={() => void loadGroups()}>
+                刷新会话列表
+              </button>
+              <button
+                className="button button-secondary button-compact"
+                onClick={() => void loadMembers()}
+                disabled={!selectedSessionIsGroup}
+              >
+                加载群成员
+              </button>
+              <button
+                className="button button-secondary button-compact"
+                onClick={() => {
+                  if (!sessionId.trim()) {
+                    setRuntimeOutput(formatJson({ error: "请先选择微信会话" }));
+                    return;
+                  }
+                  addBackfillSessions([sessionId.trim()]);
+                }}
+              >
+                加入回填
+              </button>
+              <button
+                className="button button-secondary button-compact"
+                onClick={() => {
+                  if (!groupBackfillCandidates.length) {
+                    setRuntimeOutput(formatJson({ message: "当前没有可追加的群聊会话" }));
+                    return;
+                  }
+                  addBackfillSessions(groupBackfillCandidates.map((item) => item.session_id));
+                }}
+              >
+                批量加入群聊
+              </button>
+            </div>
+          }
         />
         <div className="summary-grid">
           <div className="summary-card" data-status="ok">
@@ -653,39 +713,7 @@ export function MemoryWorkspace() {
             <strong>{runtimeProfile?.imported_message_count ?? 0}</strong>
           </div>
         </div>
-        <div className="data-flow-note">
-          <strong>当前链路</strong>
-          <span>实时消息进入控制台后，会同步更新当前会话短期记忆，并把稳定事实沉淀到全局身份记忆。</span>
-          <span>历史回填不再要求 SDK 新增专用接口，而是由平台调 SDK 的 `/ext/query/read` 自己掌握查询模板和合并逻辑。</span>
-        </div>
-        <div className="form-grid">
-          <label className="field">
-            <span>微信会话</span>
-            <SearchableSelect
-              value={sessionId}
-              onChange={(value) => {
-                selectVerifiedGroup(value);
-              }}
-              options={sessionOptions}
-              placeholder="请选择已验证群聊"
-              searchPlaceholder="搜索群名或群 ID"
-              emptyText="暂无已验证群聊"
-              noResultsText="没有匹配的会话"
-            />
-          </label>
-          <label className="field">
-            <span>群成员</span>
-            <SearchableSelect
-              value={selectedMemberWxid}
-              onChange={setSelectedMemberWxid}
-              options={memberOptions}
-              placeholder="请选择群成员"
-              searchPlaceholder="搜索成员名或 WXID"
-              emptyText="暂无群成员"
-              noResultsText="没有匹配的群成员"
-              disabled={!selectedSessionIsGroup}
-            />
-          </label>
+        <div className="page-ops-bar">
           <label className="field">
             <span>消息渠道</span>
             <select value={channel} onChange={(event) => setChannel(event.target.value)}>
@@ -703,69 +731,22 @@ export function MemoryWorkspace() {
             <span>来源键</span>
             <input value={sourceKey} onChange={(event) => setSourceKey(event.target.value)} />
           </label>
-          <div className="field span-2">
-            <span>当前记忆成员</span>
+          <p className="page-meta-line">
+            <span>记忆对象</span>
             <strong>{selectedMember ? getMemberDisplayName(selectedMember) : "尚未选择"}</strong>
-            <small className="mono">{userId || "仅可从当前群成员名册选择"}</small>
-          </div>
+            <span className="mono">{userId || "点击名册应用"}</span>
+          </p>
         </div>
-        <p className="muted-copy">
-          当前会话类型：
-          <span> {selectedSessionIsGroup ? "群聊" : sessionId ? "私聊" : "-"}</span>
-           。当前页只处理已验证群聊及其成员；跨群或私聊记忆不会在这里被手工并入。
-        </p>
-        <div className="action-row">
-          <button className="button button-secondary" onClick={() => void loadGroups()}>
-            刷新会话列表
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={() => void loadMembers()}
-            disabled={!selectedSessionIsGroup}
-          >
-            加载群成员
-          </button>
-          <button
-            className="button button-primary"
-            onClick={() => {
-              if (!selectedSessionIsGroup) {
-                setMetaOutput(formatJson({ error: "请先选择已验证群聊" }));
-                return;
-              }
-              if (!selectedMember) {
-                setMetaOutput(formatJson({ error: "请先选择群成员" }));
-                return;
-              }
-              setUserId(selectedMember.wxid || "");
-              setMetaOutput(formatJson({ applied: true, mode: "verified_group_member", member: selectedMember }));
-            }}
-          >
-            应用当前选择到记忆对象
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={() => {
-              if (!sessionId.trim()) {
-                setRuntimeOutput(formatJson({ error: "请先选择微信会话" }));
-                return;
-              }
-              addBackfillSessions([sessionId.trim()]);
-            }}
-          >
-            加入回填范围
-          </button>
-          <button
-            className="button button-secondary"
-            onClick={() => {
-              if (!groupBackfillCandidates.length) {
-                setRuntimeOutput(formatJson({ message: "当前没有可追加的群聊会话" }));
-                return;
-              }
-              addBackfillSessions(groupBackfillCandidates.map((item) => item.session_id));
-            }}
-          >
-            批量加入全部群聊
-          </button>
+        <div className="member-filter-row">
+          <label className="field">
+            <span>筛选成员</span>
+            <input
+              value={memberQuery}
+              onChange={(event) => setMemberQuery(event.target.value)}
+              placeholder="按成员名或 WXID 筛选"
+              disabled={!selectedSessionIsGroup}
+            />
+          </label>
         </div>
         <div className="table-scroll member-table-scroll">
           <table>
@@ -778,13 +759,21 @@ export function MemoryWorkspace() {
               </tr>
             </thead>
             <tbody>
-              {members.map((item) => (
-                <tr key={item.wxid}>
+              {visibleMembers.map((item) => (
+                <tr
+                  key={item.wxid}
+                  className={item.wxid === selectedMemberWxid ? "table-row-active" : ""}
+                >
                   <th scope="row">
                     <button
                       type="button"
                       className="memory-graph-row-action"
-                      onClick={() => setSelectedMemberWxid(item.wxid || "")}
+                      onClick={() => {
+                        const wxid = item.wxid || "";
+                        setSelectedMemberWxid(wxid);
+                        setUserId(wxid);
+                        setMetaOutput(formatJson({ applied: true, mode: "verified_group_member", member: item }));
+                      }}
                     >
                       {getMemberDisplayName(item)}
                     </button>
@@ -793,9 +782,9 @@ export function MemoryWorkspace() {
                   <td>{item.msg_count ?? 0}</td>
                 </tr>
               ))}
-              {!members.length && (
+              {!visibleMembers.length && (
                 <tr>
-                  <td colSpan={3}>当前群还没有加载到成员列表</td>
+                  <td colSpan={3}>{members.length ? "没有匹配的成员" : "当前群还没有加载到成员列表"}</td>
                 </tr>
               )}
             </tbody>
