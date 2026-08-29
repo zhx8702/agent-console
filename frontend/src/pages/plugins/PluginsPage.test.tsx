@@ -8,7 +8,8 @@ import { ConsoleConfigProvider, useConsoleConfig } from "../../state/console-con
 import { PluginDiagnosticsSections } from "./PluginDiagnosticsSections";
 import { PluginOverviewSection } from "./PluginOverviewSection";
 import { FlowRuntimeSection } from "./FlowRuntimeSection";
-import type { PluginSummary } from "./models";
+import type { InstalledPlugin, PluginSummary } from "./models";
+import { pluginEnablementLabel } from "./models";
 
 function AuthenticatedPluginsPage() {
   const { updateConfig } = useConsoleConfig();
@@ -40,7 +41,7 @@ describe("PluginsPage composition", () => {
     const incompleteSummary = { plugins: [] } as unknown as PluginSummary;
 
     render(
-      <>
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <PluginOverviewSection
           data={incompleteSummary}
           pluginCards={[]}
@@ -55,7 +56,7 @@ describe("PluginsPage composition", () => {
           output="{}"
           groupOutput="{}"
         />
-      </>,
+      </MemoryRouter>,
     );
 
     const overview = screen.getByRole("heading", { name: "插件管理总览" }).closest("section");
@@ -324,5 +325,47 @@ describe("PluginsPage composition", () => {
     expect(within(card as HTMLElement).getAllByText("已停用").length).toBeGreaterThan(0);
     expect(within(card as HTMLElement).getByText("接口地址")).toBeInTheDocument();
     expect(within(card as HTMLElement).getAllByText("未配置").length).toBeGreaterThan(0);
+  });
+});
+
+describe("pluginEnablementLabel", () => {
+  const enabledPlugin = (name: string): InstalledPlugin => ({
+    name,
+    version: "1",
+    enabled: true,
+    system: false,
+    status: "active",
+    restart_required: false,
+  });
+
+  it("reports unconfigured for any plugin whose runtime says so", () => {
+    expect(
+      pluginEnablementLabel(enabledPlugin("tibo_reset"), {
+        tibo_reset: { api_url_configured: false },
+      }),
+    ).toBe("未配置");
+    expect(
+      pluginEnablementLabel(enabledPlugin("draw"), {
+        draw: { configured: false, fallback_configured: false },
+      } as never),
+    ).toBe("未配置");
+    expect(
+      pluginEnablementLabel(enabledPlugin("amap"), {
+        amap: { api_key_configured: false },
+      } as never),
+    ).toBe("未配置");
+  });
+
+  it("treats a working fallback endpoint as configured", () => {
+    expect(
+      pluginEnablementLabel(enabledPlugin("draw"), {
+        draw: { configured: false, fallback_configured: true },
+      } as never),
+    ).toBe("已启用");
+  });
+
+  it("keeps enabled label when runtime facts are absent", () => {
+    expect(pluginEnablementLabel(enabledPlugin("draw"), {})).toBe("已启用");
+    expect(pluginEnablementLabel(enabledPlugin("draw"))).toBe("已启用");
   });
 });
