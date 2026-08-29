@@ -501,7 +501,9 @@ export const PLUGIN_DISPLAY_NAMES: Record<string, string> = {
 
 const PLUGIN_RUNTIME_FIELD_LABELS: Record<string, string> = {
   api_url_configured: "接口地址",
-  configured_enabled: "密钥已配置",
+  api_key_configured: "API 密钥",
+  configured: "接口配置",
+  fallback_configured: "备用接口",
   scheduler_enabled: "调度器",
   running: "运行中",
   poll_interval_seconds: "轮询间隔（秒）",
@@ -511,7 +513,24 @@ const PLUGIN_RUNTIME_FIELD_LABELS: Record<string, string> = {
   enabled_groups: "已开群数",
 };
 
-const HIDDEN_RUNTIME_KEYS = new Set(["stats", "tools"]);
+// configured_enabled duplicates api_url_configured on tibo_reset and would
+// render two identical rows on the card.
+const HIDDEN_RUNTIME_KEYS = new Set(["stats", "tools", "configured_enabled"]);
+
+function pluginRuntimeUnconfigured(
+  pluginName: string,
+  runtime?: PluginRuntime,
+): boolean {
+  const facts = runtime?.[pluginName as keyof PluginRuntime] as
+    | Record<string, unknown>
+    | undefined;
+  if (!facts) return false;
+  if (facts.api_url_configured === false) return true;
+  if (facts.api_key_configured === false) return true;
+  // A plugin with a working fallback endpoint (e.g. draw) is still usable
+  // when only the primary endpoint is missing.
+  return facts.configured === false && facts.fallback_configured !== true;
+}
 
 export function pluginEnablementLabel(
   plugin: InstalledPlugin | undefined,
@@ -520,7 +539,7 @@ export function pluginEnablementLabel(
   if (!plugin) return "未加载";
   if (plugin.restart_required) return "待重启";
   if (!plugin.enabled) return "已停用";
-  if (plugin.name === "tibo_reset" && runtime?.tibo_reset?.api_url_configured === false) {
+  if (pluginRuntimeUnconfigured(plugin.name, runtime)) {
     return "未配置";
   }
   return "已启用";
@@ -544,7 +563,7 @@ export function pluginRuntimeFacts(
 
 function formatRuntimeFact(key: string, value: unknown): string {
   if (typeof value === "boolean") {
-    if (key.endsWith("_configured") || key === "configured_enabled") {
+    if (key === "configured" || key.endsWith("_configured")) {
       return value ? "已配置" : "未配置";
     }
     return value ? "是" : "否";

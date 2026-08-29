@@ -361,7 +361,7 @@ export function usePluginsPageController() {
       const result = await apiRequest<{ restart_required?: boolean }>(
         config,
         "/v1/admin/runtime/restart-instructions",
-        { auth: true, method: "POST" },
+        { auth: true, init: { method: "POST" } },
       );
       setRestartRequired(Boolean(result.restart_required));
     } catch {
@@ -629,7 +629,7 @@ export function usePluginsPageController() {
           await loadGroups();
         }
         await loadPluginEvents();
-        await loadRestartInstructions(plugins);
+        await loadRestartInstructions(installedResult.plugins || []);
         await loadFlowRuntimeStatus();
       })().catch((err: unknown) => {
         setError(err instanceof Error ? err.message : "加载失败");

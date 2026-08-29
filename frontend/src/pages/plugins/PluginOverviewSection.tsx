@@ -1,3 +1,5 @@
+import { Link } from "react-router-dom";
+
 import { PageHeader } from "../../components/PageHeader";
 import { StatusTile } from "../../components/StatusTile";
 import type { InstalledPlugin, PluginRuntime, PluginSummary } from "./models";
@@ -63,10 +65,10 @@ export function PluginOverviewSection({
             const status = pluginStatus(name);
             return (
               <li key={name} data-enabled={status === "已启用" ? "true" : "false"}>
-                <a href={`/plugins?plugin=${encodeURIComponent(name)}`}>
+                <Link to={`/plugins?plugin=${encodeURIComponent(name)}`}>
                   <span>{label}</span>
                   <strong>{status}</strong>
-                </a>
+                </Link>
               </li>
             );
           })}
