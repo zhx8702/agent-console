@@ -424,6 +424,17 @@ def test_capability_dispatch_executor_uses_extended_timeout() -> None:
     )
 
 
+def test_capability_dispatch_executor_uses_configured_timeout() -> None:
+    deps, _sessions, _router, _capability, _bus = _deps()
+    deps.settings = Settings(
+        orchestrator_capability_dispatch_timeout_seconds=135.0,
+        orchestrator_handle_timeout_seconds=150.0,
+    )
+    executors = build_core_step_executors(deps)
+
+    assert executors["core.capability_dispatch"].timeout_seconds == 135.0
+
+
 @pytest.mark.asyncio
 async def test_core_steps_run_happy_path_flow() -> None:
     deps, sessions, router, capability, bus = _deps()

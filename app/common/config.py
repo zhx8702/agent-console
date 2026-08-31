@@ -314,6 +314,15 @@ class Settings(BaseSettings):
     wxbot_report_transient_backoff_seconds: float = Field(default=900.0, gt=0)
     wxbot_daily_report_footer: str = ""
     orchestrator_handle_timeout_seconds: float = Field(default=150.0, gt=0)
+    # The capability step may include image preparation, hosted search, and
+    # provider fallback retries. Keep its default below the outer handle
+    # budget; the flow wiring also preserves a small headroom for commit and
+    # outbound publication.
+    orchestrator_capability_dispatch_timeout_seconds: float = Field(
+        default=135.0,
+        gt=0,
+        le=300.0,
+    )
     orchestrator_flow_runtime_enabled: bool = False
     orchestrator_flow_runtime_name: str = "default_compatible_flow"
     orchestrator_flow_runtime_allowed_names: str = "default_compatible_flow"

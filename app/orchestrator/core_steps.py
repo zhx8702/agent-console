@@ -37,6 +37,7 @@ from app.orchestrator.flow import (
     CAPABILITY_DISPATCH_TIMEOUT_SECONDS,
     MessageEffect,
     StepResult,
+    resolve_capability_dispatch_timeout_seconds,
 )
 from app.orchestrator.outcome import RetryableProcessingError
 from app.orchestrator.owner_gate import (
@@ -595,6 +596,17 @@ class CapabilityDispatchStep(_BaseCoreStep):
     kind = "core.capability_dispatch"
     name = "Capability dispatch"
     timeout_seconds = CAPABILITY_DISPATCH_TIMEOUT_SECONDS
+
+    def __init__(self, deps: CoreStepDependencies) -> None:
+        super().__init__(deps)
+        self.timeout_seconds = resolve_capability_dispatch_timeout_seconds(
+            getattr(deps.settings, "orchestrator_capability_dispatch_timeout_seconds", None),
+            handle_timeout_seconds=getattr(
+                deps.settings,
+                "orchestrator_handle_timeout_seconds",
+                None,
+            ),
+        )
 
     @staticmethod
     def _recall_miss_reason(exc: Exception) -> str:

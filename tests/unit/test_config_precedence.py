@@ -172,6 +172,14 @@ def test_quota_environment_is_part_of_the_settings_contract(monkeypatch) -> None
     assert settings.tenant_default_daily_tokens == 4321
 
 
+def test_capability_dispatch_timeout_environment_is_part_of_settings_contract(monkeypatch) -> None:
+    monkeypatch.setenv("ORCHESTRATOR_CAPABILITY_DISPATCH_TIMEOUT_SECONDS", "180")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.orchestrator_capability_dispatch_timeout_seconds == 180.0
+
+
 def test_admin_and_organization_specific_features_default_fail_closed(
     monkeypatch,
 ) -> None:

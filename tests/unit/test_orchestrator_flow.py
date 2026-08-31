@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.common.config import Settings
 from app.common.types import Channel, InboundEvent, Message
 from app.orchestrator.flow import (
     CAPABILITY_DISPATCH_TIMEOUT_SECONDS,
@@ -22,6 +23,7 @@ from app.orchestrator.flow import (
     compile_default_compatible_flow,
     normalize_flow_session_kind,
     resolve_builtin_flow,
+    resolve_capability_dispatch_timeout_seconds,
 )
 from app.orchestrator.pipeline import PipelineContext
 
@@ -79,6 +81,33 @@ def test_core_capability_dispatch_has_extended_timeout() -> None:
 
     assert capability.timeout_seconds == CAPABILITY_DISPATCH_TIMEOUT_SECONDS
     assert capability.timeout_seconds > 5.0
+
+
+def test_core_capability_dispatch_timeout_can_be_configured() -> None:
+    registry = build_default_flow_registry(capability_dispatch_timeout_seconds=135.0)
+    capability = registry.get("core.capability_dispatch")
+
+    assert capability is not None
+    assert capability.timeout_seconds == 135.0
+
+
+def test_capability_dispatch_timeout_keeps_outer_deadline_headroom() -> None:
+    assert (
+        resolve_capability_dispatch_timeout_seconds(
+            180.0,
+            handle_timeout_seconds=150.0,
+        )
+        == 135.0
+    )
+
+
+def test_settings_expose_capability_dispatch_timeout() -> None:
+    settings = Settings(
+        _env_file=None,
+        orchestrator_capability_dispatch_timeout_seconds=180.0,
+    )
+
+    assert settings.orchestrator_capability_dispatch_timeout_seconds == 180.0
 
 
 def test_builtin_flow_profiles_cover_private_and_target_group_flows() -> None:

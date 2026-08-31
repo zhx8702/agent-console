@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.common.config import Settings
-from app.orchestrator.flow import DEFAULT_COMPATIBLE_FLOW_NAME
+from app.orchestrator.flow import (
+    DEFAULT_COMPATIBLE_FLOW_NAME,
+    resolve_capability_dispatch_timeout_seconds,
+)
 
 TARGET_FLOW_NAMES = {
     "default_group_channel_flow",
@@ -71,6 +74,10 @@ def build_flow_runtime_config_payload(settings: Settings) -> dict[str, Any]:
         "allow_target_flows": allow_target_flows,
         "allow_compatible_fallback": bool(
             settings.orchestrator_flow_runtime_allow_compatible_fallback
+        ),
+        "capability_dispatch_timeout_seconds": resolve_capability_dispatch_timeout_seconds(
+            settings.orchestrator_capability_dispatch_timeout_seconds,
+            handle_timeout_seconds=settings.orchestrator_handle_timeout_seconds,
         ),
         "allowed": allowed,
         "reason": reason,
