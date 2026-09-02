@@ -467,6 +467,7 @@ class MemoryWindowRelationshipExtractionRequest(StrictRequestModel):
     cursor_event_id: int | None = None
     dry_run: bool = False
     include_llm: bool = True
+    llm_timeout_seconds: int | None = None
 
     def extraction_controls(self) -> dict[str, int | bool]:
         return {
@@ -475,6 +476,9 @@ class MemoryWindowRelationshipExtractionRequest(StrictRequestModel):
             "cursor_event_id": max(0, int(self.cursor_event_id or 0)),
             "dry_run": bool(self.dry_run),
             "include_llm": bool(self.include_llm),
+            "llm_timeout_seconds": max(
+                1, min(int(self.llm_timeout_seconds or 60), 180)
+            ),
         }
 
 

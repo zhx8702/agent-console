@@ -73,11 +73,7 @@ class MemoryPlugin(Plugin):
                 self._governance_loop(),
                 name="memory-governance-cleanup",
             )
-        if self._should_run_group_graph_auto_extract():
-            self._group_graph_auto_extract_task = asyncio.create_task(
-                self._group_graph_auto_extract_loop(),
-                name="memory-group-graph-auto-extract",
-            )
+        self._ensure_group_graph_auto_extract_task()
 
     async def _scope_execution_allowed(
         self,
@@ -196,6 +192,17 @@ class MemoryPlugin(Plugin):
         )
         roles = {item.strip().lower() for item in raw.split(",") if item.strip()}
         return role in roles
+
+    def _ensure_group_graph_auto_extract_task(self) -> None:
+        if not self._should_run_group_graph_auto_extract():
+            return
+        current = self._group_graph_auto_extract_task
+        if current is not None and not current.done():
+            return
+        self._group_graph_auto_extract_task = asyncio.create_task(
+            self._group_graph_auto_extract_loop(),
+            name="memory-group-graph-auto-extract",
+        )
 
     async def _group_graph_auto_extract_loop(self) -> None:
         while self._store is not None and self._ctx is not None:

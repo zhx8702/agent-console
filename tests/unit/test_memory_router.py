@@ -350,6 +350,7 @@ class _FakeStore:
                 "max_windows": kwargs["max_windows"],
                 "cursor_event_id": kwargs["cursor_event_id"],
                 "dry_run": kwargs["dry_run"],
+                "llm_timeout_seconds": kwargs["llm_timeout_seconds"],
             },
             "windows": [{
                 "index": 1,
@@ -2872,6 +2873,7 @@ async def test_memory_router_window_group_relationship_extraction_requires_admin
         "max_windows": 50,
         "cursor_event_id": -10,
         "dry_run": True,
+        "llm_timeout_seconds": 999,
     }
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         forbidden_resp = await client.post("/plugins/memory/group-graph/extract-window", json=body)
@@ -2890,6 +2892,7 @@ async def test_memory_router_window_group_relationship_extraction_requires_admin
         "max_windows": 10,
         "cursor_event_id": 0,
         "dry_run": True,
+        "llm_timeout_seconds": 180,
     }
     assert payload["totals"]["applied"] == 1
     assert store.window_relationship_calls == [{
@@ -2904,6 +2907,7 @@ async def test_memory_router_window_group_relationship_extraction_requires_admin
         "cursor_event_id": 0,
         "dry_run": True,
         "include_llm": True,
+        "llm_timeout_seconds": 180,
     }]
     serialized = str(payload)
     assert "content" not in serialized
