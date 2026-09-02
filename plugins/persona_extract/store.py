@@ -43,6 +43,7 @@ from app.common.wxbot_auth import wxbot_sdk_headers
 from app.egress.safe_http import safe_trusted_service_request, safe_trusted_service_stream
 from app.infra.db import get_engine
 from app.infra.runtime_schema import verify_runtime_schema
+from app.llm.activity import wait_for_llm_activity
 from plugins.persona_extract.artifacts import (
     build_artifact,
     build_manual_artifact,
@@ -2413,7 +2414,10 @@ class PersonaExtractStore:
                         timeout_seconds=effective_timeout,
                     )
                     return sanitize_markdown(result.content)
-                response = await asyncio.wait_for(llm_service.chat(request), timeout=effective_timeout)
+                response = await wait_for_llm_activity(
+                    llm_service.chat(request),
+                    timeout=effective_timeout,
+                )
                 return sanitize_markdown(response.content)
             except Exception as exc:
                 last_exc = exc

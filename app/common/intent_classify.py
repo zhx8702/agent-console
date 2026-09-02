@@ -14,6 +14,7 @@ from app.common.exceptions import UpstreamRejected
 from app.common.intent import IntentDecision
 from app.common.logging import get_logger
 from app.common.types import ChatMessage, ChatRequest, Role
+from app.llm.activity import wait_for_llm_activity
 
 logger = get_logger(__name__)
 
@@ -228,7 +229,7 @@ class LlmIntentClassifier:
         response = None
         for attempt in range(1, _CLASSIFY_ATTEMPTS + 1):
             try:
-                response = await asyncio.wait_for(
+                response = await wait_for_llm_activity(
                     self._llm.chat(request),
                     timeout=_CLASSIFY_TIMEOUT_SECONDS,
                 )

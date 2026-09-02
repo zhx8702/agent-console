@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from app.common.logging import get_logger
 from app.common.types import ChatMessage, ChatRequest, Role
+from app.llm.activity import wait_for_llm_activity
 from plugins.wxbot.reports import WxbotReportService
 from plugins.wxbot.store import WxbotStore
 
@@ -296,7 +297,10 @@ class WxbotSelfReviewService:
             temperature=0.2,
             metadata={"disable_openai_fallback": True, "wxbot_self_review_job": True},
         )
-        response = await asyncio.wait_for(llm_service.chat(request), timeout=timeout)
+        response = await wait_for_llm_activity(
+            llm_service.chat(request),
+            timeout=timeout,
+        )
         return str(response.content or "").strip()
 
     async def _write_kb_document(

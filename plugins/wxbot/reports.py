@@ -15,6 +15,7 @@ from app.common.logging import get_logger
 from app.common.types import ChatMessage, ChatRequest, Role
 from app.common.wxbot_auth import wxbot_sdk_headers
 from app.egress.safe_http import safe_trusted_service_request
+from app.llm.activity import wait_for_llm_activity
 from app.social.speech_ledger import GroupSpeechLedgerProtocol
 from plugins.wxbot.store import WxbotStore
 
@@ -1315,7 +1316,10 @@ class WxbotReportService:
             temperature=0.3,
             metadata=report_llm_metadata(),
         )
-        response = await asyncio.wait_for(llm_service.chat(request), timeout=timeout)
+        response = await wait_for_llm_activity(
+            llm_service.chat(request),
+            timeout=timeout,
+        )
         self._last_llm_metadata = _report_model_metadata(self._container, response)
         return str(response.content or "").strip()
 

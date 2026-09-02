@@ -59,6 +59,7 @@ from app.common.types import (
     Turn,
     channel_id_value,
 )
+from app.llm.activity import wait_for_llm_activity
 from app.llm.service import LLMService
 
 log = get_logger(__name__)
@@ -971,16 +972,11 @@ class AgentCapabilityEngine:
         *,
         timeout: float,
     ) -> Any:
-        task = asyncio.ensure_future(self._llm.chat(request))
-        try:
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-        except asyncio.CancelledError:
-            self._cancel_background_task(task)
-            raise
-        if task not in done:
-            self._cancel_background_task(task)
-            raise TimeoutError
-        return task.result()
+        return await wait_for_llm_activity(
+            self._llm.chat(request),
+            timeout=timeout,
+            wait_for_cancellation=False,
+        )
 
     @classmethod
     def _cancel_background_task(cls, task: asyncio.Future[Any]) -> None:

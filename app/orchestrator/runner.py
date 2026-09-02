@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from app.common.types import CapabilityResult, RouteType
+from app.llm.activity import wait_for_llm_activity
 from app.orchestrator.effect_handlers import (
     EFFECT_HANDLER_STATUS_HANDLER_ERROR,
     EFFECT_HANDLER_STATUS_OWNER_SKIPPED,
@@ -520,7 +521,7 @@ class FlowRunner:
     ) -> StepResult:
         timeout_seconds = float(step.timeout_seconds or 0)
         if timeout_seconds > 0:
-            return await asyncio.wait_for(
+            return await wait_for_llm_activity(
                 executor.run(ctx),
                 timeout=timeout_seconds,
             )
