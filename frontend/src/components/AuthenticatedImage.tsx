@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiBlobRequest } from "../lib/api";
-import { useConsoleConfig } from "../state/console-config";
+import {
+  COOKIE_SESSION_MARKER,
+  useConsoleConfig,
+  type ConsoleConfig,
+} from "../state/console-config";
 
 type AuthenticatedImageProps = {
   source: string;
@@ -10,8 +14,22 @@ type AuthenticatedImageProps = {
   loading?: "eager" | "lazy";
 };
 
-const blobUrlCache = new Map<string, string>();
-const inflight = new Map<string, Promise<string>>();
+type CachedBlob = {
+  objectUrl: string;
+  expiresAtMs: number;
+};
+
+type DisplayedBlob = CachedBlob & {
+  cacheKey: string;
+};
+
+const MAX_BLOB_CACHE_ENTRIES = 64;
+const MAX_BLOB_CACHE_AGE_MS = 60_000;
+const blobUrlCache = new Map<string, CachedBlob>();
+const inflight = new Map<string, Promise<CachedBlob>>();
+let cacheGeneration = 0;
+let cookieSessionConsumers = 0;
+let cookieSessionCleanupVersion = 0;
 
 function mediaIdFromLocator(source: string) {
   const value = source.trim();
@@ -40,6 +58,20 @@ function decodeMid1Payload(mediaId: string): Record<string, unknown> | null {
   }
 }
 
+function mediaExpiryMs(source: string) {
+  const mediaId = mediaIdFromLocator(source);
+  const payload = mediaId ? decodeMid1Payload(mediaId) : null;
+  const expiresAtSeconds = payload?.e;
+  if (
+    typeof expiresAtSeconds !== "number" ||
+    !Number.isSafeInteger(expiresAtSeconds) ||
+    expiresAtSeconds <= 0
+  ) {
+    return null;
+  }
+  return expiresAtSeconds * 1000;
+}
+
 export function mediaStableKey(source: string) {
   const trimmed = source.trim();
   const mediaId = mediaIdFromLocator(trimmed);
@@ -56,6 +88,28 @@ export function mediaStableKey(source: string) {
   return `mid1:${tenant}:${kind}:${role}:${payload.l}`;
 }
 
+function normalizedApiBaseUrl(value: string) {
+  const trimmed = value.trim();
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return trimmed;
+  }
+}
+
+function scopedCacheKey(stableKey: string, config: ConsoleConfig) {
+  if (!stableKey) {
+    return "";
+  }
+  return JSON.stringify([
+    normalizedApiBaseUrl(config.apiBaseUrl),
+    config.adminToken.trim(),
+    config.tenantId.trim(),
+    config.userId.trim(),
+    stableKey,
+  ]);
+}
+
 export function sdkImageProxyPath(source: string) {
   const mediaId = mediaIdFromLocator(source);
   if (!mediaId) {
@@ -68,24 +122,92 @@ export function sdkImageDisplayPath(source: string) {
   return mediaIdFromLocator(source) ? "受保护媒体" : source;
 }
 
+function revokeObjectUrl(objectUrl: string) {
+  URL.revokeObjectURL(objectUrl);
+}
+
+function removeCachedBlob(cacheKey: string, expectedObjectUrl?: string) {
+  const cached = blobUrlCache.get(cacheKey);
+  if (!cached || (expectedObjectUrl && cached.objectUrl !== expectedObjectUrl)) {
+    return;
+  }
+  blobUrlCache.delete(cacheKey);
+  revokeObjectUrl(cached.objectUrl);
+}
+
+function getCachedBlob(cacheKey: string, source: string) {
+  const cached = blobUrlCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+  const sourceExpiryMs = mediaExpiryMs(source);
+  if (
+    cached.expiresAtMs <= Date.now() ||
+    (sourceExpiryMs !== null && sourceExpiryMs <= Date.now())
+  ) {
+    removeCachedBlob(cacheKey, cached.objectUrl);
+    return null;
+  }
+  // Map insertion order is the LRU order. A hit promotes the entry.
+  blobUrlCache.delete(cacheKey);
+  blobUrlCache.set(cacheKey, cached);
+  return cached;
+}
+
+function cacheBlob(cacheKey: string, cached: CachedBlob) {
+  removeCachedBlob(cacheKey);
+  blobUrlCache.set(cacheKey, cached);
+  while (blobUrlCache.size > MAX_BLOB_CACHE_ENTRIES) {
+    const oldestKey = blobUrlCache.keys().next().value as string | undefined;
+    if (!oldestKey) {
+      break;
+    }
+    removeCachedBlob(oldestKey);
+  }
+}
+
 export function resetAuthenticatedImageCache() {
+  cacheGeneration += 1;
+  for (const cached of blobUrlCache.values()) {
+    revokeObjectUrl(cached.objectUrl);
+  }
   blobUrlCache.clear();
   inflight.clear();
 }
 
-function loadAuthenticatedBlob(cacheKey: string, proxyPath: string, config: ReturnType<typeof useConsoleConfig>["config"]) {
+function loadAuthenticatedBlob(
+  cacheKey: string,
+  proxyPath: string,
+  source: string,
+  config: ConsoleConfig,
+) {
   const pending = inflight.get(cacheKey);
   if (pending) {
     return pending;
   }
+  const generation = cacheGeneration;
   const request = apiBlobRequest(config, proxyPath)
     .then((blob) => {
-      const objectUrl = URL.createObjectURL(blob);
-      blobUrlCache.set(cacheKey, objectUrl);
-      return objectUrl;
+      if (generation !== cacheGeneration) {
+        throw new DOMException("Authenticated image cache was reset", "AbortError");
+      }
+      const now = Date.now();
+      const signedExpiryMs = mediaExpiryMs(source);
+      const expiresAtMs = Math.min(
+        now + MAX_BLOB_CACHE_AGE_MS,
+        signedExpiryMs ?? Number.POSITIVE_INFINITY,
+      );
+      if (expiresAtMs <= now) {
+        throw new Error("Signed media identifier has expired");
+      }
+      const cached = { objectUrl: URL.createObjectURL(blob), expiresAtMs };
+      cacheBlob(cacheKey, cached);
+      return cached;
     })
     .finally(() => {
-      inflight.delete(cacheKey);
+      if (inflight.get(cacheKey) === request) {
+        inflight.delete(cacheKey);
+      }
     });
   inflight.set(cacheKey, request);
   return request;
@@ -94,18 +216,38 @@ function loadAuthenticatedBlob(cacheKey: string, proxyPath: string, config: Retu
 export function AuthenticatedImage({ source, alt, className, loading = "eager" }: AuthenticatedImageProps) {
   const { config } = useConsoleConfig();
   const hostRef = useRef<HTMLSpanElement>(null);
-  const cacheKey = useMemo(() => mediaStableKey(source), [source]);
+  const stableKey = useMemo(() => mediaStableKey(source), [source]);
+  const cacheKey = useMemo(
+    () => scopedCacheKey(stableKey, config),
+    [stableKey, config.adminToken, config.apiBaseUrl, config.tenantId, config.userId],
+  );
   const proxyPath = useMemo(() => sdkImageProxyPath(source), [source]);
-  const proxyPathRef = useRef(proxyPath);
-  const configRef = useRef(config);
-  proxyPathRef.current = proxyPath;
-  configRef.current = config;
-  const [visible, setVisible] = useState(loading !== "lazy" || !cacheKey);
-  const [blobUrl, setBlobUrl] = useState(() => blobUrlCache.get(cacheKey) || "");
-  const [failed, setFailed] = useState(Boolean(source.trim()) && !proxyPath);
+  const [visible, setVisible] = useState(loading !== "lazy" || !stableKey);
+  const [displayedBlob, setDisplayedBlob] = useState<DisplayedBlob | null>(null);
+  const [failedCacheKey, setFailedCacheKey] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    if (loading !== "lazy" || !cacheKey) {
+    if (!cacheKey || config.adminToken.trim() !== COOKIE_SESSION_MARKER) {
+      return;
+    }
+    cookieSessionConsumers += 1;
+    cookieSessionCleanupVersion += 1;
+    return () => {
+      cookieSessionConsumers -= 1;
+      const cleanupVersion = ++cookieSessionCleanupVersion;
+      queueMicrotask(() => {
+        if (cookieSessionConsumers === 0 && cleanupVersion === cookieSessionCleanupVersion) {
+          // The cookie is HttpOnly, so its administrator identity is intentionally opaque.
+          // Do not let cache entries survive the last image consumer (for example, logout).
+          resetAuthenticatedImageCache();
+        }
+      });
+    };
+  }, [cacheKey, config.adminToken]);
+
+  useEffect(() => {
+    if (loading !== "lazy" || !stableKey) {
       setVisible(true);
       return;
     }
@@ -124,38 +266,36 @@ export function AuthenticatedImage({ source, alt, className, loading = "eager" }
     );
     observer.observe(hostRef.current);
     return () => observer.disconnect();
-  }, [loading, cacheKey]);
+  }, [loading, stableKey]);
 
   useEffect(() => {
     if (!cacheKey) {
-      setBlobUrl("");
-      setFailed(false);
+      setDisplayedBlob(null);
+      setFailedCacheKey(null);
       return;
     }
-    if (!proxyPathRef.current) {
-      setBlobUrl("");
-      setFailed(true);
+    if (!proxyPath) {
+      setDisplayedBlob(null);
+      setFailedCacheKey(cacheKey);
       return;
     }
-    const cached = blobUrlCache.get(cacheKey);
+    const cached = getCachedBlob(cacheKey, source);
     if (cached) {
-      setBlobUrl(cached);
-      setFailed(false);
+      setDisplayedBlob({ cacheKey, ...cached });
+      setFailedCacheKey(null);
       return;
     }
     if (!visible) {
       return;
     }
-    if (!inflight.has(cacheKey)) {
-      setBlobUrl("");
-    }
-    setFailed(false);
+    setDisplayedBlob(null);
+    setFailedCacheKey(null);
     let cancelled = false;
-    void loadAuthenticatedBlob(cacheKey, proxyPathRef.current, configRef.current)
-      .then((objectUrl) => {
+    void loadAuthenticatedBlob(cacheKey, proxyPath, source, config)
+      .then((loaded) => {
         if (!cancelled) {
-          setBlobUrl(objectUrl);
-          setFailed(false);
+          setDisplayedBlob({ cacheKey, ...loaded });
+          setFailedCacheKey(null);
         }
       })
       .catch((error: unknown) => {
@@ -163,15 +303,39 @@ export function AuthenticatedImage({ source, alt, className, loading = "eager" }
           return;
         }
         if (!(error instanceof DOMException && error.name === "AbortError")) {
-          setFailed(true);
+          setDisplayedBlob(null);
+          setFailedCacheKey(cacheKey);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, config.adminToken, config.apiBaseUrl, visible]);
+  }, [cacheKey, proxyPath, reloadKey, source, visible]);
 
-  const displaySource = proxyPath ? blobUrl : "";
+  const currentBlob = displayedBlob?.cacheKey === cacheKey ? displayedBlob : null;
+
+  useEffect(() => {
+    if (!currentBlob) {
+      return;
+    }
+    const expire = () => {
+      removeCachedBlob(cacheKey, currentBlob.objectUrl);
+      setDisplayedBlob((current) =>
+        current?.cacheKey === cacheKey && current.objectUrl === currentBlob.objectUrl ? null : current,
+      );
+      setReloadKey((current) => current + 1);
+    };
+    const remainingMs = currentBlob.expiresAtMs - Date.now();
+    if (remainingMs <= 0) {
+      expire();
+      return;
+    }
+    const timer = window.setTimeout(expire, remainingMs);
+    return () => window.clearTimeout(timer);
+  }, [cacheKey, currentBlob]);
+
+  const failed = failedCacheKey === cacheKey;
+  const displaySource = proxyPath && !failed ? currentBlob?.objectUrl || "" : "";
   return (
     <span
       ref={hostRef}
@@ -183,7 +347,11 @@ export function AuthenticatedImage({ source, alt, className, loading = "eager" }
           src={displaySource}
           alt={alt}
           loading={loading}
-          onError={() => setFailed(true)}
+          onError={() => {
+            removeCachedBlob(cacheKey, displaySource);
+            setDisplayedBlob(null);
+            setFailedCacheKey(cacheKey);
+          }}
         />
       ) : (
         <span className="authenticated-image-placeholder" role={failed ? "alert" : undefined}>
