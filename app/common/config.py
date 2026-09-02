@@ -344,21 +344,21 @@ class Settings(BaseSettings):
     orchestrator_flow_shadow_core_preview_enabled: bool = False
     orchestrator_flow_shadow_plugin_dry_run_enabled: bool = False
     orchestrator_flow_shadow_effect_dry_run_enabled: bool = False
-    memory_llm_extraction_enabled: bool = False
-    memory_llm_extraction_timeout_seconds: float = Field(default=1.0, gt=0)
+    memory_llm_extraction_enabled: bool = True
+    memory_llm_extraction_timeout_seconds: float = Field(default=30.0, gt=0)
     memory_llm_extraction_max_actions: int = Field(default=4, ge=1)
     memory_llm_extraction_min_confidence: float = Field(default=0.75, ge=0.0, le=1.0)
     memory_acceptance_auto_accept_min: float = Field(default=0.78, ge=0.0, le=1.0)
     memory_acceptance_reject_below: float = Field(default=0.35, ge=0.0, le=1.0)
     memory_llm_extraction_job_enabled: bool = True
-    memory_llm_extraction_job_drain_enabled: bool = False
+    memory_llm_extraction_job_drain_enabled: bool = True
     memory_llm_extraction_job_scope_allowlist: str = ""
     memory_llm_extraction_job_drain_batch_size: int = Field(default=5, ge=1)
     memory_llm_extraction_job_drain_max_claims: int = Field(default=0, ge=0)
     memory_llm_extraction_job_max_attempts: int = Field(default=3, ge=1)
     memory_llm_extraction_job_backoff_seconds: float = Field(default=30.0, gt=0)
-    memory_llm_extraction_job_timeout_seconds: float = Field(default=5.0, gt=0)
-    memory_llm_extraction_job_lock_ttl_seconds: float = Field(default=60.0, gt=0)
+    memory_llm_extraction_job_timeout_seconds: float = Field(default=90.0, gt=0)
+    memory_llm_extraction_job_lock_ttl_seconds: float = Field(default=150.0, gt=0)
     memory_llm_extraction_job_drain_interval_seconds: float = Field(default=5.0, gt=0)
     memory_retrieval_enabled: bool = True
     # Identity-wide memory can contain facts learned in private conversations.
@@ -376,12 +376,12 @@ class Settings(BaseSettings):
     memory_vector_top_k: int = Field(default=12, ge=1, le=100)
     memory_graph_vector_top_k: int = Field(default=12, ge=1, le=100)
     memory_vector_index_strict_startup_check: bool = False
-    memory_graph_retrieval_enabled: bool = False
+    memory_graph_retrieval_enabled: bool = True
     memory_graph_retrieval_fact_top_k: int = Field(default=3, ge=1, le=10)
     memory_graph_retrieval_episode_top_k: int = Field(default=2, ge=1, le=10)
     memory_graph_retrieval_budget_chars: int = Field(default=600, ge=100, le=3000)
-    memory_graph_llm_extraction_enabled: bool = False
-    memory_graph_llm_extraction_timeout_seconds: float = Field(default=1.0, gt=0)
+    memory_graph_llm_extraction_enabled: bool = True
+    memory_graph_llm_extraction_timeout_seconds: float = Field(default=90.0, gt=0)
     memory_graph_llm_extraction_max_actions: int = Field(default=16, ge=1)
     memory_graph_llm_extraction_max_entities: int = Field(default=8, ge=1)
     memory_graph_llm_extraction_max_facts: int = Field(default=4, ge=1)
@@ -389,6 +389,17 @@ class Settings(BaseSettings):
     memory_graph_llm_extraction_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     memory_governance_auto_cleanup_enabled: bool = True
     memory_governance_interval_seconds: float = Field(default=86_400.0, gt=0)
+    memory_group_graph_auto_extract_enabled: bool = True
+    memory_group_graph_auto_extract_llm_enabled: bool = True
+    memory_group_graph_auto_extract_interval_seconds: float = Field(default=3_600.0, gt=0)
+    memory_group_graph_auto_extract_lookback_days: int = Field(default=7, ge=1, le=14)
+    memory_group_graph_auto_extract_max_sessions_per_tick: int = Field(default=10, ge=1, le=20)
+    memory_group_graph_auto_extract_max_windows_per_session: int = Field(default=20, ge=1, le=100)
+    memory_group_graph_auto_extract_window_size: int = Field(default=50, ge=10, le=100)
+    memory_group_graph_auto_extract_time_budget_seconds: int = Field(default=180, ge=5, le=180)
+    memory_group_graph_auto_extract_roles: str = "scheduler"
+    memory_group_graph_auto_extract_sync_enabled: bool = True
+    memory_group_graph_auto_extract_sync_max_messages: int = Field(default=200, ge=20, le=500)
     memory_needs_review_retention_days: int = Field(default=30, ge=1)
     memory_rejected_retention_days: int = Field(default=7, ge=1)
     memory_auto_expire_days: int = Field(default=180, ge=1)

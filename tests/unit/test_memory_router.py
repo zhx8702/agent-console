@@ -2903,6 +2903,7 @@ async def test_memory_router_window_group_relationship_extraction_requires_admin
         "max_windows": 10,
         "cursor_event_id": 0,
         "dry_run": True,
+        "include_llm": True,
     }]
     serialized = str(payload)
     assert "content" not in serialized
@@ -2961,6 +2962,7 @@ async def test_memory_router_window_catchup_requires_admin_scrubs_and_passes_con
         "cursor_event_id": 0,
         "dry_run": True,
         "time_budget_seconds": 180,
+        "include_llm": True,
     }]
     serialized = str(payload)
     assert "content" not in serialized
