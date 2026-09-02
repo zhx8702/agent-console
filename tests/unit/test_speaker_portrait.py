@@ -85,6 +85,27 @@ def test_apply_coverage_caps_confidence_when_unread() -> None:
     assert portrait["coverage"]["complete"] is False
 
 
+def test_apply_coverage_accumulates_incremental_counts() -> None:
+    previous = {
+        "coverage": {"lines_total": 5656, "lines_read": 5656, "complete": True},
+        "confidence": 0.89,
+    }
+    portrait = {
+        "summary": "x",
+        "confidence": 0.89,
+        "confidence_provided": True,
+        "coverage": {"lines_read": 40, "complete": True},
+        "unknowns": [],
+    }
+    apply_coverage(portrait, lines_total=40, previous=previous, mode="incremental")
+    assert portrait["coverage"] == {
+        "lines_total": 5696,
+        "lines_read": 5696,
+        "complete": True,
+    }
+    assert portrait["confidence"] == 0.89
+
+
 def test_apply_coverage_fills_missing_confidence_when_complete() -> None:
     portrait = {
         "summary": "x",

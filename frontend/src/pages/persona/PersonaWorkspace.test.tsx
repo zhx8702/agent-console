@@ -6,6 +6,8 @@ import { apiRequest } from "../../lib/api";
 import {
   portraitConfidenceLabel,
   portraitCoverageLabel,
+  portraitFreshness,
+  portraitFreshnessHint,
   portraitJobDurationLabel,
   portraitJobModeLabel,
   portraitJobStatusLabel,
@@ -119,6 +121,28 @@ describe("portrait presentation helpers", () => {
     expect(
       portraitCoverageLabel({ coverage: { lines_total: 500, lines_read: 500, complete: true } }),
     ).toBe("500/500（完整）");
+  });
+
+  it("compares last-distillation coverage against the live roster count", () => {
+    const record: PortraitRecord = {
+      pending_messages: 40,
+      portrait: {
+        confidence: 0.89,
+        coverage: { lines_total: 5656, lines_read: 5656, complete: true },
+      },
+    };
+    const freshness = portraitFreshness(record, 6120);
+    expect(freshness).toMatchObject({
+      distilledRead: 5656,
+      liveTotal: 6120,
+      sourceCount: 6120,
+      pendingCount: 40,
+      behind: true,
+      complete: false,
+    });
+    expect(portraitCoverageLabel(record.portrait, freshness)).toBe("5656/6120（部分）");
+    expect(portraitConfidenceLabel(record.portrait, freshness)).toBe("82%");
+    expect(portraitFreshnessHint(freshness)).toContain("画像尚未跟上最新聊天记录");
   });
 });
 

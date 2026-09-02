@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0049_speaker_portrait_hot_update"
+RUNTIME_SCHEMA_REVISION = "0050_speaker_portrait_cursor"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
 # 0046 adds durable memory-event provenance, evidence, and physical expiry.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
@@ -109,6 +109,7 @@ RUNTIME_SCHEMA_INDEXES = frozenset(
         "idx_local_agent_job_queue_due",
         "idx_local_agent_job_tenant_created",
         "idx_speaker_portrait_job_queue",
+        "idx_speaker_portrait_job_attempt",
         "idx_speaker_portrait_revision_portrait",
         "idx_speaker_portrait_hot_update",
         "ux_speaker_portrait_identity",
@@ -250,6 +251,8 @@ RUNTIME_SCHEMA_COLUMN_CONTRACTS = (
     ("plugin_persona_jobs", "lease_expires_at", True),
     ("plugin_persona_jobs", "request_hash", False),
     ("plugin_persona_jobs", "input_messages_json", False),
+    ("plugin_speaker_portraits", "last_distilled_message_at", False),
+    ("plugin_speaker_portrait_jobs", "claimed_pending_messages", False),
     ("plugin_persona_jobs", "total_chunks", False),
     ("plugin_persona_jobs", "completed_chunks", False),
     ("plugin_memory_event", "source_member_id", False),

@@ -396,6 +396,8 @@ def apply_coverage(
     *,
     lines_total: int,
     coverage_file: Any = None,
+    previous: dict[str, Any] | None = None,
+    mode: str = "full",
 ) -> dict[str, Any]:
     reported = portrait.get("coverage") if isinstance(portrait.get("coverage"), dict) else {}
     file_cov: dict[str, Any] = {}
@@ -408,10 +410,24 @@ def apply_coverage(
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             file_cov = {}
     try:
-        lines_read = int(file_cov.get("lines_read") or reported.get("lines_read") or 0)
+        batch_read = int(file_cov.get("lines_read") or reported.get("lines_read") or 0)
     except (TypeError, ValueError):
-        lines_read = 0
-    total = max(0, int(lines_total or 0))
+        batch_read = 0
+    batch_total = max(0, int(lines_total or 0))
+    prev_total = 0
+    prev_read = 0
+    if str(mode or "").strip().lower() == "incremental" and isinstance(previous, dict):
+        prev_cov = previous.get("coverage") if isinstance(previous.get("coverage"), dict) else {}
+        try:
+            prev_total = max(0, int(prev_cov.get("lines_total") or 0))
+        except (TypeError, ValueError):
+            prev_total = 0
+        try:
+            prev_read = max(0, int(prev_cov.get("lines_read") or 0))
+        except (TypeError, ValueError):
+            prev_read = 0
+    total = prev_total + batch_total
+    lines_read = prev_read + batch_read if batch_read > 0 else prev_read
     complete = total > 0 and lines_read >= int(total * 0.8)
     if lines_read <= 0 and total > 0:
         complete = False

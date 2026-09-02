@@ -232,11 +232,25 @@ async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> 
         portrait,
         lines_total=len(messages),
         coverage_file=coverage_file,
+        previous=previous if isinstance(previous, dict) else None,
+        mode=mode,
     )
     if not use_tools:
+        used = int(stats.get("used_messages") or len(messages))
+        portrait = apply_coverage(
+            {
+                **portrait,
+                "coverage": {"lines_read": used, "complete": True},
+                "confidence_provided": True,
+            },
+            lines_total=used,
+            previous=previous if isinstance(previous, dict) else None,
+            mode=mode,
+        )
+        coverage = portrait.get("coverage") if isinstance(portrait.get("coverage"), dict) else {}
         portrait["coverage"] = {
-            "lines_total": int(stats.get("used_messages") or len(messages)),
-            "lines_read": int(stats.get("used_messages") or len(messages)),
+            "lines_total": int(coverage.get("lines_total") or used),
+            "lines_read": int(coverage.get("lines_total") or used),
             "complete": True,
         }
     if not portrait.get("summary") and not any(portrait.get(key) for key in ("likes", "topics")):
@@ -248,7 +262,7 @@ async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> 
         speaker_id=str(job.get("speaker_id") or ""),
         speaker_name=str(job.get("speaker_name") or ""),
         tenant_id=str(job.get("tenant_id") or ""),
-        session_id=str(job.get("session_id") or ""),
+        session_id=str(job.get("external_session_id") or job.get("session_id") or ""),
         message_count=int(stats.get("used_messages") or 0),
         last_message_at=str((stats.get("time_span") or "").split(" ~ ")[-1] if stats.get("time_span") else ""),
         mode=mode,

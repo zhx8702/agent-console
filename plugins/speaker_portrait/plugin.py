@@ -126,7 +126,6 @@ class SpeakerPortraitPlugin(Plugin):
             ),
         )
         for portrait in due:
-            await self._store.clear_pending(int(portrait["id"]))
             await self._store.create_job(
                 tenant_id=str(portrait.get("tenant_id") or ""),
                 session_id=str(portrait.get("session_id") or ""),
@@ -137,7 +136,9 @@ class SpeakerPortraitPlugin(Plugin):
                 days_limit=14,
                 max_messages=800,
                 mode="incremental",
-                since_timestamp=str(portrait.get("last_message_at") or ""),
+                since_timestamp=str(portrait.get("last_distilled_message_at") or ""),
+                portrait_id=int(portrait["id"]),
+                claimed_pending_messages=int(portrait.get("pending_messages") or 0),
             )
 
     def get_api_router(self):

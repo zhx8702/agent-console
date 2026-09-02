@@ -173,13 +173,64 @@ export function shortPortraitJobError(job: PortraitJob) {
   return error.length > 120 ? `${error.slice(0, 117)}...` : error;
 }
 
-export function portraitConfidenceLabel(portrait?: PortraitPayload | null) {
-  const confidence = Number(portrait?.confidence);
-  if (!Number.isFinite(confidence)) return "-";
-  return `${Math.round(confidence * 100)}%`;
+export type PortraitFreshness = {
+  distilledRead: number;
+  distilledTotal: number;
+  liveTotal: number;
+  pendingCount: number;
+  sourceCount: number;
+  behind: boolean;
+  complete: boolean;
+};
+
+export function portraitFreshness(
+  portrait?: PortraitRecord | null,
+  sourceMessageCount?: number | null,
+): PortraitFreshness {
+  const coverage = portrait?.portrait?.coverage;
+  const storedTotal = Number(coverage?.lines_total);
+  const storedRead = Number(coverage?.lines_read);
+  const pending = Number(portrait?.pending_messages);
+  const source = Number(sourceMessageCount);
+  const distilledTotal = Number.isFinite(storedTotal) && storedTotal > 0 ? storedTotal : 0;
+  const distilledRead = Number.isFinite(storedRead) && storedRead >= 0 ? storedRead : distilledTotal;
+  const pendingCount = Number.isFinite(pending) && pending > 0 ? Math.floor(pending) : 0;
+  const sourceCount = Number.isFinite(source) && source > 0 ? Math.floor(source) : 0;
+  const liveTotal = Math.max(distilledTotal, distilledRead + pendingCount, sourceCount);
+  const behind = liveTotal > distilledRead || pendingCount > 0;
+  const complete = Boolean(coverage?.complete) && liveTotal > 0 && distilledRead >= liveTotal && pendingCount === 0;
+  return {
+    distilledRead,
+    distilledTotal,
+    liveTotal,
+    pendingCount,
+    sourceCount,
+    behind,
+    complete,
+  };
 }
 
-export function portraitCoverageLabel(portrait?: PortraitPayload | null) {
+export function portraitConfidenceLabel(
+  portrait?: PortraitPayload | null,
+  freshness?: PortraitFreshness | null,
+) {
+  const confidence = Number(portrait?.confidence);
+  if (!Number.isFinite(confidence)) return "-";
+  let score = confidence;
+  if (freshness?.behind && freshness.liveTotal > 0) {
+    score = confidence * Math.min(1, freshness.distilledRead / freshness.liveTotal);
+  }
+  return `${Math.round(score * 100)}%`;
+}
+
+export function portraitCoverageLabel(
+  portrait?: PortraitPayload | null,
+  freshness?: PortraitFreshness | null,
+) {
+  if (freshness && freshness.liveTotal > 0) {
+    const readText = Number.isFinite(freshness.distilledRead) ? freshness.distilledRead : "?";
+    return `${readText}/${freshness.liveTotal}${freshness.complete ? "（完整）" : "（部分）"}`;
+  }
   const coverage = portrait?.coverage;
   if (!coverage) return "-";
   const total = Number(coverage.lines_total);
@@ -187,6 +238,15 @@ export function portraitCoverageLabel(portrait?: PortraitPayload | null) {
   if (!Number.isFinite(total) || total <= 0) return coverage.complete ? "完整" : "-";
   const readText = Number.isFinite(read) ? read : "?";
   return `${readText}/${total}${coverage.complete ? "（完整）" : "（部分）"}`;
+}
+
+export function portraitFreshnessHint(freshness: PortraitFreshness) {
+  const parts: string[] = [];
+  if (freshness.sourceCount) parts.push(`名册 ${freshness.sourceCount} 条`);
+  if (freshness.distilledRead) parts.push(`已蒸馏 ${freshness.distilledRead} 条`);
+  if (freshness.pendingCount) parts.push(`待处理 ${freshness.pendingCount} 条`);
+  if (freshness.behind) parts.push("画像尚未跟上最新聊天记录");
+  return parts.join(" · ");
 }
 
 export const PORTRAIT_CLAIM_SECTIONS: Array<{ key: keyof PortraitPayload; label: string }> = [

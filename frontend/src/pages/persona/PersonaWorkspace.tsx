@@ -22,6 +22,8 @@ import {
   isGroupSession,
   portraitConfidenceLabel,
   portraitCoverageLabel,
+  portraitFreshness,
+  portraitFreshnessHint,
   portraitJobDurationLabel,
   portraitJobModeLabel,
   portraitJobStatusLabel,
@@ -531,6 +533,7 @@ export function PersonaWorkspace() {
   };
 
   const portraitPayload = portrait?.portrait || null;
+  const freshness = portraitFreshness(portrait, selectedMember?.msg_count);
   const claimSections = PORTRAIT_CLAIM_SECTIONS.map(({ key, label }) => ({
     key,
     label,
@@ -798,13 +801,16 @@ export function PersonaWorkspace() {
               <div className="field">
                 <span>置信度 / 覆盖</span>
                 <strong>
-                  {portraitConfidenceLabel(portraitPayload)} · {portraitCoverageLabel(portraitPayload)}
+                  {portraitConfidenceLabel(portraitPayload, freshness)} · {portraitCoverageLabel(portraitPayload, freshness)}
                 </strong>
+                <small>{portraitFreshnessHint(freshness) || "以当前名册发言数对照上次蒸馏覆盖"}</small>
               </div>
               <div className="field">
-                <span>最近更新</span>
-                <strong>{portrait.updated_at || "-"}</strong>
+                <span>最近蒸馏</span>
+                <strong>{portrait.revision_created_at || portrait.updated_at || "-"}</strong>
                 <small>
+                  {portrait.last_message_at ? `最近发言 ${portrait.last_message_at}` : "尚无新发言时间"}
+                  {" · "}
                   热更新{portrait.hot_update_enabled === false ? "已关闭" : "开启"}
                   {typeof portrait.pending_messages === "number"
                     ? ` · 待处理新消息 ${portrait.pending_messages} 条`

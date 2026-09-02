@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.channel.models import configuration_session_id
 from app.common.types import channel_id_value
 from app.orchestrator.flow import StepResult
 from app.orchestrator.pipeline import PipelineContext
@@ -19,6 +20,13 @@ def _speaker_id(ctx: PipelineContext) -> str:
         or ctx.event.user_id
         or ""
     ).strip()
+
+
+def _external_session_id(ctx: PipelineContext) -> str:
+    """Return the SDK-facing conversation id without persisting a cx1 fallback."""
+
+    session_id = configuration_session_id(ctx.event, ctx.session).strip()
+    return "" if session_id.startswith("cx1:") else session_id
 
 
 @dataclass
@@ -85,6 +93,8 @@ class SpeakerPortraitNoteStep:
     async def run(self, ctx: PipelineContext) -> StepResult:
         if bool(ctx.event.metadata.get("is_self_sent")):
             return StepResult(reason="self_sent")
+        if not str(ctx.event.message.content or "").strip():
+            return StepResult(reason="no_text")
         speaker_id = _speaker_id(ctx)
         if not speaker_id:
             return StepResult(reason="no_speaker")
@@ -97,7 +107,7 @@ class SpeakerPortraitNoteStep:
             tenant_id=ctx.event.tenant_id,
             speaker_id=speaker_id,
             speaker_name=str(metadata.get("sender_name") or ""),
-            session_id=str(ctx.event.session_id or ""),
+            session_id=_external_session_id(ctx),
             timestamp=timestamp[:64],
             channel=channel_id_value(ctx.event.channel) or "wechat",
         )
