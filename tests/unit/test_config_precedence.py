@@ -172,20 +172,19 @@ def test_quota_environment_is_part_of_the_settings_contract(monkeypatch) -> None
     assert settings.tenant_default_daily_tokens == 4321
 
 
-def test_memory_llm_extraction_defaults_are_opt_in() -> None:
+def test_memory_llm_extraction_defaults_are_enabled() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.memory_llm_extraction_enabled is False
-    assert settings.memory_llm_extraction_job_drain_enabled is False
-    assert settings.memory_graph_llm_extraction_enabled is False
-    assert settings.memory_group_graph_auto_extract_enabled is False
-    assert settings.memory_group_graph_auto_extract_llm_enabled is False
-    assert settings.memory_graph_retrieval_enabled is False
+    assert settings.memory_llm_extraction_enabled is True
+    assert settings.memory_llm_extraction_job_drain_enabled is True
+    assert settings.memory_graph_llm_extraction_enabled is True
+    assert settings.memory_group_graph_auto_extract_llm_enabled is True
+    assert settings.memory_graph_retrieval_enabled is True
     assert settings.memory_group_graph_auto_extract_lookback_days == 7
-    assert settings.memory_group_graph_auto_extract_sync_enabled is False
+    assert settings.memory_group_graph_auto_extract_sync_enabled is True
     assert settings.memory_group_graph_auto_extract_sync_max_messages == 200
-    assert settings.memory_llm_extraction_job_timeout_seconds == 5.0
-    assert settings.memory_llm_extraction_job_lock_ttl_seconds == 60.0
+    assert settings.memory_llm_extraction_job_timeout_seconds == 90.0
+    assert settings.memory_llm_extraction_job_lock_ttl_seconds == 150.0
 
 
 def test_group_graph_auto_extract_environment_is_part_of_settings_contract(monkeypatch) -> None:
