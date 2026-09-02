@@ -507,6 +507,9 @@ export type GroupGraphEdge = {
   extraction_method?: string;
   review_state?: string;
   acceptance?: Record<string, unknown>;
+  acceptance_score?: number | null;
+  acceptance_reason?: string | null;
+  evidence_dates?: string[];
   history?: unknown[];
 };
 
@@ -763,6 +766,7 @@ export type GroupGraphWindowExtractionRequest = {
   max_windows?: number;
   cursor_event_id?: number;
   dry_run?: boolean;
+  include_llm?: boolean;
 };
 
 export type GroupGraphWindowCatchupRequest = {
@@ -777,6 +781,7 @@ export type GroupGraphWindowCatchupRequest = {
   cursor_event_id?: number;
   dry_run?: boolean;
   time_budget_seconds?: number;
+  include_llm?: boolean;
 };
 
 export type GroupGraphWindowExtractionResponse = {
@@ -866,6 +871,27 @@ export type GroupGraphWindowStatsResponse = {
   [key: string]: unknown;
 };
 
+export type GroupGraphEdgeReviewAction = "accept" | "reject" | "needs_review" | "expire" | "supersede";
+
+export type GroupGraphEdgeReviewRequest = {
+  tenant_id: string;
+  channel?: string;
+  source_key?: string;
+  session_id?: string;
+  action: GroupGraphEdgeReviewAction;
+  review_reason?: string;
+  superseded_by_item_id?: number;
+  supersedes_item_id?: number;
+};
+
+export type GroupGraphEdgeReviewResponse = {
+  ok?: boolean;
+  edge_id?: string;
+  action?: string;
+  result?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
 export async function getGroupGraph(config: ConsoleConfig, query: GroupGraphQuery) {
   return apiRequest<GroupGraphResponse>(config, "/plugins/memory/group-graph", { query });
 }
@@ -931,6 +957,29 @@ export async function runGroupGraphWindowCatchup(config: ConsoleConfig, body: Gr
       body: JSON.stringify(body),
     },
   });
+}
+
+export async function reviewGroupGraphEdge(
+  config: ConsoleConfig,
+  edgeId: string,
+  body: GroupGraphEdgeReviewRequest,
+  options?: { idempotencyKey?: string },
+) {
+  return apiRequest<GroupGraphEdgeReviewResponse>(
+    config,
+    `/plugins/memory/group-graph/edges/${encodeURIComponent(edgeId)}/acceptance-review`,
+    {
+      auth: true,
+      init: {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(options?.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+        },
+        body: JSON.stringify(body),
+      },
+    },
+  );
 }
 
 export async function backfillMemoryHistory(config: ConsoleConfig, body: MemoryBackfillRequest) {

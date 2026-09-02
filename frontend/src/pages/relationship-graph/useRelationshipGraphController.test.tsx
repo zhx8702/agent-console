@@ -6,9 +6,11 @@ import { useRelationshipGraphController } from "./useRelationshipGraphController
 
 const apiMocks = vi.hoisted(() => ({
   getGroupGraph: vi.fn(),
+  getGroupGraphEdgeEvidence: vi.fn(),
   getGroupGraphHistoryDates: vi.fn(),
   getGroupGraphWindowStats: vi.fn(),
   getMemoryExtractionJobStats: vi.fn(),
+  reviewGroupGraphEdge: vi.fn(),
 }));
 
 const consoleHarness = vi.hoisted(() => ({
@@ -29,9 +31,11 @@ vi.mock("../../lib/api", async (importOriginal) => {
   return {
     ...actual,
     getGroupGraph: apiMocks.getGroupGraph,
+    getGroupGraphEdgeEvidence: apiMocks.getGroupGraphEdgeEvidence,
     getGroupGraphHistoryDates: apiMocks.getGroupGraphHistoryDates,
     getGroupGraphWindowStats: apiMocks.getGroupGraphWindowStats,
     getMemoryExtractionJobStats: apiMocks.getMemoryExtractionJobStats,
+    reviewGroupGraphEdge: apiMocks.reviewGroupGraphEdge,
   };
 });
 
@@ -69,9 +73,11 @@ describe("useRelationshipGraphController verified group loading", () => {
       userId: "",
     };
     apiMocks.getGroupGraph.mockReset();
+    apiMocks.getGroupGraphEdgeEvidence.mockReset().mockResolvedValue({ edge: { id: "edge-1" } });
     apiMocks.getGroupGraphHistoryDates.mockReset().mockResolvedValue({ items: [] });
     apiMocks.getGroupGraphWindowStats.mockReset().mockResolvedValue({ totals: {} });
     apiMocks.getMemoryExtractionJobStats.mockReset().mockResolvedValue({ counts: {} });
+    apiMocks.reviewGroupGraphEdge.mockReset().mockResolvedValue({ ok: true, action: "accept", edge_id: "edge-1" });
   });
 
   it("auto-loads a switched group and ignores the previous group's late response", async () => {
@@ -120,5 +126,127 @@ describe("useRelationshipGraphController verified group loading", () => {
     });
     expect(result.current.graph).toEqual(groupBGraph);
     expect(result.current.loading).toBe(false);
+  });
+
+  it("reviews the selected edge and reloads the graph", async () => {
+    const edge = {
+      id: "edge-1",
+      from: "person:a",
+      to: "person:b",
+      type: "replied_to",
+      acceptance_status: "needs_review",
+    };
+    const graph = {
+      scope: { session_id: "group-a@chatroom" },
+      nodes: [
+        { id: "person:a", type: "person", label: "甲" },
+        { id: "person:b", type: "person", label: "乙" },
+      ],
+      edges: [edge],
+    };
+    apiMocks.getGroupGraph.mockResolvedValue(graph);
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph).toEqual(graph));
+
+    act(() => {
+      result.current.setSelection({ kind: "edge", item: edge });
+    });
+    await act(async () => {
+      await result.current.reviewEdge("accept");
+    });
+
+    expect(apiMocks.reviewGroupGraphEdge).toHaveBeenCalledWith(
+      expect.anything(),
+      "edge-1",
+      expect.objectContaining({
+        tenant_id: "default",
+        channel: "wechat",
+        source_key: "wxbot",
+        session_id: "group-a@chatroom",
+        action: "accept",
+      }),
+      expect.objectContaining({ idempotencyKey: expect.any(String) }),
+    );
+    expect(apiMocks.getGroupGraph.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("keeps the selected edge after a graph reload and can review a queued edge", async () => {
+    const edge = {
+      id: "edge-1",
+      from: "person:a",
+      to: "person:b",
+      type: "replied_to",
+      acceptance_status: "needs_review",
+    };
+    const nextEdge = { ...edge, evidence_count: 4 };
+    const graph = {
+      scope: { session_id: "group-a@chatroom" },
+      nodes: [
+        { id: "person:a", type: "person", label: "甲" },
+        { id: "person:b", type: "person", label: "乙" },
+      ],
+      edges: [edge],
+    };
+    apiMocks.getGroupGraph.mockResolvedValue(graph);
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph).toEqual(graph));
+
+    act(() => {
+      result.current.setSelection({ kind: "edge", item: edge });
+    });
+
+    apiMocks.getGroupGraph.mockResolvedValue({ ...graph, edges: [nextEdge] });
+    await act(async () => {
+      await result.current.loadGraph();
+    });
+    expect(result.current.selectedEdge).toEqual(nextEdge);
+
+    await act(async () => {
+      await result.current.reviewEdge("expire", nextEdge);
+    });
+    expect(apiMocks.reviewGroupGraphEdge).toHaveBeenCalledWith(
+      expect.anything(),
+      "edge-1",
+      expect.objectContaining({ action: "expire" }),
+      expect.objectContaining({ idempotencyKey: expect.any(String) }),
+    );
+  });
+
+  it("loads pending review and recent range filters", async () => {
+    apiMocks.getGroupGraph.mockResolvedValue({
+      scope: { session_id: "group-a@chatroom" },
+      nodes: [],
+      edges: [],
+    });
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph).not.toBeNull());
+
+    await act(async () => {
+      await result.current.showPendingReview();
+    });
+    expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ acceptance_status: "needs_review,candidate" }),
+    );
+
+    await act(async () => {
+      await result.current.applyGraphRangeDays(14);
+    });
+    expect(result.current.graphRangeDays).toBe(14);
+    expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ from: expect.any(String) }),
+    );
+
+    await act(async () => {
+      await result.current.applyPlaybackDate("2026-08-20");
+    });
+    expect(result.current.playbackDate).toBe("2026-08-20");
+    expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ from: "2026-08-20", to: "2026-08-21" }),
+    );
   });
 });
