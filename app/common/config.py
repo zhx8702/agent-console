@@ -253,9 +253,9 @@ class Settings(BaseSettings):
         le=600.0,
     )
     openai_responses_stream_max_duration_seconds: float = Field(
-        default=3600.0,
+        default=300.0,
         ge=60.0,
-        le=7200.0,
+        le=300.0,
     )
     openai_web_search_enabled: bool = False
     openai_web_search_tool: str = "web_search"
