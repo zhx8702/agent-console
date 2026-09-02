@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import {
   AuthenticatedImage,
+  mediaStableKey,
   sdkImageDisplayPath,
   sdkImageProxyPath,
 } from "../components/AuthenticatedImage";
@@ -167,6 +168,10 @@ function queueImage(
     previewUrl: previewUrl || thumbnailUrl,
     thumbnailUrl: thumbnailUrl || previewUrl,
   };
+}
+
+function queueImageKey(image: QueueImage) {
+  return `${image.label}:${mediaStableKey(image.previewUrl)}:${mediaStableKey(image.thumbnailUrl)}`;
 }
 
 function quoteRecords(payload: Record<string, unknown>) {
@@ -370,7 +375,7 @@ function extractQueueImages(payload: Record<string, unknown>) {
   const deduped: QueueImage[] = [];
   const seen = new Set<string>();
   for (const image of images) {
-    const key = `${image.label}:${image.previewUrl}:${image.thumbnailUrl}`;
+    const key = queueImageKey(image);
     if ((!image.previewUrl && !image.thumbnailUrl) || seen.has(key)) {
       continue;
     }
@@ -880,7 +885,7 @@ export function MessageQueuesPage() {
                     {!!images.length && (
                       <span className="queue-message-card-media" aria-label={`${images.length} 张关联图片`}>
                         {images.slice(0, 2).map((image) => (
-                          <span className="queue-image-thumb-wrap" key={`${image.label}:${image.previewUrl}:${image.thumbnailUrl}`}>
+                          <span className="queue-image-thumb-wrap" key={queueImageKey(image)}>
                             <AuthenticatedImage
                               className="queue-image-thumb"
                               source={image.thumbnailUrl || image.previewUrl}
@@ -937,7 +942,7 @@ export function MessageQueuesPage() {
                 {!!selectedDirectImages.length && (
                   <div className="queue-image-preview-wrap">
                     {selectedDirectImages.map((image) => (
-                      <div className="queue-image-preview-item" key={`${image.label}:${image.previewUrl}`}>
+                      <div className="queue-image-preview-item" key={queueImageKey(image)}>
                         <div className="queue-image-preview-title">消息图片</div>
                         <AuthenticatedImage
                           className="queue-image-preview"
@@ -969,7 +974,7 @@ export function MessageQueuesPage() {
                       <p className="muted-copy mono">原消息标识 {selectedQuote.messageId}</p>
                     )}
                     {selectedQuoteImages.map((image) => (
-                      <div className="queue-image-preview-item" key={`${image.label}:${image.previewUrl}`}>
+                      <div className="queue-image-preview-item" key={queueImageKey(image)}>
                         <div className="queue-image-preview-title">引用原图</div>
                         <AuthenticatedImage
                           className="queue-image-preview"
