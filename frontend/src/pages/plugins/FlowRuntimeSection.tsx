@@ -663,19 +663,16 @@ export function FlowRuntimeSection({
             <p className="section-kicker">消息流运行状态</p>
             <h3>Flow / Effect 运行视图</h3>
           </div>
-          <div className="action-row">
-            <button
-              className="button button-secondary"
-              type="button"
-              onClick={(event) => {
-                event.preventDefault();
-                void loadFlowRuntimeStatus();
-              }}
-            >
-              {flowLoading ? "刷新中..." : "刷新 Runtime"}
-            </button>
-          </div>
         </summary>
+        <div className="action-row">
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => void loadFlowRuntimeStatus()}
+          >
+            {flowLoading ? "刷新中..." : "刷新 Runtime"}
+          </button>
+        </div>
         {flowError && <p className="muted-copy">{flowError}</p>}
         <div className="flow-runtime-board">
           <div className="flow-runtime-command-center">
