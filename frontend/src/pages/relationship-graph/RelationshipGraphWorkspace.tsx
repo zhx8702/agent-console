@@ -51,6 +51,12 @@ export function RelationshipGraphWorkspace() {
         }
       />
 
+      {(controller.graphError || controller.reviewError) && (
+        <p className="admin-notice admin-notice-danger" role="alert">
+          {controller.reviewError || controller.graphError}
+        </p>
+      )}
+
       <RelationshipActionPanel {...controller} />
 
       <div className="relationship-workbench">

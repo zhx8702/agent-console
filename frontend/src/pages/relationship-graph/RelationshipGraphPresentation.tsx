@@ -62,6 +62,8 @@ export type RelationshipGraphPresentationProps = Pick<
   | "applyPlaybackDate"
   | "playbackDates"
   | "pendingEdges"
+  | "pendingReviewError"
+  | "pendingReviewLoading"
   | "reviewing"
   | "reviewEdge"
 >;
@@ -181,6 +183,8 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
     applyPlaybackDate,
     playbackDates,
     pendingEdges,
+    pendingReviewError,
+    pendingReviewLoading,
     reviewing,
     reviewEdge,
   } = controller;
@@ -408,6 +412,11 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               <span className="relationship-queue-count">{pendingEdges.length}</span>
             </div>
             <div className="relationship-list">
+              {pendingReviewError && (
+                <p className="admin-notice admin-notice-danger" role="alert">
+                  {pendingReviewError}
+                </p>
+              )}
               {pendingEdges.map((edge) => (
                 <div
                   key={edge.id}
@@ -459,8 +468,8 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                   </div>
                 </div>
               ))}
-              {!pendingEdges.length && (
-                <p className="muted-copy">{loading ? "正在加载待审核关系..." : "当前时间范围内没有待审核关系。"}</p>
+              {!pendingReviewError && !pendingEdges.length && (
+                <p className="muted-copy">{pendingReviewLoading ? "正在加载待审核关系..." : "当前时间范围内没有待审核关系。"}</p>
               )}
             </div>
           </section>

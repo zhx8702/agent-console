@@ -892,8 +892,14 @@ export type GroupGraphEdgeReviewResponse = {
   [key: string]: unknown;
 };
 
-export async function getGroupGraph(config: ConsoleConfig, query: GroupGraphQuery) {
-  return apiRequest<GroupGraphResponse>(config, "/plugins/memory/group-graph", { query });
+export async function getGroupGraph(
+  config: ConsoleConfig,
+  query: GroupGraphQuery,
+) {
+  return apiRequest<GroupGraphResponse>(config, "/plugins/memory/group-graph", {
+    auth: true,
+    query,
+  });
 }
 
 export async function getGroupGraphEdgeEvidence(
@@ -904,12 +910,15 @@ export async function getGroupGraphEdgeEvidence(
   return apiRequest<GroupGraphEdgeEvidenceResponse>(
     config,
     `/plugins/memory/group-graph/evidence/${encodeURIComponent(edgeId)}`,
-    { query },
+    { auth: true, query },
   );
 }
 
 export async function getGroupGraphHistoryDates(config: ConsoleConfig, query: GroupGraphHistoryDatesQuery) {
-  return apiRequest<GroupGraphHistoryDatesResponse>(config, "/plugins/memory/group-graph/history-dates", { query });
+  return apiRequest<GroupGraphHistoryDatesResponse>(config, "/plugins/memory/group-graph/history-dates", {
+    auth: true,
+    query,
+  });
 }
 
 export async function getMemoryExtractionJobStats(config: ConsoleConfig, query: MemoryExtractionJobStatsQuery) {
@@ -963,7 +972,6 @@ export async function reviewGroupGraphEdge(
   config: ConsoleConfig,
   edgeId: string,
   body: GroupGraphEdgeReviewRequest,
-  options?: { idempotencyKey?: string },
 ) {
   return apiRequest<GroupGraphEdgeReviewResponse>(
     config,
@@ -974,7 +982,6 @@ export async function reviewGroupGraphEdge(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(options?.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
         },
         body: JSON.stringify(body),
       },

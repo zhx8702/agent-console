@@ -17,6 +17,7 @@ import {
   type GroupGraphEdgeReviewAction,
   type GroupGraphEdgeEvidenceResponse,
   type GroupGraphHistoryDateRow,
+  type GroupGraphNode,
   type GroupGraphResponse,
   type GroupGraphWindowStatsResponse,
   type MemoryBackfillResponse,
@@ -103,6 +104,9 @@ export function useRelationshipGraphController() {
   const [syncing, setSyncing] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [reviewing, setReviewing] = useState(false);
+  const [graphError, setGraphError] = useState("");
+  const [pendingReviewError, setPendingReviewError] = useState("");
+  const [reviewError, setReviewError] = useState("");
   const [evidence, setEvidence] = useState<GroupGraphEdgeEvidenceResponse | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceStatus, setEvidenceStatus] = useState("选择一条关系后会自动加载证据来源。");
@@ -114,6 +118,8 @@ export function useRelationshipGraphController() {
   const [windowStats, setWindowStats] = useState<GroupGraphWindowStatsResponse | null>(null);
   const [windowStatsStatus, setWindowStatsStatus] = useState("选择已验证群聊后可查看窗口关系统计。");
   const [pendingEdges, setPendingEdges] = useState<GroupGraphEdge[]>([]);
+  const [pendingNodes, setPendingNodes] = useState<GroupGraphNode[]>([]);
+  const [pendingReviewLoading, setPendingReviewLoading] = useState(false);
   const selectedNode = selection?.kind === "node" ? selection.item : null;
   const selectedEdge = selection?.kind === "edge" ? selection.item : null;
   const selectionRef = useRef(selection);
@@ -146,7 +152,7 @@ export function useRelationshipGraphController() {
     edgeTypeOptions,
     nodes,
     edges,
-    nodesById,
+    nodesById: graphNodesById,
     modeFilteredNodes,
     graphNodes,
     graphEdges,
@@ -177,8 +183,16 @@ export function useRelationshipGraphController() {
     estimatedExtractionClicks,
     historyNextStep,
     neighborNodeIds,
-    graphStateMessage,
+    graphStateMessage: projectedGraphStateMessage,
   } = projection;
+  const nodesById = useMemo(() => {
+    const merged = new Map(pendingNodes.map((node) => [node.id, node]));
+    for (const [nodeId, node] of graphNodesById) {
+      merged.set(nodeId, node);
+    }
+    return merged;
+  }, [graphNodesById, pendingNodes]);
+  const graphStateMessage = graphError || projectedGraphStateMessage;
   const pendingReviewCount = pendingEdges.length
     || Number(windowStatsAcceptance.needs_review || 0)
     + Number(windowStatsAcceptance.candidate || 0);
@@ -281,14 +295,16 @@ export function useRelationshipGraphController() {
     graphRequestIdRef.current = requestId;
     const requestScopeKey = currentGraphScopeKey;
     const queryEdgeType = overrides.edgeType ?? edgeType;
+    const queryAcceptanceStatus = overrides.acceptanceStatus ?? acceptanceStatus;
     setLoading(true);
+    setGraphError("");
     try {
       const result = await getGroupGraph(config, {
         tenant_id: config.tenantId,
         channel,
         source_key: sourceKey,
         session_id: selectedGroupId,
-        acceptance_status: overrides.acceptanceStatus ?? acceptanceStatus,
+        acceptance_status: queryAcceptanceStatus,
         node_type: overrides.nodeType ?? nodeType,
         edge_type: queryEdgeType,
         relation_type: queryEdgeType,
@@ -300,6 +316,7 @@ export function useRelationshipGraphController() {
       if (graphRequestIdRef.current !== requestId || activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setLoadedGraph(result);
       setLoadedGraphScopeKey(requestScopeKey);
+      setGraphError("");
       const nextSelection = restoreGraphSelection(selectionRef.current, result);
       setSelection(nextSelection);
       if (!nextSelection) {
@@ -325,8 +342,11 @@ export function useRelationshipGraphController() {
       setSelection(null);
       setEvidence(null);
       setEvidenceStatus("关系图加载失败，暂无证据来源。");
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "group graph request failed";
+      setGraphError(`关系图加载失败：${message}`);
       setOutput(formatJson({
-        error: err instanceof ApiError || err instanceof Error ? err.message : "group graph request failed",
+        status: "failed",
+        error: message,
       }));
     } finally {
       if (graphRequestIdRef.current === requestId && activeGraphScopeKeyRef.current === requestScopeKey) {
@@ -410,9 +430,14 @@ export function useRelationshipGraphController() {
     const tenantId = config.tenantId.trim();
     if (!tenantId || !selectedGroupIsVerified) {
       setPendingEdges([]);
+      setPendingNodes([]);
+      setPendingReviewError("");
+      setPendingReviewLoading(false);
       return;
     }
     const requestScopeKey = currentGraphScopeKey;
+    setPendingReviewLoading(true);
+    setPendingReviewError("");
     try {
       const result = await getGroupGraph(config, {
         tenant_id: tenantId,
@@ -426,9 +451,21 @@ export function useRelationshipGraphController() {
       });
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setPendingEdges(result.edges || []);
-    } catch {
+      setPendingNodes(result.nodes || []);
+      setPendingReviewError("");
+    } catch (err) {
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setPendingEdges([]);
+      setPendingNodes([]);
+      setPendingReviewError(
+        `待审核关系加载失败：${
+          err instanceof ApiError || err instanceof Error ? err.message : "pending review request failed"
+        }`,
+      );
+    } finally {
+      if (activeGraphScopeKeyRef.current === requestScopeKey) {
+        setPendingReviewLoading(false);
+      }
     }
   }, [channel, config, currentGraphScopeKey, fromDate, selectedGroupId, selectedGroupIsVerified, sourceKey, toDate]);
 
@@ -563,6 +600,7 @@ export function useRelationshipGraphController() {
     const target = edge ?? selectedEdge;
     if (!target) {
       const error = new Error("请先选择一条关系");
+      setReviewError(error.message);
       setOutput(formatJson({
         status: "validation_failed",
         message: error.message,
@@ -574,8 +612,8 @@ export function useRelationshipGraphController() {
     selectionRef.current = nextSelection;
     setSelection(nextSelection);
     setReviewing(true);
+    setReviewError("");
     try {
-      const intent = `relationship:review:${tenantId}:${sessionId}:${target.id}:${action}:${extras?.supersedes_item_id || ""}`;
       const result = await reviewGroupGraphEdge(
         config,
         target.id,
@@ -588,7 +626,6 @@ export function useRelationshipGraphController() {
           ...(extras?.supersedes_item_id ? { supersedes_item_id: extras.supersedes_item_id } : {}),
           ...(extras?.superseded_by_item_id ? { superseded_by_item_id: extras.superseded_by_item_id } : {}),
         },
-        { idempotencyKey: keyFor(intent) },
       );
       await loadGraphAndStatus();
       setOutput(formatJson({
@@ -603,12 +640,14 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出不包含原始聊天文本。",
       }));
-      clear(intent);
+      setReviewError("");
     } catch (err) {
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "edge review failed";
+      setReviewError(`关系审核失败：${message}`);
       setOutput(formatJson({
         status: "failed",
         message: "关系审核失败：请确认登录会话/权限，以及当前选中的关系仍存在。",
-        error: err instanceof ApiError || err instanceof Error ? err.message : "edge review failed",
+        error: message,
       }));
       throw err;
     } finally {
@@ -742,7 +781,6 @@ export function useRelationshipGraphController() {
         continuous: extractionContinuous,
         time_budget_seconds: extractionTimeBudgetSeconds,
       };
-      const intent = `relationship:daily:${tenantId}:${sessionId}:${targetDate}:${extractionBatchSize}:${extractionMaxJobCount}:${extractionContinuous}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphDailyExtraction>>>(
         config,
         "/plugins/memory/group-graph/extract-daily",
@@ -750,10 +788,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -790,7 +825,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出仅保留状态和计数，不显示原始聊天内容。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -855,7 +889,6 @@ export function useRelationshipGraphController() {
         dry_run: windowExtractionDryRun,
         include_llm: true,
       };
-      const intent = `relationship:window:${tenantId}:${sessionId}:${targetDate}:${windowExtractionSizeValue}:${windowExtractionMaxWindowsValue}:${windowExtractionCursor}:${windowExtractionDryRun}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowExtraction>>>(
         config,
         "/plugins/memory/group-graph/extract-window",
@@ -863,10 +896,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -899,7 +929,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出不包含原始聊天文本。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -966,7 +995,6 @@ export function useRelationshipGraphController() {
         time_budget_seconds: extractionTimeBudgetSeconds,
         include_llm: true,
       };
-      const intent = `relationship:catchup:${tenantId}:${sessionId}:${targetDate}:${windowExtractionSizeValue}:${windowCatchupMaxWindowsValue}:${windowExtractionCursor}:${windowExtractionDryRun}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowCatchup>>>(
         config,
         "/plugins/memory/group-graph/extract-window-catchup",
@@ -974,10 +1002,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -996,8 +1021,13 @@ export function useRelationshipGraphController() {
         });
         setWindowStats(refreshedWindowStats);
         setWindowStatsStatus("窗口关系统计已加载；仅显示计数。");
-      } catch {
+      } catch (err) {
         refreshedWindowStats = null;
+        setWindowStatsStatus(
+          `窗口关系统计刷新失败：${
+            err instanceof ApiError || err instanceof Error ? err.message : "window stats request failed"
+          }`,
+        );
       }
       await loadGraphAndStatus();
       setSyncOutput(formatJson({
@@ -1022,7 +1052,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出不包含原始聊天文本。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -1092,7 +1121,6 @@ export function useRelationshipGraphController() {
 
       const catchups: Array<Record<string, unknown>> = [];
       for (const date of dates) {
-        const intent = `relationship:recent-catchup:${tenantId}:${sessionId}:${date}:${windowExtractionSizeValue}:${windowCatchupMaxWindowsValue}`;
         try {
           const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowCatchup>>>(
             config,
@@ -1101,10 +1129,7 @@ export function useRelationshipGraphController() {
               auth: true,
               init: {
                 method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Idempotency-Key": keyFor(intent),
-                },
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   tenant_id: tenantId,
                   channel: normalizedChannel,
@@ -1129,7 +1154,6 @@ export function useRelationshipGraphController() {
             more_remain: result.more_remain,
             stop_reason: result.stop_reason,
           });
-          clear(intent);
         } catch (err) {
           catchups.push({
             date,
@@ -1191,6 +1215,11 @@ export function useRelationshipGraphController() {
     setSelection(null);
     setEvidence(null);
     setPendingEdges([]);
+    setPendingNodes([]);
+    setGraphError("");
+    setPendingReviewError("");
+    setReviewError("");
+    setPendingReviewLoading(false);
     setPlaybackDate("");
     setGovernanceStatus(null);
     setDateRows([]);
@@ -1273,6 +1302,9 @@ export function useRelationshipGraphController() {
     syncing,
     extracting,
     reviewing,
+    graphError,
+    pendingReviewError,
+    reviewError,
     evidence,
     evidenceLoading,
     evidenceStatus,
@@ -1317,6 +1349,7 @@ export function useRelationshipGraphController() {
     windowStatsAcceptance,
     pendingReviewCount,
     pendingEdges,
+    pendingReviewLoading,
     governanceStatus,
     governanceStatusText,
     neighborNodeIds,

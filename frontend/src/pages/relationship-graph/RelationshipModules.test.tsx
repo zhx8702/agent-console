@@ -144,11 +144,13 @@ describe("relationship graph modules", () => {
       applyPlaybackDate: vi.fn(),
       playbackDates: ["2026-08-25", "2026-08-26", "2026-08-27"],
       pendingEdges: [pendingEdge],
+      pendingReviewError: "",
+      pendingReviewLoading: false,
       reviewing: false,
       reviewEdge,
     } satisfies RelationshipGraphPresentationProps;
 
-    render(<RelationshipGraphPresentation {...controller} />);
+    const { rerender } = render(<RelationshipGraphPresentation {...controller} />);
     const nodeList = screen.getByRole("region", { name: "节点列表" });
     const edgeList = screen.getByRole("region", { name: "关系列表" });
     const queue = screen.getByRole("region", { name: "待审核队列" });
@@ -177,6 +179,15 @@ describe("relationship graph modules", () => {
     const dialog = screen.getByRole("dialog", { name: "确认接受该关系" });
     await user.click(within(dialog).getByRole("button", { name: "确认接受" }));
     expect(reviewEdge).toHaveBeenCalledWith("accept", pendingEdge);
+
+    rerender(
+      <RelationshipGraphPresentation
+        {...controller}
+        pendingEdges={[]}
+        pendingReviewError="待审核关系加载失败：401 admin session required"
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("待审核关系加载失败");
   });
 
   it("confirms edge acceptance, expiry and return-to-review from the detail panel", async () => {
