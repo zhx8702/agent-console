@@ -21,6 +21,7 @@ vi.mock("../components/AuthenticatedImage", () => ({
     alt: string;
     className: string;
   }) => <img src={source} alt={alt} className={className} data-media-source={source} />,
+  mediaStableKey: (source: string) => source,
   sdkImageProxyPath: (source: string) =>
     source.startsWith("media:") ? `/plugins/wxbot/admin/images/${source.slice(6)}` : "",
   sdkImageDisplayPath: (source: string) =>
