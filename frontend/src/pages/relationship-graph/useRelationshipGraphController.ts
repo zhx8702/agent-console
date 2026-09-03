@@ -9,12 +9,15 @@ import {
   getGroupGraphHistoryDates,
   getGroupGraphWindowStats,
   getMemoryExtractionJobStats,
+  reviewGroupGraphEdge,
   runGroupGraphDailyExtraction,
   runGroupGraphWindowCatchup,
   runGroupGraphWindowExtraction,
   type GroupGraphEdge,
+  type GroupGraphEdgeReviewAction,
   type GroupGraphEdgeEvidenceResponse,
   type GroupGraphHistoryDateRow,
+  type GroupGraphNode,
   type GroupGraphResponse,
   type GroupGraphWindowStatsResponse,
   type MemoryBackfillResponse,
@@ -24,11 +27,19 @@ import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { requireSelectedGroup, useConsoleConfig } from "../../state/console-config";
 
 import {
+  GRAPH_OVERVIEW_DAYS,
   HISTORY_RECENT_DAYS,
+  PENDING_REVIEW_STATUS,
   type Selection,
   type GraphViewMode,
   sanitizeEdgeEvidence,
+  localDateAdd,
+  localDateDaysAgo,
+  localDateSeries,
   localDateValue,
+  playbackDateSeries,
+  restoreGraphSelection,
+  reviewActionMessage,
   safeBackfillDebug,
 } from "./graphModel";
 import { useRelationshipGraphProjection } from "./useRelationshipGraphProjection";
@@ -45,8 +56,19 @@ export function useRelationshipGraphController() {
   const [edgeType, setEdgeType] = useState("");
   const [minConfidence, setMinConfidence] = useState("");
   const [limit, setLimit] = useState("100");
-  const [fromDate, setFromDate] = useState("");
+  const [fromDate, setFromDate] = useState(() => localDateDaysAgo(GRAPH_OVERVIEW_DAYS - 1));
   const [toDate, setToDate] = useState("");
+  const [graphRangeDays, setGraphRangeDays] = useState(GRAPH_OVERVIEW_DAYS);
+  const [playbackDate, setPlaybackDate] = useState("");
+  const [governanceStatus, setGovernanceStatus] = useState<{
+    auto_cleanup_enabled?: boolean | null;
+    needs_review_retention_days?: number | null;
+    rejected_retention_days?: number | null;
+    auto_expire_days?: number | null;
+    expired_items?: number;
+    expiring_within_7_days?: number;
+  } | null>(null);
+  const [governanceStatusText, setGovernanceStatusText] = useState("选择已验证群聊后可查看治理保留策略。");
   const [nodeSearch, setNodeSearch] = useState("");
   const [edgeSearch, setEdgeSearch] = useState("");
   const [graphViewMode, setGraphViewMode] = useState<GraphViewMode>("readable");
@@ -81,6 +103,10 @@ export function useRelationshipGraphController() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [extracting, setExtracting] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [graphError, setGraphError] = useState("");
+  const [pendingReviewError, setPendingReviewError] = useState("");
+  const [reviewError, setReviewError] = useState("");
   const [evidence, setEvidence] = useState<GroupGraphEdgeEvidenceResponse | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceStatus, setEvidenceStatus] = useState("选择一条关系后会自动加载证据来源。");
@@ -91,8 +117,13 @@ export function useRelationshipGraphController() {
   const [jobStatsStatus, setJobStatsStatus] = useState("填写 tenant_id 和群聊ID后可查看 AI 抽取任务数量。");
   const [windowStats, setWindowStats] = useState<GroupGraphWindowStatsResponse | null>(null);
   const [windowStatsStatus, setWindowStatsStatus] = useState("选择已验证群聊后可查看窗口关系统计。");
+  const [pendingEdges, setPendingEdges] = useState<GroupGraphEdge[]>([]);
+  const [pendingNodes, setPendingNodes] = useState<GroupGraphNode[]>([]);
+  const [pendingReviewLoading, setPendingReviewLoading] = useState(false);
   const selectedNode = selection?.kind === "node" ? selection.item : null;
   const selectedEdge = selection?.kind === "edge" ? selection.item : null;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
 
   const projection = useRelationshipGraphProjection({
     config,
@@ -121,7 +152,7 @@ export function useRelationshipGraphController() {
     edgeTypeOptions,
     nodes,
     edges,
-    nodesById,
+    nodesById: graphNodesById,
     modeFilteredNodes,
     graphNodes,
     graphEdges,
@@ -152,8 +183,19 @@ export function useRelationshipGraphController() {
     estimatedExtractionClicks,
     historyNextStep,
     neighborNodeIds,
-    graphStateMessage,
+    graphStateMessage: projectedGraphStateMessage,
   } = projection;
+  const nodesById = useMemo(() => {
+    const merged = new Map(pendingNodes.map((node) => [node.id, node]));
+    for (const [nodeId, node] of graphNodesById) {
+      merged.set(nodeId, node);
+    }
+    return merged;
+  }, [graphNodesById, pendingNodes]);
+  const graphStateMessage = graphError || projectedGraphStateMessage;
+  const pendingReviewCount = pendingEdges.length
+    || Number(windowStatsAcceptance.needs_review || 0)
+    + Number(windowStatsAcceptance.candidate || 0);
 
   const scopeQuery = useMemo(() => {
     const tenantId = config.tenantId.trim();
@@ -253,14 +295,16 @@ export function useRelationshipGraphController() {
     graphRequestIdRef.current = requestId;
     const requestScopeKey = currentGraphScopeKey;
     const queryEdgeType = overrides.edgeType ?? edgeType;
+    const queryAcceptanceStatus = overrides.acceptanceStatus ?? acceptanceStatus;
     setLoading(true);
+    setGraphError("");
     try {
       const result = await getGroupGraph(config, {
         tenant_id: config.tenantId,
         channel,
         source_key: sourceKey,
         session_id: selectedGroupId,
-        acceptance_status: overrides.acceptanceStatus ?? acceptanceStatus,
+        acceptance_status: queryAcceptanceStatus,
         node_type: overrides.nodeType ?? nodeType,
         edge_type: queryEdgeType,
         relation_type: queryEdgeType,
@@ -272,9 +316,13 @@ export function useRelationshipGraphController() {
       if (graphRequestIdRef.current !== requestId || activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setLoadedGraph(result);
       setLoadedGraphScopeKey(requestScopeKey);
-      setSelection(null);
-      setEvidence(null);
-      setEvidenceStatus("选择一条关系后会自动加载证据来源。");
+      setGraphError("");
+      const nextSelection = restoreGraphSelection(selectionRef.current, result);
+      setSelection(nextSelection);
+      if (!nextSelection) {
+        setEvidence(null);
+        setEvidenceStatus("选择一条关系后会自动加载证据来源。");
+      }
       setOutput(formatJson({
         schema: result.schema,
         scope: result.scope,
@@ -294,8 +342,11 @@ export function useRelationshipGraphController() {
       setSelection(null);
       setEvidence(null);
       setEvidenceStatus("关系图加载失败，暂无证据来源。");
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "group graph request failed";
+      setGraphError(`关系图加载失败：${message}`);
       setOutput(formatJson({
-        error: err instanceof ApiError || err instanceof Error ? err.message : "group graph request failed",
+        status: "failed",
+        error: message,
       }));
     } finally {
       if (graphRequestIdRef.current === requestId && activeGraphScopeKeyRef.current === requestScopeKey) {
@@ -375,9 +426,103 @@ export function useRelationshipGraphController() {
     }
   }, [channel, config, currentGraphScopeKey, loadJobStats, selectedGroupId, selectedGroupIsVerified, sourceKey]);
 
+  const loadPendingEdges = useCallback(async (overrides: { fromDate?: string; toDate?: string } = {}) => {
+    const tenantId = config.tenantId.trim();
+    if (!tenantId || !selectedGroupIsVerified) {
+      setPendingEdges([]);
+      setPendingNodes([]);
+      setPendingReviewError("");
+      setPendingReviewLoading(false);
+      return;
+    }
+    const requestScopeKey = currentGraphScopeKey;
+    setPendingReviewLoading(true);
+    setPendingReviewError("");
+    try {
+      const result = await getGroupGraph(config, {
+        tenant_id: tenantId,
+        channel,
+        source_key: sourceKey,
+        session_id: selectedGroupId,
+        acceptance_status: PENDING_REVIEW_STATUS,
+        limit: "100",
+        from: (overrides.fromDate ?? fromDate) || undefined,
+        to: (overrides.toDate ?? toDate) || undefined,
+      });
+      if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
+      setPendingEdges(result.edges || []);
+      setPendingNodes(result.nodes || []);
+      setPendingReviewError("");
+    } catch (err) {
+      if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
+      setPendingEdges([]);
+      setPendingNodes([]);
+      setPendingReviewError(
+        `待审核关系加载失败：${
+          err instanceof ApiError || err instanceof Error ? err.message : "pending review request failed"
+        }`,
+      );
+    } finally {
+      if (activeGraphScopeKeyRef.current === requestScopeKey) {
+        setPendingReviewLoading(false);
+      }
+    }
+  }, [channel, config, currentGraphScopeKey, fromDate, selectedGroupId, selectedGroupIsVerified, sourceKey, toDate]);
+
+  const loadGovernanceStatus = useCallback(async () => {
+    const tenantId = config.tenantId.trim();
+    if (!tenantId || !selectedGroupIsVerified) {
+      setGovernanceStatus(null);
+      setGovernanceStatusText("无法加载治理摘要：缺少已验证群聊。");
+      return;
+    }
+    const requestScopeKey = currentGraphScopeKey;
+    try {
+      const result = await apiRequest<{
+        governance?: {
+          auto_cleanup_enabled?: boolean | null;
+          needs_review_retention_days?: number | null;
+          rejected_retention_days?: number | null;
+          auto_expire_days?: number | null;
+          expired_items?: number;
+          expiring_within_7_days?: number;
+        };
+      }>(config, "/plugins/memory/management-status", {
+        auth: true,
+        query: {
+          tenant_id: tenantId,
+          channel: channel.trim(),
+          source_key: sourceKey.trim(),
+          session_id: selectedGroupId,
+        },
+      });
+      if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
+      setGovernanceStatus(result.governance || null);
+      setGovernanceStatusText("治理摘要已加载；仅显示保留天数和到期计数。");
+    } catch (err) {
+      if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
+      setGovernanceStatus(null);
+      setGovernanceStatusText(
+        `治理摘要暂不可用：${err instanceof ApiError || err instanceof Error ? err.message : "status request failed"}`,
+      );
+    }
+  }, [channel, config, currentGraphScopeKey, selectedGroupId, selectedGroupIsVerified, sourceKey]);
+
   const loadGraphAndStatus = useCallback(async (graphOverrides?: Parameters<typeof loadGraph>[0]) => {
-    await Promise.all([loadGraph(graphOverrides), loadDateStatuses(), loadJobStats(), loadWindowStats()]);
-  }, [loadDateStatuses, loadGraph, loadJobStats, loadWindowStats]);
+    await Promise.all([
+      loadGraph(graphOverrides),
+      loadDateStatuses(),
+      loadJobStats(),
+      loadWindowStats(),
+      loadPendingEdges({
+        fromDate: graphOverrides?.fromDate,
+        toDate: graphOverrides?.toDate,
+      }),
+      loadGovernanceStatus(),
+    ]);
+  }, [loadDateStatuses, loadGovernanceStatus, loadGraph, loadJobStats, loadPendingEdges, loadWindowStats]);
+  const loadGraphAndStatusRef = useRef(loadGraphAndStatus);
+  loadGraphAndStatusRef.current = loadGraphAndStatus;
 
   const showAllGraph = useCallback(async () => {
     setGraphViewMode("all");
@@ -387,6 +532,8 @@ export function useRelationshipGraphController() {
     setMinConfidence("");
     setFromDate("");
     setToDate("");
+    setGraphRangeDays(0);
+    setPlaybackDate("");
     setNodeSearch("");
     setEdgeSearch("");
     setLimit("500");
@@ -400,6 +547,113 @@ export function useRelationshipGraphController() {
       limit: "500",
     });
   }, [loadGraphAndStatus]);
+
+  const showPendingReview = useCallback(async () => {
+    setGraphViewMode("all");
+    setAcceptanceStatus(PENDING_REVIEW_STATUS);
+    setNodeType("");
+    setEdgeType("");
+    setMinConfidence("");
+    await loadGraphAndStatus({
+      acceptanceStatus: PENDING_REVIEW_STATUS,
+      nodeType: "",
+      edgeType: "",
+      minConfidence: "",
+    });
+  }, [loadGraphAndStatus]);
+
+  const applyGraphRangeDays = useCallback(async (days: number) => {
+    setGraphRangeDays(days);
+    setPlaybackDate("");
+    const nextFrom = days > 0 ? localDateDaysAgo(days - 1) : "";
+    setFromDate(nextFrom);
+    setToDate("");
+    await loadGraphAndStatus({
+      fromDate: nextFrom,
+      toDate: "",
+    });
+  }, [loadGraphAndStatus]);
+
+  const applyPlaybackDate = useCallback(async (date: string) => {
+    setPlaybackDate(date);
+    if (!date) {
+      const nextFrom = graphRangeDays > 0 ? localDateDaysAgo(graphRangeDays - 1) : "";
+      setFromDate(nextFrom);
+      setToDate("");
+      await loadGraphAndStatus({ fromDate: nextFrom, toDate: "" });
+      return;
+    }
+    setTargetDate(date);
+    const nextTo = localDateAdd(date, 1);
+    setFromDate(date);
+    setToDate(nextTo);
+    await loadGraphAndStatus({ fromDate: date, toDate: nextTo });
+  }, [graphRangeDays, loadGraphAndStatus]);
+
+  const reviewEdge = async (
+    action: GroupGraphEdgeReviewAction,
+    edge?: GroupGraphEdge,
+    extras?: { supersedes_item_id?: number; superseded_by_item_id?: number },
+  ) => {
+    const tenantId = config.tenantId.trim();
+    const sessionId = requireSelectedGroup(config, verifiedGroupIds);
+    const target = edge ?? selectedEdge;
+    if (!target) {
+      const error = new Error("请先选择一条关系");
+      setReviewError(error.message);
+      setOutput(formatJson({
+        status: "validation_failed",
+        message: error.message,
+        no_api_request_sent: true,
+      }));
+      throw error;
+    }
+    const nextSelection = { kind: "edge" as const, item: target };
+    selectionRef.current = nextSelection;
+    setSelection(nextSelection);
+    setReviewing(true);
+    setReviewError("");
+    try {
+      const result = await reviewGroupGraphEdge(
+        config,
+        target.id,
+        {
+          tenant_id: tenantId,
+          channel: channel.trim(),
+          source_key: sourceKey.trim(),
+          session_id: sessionId,
+          action,
+          ...(extras?.supersedes_item_id ? { supersedes_item_id: extras.supersedes_item_id } : {}),
+          ...(extras?.superseded_by_item_id ? { superseded_by_item_id: extras.superseded_by_item_id } : {}),
+        },
+      );
+      await loadGraphAndStatus();
+      setOutput(formatJson({
+        status: "success",
+        message: reviewActionMessage(action),
+        action,
+        edge_id: target.id,
+        result: {
+          ok: result.ok,
+          action: result.action,
+          edge_id: result.edge_id,
+        },
+        note: "调试输出不包含原始聊天文本。",
+      }));
+      setReviewError("");
+    } catch (err) {
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "edge review failed";
+      setReviewError(`关系审核失败：${message}`);
+      setOutput(formatJson({
+        status: "failed",
+        message: "关系审核失败：请确认登录会话/权限，以及当前选中的关系仍存在。",
+        error: message,
+      }));
+      throw err;
+    } finally {
+      setReviewing(false);
+    }
+  };
 
   const runHistorySync = async () => {
     const tenantId = config.tenantId.trim();
@@ -527,7 +781,6 @@ export function useRelationshipGraphController() {
         continuous: extractionContinuous,
         time_budget_seconds: extractionTimeBudgetSeconds,
       };
-      const intent = `relationship:daily:${tenantId}:${sessionId}:${targetDate}:${extractionBatchSize}:${extractionMaxJobCount}:${extractionContinuous}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphDailyExtraction>>>(
         config,
         "/plugins/memory/group-graph/extract-daily",
@@ -535,10 +788,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -575,7 +825,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出仅保留状态和计数，不显示原始聊天内容。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -638,8 +887,8 @@ export function useRelationshipGraphController() {
         max_windows: windowExtractionMaxWindowsValue,
         cursor_event_id: windowExtractionCursor,
         dry_run: windowExtractionDryRun,
+        include_llm: true,
       };
-      const intent = `relationship:window:${tenantId}:${sessionId}:${targetDate}:${windowExtractionSizeValue}:${windowExtractionMaxWindowsValue}:${windowExtractionCursor}:${windowExtractionDryRun}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowExtraction>>>(
         config,
         "/plugins/memory/group-graph/extract-window",
@@ -647,10 +896,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -683,7 +929,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出不包含原始聊天文本。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -748,8 +993,8 @@ export function useRelationshipGraphController() {
         cursor_event_id: windowExtractionCursor,
         dry_run: windowExtractionDryRun,
         time_budget_seconds: extractionTimeBudgetSeconds,
+        include_llm: true,
       };
-      const intent = `relationship:catchup:${tenantId}:${sessionId}:${targetDate}:${windowExtractionSizeValue}:${windowCatchupMaxWindowsValue}:${windowExtractionCursor}:${windowExtractionDryRun}`;
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowCatchup>>>(
         config,
         "/plugins/memory/group-graph/extract-window-catchup",
@@ -757,10 +1002,7 @@ export function useRelationshipGraphController() {
           auth: true,
           init: {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Idempotency-Key": keyFor(intent),
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           },
         },
@@ -779,8 +1021,13 @@ export function useRelationshipGraphController() {
         });
         setWindowStats(refreshedWindowStats);
         setWindowStatsStatus("窗口关系统计已加载；仅显示计数。");
-      } catch {
+      } catch (err) {
         refreshedWindowStats = null;
+        setWindowStatsStatus(
+          `窗口关系统计刷新失败：${
+            err instanceof ApiError || err instanceof Error ? err.message : "window stats request failed"
+          }`,
+        );
       }
       await loadGraphAndStatus();
       setSyncOutput(formatJson({
@@ -805,7 +1052,6 @@ export function useRelationshipGraphController() {
         },
         note: "调试输出不包含原始聊天文本。",
       }));
-      clear(intent);
     } catch (err) {
       setSyncOutput(formatJson({
         status: "failed",
@@ -814,6 +1060,135 @@ export function useRelationshipGraphController() {
       }));
       throw err;
     } finally {
+      setExtracting(false);
+    }
+  };
+
+  const runRecentCoverage = async () => {
+    const tenantId = config.tenantId.trim();
+    const sessionId = requireSelectedGroup(config, verifiedGroupIds);
+    const normalizedChannel = channel.trim();
+    const normalizedSourceKey = sourceKey.trim();
+    const connectionId = "legacy-wechat-default";
+    const dates = localDateSeries(GRAPH_OVERVIEW_DAYS);
+    if (!tenantId) {
+      setSyncOutput(formatJson({
+        status: "validation_failed",
+        message: "校验失败：缺少 tenant_id，未发送近期覆盖请求。",
+        no_api_request_sent: true,
+      }));
+      return;
+    }
+
+    setSyncing(true);
+    setExtracting(true);
+    setSyncOutput(formatJson({
+      status: "submitting",
+      message: `正在同步并抽取最近 ${GRAPH_OVERVIEW_DAYS} 天；不展示聊天原文。`,
+      scope: {
+        tenant_id: tenantId,
+        channel: normalizedChannel,
+        source_key: normalizedSourceKey,
+        connection_id: connectionId,
+        user_scope: optionalUserScopeLabel,
+        session_id: sessionId,
+        days_limit: GRAPH_OVERVIEW_DAYS,
+        dates,
+      },
+    }));
+    try {
+      const backfillIntent = `relationship:recent-sync:${tenantId}:${connectionId}:${sessionId}:${GRAPH_OVERVIEW_DAYS}`;
+      const backfill = await apiRequest<MemoryBackfillResponse>(config, "/plugins/memory/backfill", {
+        auth: true,
+        init: {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": keyFor(backfillIntent),
+          },
+          body: JSON.stringify({
+            tenant_id: tenantId,
+            channel: normalizedChannel,
+            source_key: normalizedSourceKey,
+            connection_id: connectionId,
+            session_ids: [sessionId],
+            days_limit: GRAPH_OVERVIEW_DAYS,
+            enqueue_llm_jobs: true,
+          }),
+        },
+      });
+      clear(backfillIntent);
+
+      const catchups: Array<Record<string, unknown>> = [];
+      for (const date of dates) {
+        try {
+          const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowCatchup>>>(
+            config,
+            "/plugins/memory/group-graph/extract-window-catchup",
+            {
+              auth: true,
+              init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  tenant_id: tenantId,
+                  channel: normalizedChannel,
+                  source_key: normalizedSourceKey,
+                  session_id: sessionId,
+                  date,
+                  window_size: windowExtractionSizeValue,
+                  max_windows_per_run: windowCatchupMaxWindowsValue,
+                  cursor_event_id: 0,
+                  dry_run: false,
+                  time_budget_seconds: extractionTimeBudgetSeconds,
+                  include_llm: true,
+                }),
+              },
+            },
+          );
+          catchups.push({
+            date,
+            ok: result.ok,
+            status: result.status,
+            windows_processed: result.windows_processed ?? 0,
+            more_remain: result.more_remain,
+            stop_reason: result.stop_reason,
+          });
+        } catch (err) {
+          catchups.push({
+            date,
+            ok: false,
+            error: err instanceof ApiError || err instanceof Error ? err.message : "window catchup failed",
+          });
+        }
+      }
+
+      await loadGraphAndStatus({
+        fromDate: dates[0] || localDateDaysAgo(GRAPH_OVERVIEW_DAYS - 1),
+        toDate: "",
+      });
+      setGraphRangeDays(GRAPH_OVERVIEW_DAYS);
+      setFromDate(dates[0] || localDateDaysAgo(GRAPH_OVERVIEW_DAYS - 1));
+      setToDate("");
+      setSyncOutput(formatJson({
+        status: backfill.ok === false || catchups.some((item) => item.ok === false)
+          ? "completed_with_warning"
+          : "success",
+        message: "近期覆盖已完成：已同步最近几天历史并尽量追平窗口抽取；关系图已刷新。",
+        days_limit: GRAPH_OVERVIEW_DAYS,
+        debug: safeBackfillDebug(backfill),
+        catchups,
+        note: "调试输出不包含原始聊天文本。",
+      }));
+    } catch (err) {
+      setSyncOutput(formatJson({
+        status: "failed",
+        message: "近期同步抽取失败：请确认登录会话/权限和群聊范围。",
+        error: err instanceof ApiError || err instanceof Error ? err.message : "recent coverage failed",
+      }));
+      throw err;
+    } finally {
+      setSyncing(false);
       setExtracting(false);
     }
   };
@@ -828,8 +1203,8 @@ export function useRelationshipGraphController() {
   }, [loadEdgeEvidence, selectedEdge?.id, selection]);
 
   useEffect(() => {
-    void Promise.all([loadDateStatuses(), loadJobStats()]);
-  }, [loadDateStatuses, loadJobStats]);
+    void Promise.all([loadDateStatuses(), loadJobStats(), loadWindowStats()]);
+  }, [loadDateStatuses, loadJobStats, loadWindowStats]);
 
   useEffect(() => {
     if (autoLoadedGroupScopeKeyRef.current === autoLoadGroupScopeKey) return;
@@ -839,6 +1214,14 @@ export function useRelationshipGraphController() {
     setLoadedGraphScopeKey("");
     setSelection(null);
     setEvidence(null);
+    setPendingEdges([]);
+    setPendingNodes([]);
+    setGraphError("");
+    setPendingReviewError("");
+    setReviewError("");
+    setPendingReviewLoading(false);
+    setPlaybackDate("");
+    setGovernanceStatus(null);
     setDateRows([]);
     setJobStats(null);
     setWindowStats(null);
@@ -853,7 +1236,7 @@ export function useRelationshipGraphController() {
       message: "已切换到当前已验证群聊，正在自动加载关系图。",
       session_id: selectedGroupId,
     }));
-    void loadGraphRef.current();
+    void loadGraphAndStatusRef.current();
   }, [autoLoadGroupScopeKey, selectedGroupId, selectedGroupIsVerified]);
 
   return {
@@ -878,6 +1261,11 @@ export function useRelationshipGraphController() {
     setFromDate,
     toDate,
     setToDate,
+    graphRangeDays,
+    applyGraphRangeDays,
+    playbackDate,
+    applyPlaybackDate,
+    playbackDates: playbackDateSeries(graphRangeDays, fromDate),
     nodeSearch,
     setNodeSearch,
     edgeSearch,
@@ -913,6 +1301,10 @@ export function useRelationshipGraphController() {
     loading,
     syncing,
     extracting,
+    reviewing,
+    graphError,
+    pendingReviewError,
+    reviewError,
     evidence,
     evidenceLoading,
     evidenceStatus,
@@ -955,12 +1347,20 @@ export function useRelationshipGraphController() {
     historyNextStep,
     windowStatsTotals,
     windowStatsAcceptance,
+    pendingReviewCount,
+    pendingEdges,
+    pendingReviewLoading,
+    governanceStatus,
+    governanceStatusText,
     neighborNodeIds,
     graphStateMessage,
     loadGraph,
     loadEdgeEvidence,
     loadGraphAndStatus,
     showAllGraph,
+    showPendingReview,
+    reviewEdge,
+    runRecentCoverage,
     runHistorySync,
     runDailyExtraction,
     runWindowExtraction,

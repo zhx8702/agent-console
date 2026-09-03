@@ -482,6 +482,28 @@
   flex-wrap: wrap;
 }
 
+.relationship-playback {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-2-5);
+  flex-wrap: wrap;
+}
+
+.relationship-playback label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: min(100%, 360px);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.relationship-playback input[type="range"] {
+  flex: 1;
+}
+
 .relationship-view-tabs {
   display: inline-flex;
   gap: var(--space-1);
@@ -545,6 +567,48 @@
   grid-column: 1 / -1;
 }
 
+.relationship-queue-count {
+  min-width: 1.75rem;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 999px;
+  background: var(--color-orange-50);
+  color: var(--color-orange-700);
+  font-size: var(--font-size-xs);
+  font-weight: 800;
+  text-align: center;
+}
+
+.relationship-queue-item {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.relationship-queue-item.is-selected .relationship-list-item {
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+.relationship-queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.relationship-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 var(--space-2);
+}
+
+.relationship-review-note {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
 .relationship-canvas {
   width: 100%;
   aspect-ratio: 46 / 31;
@@ -556,6 +620,12 @@
     linear-gradient(180deg, rgba(167, 179, 169, 0.1) 1px, transparent 1px),
     var(--panel);
   background-size: 32px 32px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.relationship-canvas.is-panning {
+  cursor: grabbing;
 }
 
 .relationship-graph-summary {
@@ -592,11 +662,23 @@
 }
 
 .relationship-edge {
-  cursor: default;
+  cursor: pointer;
   transition: opacity 0.16s ease;
 }
 
+.relationship-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  stroke-linecap: round;
+}
+
+.relationship-edge.is-playback .relationship-edge-line {
+  stroke: var(--color-orange-600);
+}
+
 .relationship-edge-line {
+  fill: none;
   stroke: var(--color-ink-500);
   stroke-width: 1.5;
   stroke-linecap: round;
@@ -632,7 +714,7 @@
 }
 
 .relationship-node {
-  cursor: default;
+  cursor: pointer;
   transition: opacity 0.16s ease;
 }
 

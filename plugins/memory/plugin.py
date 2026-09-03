@@ -44,6 +44,7 @@ class MemoryPlugin(Plugin):
         self._ctx: PluginContext | None = None
         self._effect_handler_enabled = False
         self._governance_task: asyncio.Task[None] | None = None
+        self._group_graph_auto_extract_task: asyncio.Task[None] | None = None
 
     async def initialize(self, ctx: PluginContext) -> None:
         self._ctx = ctx
@@ -72,6 +73,7 @@ class MemoryPlugin(Plugin):
                 self._governance_loop(),
                 name="memory-governance-cleanup",
             )
+        self._ensure_group_graph_auto_extract_task()
 
     async def _scope_execution_allowed(
         self,
@@ -148,6 +150,10 @@ class MemoryPlugin(Plugin):
             self._governance_task.cancel()
             await asyncio.gather(self._governance_task, return_exceptions=True)
             self._governance_task = None
+        if self._group_graph_auto_extract_task is not None:
+            self._group_graph_auto_extract_task.cancel()
+            await asyncio.gather(self._group_graph_auto_extract_task, return_exceptions=True)
+            self._group_graph_auto_extract_task = None
         self._store = None
         self._ctx = None
         self._effect_handler_enabled = False
@@ -171,6 +177,81 @@ class MemoryPlugin(Plugin):
             interval = float(
                 getattr(self._ctx.settings, "memory_governance_interval_seconds", 86_400.0)
                 or 86_400.0
+            )
+            await asyncio.sleep(max(60.0, interval))
+
+    def _should_run_group_graph_auto_extract(self) -> bool:
+        if self._ctx is None:
+            return False
+        if not bool(getattr(self._ctx.settings, "memory_group_graph_auto_extract_enabled", True)):
+            return False
+        role = str(getattr(self._ctx.settings, "app_process_role", "api") or "api").strip().lower()
+        raw = str(
+            getattr(self._ctx.settings, "memory_group_graph_auto_extract_roles", "scheduler")
+            or "scheduler"
+        )
+        roles = {item.strip().lower() for item in raw.split(",") if item.strip()}
+        return role in roles
+
+    def _ensure_group_graph_auto_extract_task(self) -> None:
+        if not self._should_run_group_graph_auto_extract():
+            return
+        current = self._group_graph_auto_extract_task
+        if current is not None and not current.done():
+            return
+        self._group_graph_auto_extract_task = asyncio.create_task(
+            self._group_graph_auto_extract_loop(),
+            name="memory-group-graph-auto-extract",
+        )
+
+    async def _group_graph_auto_extract_loop(self) -> None:
+        while self._store is not None and self._ctx is not None:
+            try:
+                settings = self._ctx.settings
+                await self._store.run_group_graph_auto_extract_tick(
+                    lookback_days=int(
+                        getattr(settings, "memory_group_graph_auto_extract_lookback_days", 7) or 7
+                    ),
+                    max_sessions=int(
+                        getattr(settings, "memory_group_graph_auto_extract_max_sessions_per_tick", 10)
+                        or 10
+                    ),
+                    max_windows_per_session=int(
+                        getattr(settings, "memory_group_graph_auto_extract_max_windows_per_session", 20)
+                        or 20
+                    ),
+                    window_size=int(
+                        getattr(settings, "memory_group_graph_auto_extract_window_size", 50) or 50
+                    ),
+                    time_budget_seconds=int(
+                        getattr(settings, "memory_group_graph_auto_extract_time_budget_seconds", 180)
+                        or 180
+                    ),
+                    include_llm=bool(
+                        getattr(settings, "memory_group_graph_auto_extract_llm_enabled", True)
+                    ),
+                    sync_missing_history=bool(
+                        getattr(settings, "memory_group_graph_auto_extract_sync_enabled", True)
+                    ),
+                    sync_max_messages=int(
+                        getattr(settings, "memory_group_graph_auto_extract_sync_max_messages", 200)
+                        or 200
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "memory.group_graph_auto_extract_failed",
+                    error_type=exc.__class__.__name__,
+                )
+            interval = float(
+                getattr(
+                    self._ctx.settings,
+                    "memory_group_graph_auto_extract_interval_seconds",
+                    3_600.0,
+                )
+                or 3_600.0
             )
             await asyncio.sleep(max(60.0, interval))
 

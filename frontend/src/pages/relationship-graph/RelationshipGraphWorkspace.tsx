@@ -17,7 +17,7 @@ export function RelationshipGraphWorkspace() {
       <GroupScopeEmpty
         eyebrow="关系记忆可视化"
         title="群聊关系图"
-        description="以只读方式展示当前群的关系记忆，包括审核状态与证据引用，不展示聊天原文。"
+        description="展示当前群的关系记忆与审核状态，可接受或拒绝待审核关系，不展示聊天原文。"
       />
     );
   }
@@ -27,11 +27,14 @@ export function RelationshipGraphWorkspace() {
       <PageHeader
         eyebrow="关系记忆可视化"
         title="群聊关系图"
-        description="只读展示当前群的关系记忆与审核状态，不展示聊天原文。"
+        description="默认看最近 7 天已接受关系。可按日回放、点选画布、审核或替代关系；调度会补同步已知群并抽取。不展示聊天原文。"
         actions={
           <div className="action-row">
             <button className="button button-primary" type="button" onClick={() => void controller.loadGraph()} disabled={controller.loading}>
               {controller.loading ? "加载中" : "刷新关系图"}
+            </button>
+            <button className="button button-secondary" type="button" onClick={() => void controller.showPendingReview()} disabled={controller.loading || controller.reviewing}>
+              {controller.pendingReviewCount > 0 ? `查看待审核（${controller.pendingReviewCount}）` : "查看待审核"}
             </button>
             <button className="button button-secondary" type="button" onClick={() => void controller.showAllGraph()} disabled={controller.loading}>
               显示全部关系
@@ -47,6 +50,12 @@ export function RelationshipGraphWorkspace() {
           </div>
         }
       />
+
+      {(controller.graphError || controller.reviewError) && (
+        <p className="admin-notice admin-notice-danger" role="alert">
+          {controller.reviewError || controller.graphError}
+        </p>
+      )}
 
       <RelationshipActionPanel {...controller} />
 

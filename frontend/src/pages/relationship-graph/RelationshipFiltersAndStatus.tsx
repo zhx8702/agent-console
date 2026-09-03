@@ -62,6 +62,10 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
     windowStatsStatus,
     windowStatsTotals,
     windowStatsAcceptance,
+    applyPlaybackDate,
+    playbackDate,
+    governanceStatus,
+    governanceStatusText,
   } = controller;
 
   return (
@@ -192,8 +196,11 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
             <button
               key={row.date}
               type="button"
-              className={`relationship-date-row${row.date === targetDate ? " is-selected" : ""}`}
-              onClick={() => setTargetDate(row.date)}
+              className={`relationship-date-row${row.date === targetDate || row.date === playbackDate ? " is-selected" : ""}`}
+              onClick={() => {
+                setTargetDate(row.date);
+                void applyPlaybackDate(row.date);
+              }}
             >
               <strong>{row.date}</strong>
               <span className={dateStatusClass(row.status)}>{dateStatusLabel(row.status)}</span>
@@ -215,7 +222,11 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
         <StatusTile label="数据版本" value={graph?.schema?.version || "-"} />
         <StatusTile label="节点" value={`${modeFilteredNodes.length} / ${graph?.counts?.nodes ?? nodes.length}`} />
         <StatusTile label="关系" value={`${graphEdges.length} / ${graph?.counts?.edges ?? edges.length}`} />
+        <StatusTile label="待审保留" value={`${governanceStatus?.needs_review_retention_days ?? "-"} 天`} />
+        <StatusTile label="已到期记忆" value={`${governanceStatus?.expired_items ?? 0}`} />
+        <StatusTile label="7天内到期" value={`${governanceStatus?.expiring_within_7_days ?? 0}`} />
       </section>
+      <p className="muted-copy">{governanceStatusText} 自动清理默认保留待审 {governanceStatus?.needs_review_retention_days ?? 30} 天、拒绝 {governanceStatus?.rejected_retention_days ?? 7} 天、自动记忆 {governanceStatus?.auto_expire_days ?? 180} 天。</p>
 
       <details className="panel relationship-disclosure">
         <summary>

@@ -389,6 +389,17 @@ class Settings(BaseSettings):
     memory_graph_llm_extraction_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     memory_governance_auto_cleanup_enabled: bool = True
     memory_governance_interval_seconds: float = Field(default=86_400.0, gt=0)
+    memory_group_graph_auto_extract_enabled: bool = False
+    memory_group_graph_auto_extract_llm_enabled: bool = False
+    memory_group_graph_auto_extract_interval_seconds: float = Field(default=3_600.0, gt=0)
+    memory_group_graph_auto_extract_lookback_days: int = Field(default=7, ge=1, le=14)
+    memory_group_graph_auto_extract_max_sessions_per_tick: int = Field(default=10, ge=1, le=20)
+    memory_group_graph_auto_extract_max_windows_per_session: int = Field(default=20, ge=1, le=100)
+    memory_group_graph_auto_extract_window_size: int = Field(default=50, ge=10, le=100)
+    memory_group_graph_auto_extract_time_budget_seconds: int = Field(default=180, ge=5, le=180)
+    memory_group_graph_auto_extract_roles: str = "scheduler"
+    memory_group_graph_auto_extract_sync_enabled: bool = False
+    memory_group_graph_auto_extract_sync_max_messages: int = Field(default=200, ge=20, le=500)
     memory_needs_review_retention_days: int = Field(default=30, ge=1)
     memory_rejected_retention_days: int = Field(default=7, ge=1)
     memory_auto_expire_days: int = Field(default=180, ge=1)

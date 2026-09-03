@@ -507,6 +507,9 @@ export type GroupGraphEdge = {
   extraction_method?: string;
   review_state?: string;
   acceptance?: Record<string, unknown>;
+  acceptance_score?: number | null;
+  acceptance_reason?: string | null;
+  evidence_dates?: string[];
   history?: unknown[];
 };
 
@@ -763,6 +766,7 @@ export type GroupGraphWindowExtractionRequest = {
   max_windows?: number;
   cursor_event_id?: number;
   dry_run?: boolean;
+  include_llm?: boolean;
 };
 
 export type GroupGraphWindowCatchupRequest = {
@@ -777,6 +781,7 @@ export type GroupGraphWindowCatchupRequest = {
   cursor_event_id?: number;
   dry_run?: boolean;
   time_budget_seconds?: number;
+  include_llm?: boolean;
 };
 
 export type GroupGraphWindowExtractionResponse = {
@@ -866,8 +871,35 @@ export type GroupGraphWindowStatsResponse = {
   [key: string]: unknown;
 };
 
-export async function getGroupGraph(config: ConsoleConfig, query: GroupGraphQuery) {
-  return apiRequest<GroupGraphResponse>(config, "/plugins/memory/group-graph", { query });
+export type GroupGraphEdgeReviewAction = "accept" | "reject" | "needs_review" | "expire" | "supersede";
+
+export type GroupGraphEdgeReviewRequest = {
+  tenant_id: string;
+  channel?: string;
+  source_key?: string;
+  session_id?: string;
+  action: GroupGraphEdgeReviewAction;
+  review_reason?: string;
+  superseded_by_item_id?: number;
+  supersedes_item_id?: number;
+};
+
+export type GroupGraphEdgeReviewResponse = {
+  ok?: boolean;
+  edge_id?: string;
+  action?: string;
+  result?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export async function getGroupGraph(
+  config: ConsoleConfig,
+  query: GroupGraphQuery,
+) {
+  return apiRequest<GroupGraphResponse>(config, "/plugins/memory/group-graph", {
+    auth: true,
+    query,
+  });
 }
 
 export async function getGroupGraphEdgeEvidence(
@@ -878,12 +910,15 @@ export async function getGroupGraphEdgeEvidence(
   return apiRequest<GroupGraphEdgeEvidenceResponse>(
     config,
     `/plugins/memory/group-graph/evidence/${encodeURIComponent(edgeId)}`,
-    { query },
+    { auth: true, query },
   );
 }
 
 export async function getGroupGraphHistoryDates(config: ConsoleConfig, query: GroupGraphHistoryDatesQuery) {
-  return apiRequest<GroupGraphHistoryDatesResponse>(config, "/plugins/memory/group-graph/history-dates", { query });
+  return apiRequest<GroupGraphHistoryDatesResponse>(config, "/plugins/memory/group-graph/history-dates", {
+    auth: true,
+    query,
+  });
 }
 
 export async function getMemoryExtractionJobStats(config: ConsoleConfig, query: MemoryExtractionJobStatsQuery) {
@@ -931,6 +966,27 @@ export async function runGroupGraphWindowCatchup(config: ConsoleConfig, body: Gr
       body: JSON.stringify(body),
     },
   });
+}
+
+export async function reviewGroupGraphEdge(
+  config: ConsoleConfig,
+  edgeId: string,
+  body: GroupGraphEdgeReviewRequest,
+) {
+  return apiRequest<GroupGraphEdgeReviewResponse>(
+    config,
+    `/plugins/memory/group-graph/edges/${encodeURIComponent(edgeId)}/acceptance-review`,
+    {
+      auth: true,
+      init: {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    },
+  );
 }
 
 export async function backfillMemoryHistory(config: ConsoleConfig, body: MemoryBackfillRequest) {

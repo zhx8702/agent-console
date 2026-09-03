@@ -3,6 +3,7 @@ import type {
   GroupGraphEdgeEvidenceEntity,
   GroupGraphEdgeEvidenceResponse,
   GroupGraphNode,
+  GroupGraphResponse,
   MemoryBackfillResponse,
   MemoryExtractionJobStatsResponse,
   MemoryExtractionJobStatusCounts,
@@ -28,6 +29,7 @@ export const DEFAULT_EDGE_TYPES = [
   "tested",
 ];
 export const HISTORY_RECENT_DAYS = 14;
+export const GRAPH_OVERVIEW_DAYS = 7;
 export const GRAPH_CANVAS_WIDTH = 920;
 export const GRAPH_CANVAS_HEIGHT = 620;
 export const LOW_VALUE_EDGE_TYPES = new Set(["said", "says", "quoted", "mentions_raw", "raw_mention", "message"]);
@@ -146,6 +148,194 @@ export function formatTimestamp(value?: string | null) {
 
 export function acceptanceStatusLabel(value?: string | null) {
   return ACCEPTANCE_LABELS[String(value || "unknown").toLowerCase()] || "其他状态";
+}
+
+export function normalizedAcceptanceStatus(value?: string | null) {
+  return String(value || "").trim().toLowerCase();
+}
+
+export function edgeCanAccept(status?: string | null) {
+  const normalized = normalizedAcceptanceStatus(status);
+  return normalized !== "accepted" && normalized !== "superseded" && normalized !== "expired";
+}
+
+export function edgeCanReject(status?: string | null) {
+  const normalized = normalizedAcceptanceStatus(status);
+  return normalized !== "rejected" && normalized !== "superseded" && normalized !== "expired";
+}
+
+export function edgeCanExpire(status?: string | null) {
+  const normalized = normalizedAcceptanceStatus(status);
+  return normalized !== "expired" && normalized !== "superseded";
+}
+
+export function edgeCanReturnToReview(status?: string | null) {
+  const normalized = normalizedAcceptanceStatus(status);
+  return normalized === "accepted" || normalized === "rejected" || normalized === "candidate";
+}
+
+export const PENDING_REVIEW_STATUS = "needs_review,candidate";
+
+export const GRAPH_RANGE_PRESETS = [
+  { days: 7, label: "近7天" },
+  { days: 14, label: "近14天" },
+  { days: 30, label: "近30天" },
+  { days: 0, label: "全部时间" },
+] as const;
+
+export function localDateSeries(days: number, end = new Date()) {
+  return Array.from({ length: Math.max(1, days) }, (_, index) => localDateDaysAgo(days - 1 - index, end));
+}
+
+export function extractionMethodLabel(value?: string | null) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "来源未知";
+  if (normalized.includes("llm")) return "语义抽取";
+  if (normalized.includes("deterministic") || normalized.includes("rule") || normalized.includes("stat")) {
+    return "规则抽取";
+  }
+  return "混合抽取";
+}
+
+export function isPendingReviewStatus(status?: string | null) {
+  const normalized = normalizedAcceptanceStatus(status);
+  return normalized === "needs_review" || normalized === "candidate";
+}
+
+export function edgeStrokeWidth(edge: GroupGraphEdge) {
+  return Math.min(5, 1.15 + Number(edge.evidence_count || 0) * 0.32);
+}
+
+export function edgeRecencyOpacity(edge: GroupGraphEdge) {
+  if (!edge.last_seen) return 0.82;
+  const ageDays = (Date.now() - new Date(edge.last_seen).getTime()) / 86_400_000;
+  if (!Number.isFinite(ageDays) || ageDays <= 7) return 0.9;
+  if (ageDays <= 14) return 0.68;
+  if (ageDays <= 30) return 0.46;
+  return 0.28;
+}
+
+export function restoreGraphSelection(selection: Selection, graph: GroupGraphResponse): Selection {
+  if (!selection) return null;
+  if (selection.kind === "edge") {
+    const edge = (graph.edges || []).find((item) => item.id === selection.item.id);
+    return edge ? { kind: "edge", item: edge } : null;
+  }
+  const node = (graph.nodes || []).find((item) => item.id === selection.item.id);
+  return node ? { kind: "node", item: node } : null;
+}
+
+export function reviewActionMessage(action: string) {
+  if (action === "accept") return "已接受该关系。";
+  if (action === "reject") return "已拒绝该关系。";
+  if (action === "expire") return "已将该关系标记为过期。";
+  if (action === "needs_review") return "已将该关系退回待审核。";
+  if (action === "supersede") return "已用当前关系替代另一条关系。";
+  return "已更新该关系的审核状态。";
+}
+
+export function localDateAdd(value: string, days: number) {
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return value;
+  const date = new Date(year, month - 1, day);
+  date.setDate(date.getDate() + days);
+  return localDateValue(date);
+}
+
+export function edgeEvidenceDates(edge: GroupGraphEdge) {
+  const dates = (edge.evidence_dates || [])
+    .map((value) => String(value || "").slice(0, 10))
+    .filter(Boolean);
+  if (edge.first_seen) dates.push(String(edge.first_seen).slice(0, 10));
+  if (edge.last_seen) dates.push(String(edge.last_seen).slice(0, 10));
+  return Array.from(new Set(dates));
+}
+
+export function edgeSeenOnDate(edge: GroupGraphEdge, date?: string | null) {
+  if (!date) return false;
+  return edgeEvidenceDates(edge).includes(date);
+}
+
+export function playbackDateSeries(rangeDays: number, fromDate = "") {
+  if (rangeDays > 0) return localDateSeries(rangeDays);
+  if (fromDate) return [fromDate];
+  return localDateSeries(GRAPH_OVERVIEW_DAYS);
+}
+
+export function counterpartEdges(edge: GroupGraphEdge, pool: GroupGraphEdge[]) {
+  const source = displayEdgeSource(edge);
+  const target = displayEdgeTarget(edge);
+  return pool.filter((item) => {
+    if (!item.id || item.id === edge.id) return false;
+    const from = displayEdgeSource(item);
+    const to = displayEdgeTarget(item);
+    return (from === source && to === target) || (from === target && to === source);
+  });
+}
+
+export function firstMemoryItemId(edge?: GroupGraphEdge | null) {
+  const value = Number(edge?.memory_item_ids?.[0]);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function edgePairKey(edge: GroupGraphEdge) {
+  const source = displayEdgeSource(edge);
+  const target = displayEdgeTarget(edge);
+  return source < target ? `${source}::${target}` : `${target}::${source}`;
+}
+
+export function edgeBundleOffsets(edges: GroupGraphEdge[]) {
+  const groups = new Map<string, GroupGraphEdge[]>();
+  for (const edge of edges) {
+    const key = edgePairKey(edge);
+    const group = groups.get(key) || [];
+    group.push(edge);
+    groups.set(key, group);
+  }
+  const offsets = new Map<string, number>();
+  for (const group of groups.values()) {
+    group.forEach((edge, index) => {
+      offsets.set(edgeKey(edge), group.length === 1 ? 0 : index - (group.length - 1) / 2);
+    });
+  }
+  return offsets;
+}
+
+export function quadraticEdgePath(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  offset: number,
+) {
+  if (!offset) return `M ${from.x} ${from.y} L ${to.x} ${to.y}`;
+  const midX = (from.x + to.x) / 2;
+  const midY = (from.y + to.y) / 2;
+  const deltaX = to.x - from.x;
+  const deltaY = to.y - from.y;
+  const length = Math.hypot(deltaX, deltaY) || 1;
+  return `M ${from.x} ${from.y} Q ${midX + (-deltaY / length) * offset * 22} ${midY + (deltaX / length) * offset * 22} ${to.x} ${to.y}`;
+}
+
+export function evidenceQuality(evidence?: GroupGraphEdgeEvidenceResponse | null) {
+  const items = evidence?.memory_items || [];
+  const scores = items
+    .map((item) => Number(item.acceptance_score))
+    .filter((value) => Number.isFinite(value));
+  const reasons = items
+    .map((item) => String(item.acceptance_reason || "").trim())
+    .filter(Boolean);
+  const conflicts = items.flatMap((item) => (
+    Array.isArray(item.possible_conflicts) ? item.possible_conflicts : []
+  ));
+  return {
+    score: scores.length ? Math.max(...scores) : null,
+    reason: reasons[0] || "",
+    conflicts: conflicts.length,
+  };
+}
+
+export function formatAcceptanceScore(value?: number | null) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
+  return `${Math.round(Number(value) * 100)}%`;
 }
 
 export function nodeTypeLabel(value?: string | null) {
@@ -736,6 +926,12 @@ export function localDateValue(date = new Date()) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+export function localDateDaysAgo(days: number, date = new Date()) {
+  const value = new Date(date);
+  value.setDate(value.getDate() - Math.max(0, days));
+  return localDateValue(value);
 }
 
 export function dateStatusClass(status?: string) {

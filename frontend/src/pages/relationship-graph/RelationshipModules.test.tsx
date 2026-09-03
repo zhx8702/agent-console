@@ -4,10 +4,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { GroupGraphEdge, GroupGraphNode } from "../../lib/api";
 import {
+  RelationshipDetailPanel,
   RelationshipMutationActions,
   RelationshipUnavailableReset,
   type RelationshipMutationController,
 } from "./RelationshipDetailsAndDanger";
+import type { RelationshipGraphController } from "./useRelationshipGraphController";
 import {
   RelationshipGraphPresentation,
   type RelationshipGraphPresentationProps,
@@ -44,6 +46,7 @@ describe("relationship graph modules", () => {
       runWindowExtraction: vi.fn(),
       windowCatchupMaxWindowsValue: 20,
       runWindowCatchup: vi.fn(),
+      runRecentCoverage: vi.fn(),
       loadGraphAndStatus: vi.fn(),
       dateLoading: false,
       jobStatsLoading: false,
@@ -61,9 +64,11 @@ describe("relationship graph modules", () => {
     expect(runDailyExtraction).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the accessible lists as the sole graph selection controls", async () => {
+  it("lets the canvas and review queue select graph objects", async () => {
     const user = userEvent.setup();
     const setSelection = vi.fn();
+    const reviewEdge = vi.fn().mockResolvedValue(undefined);
+    const applyGraphRangeDays = vi.fn();
     const node: GroupGraphNode = {
       id: "person:member-a",
       type: "person",
@@ -91,6 +96,18 @@ describe("relationship graph modules", () => {
       acceptance_status: "accepted",
       confidence: 0.85,
       evidence_count: 2,
+      extraction_method: "deterministic",
+    };
+    const pendingEdge: GroupGraphEdge = {
+      id: "edge-pending",
+      from: node.id,
+      to: otherNode.id,
+      type: "replied_to",
+      label: "replied_to",
+      acceptance_status: "needs_review",
+      confidence: 0.61,
+      evidence_count: 4,
+      extraction_method: "llm_window",
     };
     const controller = {
       modeHiddenNodeCount: 0,
@@ -121,11 +138,22 @@ describe("relationship graph modules", () => {
       graphEdges: [edge],
       nodesById: new Map([[node.id, node], [otherNode.id, otherNode]]),
       modeFilteredNodes: [node, otherNode],
+      graphRangeDays: 7,
+      applyGraphRangeDays,
+      playbackDate: "",
+      applyPlaybackDate: vi.fn(),
+      playbackDates: ["2026-08-25", "2026-08-26", "2026-08-27"],
+      pendingEdges: [pendingEdge],
+      pendingReviewError: "",
+      pendingReviewLoading: false,
+      reviewing: false,
+      reviewEdge,
     } satisfies RelationshipGraphPresentationProps;
 
-    render(<RelationshipGraphPresentation {...controller} />);
+    const { rerender } = render(<RelationshipGraphPresentation {...controller} />);
     const nodeList = screen.getByRole("region", { name: "节点列表" });
     const edgeList = screen.getByRole("region", { name: "关系列表" });
+    const queue = screen.getByRole("region", { name: "待审核队列" });
     const nodeRow = within(nodeList).getByRole("button", { name: /成员甲/ });
     await user.click(nodeRow);
 
@@ -133,17 +161,99 @@ describe("relationship graph modules", () => {
     expect(nodeRow).toHaveAttribute("aria-pressed", "false");
     await user.click(within(edgeList).getByRole("button"));
     expect(setSelection).toHaveBeenLastCalledWith({ kind: "edge", item: edge });
-    expect(screen.getByText(/画布仅作视觉概览/)).toBeInTheDocument();
+    expect(screen.getByText(/可在画布上点选/)).toBeInTheDocument();
+    expect(within(queue).getByRole("button", { name: /成员甲 — 回复 — 项目甲/ })).toBeInTheDocument();
 
-    const canvas = document.querySelector("svg.relationship-canvas");
-    expect(canvas).toHaveAttribute("aria-hidden", "true");
-    expect(canvas).toHaveAttribute("focusable", "false");
-    expect(canvas).toHaveAttribute("pointer-events", "none");
-    expect(canvas?.querySelectorAll("[tabindex], [role='button']")).toHaveLength(0);
-    setSelection.mockClear();
-    fireEvent.click(canvas?.querySelector(".relationship-node") as SVGElement);
-    fireEvent.click(canvas?.querySelector(".relationship-edge") as SVGElement);
-    expect(setSelection).not.toHaveBeenCalled();
-    expect(screen.queryByRole("img", { name: "群聊关系图" })).not.toBeInTheDocument();
+    const canvas = screen.getByRole("img", { name: "群聊关系图" });
+    expect(canvas).not.toHaveAttribute("pointer-events", "none");
+    fireEvent.click(canvas.querySelector("[data-graph-item='node']") as SVGElement);
+    expect(setSelection).toHaveBeenCalledWith({ kind: "node", item: node });
+    fireEvent.click(canvas.querySelector("[data-graph-item='edge']") as SVGElement);
+    expect(setSelection).toHaveBeenCalledWith({ kind: "edge", item: edge });
+
+    await user.click(screen.getByRole("button", { name: "近14天" }));
+    expect(applyGraphRangeDays).toHaveBeenCalledWith(14);
+    expect(screen.getByRole("slider")).toBeInTheDocument();
+
+    await user.click(within(queue).getByRole("button", { name: "接受" }));
+    const dialog = screen.getByRole("dialog", { name: "确认接受该关系" });
+    await user.click(within(dialog).getByRole("button", { name: "确认接受" }));
+    expect(reviewEdge).toHaveBeenCalledWith("accept", pendingEdge);
+
+    rerender(
+      <RelationshipGraphPresentation
+        {...controller}
+        pendingEdges={[]}
+        pendingReviewError="待审核关系加载失败：401 admin session required"
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("待审核关系加载失败");
+  });
+
+  it("confirms edge acceptance, expiry and return-to-review from the detail panel", async () => {
+    const user = userEvent.setup();
+    const reviewEdge = vi.fn().mockResolvedValue(undefined);
+    const node: GroupGraphNode = {
+      id: "person:member-a",
+      type: "person",
+      label: "成员甲",
+      display_label: "成员甲",
+    };
+    const otherNode: GroupGraphNode = {
+      id: "person:member-b",
+      type: "person",
+      label: "成员乙",
+      display_label: "成员乙",
+    };
+    const edge: GroupGraphEdge = {
+      id: "edge-review-1",
+      from: node.id,
+      to: otherNode.id,
+      type: "replied_to",
+      label: "replied_to",
+      acceptance_status: "needs_review",
+      confidence: 0.62,
+      evidence_count: 2,
+      extraction_method: "llm_window",
+      acceptance_score: 0.62,
+      acceptance_reason: "window_relation",
+    };
+    const controller = {
+      selection: { kind: "edge", item: edge },
+      selectedNode: null,
+      selectedEdge: edge,
+      nodesById: new Map([[node.id, node], [otherNode.id, otherNode]]),
+      evidence: null,
+      evidenceLoading: false,
+      evidenceStatus: "选择一条关系后会自动加载证据来源。",
+      loadEdgeEvidence: vi.fn(),
+      reviewing: false,
+      reviewEdge,
+      graphEdges: [edge],
+      pendingEdges: [],
+    } as unknown as RelationshipGraphController;
+
+    const { rerender } = render(<RelationshipDetailPanel {...controller} />);
+    expect(screen.getByText("语义抽取")).toBeInTheDocument();
+    expect(screen.getByText("验收分")).toBeInTheDocument();
+    expect(screen.getByText("window_relation")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "接受关系" }));
+
+    const dialog = screen.getByRole("dialog", { name: "确认接受该关系" });
+    expect(within(dialog).getByText(/回复/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/待审核/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "确认接受" }));
+
+    expect(reviewEdge).toHaveBeenCalledWith("accept");
+
+    const acceptedEdge = { ...edge, acceptance_status: "accepted" };
+    rerender(<RelationshipDetailPanel {...controller} selectedEdge={acceptedEdge} selection={{ kind: "edge", item: acceptedEdge }} />);
+    await user.click(screen.getByRole("button", { name: "标记过期" }));
+    await user.click(within(screen.getByRole("dialog", { name: "确认将该关系标记为过期" })).getByRole("button", { name: "确认过期" }));
+    expect(reviewEdge).toHaveBeenCalledWith("expire");
+
+    await user.click(screen.getByRole("button", { name: "退回待审" }));
+    await user.click(within(screen.getByRole("dialog", { name: "确认退回待审核" })).getByRole("button", { name: "确认退回" }));
+    expect(reviewEdge).toHaveBeenCalledWith("needs_review");
   });
 });
