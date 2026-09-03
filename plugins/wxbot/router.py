@@ -55,6 +55,7 @@ from app.egress.safe_http import (
 )
 from app.infra.db import get_session_factory
 from app.infra.redis_client import get_redis
+from app.llm.activity import wait_for_llm_activity
 from app.models.session import SessionRow, TurnRow
 from plugins.repeater.store import (
     RepeaterConfigVersionConflictError,
@@ -1800,7 +1801,10 @@ async def _call_report_llm(
         metadata=report_llm_metadata(),
     )
     timeout = float(getattr(store.settings, "wxbot_report_stage_timeout_seconds", 240.0) or 240.0)
-    response = await asyncio.wait_for(llm_service.chat(request), timeout=timeout)
+    response = await wait_for_llm_activity(
+        llm_service.chat(request),
+        timeout=timeout,
+    )
     return str(response.content or "").strip()
 
 

@@ -19,6 +19,7 @@ from app.common.types import (
     InboundEvent,
     Role,
 )
+from app.llm.activity import wait_for_llm_activity
 from app.orchestrator.flow import StepResult
 from app.orchestrator.pipeline import PipelineContext
 from app.plugin.hooks import HookPoint
@@ -721,7 +722,10 @@ class WxbotGroupSummaryService:
             timeout = float(
                 getattr(self._settings, "wxbot_group_summary_timeout_seconds", 90.0) or 90.0
             )
-            response = await asyncio.wait_for(self._llm.chat(request), timeout=timeout)
+            response = await wait_for_llm_activity(
+                self._llm.chat(request),
+                timeout=timeout,
+            )
             if not await scope_allowed_now():
                 return await defer_scope_denied()
             max_chars = int(

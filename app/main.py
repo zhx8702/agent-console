@@ -88,7 +88,10 @@ from app.orchestrator.effect_handlers import (
 )
 from app.orchestrator.effect_log import PostgresEffectLog
 from app.orchestrator.engine import DialogOrchestrator
-from app.orchestrator.flow import build_default_flow_registry
+from app.orchestrator.flow import (
+    build_default_flow_registry,
+    resolve_capability_dispatch_timeout_seconds,
+)
 from app.orchestrator.flow_runtime_config import build_flow_runtime_config_payload
 from app.orchestrator.simple_capabilities import (
     HandoffCapabilityEngine,
@@ -904,7 +907,12 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         await registry.reconcile_state()
     log.info("plugins.discovered", directory=dir_count, entrypoints=ep_count)
 
-    flow_step_registry = build_default_flow_registry()
+    flow_step_registry = build_default_flow_registry(
+        capability_dispatch_timeout_seconds=resolve_capability_dispatch_timeout_seconds(
+            s.orchestrator_capability_dispatch_timeout_seconds,
+            handle_timeout_seconds=s.orchestrator_handle_timeout_seconds,
+        )
+    )
     effect_handler_registry = EffectHandlerRegistry()
     register_core_session_effect_handlers(
         effect_handler_registry,

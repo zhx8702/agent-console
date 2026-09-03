@@ -8,6 +8,7 @@ FlowRunner can build on these contracts later.
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -27,7 +28,11 @@ KERNEL_INPUTS = {
 
 DEFAULT_COMPATIBLE_FLOW_NAME = "default_compatible_flow"
 DEFAULT_COMPATIBLE_FLOW_VERSION = 1
-CAPABILITY_DISPATCH_TIMEOUT_SECONDS = 90.0
+# A capability turn can include image preparation, hosted search, and the
+# provider's own fallback attempts. This remains the safe code-level default;
+# production may override it through Settings.
+CAPABILITY_DISPATCH_TIMEOUT_SECONDS = 135.0
+CAPABILITY_DISPATCH_TIMEOUT_HEADROOM_SECONDS = 15.0
 DEFAULT_REQUIRED_STEP_KINDS = {
     "core.load_session",
     "core.commit_turns_and_publish",
@@ -511,8 +516,50 @@ def normalize_flow_session_kind(
     return ""
 
 
-def build_default_flow_registry() -> FlowStepRegistry:
+def resolve_capability_dispatch_timeout_seconds(
+    configured_seconds: float | None = None,
+    *,
+    handle_timeout_seconds: float | None = None,
+) -> float:
+    """Resolve the capability budget while leaving room for outer cleanup.
+
+    FlowRunner enforces this step timeout independently from the outer
+    orchestrator deadline. A configured value equal to (or above) that outer
+    deadline would cancel the response before the remaining commit and
+    publication steps can run, so reserve a small headroom window.
+    """
+
+    try:
+        timeout = float(
+            CAPABILITY_DISPATCH_TIMEOUT_SECONDS
+            if configured_seconds is None
+            else configured_seconds
+        )
+    except (TypeError, ValueError):
+        timeout = CAPABILITY_DISPATCH_TIMEOUT_SECONDS
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = CAPABILITY_DISPATCH_TIMEOUT_SECONDS
+
+    if handle_timeout_seconds is not None:
+        try:
+            outer_timeout = float(handle_timeout_seconds)
+        except (TypeError, ValueError):
+            outer_timeout = 0.0
+        if math.isfinite(outer_timeout) and outer_timeout > 0:
+            timeout = min(
+                timeout,
+                max(1.0, outer_timeout - CAPABILITY_DISPATCH_TIMEOUT_HEADROOM_SECONDS),
+            )
+    return timeout
+
+
+def build_default_flow_registry(
+    capability_dispatch_timeout_seconds: float | None = None,
+) -> FlowStepRegistry:
     registry = FlowStepRegistry()
+    capability_timeout = resolve_capability_dispatch_timeout_seconds(
+        capability_dispatch_timeout_seconds,
+    )
     registry.register_many(
         [
             FlowStepDefinition(
@@ -615,7 +662,7 @@ def build_default_flow_registry() -> FlowStepRegistry:
                 name="Capability dispatch",
                 inputs={"event", "session", "pre", "route"},
                 outputs={"result"},
-                timeout_seconds=CAPABILITY_DISPATCH_TIMEOUT_SECONDS,
+                timeout_seconds=capability_timeout,
                 error_policy="degrade",
             ),
             FlowStepDefinition(

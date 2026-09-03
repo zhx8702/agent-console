@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.common.exceptions import UpstreamRejected
 from app.common.intent import IntentDecision, IntentDomain
 from app.common.intent_classify import (
     LlmIntentClassifier,
@@ -90,6 +91,26 @@ async def test_llm_classifier_gives_up_after_three_failures() -> None:
         context={"is_group": False},
     )
     assert llm.calls == 3
+    assert decision == IntentDecision()
+
+
+@pytest.mark.asyncio
+async def test_llm_classifier_does_not_retry_rejected_requests() -> None:
+    class _RejectingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, request):
+            _ = request
+            self.calls += 1
+            raise UpstreamRejected("bad request (400)")
+
+    llm = _RejectingLLM()
+    decision = await LlmIntentClassifier(llm).classify(
+        "你好",
+        context={"is_group": False},
+    )
+    assert llm.calls == 1
     assert decision == IntentDecision()
 
 

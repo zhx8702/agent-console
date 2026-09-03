@@ -242,6 +242,21 @@ class Settings(BaseSettings):
     grok_models_base_url: str | None = None
     openai_api_mode: str = "responses"
     openai_disable_fallback: bool = False
+    openai_responses_stream_first_event_timeout_seconds: float = Field(
+        default=45.0,
+        ge=5.0,
+        le=300.0,
+    )
+    openai_responses_stream_idle_timeout_seconds: float = Field(
+        default=120.0,
+        ge=10.0,
+        le=600.0,
+    )
+    openai_responses_stream_max_duration_seconds: float = Field(
+        default=300.0,
+        ge=60.0,
+        le=300.0,
+    )
     openai_web_search_enabled: bool = False
     openai_web_search_tool: str = "web_search"
     openai_web_search_live_enabled: bool = True
@@ -314,6 +329,15 @@ class Settings(BaseSettings):
     wxbot_report_transient_backoff_seconds: float = Field(default=900.0, gt=0)
     wxbot_daily_report_footer: str = ""
     orchestrator_handle_timeout_seconds: float = Field(default=150.0, gt=0)
+    # The capability step may include image preparation, hosted search, and
+    # provider fallback retries. Keep its default below the outer handle
+    # budget; the flow wiring also preserves a small headroom for commit and
+    # outbound publication.
+    orchestrator_capability_dispatch_timeout_seconds: float = Field(
+        default=135.0,
+        gt=0,
+        le=300.0,
+    )
     orchestrator_flow_runtime_enabled: bool = False
     orchestrator_flow_runtime_name: str = "default_compatible_flow"
     orchestrator_flow_runtime_allowed_names: str = "default_compatible_flow"

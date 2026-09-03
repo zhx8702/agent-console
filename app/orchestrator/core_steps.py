@@ -6,13 +6,14 @@ compatibility path that can be expanded behind tests.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, ClassVar
 
 from app.channel import apply_event_scope_to_session
-from app.common.exceptions import CapabilityError
+from app.common.exceptions import CapabilityError, UpstreamUnavailable
 from app.common.intent_classify import classify_context_from_event
 from app.common.intent_runtime import decision_from_pre, persist_decision
 from app.common.logging import get_logger
@@ -36,6 +37,7 @@ from app.orchestrator.flow import (
     CAPABILITY_DISPATCH_TIMEOUT_SECONDS,
     MessageEffect,
     StepResult,
+    resolve_capability_dispatch_timeout_seconds,
 )
 from app.orchestrator.outcome import RetryableProcessingError
 from app.orchestrator.owner_gate import (
@@ -55,6 +57,21 @@ from app.plugin.hooks import (
 from app.postprocessing.response_guards import apply_response_guards
 
 logger = get_logger(__name__)
+
+_DISPATCH_ATTEMPTS = 3
+
+
+def _dispatch_retryable(exc: Exception) -> bool:
+    """Whether a capability failure is worth another dispatch attempt.
+
+    Only known-transient upstream failures are replayed. Everything else is
+    either deterministic (e.g. ``UpstreamRejected``: HTTP 4xx, bugs), retried
+    at the right layer already (worker redelivery), or unsafe to replay
+    because the engine may have performed side effects before failing.
+    """
+
+    return isinstance(exc, (UpstreamUnavailable, TimeoutError))
+
 
 _CONSECUTIVE_FALLBACKS_KEY = "consecutive_fallbacks"
 _SUCCESSFUL_ANSWER_ROUTES = frozenset(
@@ -580,6 +597,17 @@ class CapabilityDispatchStep(_BaseCoreStep):
     name = "Capability dispatch"
     timeout_seconds = CAPABILITY_DISPATCH_TIMEOUT_SECONDS
 
+    def __init__(self, deps: CoreStepDependencies) -> None:
+        super().__init__(deps)
+        self.timeout_seconds = resolve_capability_dispatch_timeout_seconds(
+            getattr(deps.settings, "orchestrator_capability_dispatch_timeout_seconds", None),
+            handle_timeout_seconds=getattr(
+                deps.settings,
+                "orchestrator_handle_timeout_seconds",
+                None,
+            ),
+        )
+
     @staticmethod
     def _recall_miss_reason(exc: Exception) -> str:
         if not isinstance(exc, CapabilityError):
@@ -654,9 +682,39 @@ class CapabilityDispatchStep(_BaseCoreStep):
                     metadata={"degradation_reason": reason},
                 )
         else:
-            try:
-                result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
-            except Exception as exc:
+            result = None
+            last_exc: Exception | None = None
+            for attempt in range(1, _DISPATCH_ATTEMPTS + 1):
+                try:
+                    result = await engine.answer(ctx.pre, ctx.session, ctx.route.hints)
+                    last_exc = None
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    miss_reason = self._recall_miss_reason(exc)
+                    if miss_reason:
+                        break
+                    if not _dispatch_retryable(exc):
+                        logger.warning(
+                            "capability.dispatch_not_retryable",
+                            attempt=attempt,
+                            route=ctx.route.type.value,
+                            error_class=exc.__class__.__name__,
+                        )
+                        break
+                    logger.warning(
+                        "capability.dispatch_retry",
+                        attempt=attempt,
+                        attempts=_DISPATCH_ATTEMPTS,
+                        route=ctx.route.type.value,
+                        error_class=exc.__class__.__name__,
+                    )
+                    if attempt < _DISPATCH_ATTEMPTS:
+                        await asyncio.sleep(0.4 * attempt)
+            if result is None and last_exc is not None:
+                exc = last_exc
                 miss_reason = self._recall_miss_reason(exc)
                 if miss_reason:
                     result = await self._fallback_to_llm(
@@ -668,7 +726,7 @@ class CapabilityDispatchStep(_BaseCoreStep):
                         ctx.result = result
                         return StepResult(result=result, route_label=result.route.value)
                 if ctx.route.type != RouteType.LLM:
-                    raise
+                    raise exc
                 reason = f"capability_failed:{ctx.route.type.value}"
                 ctx.signals["capability"] = {
                     "failed": True,

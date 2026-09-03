@@ -27,6 +27,17 @@ class UpstreamUnavailable(CSError):
     code = "upstream_unavailable"
 
 
+class UpstreamRejected(CSError):
+    """The upstream actively rejected the request (HTTP 4xx).
+
+    Unlike :class:`UpstreamUnavailable`, retrying the same request cannot
+    succeed and the failure must not open circuit breakers that guard
+    against provider outages.
+    """
+
+    code = "upstream_rejected"
+
+
 class SessionLockLost(CSError):
     """The worker no longer owns the distributed session lease."""
 

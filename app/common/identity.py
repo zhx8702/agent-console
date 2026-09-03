@@ -56,18 +56,11 @@ def normalize_identity_text(text: str) -> str:
     return _SPACE_RE.sub(" ", value).strip()
 
 
-_BOT_SELF_IDENTITY_RE = re.compile(
-    r"(?:你|您).{0,8}(?:是谁|叫什么|什么名字|是真人|是人类|是机器人|是人工智能|是\s*AI|是助手)"
-    r"|自我介绍|介绍一下你自己|介绍下你自己|介绍一下你|介绍下你",
-    re.IGNORECASE,
-)
+# Guard, not recognition: a bare "介绍下/介绍一下/介绍" almost always refers
+# to whatever was just discussed (a product, a file, ...), so it vetoes the
+# semantic identity verdict, which classifiers tend to over-trigger on such
+# ultra-short follow-ups.
 _FOLLOWUP_INTRODUCE_RE = re.compile(r"^(?:介绍下|介绍一下|介绍)$")
-
-
-def is_bot_self_identity_question(text: str) -> bool:
-    """True only when the user is asking who the bot itself is."""
-
-    return bool(_BOT_SELF_IDENTITY_RE.search(normalize_identity_text(text)))
 
 
 def classify_group_human_intent(
@@ -104,12 +97,14 @@ def classify_group_human_intent(
                 "group_human_intent_none",
                 normalized,
             )
-        if decision.action == "inquiry" or is_bot_self_identity_question(normalized):
-            return GroupHumanIntent(
-                GroupHumanIntentType.IDENTITY_INQUIRY,
-                "group_identity_disclosure",
-                normalized,
-            )
+        # The identity domain has a single action in the classify contract
+        # (identity/inquiry), so the domain verdict alone is the signal;
+        # matching the action string would only add brittleness.
+        return GroupHumanIntent(
+            GroupHumanIntentType.IDENTITY_INQUIRY,
+            "group_identity_disclosure",
+            normalized,
+        )
     return GroupHumanIntent(
         GroupHumanIntentType.NONE,
         "group_human_intent_none",

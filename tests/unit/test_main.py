@@ -1516,6 +1516,7 @@ async def test_readiness_payload_reports_blocked_flow_runtime(
         "allowed_names": ["auto"],
         "allow_target_flows": False,
         "allow_compatible_fallback": False,
+        "capability_dispatch_timeout_seconds": 135.0,
         "allowed": False,
         "reason": "auto_flow_not_allowed",
     }

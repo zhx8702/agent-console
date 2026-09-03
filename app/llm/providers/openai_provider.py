@@ -11,12 +11,14 @@ Supports:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+import httpx
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -25,7 +27,7 @@ from tenacity import (
 )
 
 from app.common.config import Settings
-from app.common.exceptions import UpstreamUnavailable
+from app.common.exceptions import CSError, UpstreamRejected, UpstreamUnavailable
 from app.common.intent import (
     IntentArtifact,
     IntentDecision,
@@ -45,6 +47,7 @@ from app.common.types import (
     ToolCall,
 )
 from app.infra.metrics import LLM_API_ATTEMPTS
+from app.llm.activity import record_llm_stream_event
 from app.llm.base import EmbedRequest, EmbedResponse
 
 logger = get_logger(__name__)
@@ -58,6 +61,13 @@ _TIER_ATTR = {
 _SUPPORTED_API_MODES = {"chat", "responses"}
 _MAX_WEB_SEARCH_SOURCE_CITATIONS = 20
 _SUPPORTED_WEB_SEARCH_TOOLS = {"web_search", "web_search_preview", "x_search"}
+_RESPONSES_FIRST_EVENT_TIMEOUT_SECONDS = 45.0
+_RESPONSES_IDLE_TIMEOUT_SECONDS = 120.0
+_RESPONSES_TOTAL_TIMEOUT_SECONDS = 3600.0
+
+
+class _ResponsesStreamInterrupted(UpstreamUnavailable):
+    """A Responses stream failed after emitting data and must not be replayed."""
 
 
 def _fallback_label(fallback_from: str | None) -> str:
@@ -603,6 +613,21 @@ def _extract_responses_payload(
     )
 
 
+def _wrap_upstream_error(exc: Exception, operation: str) -> CSError:
+    """Map a provider exception to a breaker-relevant error type.
+
+    HTTP 4xx responses (except 429, which the retry policy already treats
+    as transient) mean the request itself was rejected — retrying cannot
+    succeed, and such failures must not open the circuit breaker that
+    guards against real provider outages.
+    """
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 429:
+        return UpstreamRejected(f"{operation} rejected ({status_code}): {exc}")
+    return UpstreamUnavailable(f"{operation} unavailable: {exc}")
+
+
 class OpenAIProvider:
     name = "openai"
 
@@ -827,7 +852,13 @@ class OpenAIProvider:
                 return await self._chat_via_responses(request)
             try:
                 return await self._chat_via_responses(request)
-            except UpstreamUnavailable as exc:
+            except _ResponsesStreamInterrupted:
+                # Replaying after any Responses event could duplicate hosted
+                # tool work or produce a second, inconsistent answer.
+                raise
+            except (UpstreamUnavailable, UpstreamRejected) as exc:
+                # 4xx also falls back: gateways such as sub2api may reject
+                # Responses-API-only parameters while supporting plain chat.
                 logger.warning(
                     "llm.openai.responses_fallback_to_chat",
                     api_mode="responses",
@@ -882,7 +913,7 @@ class OpenAIProvider:
                 fallback=_fallback_label(fallback_from),
                 error_class=exc.__class__.__name__,
             )
-            raise UpstreamUnavailable(f"openai chat unavailable: {exc}") from exc
+            raise _wrap_upstream_error(exc, "openai chat") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
 
         content, tool_calls, citations, resolved_model, finish_reason, usage = (
@@ -922,16 +953,61 @@ class OpenAIProvider:
             2 if (request.metadata or {}).get("openai_web_search_required") is True else 4
         )
         started = time.monotonic()
+        first_event_timeout = float(
+            getattr(
+                self._settings,
+                "openai_responses_stream_first_event_timeout_seconds",
+                _RESPONSES_FIRST_EVENT_TIMEOUT_SECONDS,
+            )
+            or _RESPONSES_FIRST_EVENT_TIMEOUT_SECONDS
+        )
+        idle_timeout = float(
+            getattr(
+                self._settings,
+                "openai_responses_stream_idle_timeout_seconds",
+                _RESPONSES_IDLE_TIMEOUT_SECONDS,
+            )
+            or _RESPONSES_IDLE_TIMEOUT_SECONDS
+        )
+        total_timeout = float(
+            getattr(
+                self._settings,
+                "openai_responses_stream_max_duration_seconds",
+                _RESPONSES_TOTAL_TIMEOUT_SECONDS,
+            )
+            or _RESPONSES_TOTAL_TIMEOUT_SECONDS
+        )
+        deadline = started + total_timeout
+        stream_retry_exceptions = (
+            *self._retry_exceptions,
+            TimeoutError,
+            httpx.TransportError,
+        )
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(max_attempts),
-                wait=wait_exponential(multiplier=0.5, min=0.5, max=8.0),
-                retry=retry_if_exception_type(self._retry_exceptions),
+                wait=wait_exponential(multiplier=0.25, min=0.25, max=1.0),
+                retry=retry_if_exception_type(stream_retry_exceptions),
                 reraise=True,
             ):
                 with attempt:
-                    raw = await self._responses_client.responses.create(**kwargs)
-        except self._retry_exceptions as exc:
+                    raw = await _aggregate_responses_stream(
+                        self,
+                        kwargs,
+                        deadline=deadline,
+                        first_event_timeout=first_event_timeout,
+                        idle_timeout=idle_timeout,
+                    )
+        except _ResponsesStreamInterrupted as exc:
+            _record_api_attempt(api_mode="responses", result="error", exc=exc)
+            logger.warning(
+                "llm.openai.responses_stream_interrupted",
+                api_mode="responses",
+                fallback="none",
+                error_class=_error_class(exc),
+            )
+            raise
+        except stream_retry_exceptions as exc:
             _record_api_attempt(api_mode="responses", result="error", exc=exc)
             logger.warning(
                 "llm.openai.upstream_unavailable",
@@ -941,14 +1017,31 @@ class OpenAIProvider:
             )
             raise UpstreamUnavailable(f"openai responses unavailable: {exc}") from exc
         except Exception as exc:
-            _record_api_attempt(api_mode="responses", result="error", exc=exc)
-            logger.warning(
-                "llm.openai.responses_failed",
+            # Some OpenAI-compatible gateways implement Responses but not SSE.
+            # A synchronous compatibility attempt is safe only before the
+            # stream has emitted an event; post-event failures are converted to
+            # _ResponsesStreamInterrupted above and never reach this branch.
+            logger.info(
+                "llm.openai.responses_stream_fallback_to_sync",
                 api_mode="responses",
-                fallback="none",
+                fallback="to_sync",
                 error_class=exc.__class__.__name__,
             )
-            raise UpstreamUnavailable(f"openai responses unavailable: {exc}") from exc
+            try:
+                raw = await _create_sync_response_with_deadline(
+                    self,
+                    kwargs,
+                    deadline=deadline,
+                )
+            except Exception as sync_exc:
+                _record_api_attempt(api_mode="responses", result="error", exc=sync_exc)
+                logger.warning(
+                    "llm.openai.responses_failed",
+                    api_mode="responses",
+                    fallback="none",
+                    error_class=sync_exc.__class__.__name__,
+                )
+                raise _wrap_upstream_error(sync_exc, "openai responses") from sync_exc
 
         latency_ms = int((time.monotonic() - started) * 1000)
         content, tool_calls, citations, resolved_model, finish_reason, usage = (
@@ -1012,7 +1105,7 @@ class OpenAIProvider:
                 error=exc.__class__.__name__,
                 model=model,
             )
-            raise UpstreamUnavailable(f"openai embeddings unavailable: {exc}") from exc
+            raise _wrap_upstream_error(exc, "openai embeddings") from exc
 
         data = getattr(raw, "data", None) or []
         vectors = [list(item.embedding) for item in data]
@@ -1035,6 +1128,97 @@ class OpenAIProvider:
                     await result
             except Exception:
                 logger.debug("llm.openai.close_failed", exc_info=True)
+
+
+def _remaining_responses_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("openai responses exceeded the safety time limit")
+    return remaining
+
+
+async def _close_responses_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:
+        logger.debug("llm.openai.responses_stream_close_failed", exc_info=True)
+
+
+async def _aggregate_responses_stream(
+    provider: OpenAIProvider,
+    kwargs: dict[str, Any],
+    *,
+    deadline: float,
+    first_event_timeout: float = _RESPONSES_FIRST_EVENT_TIMEOUT_SECONDS,
+    idle_timeout: float = _RESPONSES_IDLE_TIMEOUT_SECONDS,
+) -> Any:
+    """Consume a Responses SSE stream and return its complete terminal response."""
+
+    stream: Any = None
+    received_event = False
+    first_event_deadline = time.monotonic() + max(0.001, first_event_timeout)
+    try:
+        create_timeout = min(
+            _remaining_responses_time(first_event_deadline),
+            _remaining_responses_time(deadline),
+        )
+        stream = await asyncio.wait_for(
+            provider._responses_client.responses.create(**kwargs, stream=True),
+            timeout=create_timeout,
+        )
+        iterator = aiter(stream)
+        while True:
+            event_timeout = min(
+                (
+                    max(0.001, idle_timeout)
+                    if received_event
+                    else _remaining_responses_time(first_event_deadline)
+                ),
+                _remaining_responses_time(deadline),
+            )
+            try:
+                event = await asyncio.wait_for(anext(iterator), timeout=event_timeout)
+            except StopAsyncIteration:
+                break
+            received_event = True
+            record_llm_stream_event(idle_timeout_seconds=idle_timeout)
+            event_type = str(_field(event, "type", "") or "")
+            if event_type == "response.completed":
+                response = _field(event, "response", None)
+                if response is None:
+                    raise RuntimeError("response.completed did not include a response")
+                return response
+            if event_type in {"response.failed", "response.incomplete", "error"}:
+                raise RuntimeError(f"responses stream ended with {event_type}")
+        raise RuntimeError("responses stream ended without response.completed")
+    except _ResponsesStreamInterrupted:
+        raise
+    except Exception as exc:
+        if received_event:
+            raise _ResponsesStreamInterrupted(
+                f"openai responses stream interrupted after first event: {exc}"
+            ) from exc
+        raise
+    finally:
+        if stream is not None:
+            await _close_responses_stream(stream)
+
+
+async def _create_sync_response_with_deadline(
+    provider: OpenAIProvider,
+    kwargs: dict[str, Any],
+    *,
+    deadline: float,
+) -> Any:
+    return await asyncio.wait_for(
+        provider._responses_client.responses.create(**kwargs),
+        timeout=_remaining_responses_time(deadline),
+    )
 
 
 async def _openai_stream(
@@ -1080,7 +1264,7 @@ async def _openai_stream(
             fallback=_fallback_label(fallback_from),
             error_class=exc.__class__.__name__,
         )
-        raise UpstreamUnavailable(f"openai stream unavailable: {exc}") from exc
+        raise _wrap_upstream_error(exc, "openai stream") from exc
     _record_api_attempt(
         api_mode="chat",
         result="success",
@@ -1118,7 +1302,7 @@ async def _openai_responses_stream(
             fallback="none",
             error_class=exc.__class__.__name__,
         )
-        raise UpstreamUnavailable(f"openai responses stream unavailable: {exc}") from exc
+        raise _wrap_upstream_error(exc, "openai responses stream") from exc
     _record_api_attempt(api_mode="responses", result="success")
 
 

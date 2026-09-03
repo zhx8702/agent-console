@@ -37,6 +37,7 @@ from app.orchestrator.flow import (
     build_default_flow_registry,
     normalize_flow_session_kind,
     resolve_builtin_flow,
+    resolve_capability_dispatch_timeout_seconds,
 )
 from app.orchestrator.flow_runtime_config import flow_runtime_allowed
 from app.orchestrator.outcome import PermanentProcessingError, ProcessingOutcome
@@ -350,8 +351,23 @@ class FlowRuntimeCoordinator:
             )
 
     def _compile(self, profile: BuiltinFlowProfile) -> CompiledFlow:
+        settings = self._ports.settings
         return FlowCompiler(
-            self._step_registry or build_default_flow_registry(),
+            self._step_registry
+            or build_default_flow_registry(
+                capability_dispatch_timeout_seconds=resolve_capability_dispatch_timeout_seconds(
+                    getattr(
+                        settings,
+                        "orchestrator_capability_dispatch_timeout_seconds",
+                        None,
+                    ),
+                    handle_timeout_seconds=getattr(
+                        settings,
+                        "orchestrator_handle_timeout_seconds",
+                        None,
+                    ),
+                )
+            ),
             owner_permissions=self._owner_permissions,
         ).compile(
             name=profile.name,

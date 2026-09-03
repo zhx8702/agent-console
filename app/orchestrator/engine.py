@@ -55,6 +55,7 @@ from app.common.types import (
     Turn,
 )
 from app.infra.metrics import E2E_LATENCY, PIPELINE_ERRORS, ROUTE_DECISIONS
+from app.llm.activity import wait_for_llm_activity
 from app.orchestrator.effect_handlers import EffectHandlerRegistry
 from app.orchestrator.engine_flow_runtime import (
     FlowRuntimeCoordinator,
@@ -363,7 +364,10 @@ class DialogOrchestrator:
                         outcome = await self._run_transactional(event, runner)
                     else:
                         outcome = normalize_processing_outcome(
-                            await asyncio.wait_for(runner(event), timeout=self.handle_timeout)
+                            await wait_for_llm_activity(
+                                runner(event),
+                                timeout=self.handle_timeout,
+                            )
                         )
                     route_label = outcome.route_label
                     break
@@ -486,7 +490,7 @@ class DialogOrchestrator:
                         with self.message_store.stage():
                             try:
                                 outcome = normalize_processing_outcome(
-                                    await asyncio.wait_for(
+                                    await wait_for_llm_activity(
                                         runner(event),
                                         timeout=self.handle_timeout,
                                     )

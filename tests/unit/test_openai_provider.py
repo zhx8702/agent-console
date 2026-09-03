@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import httpx
@@ -657,10 +658,22 @@ class _FakeResponsesAPI:
 
     async def create(self, **kwargs):
         self._owner.responses_calls.append(kwargs)
+        if kwargs.get("stream") and self._owner.responses_stream_attempts:
+            result = self._owner.responses_stream_attempts.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         if self._owner.responses_error is not None:
             raise self._owner.responses_error
         if kwargs.get("stream"):
-            return self._owner.responses_stream
+            return self._owner.responses_stream or _AsyncItems(
+                [
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=self._owner.responses_result,
+                    )
+                ]
+            )
         return self._owner.responses_result
 
 
@@ -701,6 +714,7 @@ class _FakeClient:
         chat_stream=None,
         responses_error: Exception | None = None,
         chat_error: Exception | None = None,
+        responses_stream_attempts: list[object] | None = None,
     ) -> None:
         self.base_url = base_url
         self.responses_calls: list[dict] = []
@@ -711,6 +725,7 @@ class _FakeClient:
         self.responses_result = responses_result or _responses_response()
         self.chat_result = chat_result or _chat_response()
         self.responses_stream = responses_stream
+        self.responses_stream_attempts = list(responses_stream_attempts or [])
         self.chat_stream = chat_stream
         self.responses = _FakeResponsesAPI(self)
         self.chat = SimpleNamespace(completions=_FakeChatCompletionsAPI(self))
@@ -730,7 +745,27 @@ class _AsyncItems:
     async def __anext__(self):
         if not self._items:
             raise StopAsyncIteration
-        return self._items.pop(0)
+        item = self._items.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _ScheduledAsyncItems:
+    def __init__(self, items: list[tuple[float, object]]) -> None:
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        delay, item = self._items.pop(0)
+        await asyncio.sleep(delay)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 def _internal_server_error() -> Exception:
@@ -779,7 +814,7 @@ async def test_openai_provider_uses_root_url_for_responses_and_v1_for_chat_fallb
     assert len(created_clients) == 2
     assert created_clients[0].base_url == "https://openai-gateway.example.test"
     assert created_clients[1].base_url == "https://openai-gateway.example.test/v1"
-    assert len(created_clients[0].responses_calls) == 1
+    assert len(created_clients[0].responses_calls) == 2
     assert len(created_clients[1].chat_calls) == 1
 
 
@@ -940,6 +975,268 @@ async def test_openai_provider_keeps_responses_success_without_fallback(
     assert resp.content == "responses primary"
     assert len(created_clients[0].responses_calls) == 1
     assert len(created_clients[1].chat_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_aggregates_responses_stream_into_complete_chat_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    final_response = SimpleNamespace(
+        model="gpt-5.4-streamed",
+        status="completed",
+        output=[
+            SimpleNamespace(type="web_search_call", status="completed"),
+            SimpleNamespace(
+                type="function_call",
+                call_id="call_streamed",
+                name="remember_result",
+                arguments='{"value": 7}',
+            ),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        text="完整结果",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url="https://example.com/source",
+                                title="Source",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+        output_text="完整结果",
+        usage=SimpleNamespace(input_tokens=21, output_tokens=13),
+    )
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        assert max_retries == 0
+        client = _FakeClient(base_url=base_url, responses_result=final_response)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(update={"openai_api_mode": "responses"})
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    response = await provider.chat(_make_request())
+
+    assert response.content == "完整结果"
+    assert response.model == "gpt-5.4-streamed"
+    assert response.finish_reason == "completed"
+    assert response.usage.input_tokens == 21
+    assert response.usage.output_tokens == 13
+    assert response.tool_calls == [
+        ToolCall(id="call_streamed", name="remember_result", arguments={"value": 7})
+    ]
+    assert [citation.url for citation in response.citations] == [
+        "https://example.com/source"
+    ]
+    assert response.metadata["semantic_intent"]["source"] == "web"
+    assert response.metadata["semantic_intent_method"] == "native_tool_call"
+    assert created_clients[0].responses_calls[0]["stream"] is True
+    assert len(created_clients[0].responses_calls) == 1
+    assert created_clients[1].chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_keeps_stream_alive_while_events_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    final_response = _responses_response(content="slow complete")
+    stream = _ScheduledAsyncItems(
+        [
+            (0.02, SimpleNamespace(type="response.created")),
+            (0.02, SimpleNamespace(type="response.in_progress")),
+            (0.02, SimpleNamespace(type="response.output_text.delta", delta="slow ")),
+            (
+                0.02,
+                SimpleNamespace(type="response.completed", response=final_response),
+            ),
+        ]
+    )
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        client = _FakeClient(base_url=base_url, responses_stream=stream)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(
+        update={
+            "openai_api_mode": "responses",
+            "openai_responses_stream_first_event_timeout_seconds": 0.05,
+            "openai_responses_stream_idle_timeout_seconds": 0.1,
+            "openai_responses_stream_max_duration_seconds": 0.5,
+        }
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    from app.llm.activity import wait_for_llm_activity
+
+    response = await wait_for_llm_activity(
+        provider.chat(_make_request()),
+        timeout=0.03,
+    )
+
+    assert response.content == "slow complete"
+    assert len(created_clients[0].responses_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_retries_transient_error_only_before_first_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    monkeypatch.setattr(
+        "app.llm.providers.openai_provider.wait_exponential",
+        lambda **_: wait_none(),
+    )
+    final_response = _responses_response(content="retry recovered")
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        client = _FakeClient(
+            base_url=base_url,
+            responses_stream_attempts=[
+                _internal_server_error(),
+                _AsyncItems(
+                    [SimpleNamespace(type="response.completed", response=final_response)]
+                ),
+            ],
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(update={"openai_api_mode": "responses"})
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    response = await provider.chat(_make_request())
+
+    assert response.content == "retry recovered"
+    assert len(created_clients[0].responses_calls) == 2
+    assert all(call["stream"] is True for call in created_clients[0].responses_calls)
+    assert created_clients[1].chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_uses_sync_responses_compatibility_before_first_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        client = _FakeClient(
+            base_url=base_url,
+            responses_result=_responses_response(content="sync compatible"),
+            responses_stream_attempts=[RuntimeError("SSE unsupported")],
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(update={"openai_api_mode": "responses"})
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    response = await provider.chat(_make_request())
+
+    assert response.content == "sync compatible"
+    assert created_clients[0].responses_calls[0]["stream"] is True
+    assert "stream" not in created_clients[0].responses_calls[1]
+    assert created_clients[1].chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_does_not_retry_or_fallback_after_stream_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    stream = _AsyncItems(
+        [SimpleNamespace(type="response.created"), _internal_server_error()]
+    )
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        client = _FakeClient(
+            base_url=base_url,
+            responses_stream=stream,
+            chat_result=_chat_response(content="must not replay"),
+        )
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(
+        update={"openai_api_mode": "responses", "openai_disable_fallback": False}
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    with pytest.raises(UpstreamUnavailable, match="interrupted after first event"):
+        await provider.chat(_make_request())
+
+    assert len(created_clients[0].responses_calls) == 1
+    assert created_clients[1].chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_fails_on_idle_timeout_after_stream_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    stream = _ScheduledAsyncItems(
+        [
+            (0.0, SimpleNamespace(type="response.created")),
+            (
+                0.05,
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_responses_response(content="too late"),
+                ),
+            ),
+        ]
+    )
+    created_clients: list[_FakeClient] = []
+
+    def _factory(*, api_key: str, base_url: str, max_retries: int = 0):
+        _ = api_key
+        client = _FakeClient(base_url=base_url, responses_stream=stream)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _factory)
+    settings = get_settings().model_copy(
+        update={
+            "openai_api_mode": "responses",
+            "openai_responses_stream_idle_timeout_seconds": 0.01,
+        }
+    )
+    provider = OpenAIProvider(api_key="sk-test", settings=settings)
+
+    with pytest.raises(UpstreamUnavailable, match="interrupted after first event"):
+        await provider.chat(_make_request())
+
+    assert len(created_clients[0].responses_calls) == 1
+    assert created_clients[1].chat_calls == []
 
 
 @pytest.mark.asyncio
@@ -1273,7 +1570,7 @@ async def test_openai_provider_can_disable_responses_chat_fallback(
         await provider.chat(req)
 
     assert len(created_clients) == 2
-    assert len(created_clients[0].responses_calls) == 1
+    assert len(created_clients[0].responses_calls) == 2
     assert len(created_clients[1].chat_calls) == 0
 
 
@@ -1311,5 +1608,5 @@ async def test_openai_provider_can_disable_fallback_globally(
         await provider.chat(_make_request())
 
     assert len(created_clients) == 2
-    assert len(created_clients[0].responses_calls) == 1
+    assert len(created_clients[0].responses_calls) == 2
     assert len(created_clients[1].chat_calls) == 0

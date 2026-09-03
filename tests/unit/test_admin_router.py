@@ -1195,6 +1195,7 @@ async def test_admin_router_exposes_message_flow_runtime_config() -> None:
         "allowed_names": ["default_compatible_flow"],
         "allow_target_flows": False,
         "allow_compatible_fallback": False,
+        "capability_dispatch_timeout_seconds": 135.0,
         "allowed": False,
         "reason": "requested_flow_not_allowed",
     }
