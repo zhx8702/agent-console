@@ -7,6 +7,9 @@ dedupe to avoid repeated spam.
 """
 from __future__ import annotations
 
+import asyncio
+
+from app.common.logging import get_logger
 from app.orchestrator.flow import FlowStepDefinition
 from app.plugin.base import Plugin, PluginContext, PluginMeta
 from plugins.repeater.hooks import (
@@ -17,6 +20,8 @@ from plugins.repeater.hooks import (
 from plugins.repeater.router import build_repeater_router
 from plugins.repeater.store import RepeaterStore
 
+logger = get_logger(__name__)
+
 
 class RepeaterPlugin(Plugin):
     meta = PluginMeta(
@@ -26,10 +31,12 @@ class RepeaterPlugin(Plugin):
     )
 
     def __init__(self) -> None:
+        self._ctx: PluginContext | None = None
         self._store: RepeaterStore | None = None
         self._effect_handler_enabled = False
 
     async def initialize(self, ctx: PluginContext) -> None:
+        self._ctx = ctx
         self._store = RepeaterStore(ctx.settings)
         self._effect_handler_enabled = any(
             bool(getattr(ctx.settings, name, False))
@@ -42,8 +49,38 @@ class RepeaterPlugin(Plugin):
         await self._store.ensure_tables()
 
     async def shutdown(self) -> None:
+        self._ctx = None
         self._store = None
         self._effect_handler_enabled = False
+
+    async def _scope_execution_allowed(
+        self,
+        tenant_id: str,
+        session_id: str = "",
+    ) -> bool:
+        registry = getattr(self._ctx.container, "plugin_registry", None) if self._ctx else None
+        gate = getattr(registry, "scope_execution_allowed", None)
+        if not callable(gate):
+            logger.error(
+                "repeater.scope_execution_gate_missing",
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            return False
+        try:
+            return (
+                await gate(
+                    self.meta.name,
+                    tenant_id=str(tenant_id or "").strip(),
+                    session_id=str(session_id or "").strip(),
+                )
+                is True
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("repeater.scope_execution_gate_error", error=str(exc))
+            return False
 
     def get_api_router(self):
         if self._store is None:
@@ -53,7 +90,12 @@ class RepeaterPlugin(Plugin):
     def get_pipeline_hooks(self):
         if self._store is None:
             return []
-        return [RepeaterHook(self._store)]
+        return [
+            RepeaterHook(
+                self._store,
+                scope_execution_allowed=self._scope_execution_allowed,
+            )
+        ]
 
     def get_flow_steps(self) -> list[FlowStepDefinition]:
         return [
@@ -76,6 +118,7 @@ class RepeaterPlugin(Plugin):
             "plugin.repeater.detect": RepeaterDetectStep(
                 self._store,
                 effect_handler_enabled=self._effect_handler_enabled,
+                scope_execution_allowed=self._scope_execution_allowed,
             )
         }
 

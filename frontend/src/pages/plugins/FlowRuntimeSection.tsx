@@ -657,16 +657,21 @@ export function FlowRuntimeSection({
   return (
     <>
       <section className="panel panel-scroll plugins-flow-panel span-3">
-        <div className="panel-header">
+        <details className="plugins-flow-details">
+        <summary className="panel-header">
           <div>
             <p className="section-kicker">消息流运行状态</p>
             <h3>Flow / Effect 运行视图</h3>
           </div>
-          <div className="action-row">
-            <button className="button button-secondary" onClick={() => void loadFlowRuntimeStatus()}>
-              {flowLoading ? "刷新中..." : "刷新 Runtime"}
-            </button>
-          </div>
+        </summary>
+        <div className="action-row">
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => void loadFlowRuntimeStatus()}
+          >
+            {flowLoading ? "刷新中..." : "刷新 Runtime"}
+          </button>
         </div>
         {flowError && <p className="muted-copy">{flowError}</p>}
         <div className="flow-runtime-board">
@@ -738,7 +743,7 @@ export function FlowRuntimeSection({
           </div>
 
           <div className="flow-runtime-results">
-            <article className={`plugin-card flow-run-card ${runtimeResult?.error ? "has-error" : ""}`}>
+            <article className={`flow-run-card ${runtimeResult?.error ? "has-error" : ""}`}>
               <div className="plugin-card-header">
                 <div>
                   <strong>最近 Runtime</strong>
@@ -763,7 +768,7 @@ export function FlowRuntimeSection({
               {renderFlowTraceTables(runtimeResult)}
             </article>
 
-            <article className={`plugin-card flow-run-card ${shadowResult?.error ? "has-error" : ""}`}>
+            <article className={`flow-run-card ${shadowResult?.error ? "has-error" : ""}`}>
               <div className="plugin-card-header">
                 <div>
                   <strong>最近 Shadow</strong>
@@ -1205,6 +1210,7 @@ export function FlowRuntimeSection({
           </details>
 
         </div>
+        </details>
       </section>
 
       {traceFlowModalOpen && activeTraceAggregate && (

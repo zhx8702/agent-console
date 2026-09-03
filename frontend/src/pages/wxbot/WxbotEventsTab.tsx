@@ -51,7 +51,7 @@ export function WxbotEventsTab({ controller }: { controller: WxbotPageController
 
   return (
         <>
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">成员事件 Webhook</p>
@@ -172,7 +172,7 @@ export function WxbotEventsTab({ controller }: { controller: WxbotPageController
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">欢迎语</p>
@@ -316,8 +316,8 @@ export function WxbotEventsTab({ controller }: { controller: WxbotPageController
             </div>
           </section>
 
-          <OutputPanel title="事件订阅 / 成员事件响应" value={eventOutput} />
-          <OutputPanel title="群欢迎语响应" value={groupOutput} />
+          <OutputPanel flush title="事件订阅 / 成员事件响应" value={eventOutput} />
+          <OutputPanel flush title="群欢迎语响应" value={groupOutput} />
         </>
       );
 }

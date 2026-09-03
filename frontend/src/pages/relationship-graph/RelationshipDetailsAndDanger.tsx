@@ -282,8 +282,8 @@ export function RelationshipHistorySummary(controller: RelationshipGraphControll
         </div>
       </section>
 
-      <OutputPanel title="历史同步调试 JSON" value={syncOutput} />
-      <OutputPanel title="关系图响应摘要 JSON" value={output} />
+      <OutputPanel flush title="历史同步调试 JSON" value={syncOutput} />
+      <OutputPanel flush title="关系图响应摘要 JSON" value={output} />
     </>
   );
 }

@@ -32,7 +32,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
 
   return (
         <>
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">端到端测试</p>
@@ -48,7 +48,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">发送说明</p>
@@ -63,7 +63,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
             </ul>
           </section>
 
-          <section className="panel span-2">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">系统发送队列</p>
@@ -133,7 +133,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
             </div>
           </section>
 
-          <section className="panel">
+          <section className="panel span-3">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">SDK 发送队列</p>
@@ -263,7 +263,7 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
             </div>
           </section>
 
-          <OutputPanel title="发送响应" value={actionOutput} />
+          <OutputPanel flush title="发送响应" value={actionOutput} />
         </>
       );
 }

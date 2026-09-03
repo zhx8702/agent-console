@@ -88,9 +88,11 @@ class TiboResetPlugin(Plugin):
         self._execution_gate_confirmed = False
         self._execution_gate_grace_deadline = 0.0
         self._lifecycle_lock = asyncio.Lock()
-        # initialize() overwrites this from the deployment-level setting.
-        # Directly assembled instances retain the historical lifecycle behavior.
+        # Directly assembled instances keep historical lifecycle behavior.
+        # initialize() treats plugin_state as the run switch and the API URL
+        # as configuration, not a second enablement lock.
         self._configured_enabled = True
+        self._api_url_configured = False
 
     def _owns_scheduler_role(self) -> bool:
         if self._ctx is None:
@@ -105,17 +107,17 @@ class TiboResetPlugin(Plugin):
 
     async def initialize(self, ctx: PluginContext) -> None:
         self._ctx = ctx
-        self._configured_enabled = bool(
-            getattr(ctx.settings, "tibo_reset_enabled", False)
-        )
+        api_url = str(getattr(ctx.settings, "tibo_reset_api_url", "") or "").strip()
+        self._api_url_configured = bool(api_url)
+        self._configured_enabled = self._api_url_configured
         self._store = TiboResetStore(ctx.settings)
         if ctx.db_ok:
             await self._store.ensure_tables()
-        if not self._configured_enabled:
+        if not self._api_url_configured:
             self._service = _DisabledTiboResetService(self._store)  # type: ignore[assignment]
             return
         self._client = TiboResetClient(
-            str(getattr(ctx.settings, "tibo_reset_api_url", "") or ""),
+            api_url,
             timeout_seconds=float(
                 getattr(ctx.settings, "tibo_reset_request_timeout_seconds", 15.0)
             ),
@@ -154,6 +156,7 @@ class TiboResetPlugin(Plugin):
             self._store = None
             self._ctx = None
             self._configured_enabled = False
+            self._api_url_configured = False
             self._scheduler_wakeup = asyncio.Event()
             self._scheduler_stop = asyncio.Event()
 
@@ -233,15 +236,15 @@ class TiboResetPlugin(Plugin):
             "scope": "group",
             "label": "Codex Tibo 重置提醒",
             "summary": (
-                "Requires deployment-level TIBO_RESET_ENABLED plus per-group enablement. "
-                "Confirmed history is retained, reset questions are answered, and later "
-                "confirmed entries are forwarded verbatim."
+                "按群启用后会保留已确认的重置记录、回答群里的相关提问，并原样转发新确认条目。"
+                "缺少接口地址时显示未配置，不会当成未安装。"
             ),
         }
 
     async def get_runtime_status(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "configured_enabled": self._configured_enabled,
+            "api_url_configured": self._api_url_configured,
             "running": bool(self._scheduler_task and not self._scheduler_task.done()),
             "scheduler_enabled": self._scheduler_enabled,
             "poll_interval_seconds": self._poll_interval(),

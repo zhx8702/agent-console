@@ -1,12 +1,34 @@
 :root {
   /* Raw palette: component styles must consume these through var(). */
+
+  /* Ink & Pine theme primitives */
+  --color-paper: #f2efe6;
+  --color-paper-bright: #fbfaf5;
+  --color-paper-dim: #eae6da;
+  --color-paper-line: #ddd7c8;
+  --color-paper-line-light: #e9e5d8;
+  --color-paper-line-strong: #c9c2ae;
+  --color-ink-900: #1d201c;
+  --color-ink-700: #3c413a;
+  --color-ink-600: #575d52;
+  --color-ink-500: #596254;
+  --color-ink-sidebar: #101915;
+  --color-ink-sidebar-raised: #16211c;
+  --color-pine-300: #5eead4;
+  --color-pine-400: #2dd4bf;
+  --color-pine-600: #0d9488;
+  --color-pine-700: #0b655f;
+  --color-pine-800: #115e59;
+  --color-pine-900: #134e4a;
+  --color-sage-300: #a7b3a9;
+  --color-sage-100: #e6ece7;
   --color-sky-600: #0284c7;
   --color-emerald-700: #047857;
   --color-sky-800: #075985;
   --color-custom-0b1422: #0b1422;
   --color-sky-500: #0ea5e9;
   --color-slate-900: #0f172a;
-  --color-teal-700: #0f766e;
+  --color-teal-700: #0b655f;
   --color-custom-101827: #101827;
   --color-gray-900: #111827;
   --color-teal-800: #115e59;

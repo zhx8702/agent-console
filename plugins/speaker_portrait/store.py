@@ -66,20 +66,70 @@ class SpeakerPortraitStore:
         max_messages: int = 4000,
         mode: str = "full",
         since_timestamp: str = "",
+        portrait_id: int | None = None,
+        claimed_pending_messages: int | None = None,
     ) -> dict[str, Any]:
         normalized_mode = "incremental" if str(mode or "").strip().lower() == "incremental" else "full"
         async with get_engine().begin() as conn:
+            portrait_result = await conn.execute(
+                text(
+                    f"""
+                    SELECT id, session_id, pending_messages, last_distilled_message_at
+                    FROM {PORTRAIT_TABLE}
+                    WHERE tenant_id = :tenant_id AND channel = 'wechat'
+                      AND source_key = 'wxbot' AND speaker_id = :speaker_id
+                    FOR UPDATE
+                    """
+                ),
+                {"tenant_id": tenant_id, "speaker_id": speaker_id},
+            )
+            portrait = portrait_result.mappings().first()
+            resolved_portrait_id = int(portrait_id) if portrait_id is not None else None
+            if resolved_portrait_id is None and portrait is not None:
+                resolved_portrait_id = int(portrait["id"])
+            resolved_pending = claimed_pending_messages
+            if resolved_pending is None:
+                resolved_pending = int(portrait["pending_messages"] or 0) if portrait is not None else 0
+            resolved_since = str(since_timestamp or "").strip()
+            if normalized_mode == "incremental" and not resolved_since and portrait is not None:
+                resolved_since = str(portrait["last_distilled_message_at"] or "").strip()
+            resolved_external_session_id = str(external_session_id or "").strip()
+            if (
+                (not resolved_external_session_id or resolved_external_session_id.startswith("cx1:"))
+                and portrait is not None
+            ):
+                stored_session_id = str(portrait["session_id"] or "").strip()
+                if stored_session_id and not stored_session_id.startswith("cx1:"):
+                    resolved_external_session_id = stored_session_id
+            if resolved_portrait_id is not None:
+                active_result = await conn.execute(
+                    text(
+                        f"""
+                        SELECT * FROM {JOB_TABLE}
+                        WHERE portrait_id = :portrait_id
+                          AND status IN ('queued', 'running')
+                        ORDER BY id
+                        LIMIT 1
+                        """
+                    ),
+                    {"portrait_id": resolved_portrait_id},
+                )
+                active = active_result.mappings().first()
+                if active is not None:
+                    return dict(active)
             result = await conn.execute(
                 text(
                     f"""
                     INSERT INTO {JOB_TABLE} (
                         tenant_id, session_id, session_name, speaker_id, speaker_name,
                         connection_id, external_session_id, status, days_limit, max_messages,
-                        mode, since_timestamp, created_at, updated_at
+                        mode, since_timestamp, portrait_id, claimed_pending_messages,
+                        created_at, updated_at
                     ) VALUES (
                         :tenant_id, :session_id, :session_name, :speaker_id, :speaker_name,
                         :connection_id, :external_session_id, 'queued', :days_limit, :max_messages,
-                        :mode, :since_timestamp, :now, :now
+                        :mode, :since_timestamp, :portrait_id, :claimed_pending_messages,
+                        :now, :now
                     )
                     RETURNING id
                     """
@@ -91,11 +141,13 @@ class SpeakerPortraitStore:
                     "speaker_id": speaker_id,
                     "speaker_name": speaker_name,
                     "connection_id": connection_id,
-                    "external_session_id": external_session_id,
+                    "external_session_id": resolved_external_session_id,
                     "days_limit": days_limit,
                     "max_messages": max_messages,
                     "mode": normalized_mode,
-                    "since_timestamp": str(since_timestamp or "")[:64],
+                    "since_timestamp": resolved_since[:64],
+                    "portrait_id": resolved_portrait_id,
+                    "claimed_pending_messages": max(0, int(resolved_pending or 0)),
                     "now": _now(),
                 },
             )
@@ -208,6 +260,23 @@ class SpeakerPortraitStore:
     ) -> dict[str, Any]:
         now = _now()
         async with get_engine().begin() as conn:
+            job_state = await conn.execute(
+                text(
+                    f"""
+                    SELECT claimed_pending_messages
+                    FROM {JOB_TABLE}
+                    WHERE id = :job_id
+                    FOR UPDATE
+                    """
+                ),
+                {"job_id": job_id},
+            )
+            job_row = job_state.mappings().first()
+            claimed_pending_messages = (
+                max(0, int(job_row["claimed_pending_messages"] or 0))
+                if job_row is not None
+                else 0
+            )
             existing = await conn.execute(
                 text(
                     f"""
@@ -255,7 +324,12 @@ class SpeakerPortraitStore:
                     text(
                         f"""
                         UPDATE {PORTRAIT_TABLE}
-                        SET display_name = :display_name, session_id = :session_id,
+                        SET display_name = :display_name,
+                            session_id = CASE
+                                WHEN :session_id <> '' AND :session_id NOT LIKE 'cx1:%'
+                                    THEN :session_id
+                                ELSE session_id
+                            END,
                             status = 'ready', updated_at = :now
                         WHERE id = :id
                         """
@@ -295,9 +369,22 @@ class SpeakerPortraitStore:
                     UPDATE {PORTRAIT_TABLE}
                     SET current_revision_id = :revision_id,
                         last_message_at = CASE
-                            WHEN :last_message_at <> '' THEN :last_message_at
+                            WHEN :last_message_at <> '' AND (
+                                last_message_at = '' OR :last_message_at > last_message_at
+                            ) THEN :last_message_at
                             ELSE last_message_at
                         END,
+                        last_distilled_message_at = CASE
+                            WHEN :last_message_at <> '' AND (
+                                last_distilled_message_at = ''
+                                OR :last_message_at > last_distilled_message_at
+                            ) THEN :last_message_at
+                            ELSE last_distilled_message_at
+                        END,
+                        pending_messages = GREATEST(
+                            pending_messages - :claimed_pending_messages,
+                            0
+                        ),
                         last_full_at = CASE
                             WHEN :mode = 'full' THEN :now
                             ELSE last_full_at
@@ -310,6 +397,7 @@ class SpeakerPortraitStore:
                     "revision_id": revision_id,
                     "last_message_at": str(last_message_at or "")[:64],
                     "mode": "incremental" if str(mode or "") == "incremental" else "full",
+                    "claimed_pending_messages": claimed_pending_messages,
                     "now": now,
                     "id": portrait_id,
                 },
@@ -433,14 +521,16 @@ class SpeakerPortraitStore:
                             ELSE display_name
                         END,
                         session_id = CASE
-                            WHEN :session_id <> '' THEN :session_id
+                            WHEN :session_id <> '' AND :session_id NOT LIKE 'cx1:%'
+                                THEN :session_id
                             ELSE session_id
                         END,
                         last_message_at = CASE
-                            WHEN :timestamp <> '' THEN :timestamp
+                            WHEN :timestamp <> '' AND (
+                                last_message_at = '' OR :timestamp > last_message_at
+                            ) THEN :timestamp
                             ELSE last_message_at
-                        END,
-                        updated_at = :now
+                        END
                     WHERE tenant_id = :tenant_id AND channel = :channel
                       AND source_key = :source_key AND speaker_id = :speaker_id
                       AND hot_update_enabled IS TRUE
@@ -450,7 +540,6 @@ class SpeakerPortraitStore:
                     "speaker_name": str(speaker_name or "")[:256],
                     "session_id": str(session_id or "")[:256],
                     "timestamp": str(timestamp or "")[:64],
-                    "now": _now(),
                     "tenant_id": tenant_id,
                     "channel": channel,
                     "source_key": source_key,
@@ -481,9 +570,14 @@ class SpeakerPortraitStore:
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM {JOB_TABLE} j
-                        WHERE j.tenant_id = p.tenant_id
-                          AND j.speaker_id = p.speaker_id
-                          AND j.status IN ('queued', 'running')
+                        WHERE j.portrait_id = p.id
+                          AND (
+                            j.status IN ('queued', 'running')
+                            OR (
+                              j.mode = 'incremental'
+                              AND j.created_at > :cutoff
+                            )
+                          )
                       )
                     ORDER BY p.pending_messages DESC, p.updated_at ASC
                     LIMIT :limit

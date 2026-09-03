@@ -574,8 +574,8 @@ class Settings(BaseSettings):
     )
     wxbot_preview_wait_seconds: float = 30.0
     wxbot_preview_poll_interval_seconds: float = 0.7
-    # Organization-specific polling is inert until both the feature flag and
-    # an explicit feed endpoint are configured by the operator.
+    # Compatibility flag for existing env files. Runtime enablement is
+    # plugin_state; a missing API URL is reported as unconfigured.
     tibo_reset_enabled: bool = False
     tibo_reset_api_url: str = ""
     tibo_reset_poll_interval_seconds: float = Field(default=300.0, ge=30.0)
@@ -636,6 +636,7 @@ class Settings(BaseSettings):
     speaker_portrait_hot_update_enabled: bool = True
     speaker_portrait_hot_update_min_messages: int = Field(default=40, ge=1)
     speaker_portrait_hot_update_min_seconds: float = Field(default=3600.0, ge=60)
+    speaker_portrait_style_sync_enabled: bool = True
     speaker_portrait_data_dir: str = "/data/portraits"
     speaker_portrait_host_dir: str = "/opt/agent-console-portraits"
     speaker_portrait_inline_max_messages: int = Field(default=400, ge=50)

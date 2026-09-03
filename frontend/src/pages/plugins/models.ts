@@ -89,6 +89,9 @@ export type PluginRuntime = {
   tibo_reset?: {
     running?: boolean;
     scheduler_enabled?: boolean;
+    configured_enabled?: boolean;
+    api_url_configured?: boolean;
+    poll_interval_seconds?: number;
     enabled_groups?: number;
     latest_tweet_id?: string;
     last_success_at?: string;
@@ -483,3 +486,91 @@ export const PLUGIN_LINKS: Record<string, string> = {
   repeater: "/repeater",
   wxbot: "/wxbot",
 };
+
+export const PLUGIN_DISPLAY_NAMES: Record<string, string> = {
+  amap: "高德地图",
+  commands: "命令中心",
+  credits: "积分运营",
+  memory: "成员记忆",
+  moderation: "内容审核",
+  wxbot: "微信适配器",
+  persona_extract: "回复风格",
+  repeater: "复读策略",
+  tibo_reset: "Tibo 重置",
+};
+
+const PLUGIN_RUNTIME_FIELD_LABELS: Record<string, string> = {
+  api_url_configured: "接口地址",
+  api_key_configured: "API 密钥",
+  configured: "接口配置",
+  fallback_configured: "备用接口",
+  scheduler_enabled: "调度器",
+  running: "运行中",
+  poll_interval_seconds: "轮询间隔（秒）",
+  last_error: "最近错误",
+  last_success_at: "最近成功",
+  latest_tweet_id: "最新条目",
+  enabled_groups: "已开群数",
+};
+
+// configured_enabled duplicates api_url_configured on tibo_reset and would
+// render two identical rows on the card.
+const HIDDEN_RUNTIME_KEYS = new Set(["stats", "tools", "configured_enabled"]);
+
+function pluginRuntimeUnconfigured(
+  pluginName: string,
+  runtime?: PluginRuntime,
+): boolean {
+  const facts = runtime?.[pluginName as keyof PluginRuntime] as
+    | Record<string, unknown>
+    | undefined;
+  if (!facts) return false;
+  if (facts.api_url_configured === false) return true;
+  if (facts.api_key_configured === false) return true;
+  // A plugin with a working fallback endpoint (e.g. draw) is still usable
+  // when only the primary endpoint is missing.
+  return facts.configured === false && facts.fallback_configured !== true;
+}
+
+export function pluginEnablementLabel(
+  plugin: InstalledPlugin | undefined,
+  runtime?: PluginRuntime,
+): string {
+  if (!plugin) return "未加载";
+  if (plugin.restart_required) return "待重启";
+  if (!plugin.enabled) return "已停用";
+  if (pluginRuntimeUnconfigured(plugin.name, runtime)) {
+    return "未配置";
+  }
+  return "已启用";
+}
+
+export function pluginRuntimeFacts(
+  pluginName: string,
+  runtime: PluginRuntime,
+): Array<{ label: string; value: string }> {
+  const raw = runtime[pluginName as keyof PluginRuntime];
+  if (!raw || typeof raw !== "object") {
+    return [];
+  }
+  return Object.entries(raw)
+    .filter(([key, value]) => !HIDDEN_RUNTIME_KEYS.has(key) && value != null && typeof value !== "object")
+    .map(([key, value]) => ({
+      label: PLUGIN_RUNTIME_FIELD_LABELS[key] || key,
+      value: formatRuntimeFact(key, value),
+    }));
+}
+
+function formatRuntimeFact(key: string, value: unknown): string {
+  if (typeof value === "boolean") {
+    if (key === "configured" || key.endsWith("_configured")) {
+      return value ? "已配置" : "未配置";
+    }
+    return value ? "是" : "否";
+  }
+  if (typeof value === "number" || typeof value === "string") {
+    const text = String(value).trim();
+    return text || "-";
+  }
+  return "-";
+}

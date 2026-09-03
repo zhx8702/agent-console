@@ -4,7 +4,7 @@ import type { DocumentsController } from "./useDocumentsController";
 export function DocumentsWorkspace({ documents }: { documents: DocumentsController }) {
   return (
     <>
-      <section className="panel span-2">
+      <section className="panel span-3">
         <div className="knowledge-workbench">
           <aside className="knowledge-sidebar">
             <div className="panel-header"><div><p className="section-kicker">知识文档</p><h3>知识文档列表</h3></div></div>

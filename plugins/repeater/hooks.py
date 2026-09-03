@@ -8,6 +8,7 @@ system repeats the message once and suppresses the normal capability chain.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from app.channel import set_reply_policy_override
@@ -28,6 +29,8 @@ from app.preprocessing.pii import detect_and_mask
 from plugins.repeater.store import RepeaterStore
 
 logger = get_logger(__name__)
+
+ScopeExecutionAllowed = Callable[[str, str], Awaitable[bool]]
 _MENTION_PREFIX_RE = re.compile(r"^\s*(?:@\S+[\s\u2005\u00a0]+)+")
 _NON_TEXT_PLACEHOLDERS = {"[图片]", "[语音]", "[视频]", "[文件]"}
 _URL_RE = re.compile(
@@ -191,6 +194,7 @@ def _repeat_member_reason(ctx: PipelineContext, previous_turn: Turn) -> str:
 class RepeaterHook:
     store: RepeaterStore
     record_trigger_enabled: bool = True
+    scope_execution_allowed: ScopeExecutionAllowed | None = None
     name: str = "repeater.repeat"
     point: HookPoint = HookPoint.BEFORE_ROUTE
     # Run after command hooks, but before wxbot group reply-policy suppression.
@@ -217,6 +221,18 @@ class RepeaterHook:
             return
 
         policy_session_id = _repeater_policy_session_id(ctx)
+        if self.scope_execution_allowed is not None:
+            allowed = await self.scope_execution_allowed(
+                event.tenant_id,
+                policy_session_id,
+            )
+            if allowed is not True:
+                ctx.extras["repeater"] = {
+                    "triggered": False,
+                    "reason": "scope_disabled",
+                    "content": "",
+                }
+                return
         cfg = await self.store.get_config(event.tenant_id, policy_session_id)
         if not cfg.get("enabled"):
             return
@@ -339,6 +355,7 @@ def _record_trigger_effect(
 class RepeaterDetectStep:
     store: RepeaterStore
     effect_handler_enabled: bool = False
+    scope_execution_allowed: ScopeExecutionAllowed | None = None
     kind: str = "plugin.repeater.detect"
     owner: str = "repeater"
     name: str = "Detect group repeater"
@@ -360,6 +377,7 @@ class RepeaterDetectStep:
             await RepeaterHook(
                 self.store,
                 record_trigger_enabled=not trigger_as_effect,
+                scope_execution_allowed=self.scope_execution_allowed,
             ).run(ctx)
         except HookAbort as exc:
             signal = _sync_repeater_signal(ctx)

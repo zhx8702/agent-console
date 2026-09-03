@@ -1,6 +1,7 @@
 import axe from "axe-core";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { apiRequest } from "../lib/api";
@@ -124,7 +125,11 @@ describe("high-risk action dialogs", () => {
       return {};
     });
 
-    render(<PluginMarketplacePage />);
+    render(
+      <MemoryRouter>
+        <PluginMarketplacePage />
+      </MemoryRouter>,
+    );
     await user.click(await screen.findByRole("button", { name: "卸载插件" }));
 
     const dialog = screen.getByRole("dialog", { name: "确认卸载 Memory" });
@@ -187,7 +192,11 @@ describe("high-risk action dialogs", () => {
       return {};
     });
 
-    render(<PluginMarketplacePage />);
+    render(
+      <MemoryRouter>
+        <PluginMarketplacePage />
+      </MemoryRouter>,
+    );
     await user.click(await screen.findByRole("button", { name: "预览安装" }));
     await waitFor(() => {
       expect(apiRequestMock.mock.calls.some(([, path]) => path === "/v1/admin/plugins/install/preview")).toBe(true);

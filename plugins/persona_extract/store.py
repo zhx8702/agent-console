@@ -1653,6 +1653,19 @@ class PersonaExtractStore:
         )
         return self._hydrate_profile(rows[0]) if rows else None
 
+    async def list_profiles_by_slug(self, tenant_id: str, skill_slug: str) -> list[dict]:
+        """All profiles derived from one skill slug, across sessions."""
+
+        if not skill_slug.strip():
+            return []
+        rows = await _exec(
+            "SELECT * FROM plugin_persona_profiles "
+            "WHERE tenant_id = :tid AND skill_slug = :slug "
+            "ORDER BY updated_at DESC",
+            {"tid": tenant_id, "slug": skill_slug.strip()},
+        )
+        return [self._hydrate_profile(row) for row in rows]
+
     async def upsert_profile(
         self,
         *,

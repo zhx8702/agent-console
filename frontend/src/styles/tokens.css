@@ -1,32 +1,36 @@
 :root {
   color-scheme: light;
 
+  /* Ink & Pine: warm paper canvas, ink text, pine accent. */
+
   /* Semantic color tokens */
-  --bg: var(--color-custom-f5f7fa);
-  --bg-surface: var(--color-white);
-  --sidebar-bg: var(--color-slate-900);
-  --sidebar-text: var(--color-slate-300);
-  --sidebar-text-bright: var(--color-slate-100);
-  --sidebar-hover: rgba(255, 255, 255, 0.06);
-  --sidebar-active: rgba(99, 102, 241, 0.15);
-  --sidebar-active-text: var(--color-indigo-400);
-  --sidebar-border: rgba(255, 255, 255, 0.06);
-  --panel: var(--color-white);
-  --panel-alt: var(--color-slate-50);
-  --line: var(--color-slate-200);
-  --line-light: var(--color-slate-100);
-  --text: var(--color-slate-900);
-  --text-secondary: var(--color-slate-600);
-  --text-muted: var(--color-slate-500);
-  --muted: var(--color-slate-500);
-  --accent: var(--color-custom-5b5bd6);
-  --accent-hover: var(--color-indigo-600);
-  --accent-light: rgba(91, 91, 214, 0.08);
+  --bg: var(--color-paper);
+  --bg-surface: var(--color-paper-bright);
+  --sidebar-bg: var(--color-ink-sidebar);
+  --sidebar-text: var(--color-sage-300);
+  --sidebar-text-bright: var(--color-sage-100);
+  --sidebar-hover: rgba(255, 255, 255, 0.05);
+  --sidebar-active: rgba(45, 212, 191, 0.09);
+  --sidebar-active-text: var(--color-pine-300);
+  --sidebar-border: rgba(255, 255, 255, 0.07);
+  --panel: var(--color-paper-bright);
+  --panel-alt: var(--color-paper-dim);
+  --line: var(--color-paper-line);
+  --line-light: var(--color-paper-line-light);
+  --line-strong: var(--color-paper-line-strong);
+  --text: var(--color-ink-900);
+  --text-secondary: var(--color-ink-600);
+  --text-muted: var(--color-ink-500);
+  --muted: var(--color-ink-500);
+  --accent: var(--color-pine-700);
+  --accent-hover: var(--color-pine-800);
+  --accent-bright: var(--color-pine-600);
+  --accent-light: rgba(15, 118, 110, 0.08);
   --success: var(--color-emerald-700);
   --warning: var(--color-amber-700);
   --danger: var(--color-red-700);
-  --focus-ring: var(--color-sky-600);
-  --focus-ring-shadow: rgba(2, 132, 199, 0.2);
+  --focus-ring: var(--color-pine-600);
+  --focus-ring-shadow: rgba(13, 148, 136, 0.22);
 
   /* Reusable status tones */
   --tone-info-bg: var(--color-blue-50);
@@ -41,15 +45,21 @@
   --tone-danger-bg: var(--color-red-50);
   --tone-danger-text: var(--color-red-700);
   --tone-danger-border: var(--color-red-200);
-  --tone-muted-bg: var(--color-slate-100);
-  --tone-muted-text: var(--color-slate-600);
-  --tone-muted-border: var(--color-slate-200);
-  --tone-accent-bg: var(--color-purple-50);
-  --tone-accent-text: var(--color-purple-800);
-  --tone-accent-border: var(--color-purple-200);
-  --tone-inverse-bg: rgba(15, 23, 42, 0.78);
-  --tone-inverse-text: var(--color-slate-100);
-  --tone-inverse-border: rgba(148, 163, 184, 0.2);
+  --tone-muted-bg: var(--color-paper-dim);
+  --tone-muted-text: var(--color-ink-600);
+  --tone-muted-border: var(--color-paper-line);
+  --tone-accent-bg: rgba(15, 118, 110, 0.08);
+  --tone-accent-text: var(--color-pine-800);
+  --tone-accent-border: rgba(15, 118, 110, 0.28);
+  --tone-inverse-bg: rgba(29, 32, 28, 0.82);
+  --tone-inverse-text: var(--color-paper-bright);
+  --tone-inverse-border: rgba(233, 229, 216, 0.22);
+
+  /* Typography */
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, "SFMono-Regular",
+    Menlo, "PingFang SC", "Microsoft YaHei", monospace;
 
   /* Spacing scale */
   --space-0: 0;
@@ -82,12 +92,12 @@
   --font-size-4xl: 1.75rem;
 
   /* Shape, elevation, and interaction */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
-  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
-  --radius-sm: 6px;
-  --radius: 8px;
-  --radius-lg: 12px;
+  --shadow-sm: 0 1px 0 rgba(29, 32, 28, 0.04);
+  --shadow: 0 1px 2px rgba(29, 32, 28, 0.05), 0 1px 0 rgba(29, 32, 28, 0.03);
+  --shadow-md: 0 6px 16px -8px rgba(29, 32, 28, 0.18), 0 2px 4px -2px rgba(29, 32, 28, 0.06);
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
   --radius-pill: 999px;
   --touch-target: 44px;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { DangerAction } from "../components/DangerAction";
 import { OutputPanel } from "../components/OutputPanel";
@@ -82,6 +83,8 @@ function marketplaceStateLabel(item: MarketplaceItem) {
 
 export function PluginMarketplacePage() {
   const { config } = useConsoleConfig();
+  const [searchParams] = useSearchParams();
+  const selectedPluginName = searchParams.get("plugin")?.trim() || "";
   const { keyFor, clear } = useStableIdempotencyKeys();
   const [data, setData] = useState<MarketplaceResponse | null>(null);
   const [restart, setRestart] = useState<RestartInstructions | null>(null);
@@ -227,12 +230,30 @@ export function PluginMarketplacePage() {
     void loadMarketplace();
   }, [config.apiBaseUrl, config.adminToken]);
 
+  useEffect(() => {
+    if (!selectedPluginName) {
+      return;
+    }
+    const card = document.getElementById(`marketplace-card-${selectedPluginName}`);
+    if (card && typeof card.scrollIntoView === "function") {
+      card.scrollIntoView({
+        block: "nearest",
+        behavior: "smooth",
+      });
+    }
+  }, [selectedPluginName, data?.items.length]);
+
   return (
     <div>
       <PageHeader
         eyebrow="插件市场"
         title="插件市场"
         description="从本地插件清单查看、预览和安装内置插件；安装和卸载只写入状态，重启后生效。"
+        actions={
+          <button className="button button-secondary" onClick={() => void loadMarketplace()} disabled={loading}>
+            {loading ? "刷新中" : "刷新"}
+          </button>
+        }
       />
 
       {restartRequired && (
@@ -253,22 +274,19 @@ export function PluginMarketplacePage() {
         </div>
       )}
 
-      <section className="status-grid">
+      <section className="status-grid page-hero-metrics">
         <StatusTile label="已安装" value={`${installedCount}`} />
         <StatusTile label="可安装" value={`${availableCount}`} />
         <StatusTile label="风险提示" value={`${blockedCount}`} />
       </section>
 
       <section className="page-grid u-mt-5">
-        <div className="panel span-2">
+        <div className="panel span-3">
           <div className="panel-heading-row">
             <div>
               <p className="section-kicker">清单信息</p>
               <h3>本地插件清单</h3>
             </div>
-            <button className="button button-secondary" onClick={() => void loadMarketplace()} disabled={loading}>
-              {loading ? "刷新中" : "刷新"}
-            </button>
           </div>
 
           <div className="plugin-card-grid marketplace-grid">
@@ -278,7 +296,11 @@ export function PluginMarketplacePage() {
               const canUpgrade = item.installed && item.installed_version && item.installed_version !== item.version;
               const preparedChange = pendingChange?.pluginName === item.name ? pendingChange : null;
               return (
-                <article className="plugin-card marketplace-card" key={item.name}>
+                <article
+                  id={`marketplace-card-${item.name}`}
+                  className={`plugin-card marketplace-card ${selectedPluginName === item.name ? "is-selected" : ""}`}
+                  key={item.name}
+                >
                   <div className="plugin-card-header">
                     <div>
                       <strong>{item.display_name}</strong>
@@ -437,9 +459,8 @@ export function PluginMarketplacePage() {
             })}
             {!sortedItems.length && <p className="plugin-card-empty">本地插件清单暂无可用条目。</p>}
           </div>
+          <OutputPanel flush title="插件市场接口响应" value={output} />
         </div>
-
-        <OutputPanel title="插件市场接口响应" value={output} />
       </section>
     </div>
   );

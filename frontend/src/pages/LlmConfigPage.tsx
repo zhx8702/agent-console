@@ -129,7 +129,7 @@ function changedPayload(
 }
 
 function SourceBadge({ source }: { source: FieldSource | undefined }) {
-  if (!source) {
+  if (!source || source === "environment" || source === "dotenv_or_default") {
     return null;
   }
   return (
@@ -288,38 +288,49 @@ export function LlmConfigPage() {
         <PageHeader
           eyebrow="运行时模型控制"
           title="大模型配置"
-          description="直接编辑并保存非敏感模型参数。控制台版本会覆盖运行环境中的默认值；密钥提供方仍保持只读。保存不会改写部署文件，也不会热替换正在服务的模型。"
+          description="直接编辑并保存非敏感模型参数。控制台版本会覆盖运行环境默认值；密钥提供方只读。保存不会改写部署文件，也不会热替换正在服务的模型。"
+          actions={
+            <div className="action-row">
+              <button
+                type="button"
+                className="button button-primary"
+                onClick={() => void saveConfig()}
+                disabled={!dirty || !etag || status === "saving" || status === "loading" || status === "conflict"}
+              >
+                {status === "saving" ? "提交版本中…" : "保存为新版本"}
+              </button>
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => void loadConfig(true)}
+                disabled={status === "loading" || status === "saving"}
+              >
+                {status === "loading" ? "读取中…" : dirty ? "放弃草稿并重新读取" : "重新读取"}
+              </button>
+              {dirty ? (
+                <button type="button" className="button button-ghost" onClick={discardDraft}>
+                  还原本地草稿
+                </button>
+              ) : null}
+            </div>
+          }
         />
-        <div className="action-row">
-          <button
-            type="button"
-            className="button button-primary"
-            onClick={() => void saveConfig()}
-            disabled={!dirty || !etag || status === "saving" || status === "loading" || status === "conflict"}
-          >
-            {status === "saving" ? "提交版本中…" : "保存为新版本"}
-          </button>
-          <button
-            type="button"
-            className="button button-secondary"
-            onClick={() => void loadConfig(true)}
-            disabled={status === "loading" || status === "saving"}
-          >
-            {status === "loading" ? "读取中…" : dirty ? "放弃草稿并重新读取" : "重新读取"}
-          </button>
-          {dirty ? (
-            <button type="button" className="button button-ghost" onClick={discardDraft}>
-              还原本地草稿
-            </button>
-          ) : null}
-        </div>
 
         <div className="status-grid" aria-live="polite">
           <StatusTile label="状态" value={STATUS_LABELS[status]} />
           <StatusTile label="配置版本" value={loadedConfig ? `v${loadedConfig.version}` : "未加载"} />
           <StatusTile label="待保存" value={dirty ? "有本地修改" : "无"} />
           <StatusTile label="可编辑字段" value={`${DRAFT_FIELDS.length - lockedCount}`} />
-          <StatusTile label="影响服务" value={loadedConfig?.affected_roles.map(roleLabel).join(" / ") || "-"} />
+          <StatusTile
+            label="影响服务"
+            value={
+              loadedConfig?.affected_roles.length
+                ? loadedConfig.affected_roles.length > 2
+                  ? `${loadedConfig.affected_roles.length} 个服务`
+                  : loadedConfig.affected_roles.map(roleLabel).join("、")
+                : "-"
+            }
+          />
           <StatusTile
             label="OpenAI 凭据"
             value={secretStatus?.configured ? "由外部提供" : "未配置"}
@@ -389,6 +400,7 @@ export function LlmConfigPage() {
           </div>
         ) : (
           <div className="form-grid">
+            <p className="muted-copy span-2">未标注来源的字段使用运行环境默认值；控制台覆盖和密钥提供方会单独标出。</p>
             <label className="field">
               <span>聊天模型提供方</span>
               <SourceBadge source={sourceFor("llm_provider")} />
@@ -488,7 +500,7 @@ export function LlmConfigPage() {
       </section>
 
       <div className="span-3">
-        <OutputPanel title="安全响应（不含密钥）" value={output} />
+        <OutputPanel flush title="安全响应（不含密钥）" value={output} />
       </div>
     </div>
   );

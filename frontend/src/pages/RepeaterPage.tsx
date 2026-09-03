@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Alert } from "../components/Alert";
+import { GroupScopeEmpty } from "../components/GroupScopeEmpty";
 import { OutputPanel } from "../components/OutputPanel";
 import { PageHeader } from "../components/PageHeader";
 import { UnsavedChangesGuard } from "../components/UnsavedChangesGuard";
@@ -134,26 +135,43 @@ export function RepeaterPage() {
   }, [loadConfig]);
 
   return (
+    !selectedGroup ? (
+      <GroupScopeEmpty
+        eyebrow="复读策略"
+        title="复读策略"
+        description="按当前已验证群聊配置。复读内容还会经过真实成员数、敏感信息、链接、命令和统一发言预算检查。"
+      />
+    ) : (
     <div className="page-grid">
       <UnsavedChangesGuard when={dirty} />
-      <section className="panel span-2">
+      <section className="panel span-3">
         <PageHeader
           eyebrow="复读策略"
           title="复读策略"
-          description="按当前已验证群聊配置。复读内容还会经过真实成员数、敏感信息、链接、命令和统一发言预算检查。SDK 群消息门禁只由回复策略的一键聚合配置调整。"
+          description="按当前已验证群聊配置冷却与启用；复读仍受真实成员数、敏感信息和发言预算约束。"
+          actions={
+            <div className="action-row">
+              <button className="button button-secondary" type="button" onClick={() => void loadConfig()} disabled={!selectedGroup || status === "loading" || status === "saving"}>
+                重新读取
+              </button>
+              <button className="button button-primary" type="button" onClick={() => void saveConfig()} disabled={!selectedGroup || !etag || !dirty || !draftValid || status === "loading" || status === "saving" || status === "conflict"}>
+                {status === "saving" ? "保存中…" : "保存配置"}
+              </button>
+              <button className="button button-secondary" type="button" onClick={() => void loadEvents()} disabled={!selectedGroup}>
+                查看触发记录
+              </button>
+            </div>
+          }
         />
-        {!selectedGroup ? (
-          <Alert variant="warning" title="尚未选择已验证群聊">选择群聊后才能读取或修改复读策略。</Alert>
-        ) : null}
         {error ? (
           <Alert variant={status === "conflict" ? "warning" : "danger"} title={status === "conflict" ? "版本冲突" : "配置操作失败"}>
             {error}
           </Alert>
         ) : null}
-        <div className="form-grid">
-          <label className="field field-toggle">
+        <div className="repeater-config-grid">
+          <label className="field">
             <span>启用群复读</span>
-            <span className="toggle-chip">
+            <span className="toggle-row">
               <input
                 type="checkbox"
                 checked={draft.enabled}
@@ -189,20 +207,9 @@ export function RepeaterPage() {
           <span className="pill pill-muted">{dirty ? "有未保存修改" : "已同步"}</span>
           <span className="pill pill-muted">版本 {etag || "-"}</span>
         </div>
-        <div className="action-row">
-          <button className="button button-secondary" type="button" onClick={() => void loadConfig()} disabled={!selectedGroup || status === "loading" || status === "saving"}>
-            重新读取
-          </button>
-          <button className="button button-primary" type="button" onClick={() => void saveConfig()} disabled={!selectedGroup || !etag || !dirty || !draftValid || status === "loading" || status === "saving" || status === "conflict"}>
-            {status === "saving" ? "保存中…" : "保存配置"}
-          </button>
-          <button className="button button-secondary" type="button" onClick={() => void loadEvents()} disabled={!selectedGroup}>
-            查看触发记录
-          </button>
-        </div>
+        <OutputPanel flush title="复读触发记录（技术详情）" value={eventsOutput} />
       </section>
-
-      <OutputPanel title="复读触发记录（技术详情）" value={eventsOutput} />
     </div>
+    )
   );
 }

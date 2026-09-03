@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { DangerAction } from "../../components/DangerAction";
+import { GroupScopeEmpty } from "../../components/GroupScopeEmpty";
 import { OutputPanel } from "../../components/OutputPanel";
 import { PageHeader } from "../../components/PageHeader";
-import { SearchableSelect } from "../../components/SearchableSelect";
-import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
-import { apiBlobRequest, apiRequest, formatJson, parseJsonInput } from "../../lib/api";
+import { apiRequest, formatJson } from "../../lib/api";
 import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { requireSelectedGroup, useConsoleConfig } from "../../state/console-config";
 
@@ -14,26 +13,27 @@ import {
   type GroupRosterCandidate,
   type GroupRosterPayload,
   type GroupSessionRosterPayload,
-  type PersonaArtifact,
-  type PersonaJob,
   type PersonaProfile,
-  isGroupSession,
+  type PortraitJob,
+  type PortraitRecord,
+  type PortraitStylePreview,
+  PORTRAIT_CLAIM_SECTIONS,
   getMemberDisplayName,
-  buildSkillFrontmatter,
-  buildDefaultMeta,
-  getArtifactPrompt,
-  personaArtifactModeLabel,
-  personaJobDurationLabel,
-  personaJobRetryLabel,
-  personaJobStageLabel,
-  personaJobStatusLabel,
-  shortJobError,
+  isGroupSession,
+  portraitConfidenceLabel,
+  portraitCoverageLabel,
+  portraitFreshness,
+  portraitFreshnessHint,
+  portraitJobDurationLabel,
+  portraitJobModeLabel,
+  portraitJobStatusLabel,
+  shortPortraitJobError,
 } from "./model";
 
-const PERSONA_JOB_POLL_DELAYS = [2_000, 5_000, 10_000, 15_000] as const;
+const PORTRAIT_JOB_POLL_DELAYS = [2_000, 5_000, 10_000, 15_000] as const;
 
-function isActivePersonaJob(job: PersonaJob | null | undefined) {
-  return ["pending", "queued", "running"].includes(String(job?.status || ""));
+function isActivePortraitJob(job: PortraitJob | null | undefined) {
+  return ["queued", "running"].includes(String(job?.status || ""));
 }
 
 function isAbortError(error: unknown) {
@@ -42,239 +42,91 @@ function isAbortError(error: unknown) {
     : error instanceof Error && error.name === "AbortError";
 }
 
-type PersonaJobMutationResponse = {
-  job_id?: number;
-  status?: string;
-  accepted?: boolean;
-  status_url?: string;
-  cancel_requested?: boolean;
-  download_url?: string;
-  job?: PersonaJob;
-};
-
 export function PersonaWorkspace() {
   const { config, verifiedGroupIds } = useConsoleConfig();
   const { keyFor, clear } = useStableIdempotencyKeys();
+
   const [sessions, setSessions] = useState<WxbotSession[]>([]);
   const [members, setMembers] = useState<GroupRosterCandidate[]>([]);
-  const [jobs, setJobs] = useState<PersonaJob[]>([]);
+  const [jobs, setJobs] = useState<PortraitJob[]>([]);
   const [profiles, setProfiles] = useState<PersonaProfile[]>([]);
+  const [portrait, setPortrait] = useState<PortraitRecord | null>(null);
+  const [stylePreview, setStylePreview] = useState<PortraitStylePreview | null>(null);
 
-  const [personaSessionName, setPersonaSessionName] = useState("");
+  const [sessionName, setSessionName] = useState("");
   const [selectedMemberWxid, setSelectedMemberWxid] = useState("");
+  const [daysLimit, setDaysLimit] = useState(90);
+  const [maxMessages, setMaxMessages] = useState(4000);
+  const [jobMode, setJobMode] = useState<"full" | "incremental">("full");
+  const [styleEnabled, setStyleEnabled] = useState(true);
+  const [jobNotice, setJobNotice] = useState("");
+  const [memberQuery, setMemberQuery] = useState("");
 
   const [selectionOutput, setSelectionOutput] = useState('{\n  "status": "waiting"\n}');
-  const [output, setOutput] = useState('{\n  "status": "waiting"\n}');
+  const [jobOutput, setJobOutput] = useState('{\n  "status": "waiting"\n}');
+  const [portraitOutput, setPortraitOutput] = useState('{\n  "status": "waiting"\n}');
   const [profileOutput, setProfileOutput] = useState('{\n  "status": "waiting"\n}');
 
-  const [targetUserId, setTargetUserId] = useState("");
-  const [targetName, setTargetName] = useState("");
-  const [fullExtract, setFullExtract] = useState(false);
-  const [daysLimit, setDaysLimit] = useState(90);
-  const [maxMessages, setMaxMessages] = useState(2000);
-  const [jobId, setJobId] = useState("");
-  const [messages, setMessages] = useState("");
-
-  const [profileId, setProfileId] = useState("");
-  const [profileName, setProfileName] = useState("default");
-  const [profileChannel, setProfileChannel] = useState("wechat");
-  const [profileSourceKey, setProfileSourceKey] = useState("wxbot");
-  const [profileSourceLabel, setProfileSourceLabel] = useState("微信机器人");
-  const [profileEnabled, setProfileEnabled] = useState("true");
-  const [profileSkillSlug, setProfileSkillSlug] = useState("");
-
-  const [artifactMode, setArtifactMode] = useState("manual");
-  const [artifactSkillPrompt, setArtifactSkillPrompt] = useState("");
-  const [artifactSkillMd, setArtifactSkillMd] = useState("");
-  const [artifactPersonaMd, setArtifactPersonaMd] = useState("");
-  const [artifactWorkMd, setArtifactWorkMd] = useState("");
-  const [artifactMetaJson, setArtifactMetaJson] = useState("{\n  \n}");
-  const [artifactKnowledgeText, setArtifactKnowledgeText] = useState("");
-  const [artifactFirstTimestamp, setArtifactFirstTimestamp] = useState("");
-  const [artifactLastTimestamp, setArtifactLastTimestamp] = useState("");
-  const [artifactMessageCount, setArtifactMessageCount] = useState("0");
-  const [profileLoaded, setProfileLoaded] = useState(false);
-  const [loadedProfileFingerprint, setLoadedProfileFingerprint] = useState("");
-  const [profileBaselineRequest, setProfileBaselineRequest] = useState(0);
-  const [profileBaselineCaptured, setProfileBaselineCaptured] = useState(0);
-  const [jobNotice, setJobNotice] = useState("");
-  const [offlineArtifactFile, setOfflineArtifactFile] = useState<File | null>(null);
-  const profileDirtyRef = useRef(false);
-  const artifactEditorDirtyRef = useRef(false);
   const jobRequestRef = useRef<AbortController | null>(null);
-  const offlineArtifactInputRef = useRef<HTMLInputElement | null>(null);
   const autoLoadedSessionRef = useRef("");
 
   const effectiveSessionId = config.sessionId.trim();
-  const selectedSessionIsVerified = Boolean(effectiveSessionId && verifiedGroupIds.has(effectiveSessionId));
-  const memberOptions = useMemo(
-    () =>
-      members.map((item) => ({
-        value: item.wxid,
-        label: `${getMemberDisplayName(item)} (${item.wxid})`,
-        keywords: [item.wxid, item.name || "", item.alias || "", item.remark || "", item.nick_name || ""],
-      })),
-    [members],
+  const selectedSessionIsVerified = Boolean(
+    effectiveSessionId && verifiedGroupIds.has(effectiveSessionId),
   );
+  const visibleMembers = useMemo(() => {
+    const query = memberQuery.trim().toLowerCase();
+    if (!query) return members;
+    return members.filter((item) => {
+      const haystack = [
+        item.wxid,
+        item.name,
+        item.alias,
+        item.remark,
+        item.nick_name,
+        getMemberDisplayName(item),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [memberQuery, members]);
   const selectedMember = members.find((item) => item.wxid === selectedMemberWxid) || null;
-  const selectedJob = useMemo(
-    () => jobs.find((item) => String(item.id) === String(jobId || "")) || null,
-    [jobs, jobId],
+  const selectedMemberName = selectedMember ? getMemberDisplayName(selectedMember) : "";
+  const pollingJobId = useMemo(
+    () => String(jobs.find(isActivePortraitJob)?.id || ""),
+    [jobs],
   );
-  const selectedAwaitingImportJob = useMemo(
-    () => (
-      selectedJob?.status === "awaiting_import"
-        ? selectedJob
-        : jobs.find((item) => item.status === "awaiting_import") || null
-    ),
-    [jobs, selectedJob],
-  );
-  const personaDisplayName = (profileName || targetName || profileSkillSlug).trim();
-  const hasSaveablePersonaDraft = Boolean(
-    personaDisplayName && artifactSkillPrompt.trim(),
-  );
-  const pollingJobId = useMemo(() => {
-    if (isActivePersonaJob(selectedJob)) return String(selectedJob?.id || "");
-    return String(jobs.find(isActivePersonaJob)?.id || "");
-  }, [jobs, selectedJob]);
-  const canApplySelectedJob = Boolean(String(jobId || "").trim()) && (!selectedJob || selectedJob.status === "completed");
-
-  const syncArtifactEditors = useCallback(
-    (artifact: PersonaArtifact | null | undefined, fallback?: { promptText?: string; mode?: string; slug?: string }) => {
-      artifactEditorDirtyRef.current = false;
-      const nextArtifact = artifact || null;
-      const nextPrompt = getArtifactPrompt(nextArtifact, fallback?.promptText || "");
-      const nextSlug =
-        nextArtifact?.slug ||
-        fallback?.slug ||
-        (typeof nextArtifact?.meta?.slug === "string" ? nextArtifact.meta.slug : "") ||
-        profileSkillSlug;
-      const nextMode = nextArtifact?.mode || fallback?.mode || "manual";
-      const nextKnowledge = nextArtifact?.knowledge?.messages_text || "";
-      const nextMeta =
-        nextArtifact?.meta && Object.keys(nextArtifact.meta).length
-          ? nextArtifact.meta
-          : buildDefaultMeta({
-              targetName: nextArtifact?.target?.name || targetName,
-              targetUserId: nextArtifact?.target?.user_id || targetUserId,
-              slug: nextSlug,
-              sessionName: personaSessionName,
-              sessionId: effectiveSessionId,
-              messageCount:
-                nextArtifact?.knowledge?.message_count ||
-                (nextKnowledge ? nextKnowledge.split("\n").filter(Boolean).length : 0),
-              firstTimestamp: nextArtifact?.knowledge?.first_timestamp || "",
-              lastTimestamp: nextArtifact?.knowledge?.last_timestamp || "",
-            });
-
-      setArtifactMode(nextMode);
-      setArtifactSkillPrompt(nextPrompt);
-      setArtifactSkillMd(nextArtifact?.files?.["SKILL.md"] || buildSkillFrontmatter(nextSlug, targetName, nextPrompt));
-      setArtifactPersonaMd(nextArtifact?.files?.["persona.md"] || "");
-      setArtifactWorkMd(nextArtifact?.files?.["work.md"] || "");
-      setArtifactMetaJson(formatJson(nextMeta));
-      setArtifactKnowledgeText(nextKnowledge);
-      setArtifactFirstTimestamp(nextArtifact?.knowledge?.first_timestamp || "");
-      setArtifactLastTimestamp(nextArtifact?.knowledge?.last_timestamp || "");
-      setArtifactMessageCount(
-        String(
-          nextArtifact?.knowledge?.message_count ||
-            (nextKnowledge ? nextKnowledge.split("\n").filter(Boolean).length : 0),
-        ),
-      );
-      setProfileSkillSlug(nextSlug);
-    },
-    [effectiveSessionId, personaSessionName, profileSkillSlug, targetName, targetUserId],
-  );
-
-  const hydrateProfileForm = useCallback(
-    (profile: PersonaProfile, options?: { syncJobId?: boolean }) => {
-      setProfileId(String(profile.id || ""));
-      setProfileName(String(profile.profile_name || profile.target_name || "default"));
-      setProfileChannel(String(profile.channel || "wechat"));
-      setProfileSourceKey(String(profile.source_key || "wxbot"));
-      setProfileSourceLabel(String(profile.source_label || personaSessionName || ""));
-      setProfileEnabled(String(Boolean(profile.enabled)));
-      setProfileSkillSlug(String(profile.skill_slug || profile.artifact?.slug || ""));
-      if (options?.syncJobId && profile.job_id != null) {
-        setJobId(String(profile.job_id));
-      }
-      if (profile.target_user_id) {
-        setTargetUserId(String(profile.target_user_id));
-      }
-      if (profile.target_name) {
-        setTargetName(String(profile.target_name));
-      }
-      syncArtifactEditors(profile.artifact, {
-        promptText: profile.prompt_text || "",
-        slug: profile.skill_slug || "",
-      });
-      setProfileBaselineRequest((current) => current + 1);
-    },
-    [personaSessionName, syncArtifactEditors],
-  );
-
-  const hydrateJobSelection = useCallback(
-    (job: PersonaJob, options?: { preserveDirtyArtifact?: boolean }) => {
-      setJobId(String(job.id || ""));
-      setTargetUserId(String(job.target_user_id || ""));
-      setTargetName(String(job.target_name || ""));
-      if (
-        String(job.status || "") === "completed"
-        && !(
-          options?.preserveDirtyArtifact
-          && (profileDirtyRef.current || artifactEditorDirtyRef.current)
-        )
-      ) {
-        syncArtifactEditors(job.artifact, {
-          promptText: job.result_text || "",
-          mode: job.mode || "",
-          slug: job.output_slug || "",
-        });
-      }
-      setOutput(formatJson(job));
-    },
-    [syncArtifactEditors],
-  );
-
-  const mergeJobUpdate = useCallback(
-    (job: PersonaJob, options?: { select?: boolean; preserveDirtyArtifact?: boolean }) => {
-      setJobs((current) => {
-        const found = current.some((item) => String(item.id) === String(job.id));
-        return found
-          ? current.map((item) => (String(item.id) === String(job.id) ? job : item))
-          : [job, ...current];
-      });
-      if (options?.select || String(job.id) === String(jobId || "")) {
-        hydrateJobSelection(job, {
-          preserveDirtyArtifact: options?.preserveDirtyArtifact ?? true,
-        });
-      }
-    },
-    [hydrateJobSelection, jobId],
+  const appliedProfile = useMemo(
+    () =>
+      profiles.find(
+        (item) =>
+          selectedMemberWxid &&
+          (item.target_user_id === selectedMemberWxid ||
+            item.skill_slug === `portrait-${selectedMemberWxid.replace(/_/g, "-")}`),
+      ) || null,
+    [profiles, selectedMemberWxid],
   );
 
   const loadSessions = useCallback(async () => {
     try {
-      const result = await apiRequest<GroupSessionRosterPayload>(config, "/plugins/wxbot/admin/roster/groups", {
-        auth: true,
-      });
+      const result = await apiRequest<GroupSessionRosterPayload>(
+        config,
+        "/plugins/wxbot/admin/roster/groups",
+        { auth: true },
+      );
       const nextSessions = (result.sessions || []).filter(isGroupSession);
       setSessions(nextSessions);
-      if (effectiveSessionId) {
-        const matched = nextSessions.find((item) => item.session_id === effectiveSessionId);
-        setPersonaSessionName(matched?.session_name || "");
-      }
       setSelectionOutput(formatJson({ sessions: nextSessions.slice(0, 50), count: nextSessions.length }));
     } catch (err) {
       setSessions([]);
-      setPersonaSessionName("");
       setSelectionOutput(formatJson({
         error: err instanceof Error ? err.message : "读取权威群列表失败",
         recovery: "请刷新页面上方的已验证群聊列表后重试",
       }));
     }
-  }, [config, effectiveSessionId]);
+  }, [config]);
 
   const loadMembers = useCallback(async () => {
     if (!selectedSessionIsVerified) {
@@ -297,110 +149,84 @@ export function PersonaWorkspace() {
     }
   }, [config, effectiveSessionId, selectedSessionIsVerified]);
 
-  const listJobs = useCallback(async (options?: { hydrateFirst?: boolean; quiet?: boolean }) => {
+  const listJobs = useCallback(async (options?: { quiet?: boolean }) => {
     if (!selectedSessionIsVerified) {
-      if (!options?.quiet) setOutput(formatJson({ error: "请先选择群会话" }));
+      if (!options?.quiet) setJobOutput(formatJson({ error: "请先选择群会话" }));
       setJobs([]);
-      return [] as PersonaJob[];
+      return [] as PortraitJob[];
     }
     try {
-      const result = await apiRequest<{ items?: PersonaJob[] }>(config, "/plugins/persona_extract/jobs", {
-        query: { tenant_id: config.tenantId, session_id: effectiveSessionId },
-      });
+      const result = await apiRequest<{ items?: PortraitJob[] }>(
+        config,
+        "/plugins/speaker_portrait/jobs",
+        { query: { tenant_id: config.tenantId, session_id: effectiveSessionId } },
+      );
       const items = result.items || [];
       setJobs(items);
-      if (items[0] && !jobId && options?.hydrateFirst !== false) {
-        hydrateJobSelection(items[0], { preserveDirtyArtifact: true });
-      }
-      const active = items.find((item) => String(item.id) === String(jobId || "")) || items[0] || null;
-      if (!options?.quiet) setOutput(formatJson(active || result));
+      if (!options?.quiet) setJobOutput(formatJson(result));
       return items;
     } catch (err) {
       if (!options?.quiet) {
         setJobs([]);
-        setOutput(formatJson({ error: err instanceof Error ? err.message : "查询任务失败" }));
+        setJobOutput(formatJson({ error: err instanceof Error ? err.message : "查询画像任务失败" }));
       }
       return null;
     }
-  }, [config, effectiveSessionId, hydrateJobSelection, jobId, selectedSessionIsVerified]);
+  }, [config, effectiveSessionId, selectedSessionIsVerified]);
 
-  const getJob = useCallback(async () => {
-    const scopedJob = jobs.find((item) => String(item.id) === String(jobId));
-    if (!selectedSessionIsVerified || !scopedJob) {
-      setOutput(formatJson({ error: "请先从当前群任务列表选择任务" }));
-      return;
+  const loadPortrait = useCallback(async (speakerId?: string, options?: { quiet?: boolean }) => {
+    const target = String(speakerId || selectedMemberWxid || "").trim();
+    if (!target) {
+      if (!options?.quiet) setPortraitOutput(formatJson({ error: "请先选择群成员" }));
+      setPortrait(null);
+      return null;
     }
-    if (jobRequestRef.current) return;
-    const controller = new AbortController();
-    jobRequestRef.current = controller;
     try {
-      const result = await apiRequest<PersonaJob>(config, `/plugins/persona_extract/jobs/${jobId}`, {
-        init: { signal: controller.signal },
-      });
-      mergeJobUpdate(result, { select: true, preserveDirtyArtifact: false });
+      const result = await apiRequest<PortraitRecord>(
+        config,
+        `/plugins/speaker_portrait/portraits/${encodeURIComponent(target)}`,
+        { query: { tenant_id: config.tenantId } },
+      );
+      setPortrait(result);
+      setStylePreview(null);
+      if (!options?.quiet) setPortraitOutput(formatJson(result));
+      return result;
     } catch (err) {
-      if (!isAbortError(err)) {
-        setOutput(formatJson({ error: err instanceof Error ? err.message : "读取任务失败" }));
+      setPortrait(null);
+      setStylePreview(null);
+      if (!options?.quiet) {
+        const message = err instanceof Error ? err.message : "读取画像失败";
+        setPortraitOutput(formatJson(
+          message.includes("portrait_not_found") || message.includes("404")
+            ? { status: "portrait_not_found", hint: "该成员还没有画像，请先创建画像任务。" }
+            : { error: message },
+        ));
       }
-    } finally {
-      if (jobRequestRef.current === controller) jobRequestRef.current = null;
+      return null;
     }
-  }, [config, jobId, jobs, mergeJobUpdate, selectedSessionIsVerified]);
+  }, [config, selectedMemberWxid]);
 
-  const reconcileSubmittedJob = useCallback(async (
-    clientRequestId: string,
-    fallback?: { jobId: string; previousAttemptCount: number },
-  ) => {
-    const items = await listJobs({ hydrateFirst: false, quiet: true });
-    if (!items) return null;
-    const exact = items.find((item) => item.client_request_id === clientRequestId);
-    const fallbackMatch = fallback
-      ? items.find((item) => (
-          String(item.id) === fallback.jobId
-          && (
-            isActivePersonaJob(item)
-            || Number(item.attempt_count || 0) > fallback.previousAttemptCount
-          )
-        ))
-      : null;
-    const recovered = exact || fallbackMatch || null;
-    if (recovered) {
-      mergeJobUpdate(recovered, { select: true, preserveDirtyArtifact: true });
-    }
-    return recovered;
-  }, [listJobs, mergeJobUpdate]);
-
-  const listProfiles = useCallback(async (options?: { hydrateFirst?: boolean }) => {
+  const listProfiles = useCallback(async (options?: { quiet?: boolean }) => {
     if (!selectedSessionIsVerified) {
-      setProfileOutput(formatJson({ error: "请先选择群会话" }));
+      if (!options?.quiet) setProfileOutput(formatJson({ error: "请先选择群会话" }));
       setProfiles([]);
-      setProfileLoaded(false);
       return;
     }
     try {
-      const result = await apiRequest<{ items?: PersonaProfile[] }>(config, "/plugins/persona_extract/profiles", {
-        query: { tenant_id: config.tenantId, session_id: effectiveSessionId },
-      });
-      const items = result.items || [];
-      setProfiles(items);
-      setProfileLoaded(true);
-      if (items[0] && options?.hydrateFirst !== false) {
-        hydrateProfileForm(items[0], { syncJobId: false });
-      } else if (!items.length) {
-        setProfileId("");
-        setProfileName(targetName || "default");
-        setProfileSkillSlug("");
-        setProfileSourceKey("wxbot");
-        setProfileSourceLabel(personaSessionName || "当前群");
-        setProfileBaselineRequest((current) => current + 1);
-      }
-      setProfileOutput(formatJson(result));
+      const result = await apiRequest<{ items?: PersonaProfile[] }>(
+        config,
+        "/plugins/persona_extract/profiles",
+        { query: { tenant_id: config.tenantId, session_id: effectiveSessionId } },
+      );
+      setProfiles(result.items || []);
+      if (!options?.quiet) setProfileOutput(formatJson(result));
     } catch (err) {
       setProfiles([]);
-      setProfileLoaded(false);
-      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "读取风格技能失败" }));
+      if (!options?.quiet) {
+        setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "读取风格档案失败" }));
+      }
     }
-  }, [config, effectiveSessionId, hydrateProfileForm, personaSessionName, selectedSessionIsVerified, targetName]);
+  }, [config, effectiveSessionId, selectedSessionIsVerified]);
 
   useEffect(() => {
     void loadSessions();
@@ -408,8 +234,7 @@ export function PersonaWorkspace() {
 
   useEffect(() => {
     const matched = sessions.find((item) => item.session_id === effectiveSessionId);
-    setPersonaSessionName(matched?.session_name || "");
-    setProfileSourceLabel(matched?.session_name || (effectiveSessionId ? "当前群" : ""));
+    setSessionName(matched?.session_name || "");
   }, [effectiveSessionId, sessions]);
 
   useEffect(() => {
@@ -417,11 +242,9 @@ export function PersonaWorkspace() {
     setMembers([]);
     setJobs([]);
     setProfiles([]);
+    setPortrait(null);
+    setStylePreview(null);
     setSelectedMemberWxid("");
-    setTargetUserId("");
-    setTargetName("");
-    setProfileLoaded(false);
-    setLoadedProfileFingerprint("");
   }, [config.tenantId, effectiveSessionId]);
 
   useEffect(() => {
@@ -445,6 +268,15 @@ export function PersonaWorkspace() {
   ]);
 
   useEffect(() => {
+    if (!selectedMemberWxid) {
+      setPortrait(null);
+      setStylePreview(null);
+      return;
+    }
+    void loadPortrait(selectedMemberWxid, { quiet: true });
+  }, [loadPortrait, selectedMemberWxid]);
+
+  useEffect(() => {
     if (!pollingJobId || !selectedSessionIsVerified) return undefined;
 
     let disposed = false;
@@ -462,8 +294,8 @@ export function PersonaWorkspace() {
     const scheduleNext = () => {
       clearTimer();
       if (disposed || document.visibilityState === "hidden") return;
-      const delay = PERSONA_JOB_POLL_DELAYS[Math.min(delayIndex, PERSONA_JOB_POLL_DELAYS.length - 1)];
-      delayIndex = Math.min(delayIndex + 1, PERSONA_JOB_POLL_DELAYS.length - 1);
+      const delay = PORTRAIT_JOB_POLL_DELAYS[Math.min(delayIndex, PORTRAIT_JOB_POLL_DELAYS.length - 1)];
+      delayIndex = Math.min(delayIndex + 1, PORTRAIT_JOB_POLL_DELAYS.length - 1);
       timer = window.setTimeout(() => void poll(), delay);
     };
 
@@ -477,15 +309,24 @@ export function PersonaWorkspace() {
       jobRequestRef.current = controller;
       let shouldContinue = true;
       try {
-        const result = await apiRequest<PersonaJob>(
+        const result = await apiRequest<PortraitJob>(
           config,
-          `/plugins/persona_extract/jobs/${pollingJobId}`,
+          `/plugins/speaker_portrait/jobs/${pollingJobId}`,
           { init: { signal: controller.signal } },
         );
         if (disposed) return;
-        mergeJobUpdate(result, { preserveDirtyArtifact: true });
-        shouldContinue = isActivePersonaJob(result);
+        setJobs((current) =>
+          current.map((item) => (String(item.id) === String(result.id) ? result : item)),
+        );
+        shouldContinue = isActivePortraitJob(result);
         setJobNotice("");
+        if (!shouldContinue) {
+          setJobOutput(formatJson(result));
+          // A finished job may have refreshed the portrait and (via the
+          // backend style sync) any applied reply-style profiles.
+          void loadPortrait(result.speaker_id, { quiet: true });
+          void listProfiles({ quiet: true });
+        }
       } catch (err) {
         if (!isAbortError(err) && !disposed) {
           setJobNotice("任务状态自动刷新暂时失败，页面会继续退避重试；无需重新创建任务。");
@@ -515,123 +356,23 @@ export function PersonaWorkspace() {
       controller?.abort();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [config, mergeJobUpdate, pollingJobId, selectedSessionIsVerified]);
-
-  const applySelectedMember = () => {
-    if (!selectedMember) {
-      setSelectionOutput(formatJson({ error: "请先选择群成员" }));
-      return;
-    }
-    setTargetUserId(selectedMember.wxid || "");
-    setTargetName(getMemberDisplayName(selectedMember));
-    setSelectionOutput(formatJson({ applied: true, session_id: effectiveSessionId, member: selectedMember }));
-  };
+  }, [config, listProfiles, loadPortrait, pollingJobId, selectedSessionIsVerified]);
 
   const createJob = async () => {
-    if (fullExtract) {
-      await createOfflineExport("full");
-      return;
-    }
     const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const member = members.find((item) => item.wxid === targetUserId);
+    const member = members.find((item) => item.wxid === selectedMemberWxid);
     if (!member) {
-      const error = new Error("蒸馏目标必须来自当前群的已验证成员名册");
-      setOutput(formatJson({ error: error.message }));
+      const error = new Error("画像目标必须来自当前群的已验证成员名册");
+      setJobOutput(formatJson({ error: error.message }));
       throw error;
     }
-    const intent = `persona:create:${config.tenantId}:${groupId}:${targetUserId}:${daysLimit}:${maxMessages}`;
+    const intent = `portrait:create:${config.tenantId}:${groupId}:${member.wxid}:${jobMode}:${daysLimit}:${maxMessages}`;
     const clientRequestId = keyFor(intent);
     setJobNotice("");
     try {
-      const result = await apiRequest<PersonaJobMutationResponse & {
-        result?: {
-          prompt_text?: string;
-          skill_slug?: string;
-          mode?: string;
-          artifact?: PersonaArtifact;
-        };
-      }>(config, "/plugins/persona_extract/jobs", {
-        auth: true,
-        init: {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": clientRequestId,
-          },
-          body: JSON.stringify({
-            client_request_id: clientRequestId,
-            tenant_id: config.tenantId,
-            session_id: groupId,
-            session_name: personaSessionName,
-            connection_id: "legacy-wechat-default",
-            adapter_id: "wxbot",
-            external_session_id: groupId,
-            target_user_id: targetUserId,
-            target_name: targetName,
-            days_limit: daysLimit,
-            max_messages: maxMessages,
-            messages: parseJsonInput(messages, []),
-          }),
-        },
-      });
-      if (result.job_id != null) {
-        setJobId(String(result.job_id));
-      }
-      if (result.job) {
-        mergeJobUpdate(result.job, { select: true, preserveDirtyArtifact: true });
-      }
-      if (result.result?.artifact && !artifactEditorDirtyRef.current) {
-        syncArtifactEditors(result.result.artifact, {
-          promptText: result.result.prompt_text || "",
-          mode: result.result.mode || "",
-          slug: result.result.skill_slug || "",
-        });
-      }
-      if (!result.job) await listJobs({ hydrateFirst: false });
-      setOutput(formatJson(result));
-      setJobNotice(result.accepted === false
-        ? "任务已记录，但执行器暂未接收；请稍后刷新任务状态。"
-        : "任务已进入异步队列，页面会自动刷新当前任务状态。",
-      );
-      clear(intent);
-    } catch (err) {
-      const recovered = await reconcileSubmittedJob(clientRequestId);
-      if (recovered) {
-        setJobNotice("提交响应中断，但已按请求标识核对到任务；无需重复创建。页面将继续跟踪该任务。");
-        setOutput(formatJson({
-          status: "submission_result_reconciled",
-          client_request_id: clientRequestId,
-          job: recovered,
-        }));
-        clear(intent);
-        return;
-      }
-      const message = err instanceof Error ? err.message : "创建蒸馏任务失败";
-      setJobNotice(`提交结果未知（请求标识 ${clientRequestId}）。请先刷新任务核对，不要盲目重复提交。`);
-      setOutput(formatJson({
-        status: "submission_result_unknown",
-        client_request_id: clientRequestId,
-        error: message,
-      }));
-      throw new Error("提交结果未知，系统未核对到对应任务；请先刷新任务列表后再决定是否重试");
-    }
-  };
-
-  const createOfflineExport = async (mode: "full" | "incremental") => {
-    const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const member = members.find((item) => item.wxid === targetUserId);
-    if (!member) {
-      const error = new Error("离线蒸馏目标必须来自当前群的已验证成员名册");
-      setOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:offline:${mode}:${config.tenantId}:${groupId}:${targetUserId}`;
-    const clientRequestId = keyFor(intent);
-    setJobNotice("");
-    try {
-      const result = await apiRequest<PersonaJobMutationResponse>(
+      const result = await apiRequest<{ status?: string; job?: PortraitJob }>(
         config,
-        "/plugins/persona_extract/offline-exports",
+        "/plugins/speaker_portrait/jobs",
         {
           auth: true,
           init: {
@@ -641,294 +382,98 @@ export function PersonaWorkspace() {
               "Idempotency-Key": clientRequestId,
             },
             body: JSON.stringify({
-              client_request_id: clientRequestId,
               tenant_id: config.tenantId,
               session_id: groupId,
-              session_name: personaSessionName,
+              session_name: sessionName,
+              speaker_id: member.wxid,
+              speaker_name: getMemberDisplayName(member),
               connection_id: "legacy-wechat-default",
-              adapter_id: "wxbot",
               external_session_id: groupId,
-              target_user_id: targetUserId,
-              target_name: targetName,
-              mode,
+              days_limit: daysLimit,
+              max_messages: maxMessages,
+              mode: jobMode,
             }),
           },
         },
       );
-      if (result.job_id != null) setJobId(String(result.job_id));
       if (result.job) {
-        mergeJobUpdate(result.job, { select: true, preserveDirtyArtifact: true });
+        const job = result.job;
+        setJobs((current) => {
+          const found = current.some((item) => String(item.id) === String(job.id));
+          return found
+            ? current.map((item) => (String(item.id) === String(job.id) ? job : item))
+            : [job, ...current];
+        });
       } else {
-        await listJobs({ hydrateFirst: false });
+        await listJobs({ quiet: true });
       }
-      setOutput(formatJson(result));
-      setJobNotice(
-        result.accepted === false
-          ? "离线导出任务已记录，但执行器暂未接收；请稍后刷新。"
-          : mode === "full"
-            ? "正在流式准备全量离线包；就绪后下载到本地处理。"
-            : "正在准备仅含新增消息和旧产物基线的增量包。",
-      );
+      setJobOutput(formatJson(result));
+      setJobNotice("画像任务已进入队列，页面会自动跟踪任务状态；完成后画像和已应用风格会自动刷新。");
       clear(intent);
     } catch (err) {
-      const recovered = await reconcileSubmittedJob(clientRequestId);
-      if (recovered) {
-        setJobNotice("提交响应中断，但已核对到离线导出任务；无需重复创建。");
-        clear(intent);
-        return;
-      }
-      const message = err instanceof Error ? err.message : "创建离线导出任务失败";
-      setOutput(formatJson({ error: message, client_request_id: clientRequestId }));
+      const message = err instanceof Error ? err.message : "创建画像任务失败";
+      setJobOutput(formatJson({ error: message }));
       throw err;
     }
   };
 
-  const downloadOfflineBundle = async (job: PersonaJob) => {
+  const previewStyle = async () => {
+    const target = String(selectedMemberWxid || "").trim();
+    if (!target) {
+      setPortraitOutput(formatJson({ error: "请先选择群成员" }));
+      return;
+    }
     try {
-      const blob = await apiBlobRequest(
+      const result = await apiRequest<PortraitStylePreview>(
         config,
-        `/plugins/persona_extract/offline-exports/${job.id}/download`,
+        `/plugins/speaker_portrait/portraits/${encodeURIComponent(target)}/style`,
+        { query: { tenant_id: config.tenantId } },
       );
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `persona-${job.output_slug || job.target_name || "offline"}-${job.id}.zip`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
-      setJobNotice("离线包已下载。按包内 PROMPT.md 生成 output/ 四个文件，再压缩 output/ 上传。");
+      setStylePreview(result);
+      setPortraitOutput(formatJson({ status: result.status, name: result.name, prompt_chars: result.prompt_chars }));
     } catch (err) {
-      setOutput(formatJson({ error: err instanceof Error ? err.message : "下载离线包失败" }));
-      throw err;
+      setStylePreview(null);
+      setPortraitOutput(formatJson({ error: err instanceof Error ? err.message : "预览风格失败" }));
     }
   };
 
-  const uploadOfflineArtifact = async () => {
-    if (!selectedAwaitingImportJob) {
-      throw new Error("请先选择一个等待回传的离线任务");
+  const applyStyle = async () => {
+    const groupId = requireSelectedGroup(config, verifiedGroupIds);
+    const target = String(selectedMemberWxid || "").trim();
+    if (!target) {
+      setProfileOutput(formatJson({ error: "请先选择群成员" }));
+      return;
     }
-    if (!offlineArtifactFile) {
-      throw new Error("请选择只包含 output/ 生成结果的 ZIP");
-    }
-    const intent = `persona:offline-import:${config.tenantId}:${selectedAwaitingImportJob.id}:${offlineArtifactFile.name}:${offlineArtifactFile.size}`;
+    const intent = `portrait:apply:${config.tenantId}:${groupId}:${target}:${styleEnabled}`;
     try {
-      const result = await apiRequest<PersonaJob>(
+      const result = await apiRequest<PortraitStylePreview>(
         config,
-        `/plugins/persona_extract/offline-exports/${selectedAwaitingImportJob.id}/artifact`,
+        `/plugins/speaker_portrait/portraits/${encodeURIComponent(target)}/apply-style`,
         {
           auth: true,
           init: {
-            method: "PUT",
+            method: "POST",
             headers: {
-              "Content-Type": offlineArtifactFile.type || "application/zip",
+              "Content-Type": "application/json",
               "Idempotency-Key": keyFor(intent),
             },
-            body: offlineArtifactFile,
+            body: JSON.stringify({
+              tenant_id: config.tenantId,
+              session_id: groupId,
+              session_name: sessionName,
+              channel: "wechat",
+              source_key: "wxbot",
+              enabled: styleEnabled,
+            }),
           },
         },
       );
-      mergeJobUpdate(result, { select: true, preserveDirtyArtifact: false });
-      setOfflineArtifactFile(null);
-      if (offlineArtifactInputRef.current) offlineArtifactInputRef.current.value = "";
-      setJobNotice("离线产物校验通过，任务已完成；现在可以“应用”到当前群。");
-      setOutput(formatJson(result));
-      clear(intent);
-    } catch (err) {
-      setOutput(formatJson({ error: err instanceof Error ? err.message : "上传离线产物失败" }));
-      throw err;
-    }
-  };
-
-  const buildArtifactDraft = () => {
-    let parsedMeta: Record<string, unknown>;
-    try {
-      parsedMeta = artifactMetaJson.trim()
-        ? (JSON.parse(artifactMetaJson) as Record<string, unknown>)
-        : {};
-    } catch (err) {
-      throw new Error(`meta.json 不是合法 JSON：${err instanceof Error ? err.message : "未知错误"}`);
-    }
-
-    const slug = profileSkillSlug || targetUserId || "default";
-    const artifactPersonaName = targetName || personaDisplayName;
-    const skillPrompt = artifactSkillPrompt.trim();
-    const skillMd = (
-      artifactSkillMd.trim()
-      || buildSkillFrontmatter(slug, artifactPersonaName, skillPrompt)
-    ).trim();
-    const messageCount =
-      Number(artifactMessageCount) ||
-      artifactKnowledgeText
-        .split("\n")
-        .map((item) => item.trim())
-        .filter(Boolean).length;
-
-    const meta =
-      Object.keys(parsedMeta).length > 0
-        ? parsedMeta
-        : buildDefaultMeta({
-            targetName: artifactPersonaName,
-            targetUserId,
-            slug,
-            sessionName: personaSessionName,
-            sessionId: effectiveSessionId,
-            messageCount,
-            firstTimestamp: artifactFirstTimestamp,
-            lastTimestamp: artifactLastTimestamp,
-          });
-
-    return {
-      version: "persona-skill-v1",
-      generated_at: new Date().toISOString(),
-      slug,
-      mode: artifactMode || "manual",
-      target: {
-        user_id: targetUserId,
-        name: artifactPersonaName,
-      },
-      source: {
-        tenant_id: config.tenantId,
-        session_id: effectiveSessionId,
-        session_name: personaSessionName,
-        channel: profileChannel,
-        source_key: profileSourceKey || "wxbot",
-        source_label: profileSourceLabel || personaSessionName || "当前群",
-        job_id: jobId ? Number(jobId) : null,
-      },
-      knowledge: {
-        message_count: messageCount,
-        first_timestamp: artifactFirstTimestamp,
-        last_timestamp: artifactLastTimestamp,
-        messages_text: artifactKnowledgeText,
-        knowledge_sources: Array.isArray((meta as { knowledge_sources?: unknown }).knowledge_sources)
-          ? ((meta as { knowledge_sources: unknown[] }).knowledge_sources as string[])
-          : [],
-        source_sessions: Array.isArray((meta as { source_sessions?: unknown }).source_sessions)
-          ? ((meta as { source_sessions: unknown[] }).source_sessions as string[])
-          : [effectiveSessionId].filter(Boolean),
-      },
-      files: {
-        "SKILL.md": skillMd,
-        skill_prompt: skillPrompt,
-        "persona.md": artifactPersonaMd,
-        "work.md": artifactWorkMd,
-      },
-      meta,
-    } satisfies PersonaArtifact;
-  };
-
-  const saveProfile = async () => {
-    const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    if (!profileLoaded) {
-      const error = new Error("当前群风格技能尚未成功读取，请先读取后再保存，避免覆盖线上配置");
-      setProfileOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    if (!personaDisplayName) {
-      const error = new Error("请填写人格名称或技能标识");
-      setProfileOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    if (!artifactSkillPrompt.trim()) {
-      const error = new Error("请填写技能提示词正文后再保存");
-      setProfileOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:save:${config.tenantId}:${groupId}:${profileId || "new"}:${profileSkillSlug}:${targetUserId}`;
-    try {
-      const artifact = buildArtifactDraft();
-      const result = await apiRequest<PersonaProfile>(config, "/plugins/persona_extract/profiles", {
-        auth: true,
-        init: {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": keyFor(intent),
-          },
-          body: JSON.stringify({
-            profile_id: profileId ? Number(profileId) : null,
-            tenant_id: config.tenantId,
-            session_id: groupId,
-            session_name: personaSessionName,
-            channel: profileChannel,
-            source_key: profileSourceKey || "wxbot",
-            source_label: profileSourceLabel || personaSessionName || "当前群",
-            profile_name: personaDisplayName,
-            target_user_id: targetUserId,
-            target_name: targetName || personaDisplayName,
-            skill_slug: profileSkillSlug,
-            prompt_text: artifactSkillPrompt,
-            artifact,
-            enabled: profileEnabled === "true",
-            job_id: jobId ? Number(jobId) : null,
-          }),
-        },
-      });
-      if (result.id != null) {
-        setProfileId(String(result.id));
-      }
-      await listProfiles();
+      setStylePreview(result);
       setProfileOutput(formatJson(result));
+      await listProfiles({ quiet: true });
       clear(intent);
     } catch (err) {
-      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "保存风格技能失败" }));
-      throw err;
-    }
-  };
-
-  const applyJobToProfile = async (selectedJobId?: number | string) => {
-    const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const effectiveJobId = String(selectedJobId || jobId || "").trim();
-    if (!effectiveJobId) {
-      setProfileOutput(formatJson({ error: "请先选择任务 ID" }));
-      return;
-    }
-    const numericJobId = Number(effectiveJobId);
-    if (!Number.isFinite(numericJobId)) {
-      setProfileOutput(formatJson({ error: "任务 ID 必须是数字" }));
-      return;
-    }
-    const jobForApply = jobs.find((item) => String(item.id) === effectiveJobId) || null;
-    if (
-      !jobForApply
-      || jobForApply.session_id !== groupId
-      || jobForApply.status !== "completed"
-    ) {
-      const error = new Error("只能应用当前已验证群内已完成的蒸馏任务");
-      setProfileOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:apply:${config.tenantId}:${groupId}:${numericJobId}:${profileEnabled}`;
-    try {
-      const result = await apiRequest<PersonaProfile>(config, "/plugins/persona_extract/profiles/apply-job", {
-        auth: true,
-        init: {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": keyFor(intent),
-          },
-          body: JSON.stringify({
-            tenant_id: config.tenantId,
-            session_id: groupId,
-            session_name: personaSessionName || jobForApply?.session_name || "",
-            job_id: numericJobId,
-            channel: profileChannel,
-            source_key: profileSourceKey || "wxbot",
-            source_label: profileSourceLabel || personaSessionName || "当前群",
-            profile_name: jobForApply?.target_name || profileName || targetName || "default",
-            enabled: profileEnabled === "true",
-          }),
-        },
-      });
-      hydrateProfileForm(result, { syncJobId: false });
-      await listProfiles({ hydrateFirst: false });
-      hydrateProfileForm(result, { syncJobId: false });
-      setProfileOutput(formatJson(result));
-      clear(intent);
-    } catch (err) {
-      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "应用蒸馏任务失败" }));
+      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "应用回复风格失败" }));
       throw err;
     }
   };
@@ -936,9 +481,9 @@ export function PersonaWorkspace() {
   const activateProfile = async (profile: PersonaProfile) => {
     const groupId = requireSelectedGroup(config, verifiedGroupIds);
     if (profile.session_id !== groupId) {
-      throw new Error("只能启用当前群的风格技能");
+      throw new Error("只能启用当前群的风格档案");
     }
-    const intent = `persona:activate:${config.tenantId}:${groupId}:${profile.id}`;
+    const intent = `portrait:activate:${config.tenantId}:${groupId}:${profile.id}`;
     try {
       const result = await apiRequest<PersonaProfile>(
         config,
@@ -951,310 +496,102 @@ export function PersonaWorkspace() {
               "Content-Type": "application/json",
               "Idempotency-Key": keyFor(intent),
             },
-            body: JSON.stringify({
-              tenant_id: config.tenantId,
-              session_id: groupId,
-            }),
+            body: JSON.stringify({ tenant_id: config.tenantId, session_id: groupId }),
           },
         },
       );
-      hydrateProfileForm(result, { syncJobId: true });
-      await listProfiles({ hydrateFirst: false });
-      hydrateProfileForm(result, { syncJobId: true });
       setProfileOutput(formatJson(result));
+      await listProfiles({ quiet: true });
       clear(intent);
     } catch (err) {
-      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "启用风格技能失败" }));
+      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "启用风格档案失败" }));
       throw err;
     }
   };
 
-  const rerunJob = async (selectedJobId: number | string) => {
+  const deleteProfile = async (profile: PersonaProfile) => {
     const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const effectiveJobId = String(selectedJobId || "").trim();
-    if (!effectiveJobId) {
-      setOutput(formatJson({ error: "请先选择任务 ID" }));
-      return;
+    if (profile.session_id !== groupId) {
+      throw new Error("只能删除当前群的风格档案");
     }
-    const scopedJob = jobs.find((item) => String(item.id) === effectiveJobId);
-    if (
-      !scopedJob
-      || scopedJob.session_id !== groupId
-      || !members.some((item) => item.wxid === scopedJob.target_user_id)
-    ) {
-      const error = new Error("只能重跑当前已验证群内的任务");
-      setOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:rerun:${config.tenantId}:${groupId}:${effectiveJobId}`;
-    const clientRequestId = keyFor(intent);
-    const previousAttemptCount = Number(scopedJob.attempt_count || 0);
-    setJobNotice("");
+    const deleteQuery = new URLSearchParams({
+      tenant_id: config.tenantId,
+      session_id: groupId,
+    });
     try {
-      const result = await apiRequest<PersonaJobMutationResponse>(config, `/plugins/persona_extract/jobs/${effectiveJobId}/run`, {
-        auth: true,
-        init: {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Idempotency-Key": clientRequestId,
-          },
-          body: "[]",
-        },
-      });
-      if (result.job_id != null) {
-        setJobId(String(result.job_id));
-      }
-      if (result.job) {
-        mergeJobUpdate(result.job, { select: true, preserveDirtyArtifact: true });
-      }
-      if (!result.job) await listJobs({ hydrateFirst: false });
-      setOutput(formatJson(result));
-      setJobNotice(result.accepted === false
-        ? "重跑请求已记录，但执行器暂未接收；请稍后刷新任务状态。"
-        : "任务已重新进入异步队列。",
-      );
-      clear(intent);
-    } catch (err) {
-      const recovered = await reconcileSubmittedJob(clientRequestId, {
-        jobId: effectiveJobId,
-        previousAttemptCount,
-      });
-      if (recovered) {
-        setJobNotice("重跑响应中断，但已核对到任务进入执行流程；无需再次重跑。");
-        setOutput(formatJson({ status: "submission_result_reconciled", job: recovered }));
-        clear(intent);
-        return;
-      }
-      const message = err instanceof Error ? err.message : "重跑任务失败";
-      setJobNotice(`重跑结果未知（请求标识 ${clientRequestId}）。请先刷新任务核对，不要重复操作。`);
-      setOutput(formatJson({
-        status: "submission_result_unknown",
-        client_request_id: clientRequestId,
-        error: message,
-      }));
-      throw new Error("重跑结果未知，系统未核对到任务状态变化；请先刷新任务列表");
-    }
-  };
-
-  const cancelJob = async (selectedJobId: number | string) => {
-    const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const effectiveJobId = String(selectedJobId || "").trim();
-    const scopedJob = jobs.find((item) => String(item.id) === effectiveJobId);
-    if (!scopedJob || scopedJob.session_id !== groupId || !isActivePersonaJob(scopedJob)) {
-      const error = new Error("只能取消当前已验证群内仍在排队或运行的任务");
-      setOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:cancel:${config.tenantId}:${groupId}:${effectiveJobId}`;
-    const clientRequestId = keyFor(intent);
-    setJobNotice("");
-    try {
-      const result = await apiRequest<PersonaJob | PersonaJobMutationResponse>(
+      const result = await apiRequest(
         config,
-        `/plugins/persona_extract/jobs/${effectiveJobId}/cancel`,
-        {
-          auth: true,
-          init: {
-            method: "POST",
-            headers: { "Idempotency-Key": clientRequestId },
-          },
-        },
+        `/plugins/persona_extract/profiles/${profile.id}?${deleteQuery.toString()}`,
+        { auth: true, init: { method: "DELETE" } },
       );
-      const nestedJob = "job" in result ? result.job : undefined;
-      const directJob = "id" in result ? result : undefined;
-      const updatedJob = nestedJob || directJob || {
-        ...scopedJob,
-        status: result.status || scopedJob.status,
-        cancel_requested: result.cancel_requested ?? true,
-      };
-      mergeJobUpdate(updatedJob, { preserveDirtyArtifact: true });
-      setOutput(formatJson(result));
-      setJobNotice(updatedJob.status === "cancelled"
-        ? `任务 #${effectiveJobId} 已取消。`
-        : `任务 #${effectiveJobId} 已申请取消，执行器会在安全检查点停止。`,
-      );
-      clear(intent);
-    } catch (err) {
-      const items = await listJobs({ hydrateFirst: false, quiet: true });
-      const recovered = items?.find((item) => (
-        String(item.id) === effectiveJobId
-        && (item.status === "cancelled" || item.cancel_requested)
-      ));
-      if (recovered) {
-        mergeJobUpdate(recovered, { preserveDirtyArtifact: true });
-        setJobNotice("取消响应中断，但已核对到取消状态；无需重复操作。");
-        clear(intent);
-        return;
-      }
-      const message = err instanceof Error ? err.message : "取消任务失败";
-      setJobNotice("取消结果未知，请刷新任务确认状态后再操作。");
-      setOutput(formatJson({ status: "cancel_result_unknown", job_id: effectiveJobId, error: message }));
-      throw new Error("取消结果未知，请刷新任务确认状态后再操作");
-    }
-  };
-
-  const deleteProfile = async () => {
-    const groupId = requireSelectedGroup(config, verifiedGroupIds);
-    const scopedProfile = profiles.find((item) => String(item.id) === String(profileId));
-    if (!scopedProfile || scopedProfile.session_id !== groupId) {
-      const error = new Error("请先从当前群的风格技能列表选择目标");
-      setProfileOutput(formatJson({ error: error.message }));
-      throw error;
-    }
-    const intent = `persona:delete:${config.tenantId}:${groupId}:${profileId}`;
-    try {
-      const deleteQuery = new URLSearchParams({
-        tenant_id: config.tenantId,
-        session_id: groupId,
-      });
-      const result = await apiRequest(config, `/plugins/persona_extract/profiles/${profileId}?${deleteQuery.toString()}`, {
-        auth: true,
-        init: {
-          method: "DELETE",
-          headers: { "Idempotency-Key": keyFor(intent) },
-        },
-      });
-      await listProfiles();
       setProfileOutput(formatJson(result));
-      clear(intent);
+      await listProfiles({ quiet: true });
     } catch (err) {
-      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "删除风格技能失败" }));
+      setProfileOutput(formatJson({ error: err instanceof Error ? err.message : "删除风格档案失败" }));
       throw err;
     }
   };
 
-  const profileDraftFingerprint = useMemo(
-    () => JSON.stringify({
-      profileId,
-      profileName,
-      profileChannel,
-      profileSourceKey,
-      profileSourceLabel,
-      profileEnabled,
-      profileSkillSlug,
-      targetUserId,
-      targetName,
-      jobId,
-      artifactMode,
-      artifactSkillPrompt,
-      artifactSkillMd,
-      artifactPersonaMd,
-      artifactWorkMd,
-      artifactMetaJson,
-      artifactKnowledgeText,
-      artifactFirstTimestamp,
-      artifactLastTimestamp,
-      artifactMessageCount,
-    }),
-    [
-      artifactFirstTimestamp,
-      artifactKnowledgeText,
-      artifactLastTimestamp,
-      artifactMessageCount,
-      artifactMetaJson,
-      artifactMode,
-      artifactPersonaMd,
-      artifactSkillMd,
-      artifactSkillPrompt,
-      artifactWorkMd,
-      jobId,
-      profileChannel,
-      profileEnabled,
-      profileId,
-      profileName,
-      profileSkillSlug,
-      profileSourceKey,
-      profileSourceLabel,
-      targetName,
-      targetUserId,
-    ],
-  );
-  const profileDirty = profileLoaded
-    && Boolean(loadedProfileFingerprint)
-    && profileDraftFingerprint !== loadedProfileFingerprint;
+  const portraitPayload = portrait?.portrait || null;
+  const freshness = portraitFreshness(portrait, selectedMember?.msg_count);
+  const claimSections = PORTRAIT_CLAIM_SECTIONS.map(({ key, label }) => ({
+    key,
+    label,
+    claims: Array.isArray(portraitPayload?.[key]) ? (portraitPayload?.[key] as Array<Record<string, unknown>>) : [],
+  })).filter((section) => section.claims.length > 0);
 
-  useEffect(() => {
-    profileDirtyRef.current = profileDirty;
-  }, [profileDirty]);
-
-  useEffect(() => {
-    if (profileBaselineRequest <= profileBaselineCaptured) {
-      return;
-    }
-    setLoadedProfileFingerprint(profileDraftFingerprint);
-    setProfileBaselineCaptured(profileBaselineRequest);
-  }, [profileBaselineCaptured, profileBaselineRequest, profileDraftFingerprint]);
-
-  const artifactSummary = useMemo(
-    () => ({
-      slug: profileSkillSlug || "-",
-      mode: artifactMode || "-",
-      messages: artifactMessageCount || "0",
-      first: artifactFirstTimestamp || "-",
-      last: artifactLastTimestamp || "-",
-    }),
-    [artifactFirstTimestamp, artifactLastTimestamp, artifactMessageCount, artifactMode, profileSkillSlug],
-  );
+  if (!selectedSessionIsVerified) {
+    return (
+      <GroupScopeEmpty
+        eyebrow="回复风格"
+        title="人物画像 / 回复风格"
+        description="以说话人画像为唯一蒸馏管线：为群成员构建画像，画像编译成回复风格并应用到本群；画像热更新后，已应用的风格会自动同步。"
+      />
+    );
+  }
 
   return (
     <div className="page-grid persona-page">
-      <UnsavedChangesGuard when={profileDirty} />
       <section className="panel span-2">
         <PageHeader
           eyebrow="回复风格"
-          title="人物蒸馏 / 回复风格"
-          description="沿用旧版微信机器人的人物蒸馏流程：先选择群成员提炼风格，再围绕 work.md、persona.md、SKILL.md 和 meta.json 管理、应用完整产物，而不是只保存一段模型总结。"
+          title="人物画像 / 回复风格"
+          description="以说话人画像为唯一蒸馏管线：为群成员构建画像，画像编译成回复风格并应用到本群；画像热更新后，已应用的风格会自动同步。"
+          actions={
+            <div className="action-row">
+              <button className="button button-secondary" onClick={() => void loadSessions()}>
+                刷新群列表
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={() => void loadMembers()}
+                disabled={!selectedSessionIsVerified}
+              >
+                加载群成员
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={() => void loadPortrait()}
+                disabled={!selectedMemberWxid}
+              >
+                读取画像
+              </button>
+            </div>
+          }
         />
-        <div className="data-flow-note">
-          <strong>当前链路</strong>
-          <span>有限样本仍可在线分块蒸馏；全量数据会流式导出成私有 ZIP，不再把全部消息塞进后台模型上下文。</span>
-          <span>下载后可让 Codex 或其他基于文件夹的工具按 <code>PROMPT.md</code> 处理，再只上传 <code>output/</code>。首次全量产物会记录游标，后续增量包只包含新增消息和旧产物基线。</span>
-        </div>
-        <div className="form-grid">
-          <div className="field span-2">
-            <span>当前已验证群聊</span>
-            <strong>{selectedSessionIsVerified ? (personaSessionName || effectiveSessionId) : "尚未选择"}</strong>
-            <small>
-              {selectedSessionIsVerified
-                ? effectiveSessionId
-                : "请从页面上方的后端群聊名册选择；本页不接受手工群 ID。"}
-            </small>
-          </div>
-          <label className="field span-2">
-            <span>群成员候选</span>
-            <SearchableSelect
-              value={selectedMemberWxid}
-              onChange={setSelectedMemberWxid}
-              options={memberOptions}
-              placeholder="请选择群成员"
-              searchPlaceholder="搜索成员名或 WXID"
-              emptyText={selectedSessionIsVerified ? "暂无群成员" : "请先选择已验证群聊"}
-              noResultsText="没有匹配的群成员"
-              disabled={!selectedSessionIsVerified || !memberOptions.length}
+        <div className="member-filter-row">
+          <label className="field">
+            <span>筛选成员</span>
+            <input
+              value={memberQuery}
+              onChange={(event) => setMemberQuery(event.target.value)}
+              placeholder="按成员名或 WXID 筛选"
             />
           </label>
         </div>
-        <div className="action-row">
-          <button className="button button-secondary" onClick={() => void loadSessions()}>
-            刷新群列表
-          </button>
-          <button className="button button-secondary" onClick={() => void loadMembers()} disabled={!selectedSessionIsVerified}>
-            加载群成员
-          </button>
-          <button className="button button-primary" onClick={applySelectedMember} disabled={!selectedMember}>
-            应用到蒸馏目标
-          </button>
-        </div>
-        <div className="persona-subhead">
-          <p className="muted-copy">
-            当前会话：<span className="mono">{effectiveSessionId || "-"}</span>
-          </p>
-          <p className="muted-copy">候选列表来自群成员名册，`可提取` 表示当前消息库中存在该成员可用于蒸馏的文本记录。</p>
-        </div>
         <div className="table-scroll member-table-scroll">
           <table>
-            <caption className="sr-only">当前群画像蒸馏成员候选</caption>
+            <caption className="sr-only">当前群画像成员候选</caption>
             <thead>
               <tr>
                 <th scope="col">成员</th>
@@ -1265,7 +602,7 @@ export function PersonaWorkspace() {
               </tr>
             </thead>
             <tbody>
-              {members.map((item) => (
+              {visibleMembers.map((item) => (
                 <tr
                   key={item.wxid}
                   className={item.wxid === selectedMemberWxid ? "table-row-active" : ""}
@@ -1274,11 +611,7 @@ export function PersonaWorkspace() {
                     <button
                       type="button"
                       className="table-cell-action"
-                      onClick={() => {
-                      setSelectedMemberWxid(item.wxid || "");
-                      setTargetUserId(item.wxid || "");
-                      setTargetName(getMemberDisplayName(item));
-                      }}
+                      onClick={() => setSelectedMemberWxid(item.wxid || "")}
                     >
                       {getMemberDisplayName(item)}
                     </button>
@@ -1289,9 +622,11 @@ export function PersonaWorkspace() {
                   <td>{item.has_history ? "可提取" : "无历史"}</td>
                 </tr>
               ))}
-              {!members.length && (
+              {!visibleMembers.length && (
                 <tr>
-                  <td colSpan={5}>当前群还没有加载成员候选</td>
+                  <td colSpan={5}>
+                    {members.length ? "没有匹配的群成员" : "当前群还没有加载成员候选"}
+                  </td>
                 </tr>
               )}
             </tbody>
@@ -1303,35 +638,26 @@ export function PersonaWorkspace() {
         <section className="panel panel-scroll">
           <div className="panel-header">
             <div>
-              <p className="section-kicker">风格提炼任务</p>
-              <h3>蒸馏任务</h3>
+              <p className="section-kicker">画像蒸馏</p>
+              <h3>{selectedMemberName ? `${selectedMemberName} 的画像任务` : "画像任务"}</h3>
             </div>
           </div>
           <div className="form-grid">
             <label className="field">
-              <span>蒸馏目标成员</span>
-              <strong>{targetName || "尚未选择"}</strong>
-              <small className="mono">{targetUserId || "仅可从当前群成员名册选择"}</small>
+              <span>任务模式</span>
+              <select
+                value={jobMode}
+                onChange={(event) => setJobMode(event.target.value === "incremental" ? "incremental" : "full")}
+              >
+                <option value="full">全量画像</option>
+                <option value="incremental">增量热更新</option>
+              </select>
             </label>
-            <label className="field">
-              <span>目标来源</span>
-              <strong>{members.some((item) => item.wxid === targetUserId) ? "已验证群成员" : "未验证"}</strong>
-              <small>不会接受手工 user_id。</small>
-            </label>
-            <div className="field span-2 field-toggle">
-              <span>提取范围</span>
-              <label className="toggle-chip">
-                <input type="checkbox" checked={fullExtract} onChange={(event) => setFullExtract(event.target.checked)} />
-                <strong>全量离线</strong>
-                <em>开启后只准备提示词和全量消息文件，不在后台调用大上下文模型。</em>
-              </label>
-            </div>
             <label className="field">
               <span>回溯天数</span>
               <input
                 type="number"
                 value={daysLimit}
-                disabled={fullExtract}
                 onChange={(event) => setDaysLimit(Number(event.target.value))}
               />
             </label>
@@ -1340,211 +666,52 @@ export function PersonaWorkspace() {
               <input
                 type="number"
                 value={maxMessages}
-                disabled={fullExtract}
                 onChange={(event) => setMaxMessages(Number(event.target.value))}
               />
             </label>
-            <label className="field span-2">
-              <span>当前任务</span>
-              <select value={jobId} onChange={(event) => setJobId(event.target.value)}>
-                <option value="">从当前群任务列表选择</option>
-                {jobs.map((item) => (
-                  <option key={item.id} value={item.id}>{`#${item.id} · ${item.target_name || item.target_user_id || "未命名"} · ${personaJobStatusLabel(item.status)}`}</option>
-                ))}
-              </select>
-            </label>
-            <details className="technical-details span-2">
-              <summary>技术详情：测试消息 JSON</summary>
-              <label className="field">
-                <span>仅用于授权测试数据；留空时从当前群按目标成员采样</span>
-                <textarea
-                  rows={6}
-                  value={messages}
-                  onChange={(event) => setMessages(event.target.value)}
-                  placeholder='[{"sender_name":"Alice","text":"...","timestamp":"2026-04-21 10:00:00"}]'
-                />
-              </label>
-            </details>
-            {selectedAwaitingImportJob ? (
-              <label className="field span-2">
-                <span>上传离线生成结果 ZIP</span>
-                <input
-                  ref={offlineArtifactInputRef}
-                  type="file"
-                  aria-label="上传离线生成结果 ZIP"
-                  accept=".zip,application/zip,application/x-zip-compressed"
-                  onChange={(event) => setOfflineArtifactFile(event.target.files?.[0] || null)}
-                />
-                <small>只能包含 output/SKILL.md、persona.md、work.md、meta.json；不要上传原始消息。</small>
-              </label>
-            ) : null}
           </div>
           <div className="action-row">
+            <button
+              className="button button-primary"
+              onClick={() => void createJob()}
+              disabled={!selectedSessionIsVerified || !selectedMemberWxid}
+            >
+              创建画像任务
+            </button>
             <button className="button button-secondary" onClick={() => void listJobs()}>
               刷新任务
             </button>
-            <button className="button button-secondary" onClick={() => void getJob()} disabled={!jobId}>
-              读取任务
-            </button>
-            <DangerAction
-              label={fullExtract ? "准备全量离线包" : "创建并执行蒸馏"}
-              title={fullExtract ? "确认准备全量离线包" : "确认创建人物蒸馏任务"}
-              confirmLabel={fullExtract ? "确认准备离线包" : "确认创建任务"}
-              pendingLabel="正在创建…"
-              disabled={
-                !selectedSessionIsVerified
-                || !members.some((item) => item.wxid === targetUserId)
-              }
-              impact={(
-                <dl>
-                  <div><dt>目标群</dt><dd><code>{effectiveSessionId || "未选择"}</code></dd></div>
-                  <div><dt>目标成员</dt><dd>{targetName || "未选择"} <code>{targetUserId || ""}</code></dd></div>
-                  <div><dt>样本范围</dt><dd>{fullExtract ? "全量文件导出" : `最近 ${daysLimit} 天，最多 ${maxMessages} 条`}</dd></div>
-                  <div><dt>影响</dt><dd>{fullExtract ? "消息只会进入受限离线包，后台不做大上下文生成。" : "会读取获授权的有限消息样本并在线分块生成风格产物。"}</dd></div>
-                </dl>
-              )}
-              onConfirm={createJob}
-            />
-            <DangerAction
-              label="准备增量更新包"
-              title="确认准备人格增量包"
-              confirmLabel="确认准备增量包"
-              pendingLabel="正在创建…"
-              disabled={
-                !selectedSessionIsVerified
-                || !members.some((item) => item.wxid === targetUserId)
-              }
-              impact={(
-                <dl>
-                  <div><dt>目标人物</dt><dd>{targetName || "未选择"}</dd></div>
-                  <div><dt>前提</dt><dd>该人物已完成并应用过一次新版离线全量产物。</dd></div>
-                  <div><dt>范围</dt><dd>从服务端游标之后提取新增消息，并附带旧产物作为基线。</dd></div>
-                </dl>
-              )}
-              onConfirm={() => createOfflineExport("incremental")}
-            />
-            {selectedAwaitingImportJob ? (
-              <>
-                <button
-                  className="button button-secondary"
-                  onClick={() => void downloadOfflineBundle(selectedAwaitingImportJob)}
-                >
-                  下载当前离线包
-                </button>
-                <DangerAction
-                  label="上传生成结果"
-                  title="确认上传离线人格产物"
-                  confirmLabel="确认上传"
-                  pendingLabel="正在校验…"
-                  disabled={!offlineArtifactFile}
-                  impact={<p>只导入结构化人格产物；上传包中的原始消息或额外文件会被拒绝。</p>}
-                  onConfirm={uploadOfflineArtifact}
-                />
-              </>
-            ) : null}
           </div>
-          {jobNotice ? <p className="muted-copy" role="status">{jobNotice}</p> : null}
-          <div
-            className="table-scroll compact-table-scroll"
-            role="region"
-            aria-label="当前群人物画像蒸馏任务表格"
-            tabIndex={0}
-          >
+          {jobNotice ? <p className="muted-copy">{jobNotice}</p> : null}
+          <div className="table-scroll">
             <table>
-              <caption className="sr-only">当前群人物画像蒸馏任务</caption>
+              <caption className="sr-only">当前群画像蒸馏任务</caption>
               <thead>
                 <tr>
-                  <th scope="col">ID</th>
-                  <th scope="col">人物</th>
-                  <th scope="col">技能标识 / 生成模式</th>
-                  <th scope="col">阶段</th>
-                  <th scope="col">耗时 / 尝试</th>
+                  <th scope="col">#</th>
+                  <th scope="col">成员</th>
+                  <th scope="col">模式</th>
                   <th scope="col">状态</th>
-                  <th scope="col">操作</th>
+                  <th scope="col">消息数</th>
+                  <th scope="col">耗时</th>
+                  <th scope="col">错误</th>
                 </tr>
               </thead>
               <tbody>
                 {jobs.map((item) => (
-                  <tr
-                    key={item.id}
-                    className={String(item.id) === String(jobId || "") ? "table-row-active" : ""}
-                  >
-                    <th scope="row" className="mono">
-                      <button type="button" className="table-cell-action mono" onClick={() => hydrateJobSelection(item)}>
-                        {item.id}
-                      </button>
-                    </th>
-                    <td>{item.target_name || item.target_user_id || "-"}</td>
-                    <td>{item.output_slug || "-"} / {personaArtifactModeLabel(item.mode)}</td>
-                    <td>{personaJobStageLabel(item.current_stage, item.checkpoint)}</td>
-                    <td>
-                      <span>{personaJobDurationLabel(item)}</span>
-                      <div className="muted-copy">{personaJobRetryLabel(item)}</div>
-                    </td>
-                    <td>
-                      <span className={item.status === "failed" ? "pill pill-danger" : item.status === "completed" ? "pill pill-ok" : "pill pill-muted"}>
-                        {item.cancel_requested && isActivePersonaJob(item) ? "取消中" : personaJobStatusLabel(item.status)}
-                      </span>
-                      {item.status === "failed" ? (
-                        <div className="persona-job-error" title={item.error || ""}>
-                          {shortJobError(item)}
-                        </div>
-                      ) : null}
-                    </td>
-                    <td>
-                      <DangerAction
-                        label="应用"
-                        title="确认应用蒸馏结果"
-                        confirmLabel="确认应用"
-                        className="button-compact"
-                        disabled={item.status !== "completed" || item.session_id !== effectiveSessionId}
-                        impact={<p>将任务 #{item.id} 的人物风格应用到当前群；现有同范围配置可能被更新。</p>}
-                        onConfirm={async () => {
-                          hydrateJobSelection(item);
-                          await applyJobToProfile(item.id);
-                        }}
-                      />
-                      {item.status === "failed" ? (
-                        <DangerAction
-                          label="重跑"
-                          title="确认重跑蒸馏任务"
-                          confirmLabel="确认重跑"
-                          className="button-compact"
-                          disabled={item.session_id !== effectiveSessionId}
-                          impact={<p>任务 #{item.id} 将重新读取当前群授权样本并执行，失败记录会保留。</p>}
-                          onConfirm={() => rerunJob(item.id)}
-                        />
-                      ) : null}
-                      {item.status === "awaiting_import" ? (
-                        <button
-                          type="button"
-                          className="button button-secondary button-compact"
-                          onClick={() => {
-                            hydrateJobSelection(item);
-                            void downloadOfflineBundle(item);
-                          }}
-                        >
-                          下载包
-                        </button>
-                      ) : null}
-                      {isActivePersonaJob(item) ? (
-                        <DangerAction
-                          label="取消"
-                          title="确认取消蒸馏任务"
-                          confirmLabel="确认取消"
-                          pendingLabel="正在取消…"
-                          className="button-compact"
-                          disabled={item.session_id !== effectiveSessionId || Boolean(item.cancel_requested)}
-                          impact={<p>任务 #{item.id} 会在安全检查点停止；已经持久化的分段进度会保留。</p>}
-                          onConfirm={() => cancelJob(item.id)}
-                        />
-                      ) : null}
-                    </td>
+                  <tr key={item.id}>
+                    <td className="mono">{item.id}</td>
+                    <td>{item.speaker_name || item.speaker_id || "-"}</td>
+                    <td>{portraitJobModeLabel(item.mode)}</td>
+                    <td>{portraitJobStatusLabel(item.status)}</td>
+                    <td>{item.message_count ?? 0}</td>
+                    <td>{portraitJobDurationLabel(item)}</td>
+                    <td>{shortPortraitJobError(item)}</td>
                   </tr>
                 ))}
                 {!jobs.length && (
                   <tr>
-                    <td colSpan={7}>当前群还没有蒸馏任务</td>
+                    <td colSpan={7}>当前群还没有画像任务</td>
                   </tr>
                 )}
               </tbody>
@@ -1555,332 +722,185 @@ export function PersonaWorkspace() {
         <section className="panel panel-scroll">
           <div className="panel-header">
             <div>
-              <p className="section-kicker">已应用风格技能</p>
-              <h3>当前群启用的风格技能</h3>
+              <p className="section-kicker">运行时注入</p>
+              <h3>已应用回复风格</h3>
             </div>
           </div>
-          <div className="persona-scope-note">
-            <strong>{personaSessionName || "未选择群"}</strong>
-            <span>当前群可以保存多个风格技能；同一消息渠道和来源键只启用一个，其余技能会保留以便随时切换。</span>
-          </div>
-          <div className="form-grid">
-            <label className="field">
-              <span>当前风格技能</span>
-              <select
-                value={profileId}
-                onChange={(event) => {
-                  const next = profiles.find((item) => String(item.id) === event.target.value);
-                  if (next) {
-                    hydrateProfileForm(next, { syncJobId: true });
-                  } else {
-                    setProfileId("");
-                  }
-                }}
-              >
-                <option value="">新建当前群风格技能</option>
-                {profiles.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {`#${item.id} · ${item.profile_name || item.target_name || "未命名"} · ${item.enabled ? "当前启用" : "已保存"}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              <span>配置名称</span>
-              <input value={profileName} onChange={(event) => setProfileName(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>消息渠道</span>
-              <select value={profileChannel} onChange={(event) => setProfileChannel(event.target.value)}>
-                <option value="wechat">微信</option>
-                <option value="all">全部渠道</option>
-                <option value="web">网页</option>
-                <option value="whatsapp">WhatsApp</option>
-                <option value="telegram">Telegram</option>
-                <option value="email">电子邮件</option>
-                <option value="sms">短信</option>
-                <option value="voice">语音</option>
-                <option value="custom">自定义</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>来源键</span>
-              <input value={profileSourceKey} onChange={(event) => setProfileSourceKey(event.target.value)} />
-            </label>
-            <label className="field span-2">
-              <span>来源名称</span>
-              <input value={profileSourceLabel} onChange={(event) => setProfileSourceLabel(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>技能标识</span>
-              <input value={profileSkillSlug} onChange={(event) => setProfileSkillSlug(event.target.value)} />
-            </label>
-            <label className="field">
-              <span>是否启用</span>
-              <select value={profileEnabled} onChange={(event) => setProfileEnabled(event.target.value)}>
-                <option value="true">启用</option>
-                <option value="false">停用</option>
-              </select>
-            </label>
-          </div>
-          <div className="action-row">
-            <button className="button button-secondary" onClick={() => void listProfiles()}>
-              读取当前群 Skill
-            </button>
-            <DangerAction
-              label="从任务应用"
-              title="确认应用蒸馏任务"
-              confirmLabel="确认应用"
-              disabled={!canApplySelectedJob}
-              impact={(
-                <dl>
-                  <div><dt>目标群</dt><dd><code>{effectiveSessionId || "未选择"}</code></dd></div>
-                  <div><dt>任务</dt><dd><code>{jobId || "未选择"}</code></dd></div>
-                  <div><dt>影响</dt><dd>将任务产物设为当前群人物风格配置，并保留任务和配置审计链。</dd></div>
-                </dl>
-              )}
-              onConfirm={() => applyJobToProfile()}
-            />
-            <DangerAction
-              label="保存风格技能"
-              title="确认保存人物回复风格技能"
-              confirmLabel="确认保存"
-              pendingLabel="正在保存…"
-              disabled={
-                !selectedSessionIsVerified
-                || !profileLoaded
-                || !hasSaveablePersonaDraft
-              }
-              impact={(
-                <dl>
-                  <div><dt>目标群</dt><dd><code>{effectiveSessionId || "未选择"}</code></dd></div>
-                  <div><dt>运行人格</dt><dd>{personaDisplayName || "未填写"}</dd></div>
-                  <div><dt>状态</dt><dd>{profileEnabled === "true" ? "保存后启用" : "保存但不启用"}</dd></div>
-                  <div><dt>影响</dt><dd>会更新当前群的回复人格；机器人将以该人格自然说话，安全、事实和记忆受众规则仍优先。</dd></div>
-                </dl>
-              )}
-              onConfirm={saveProfile}
-            />
-            <DangerAction
-              label="删除风格技能"
-              title="确认删除人物回复风格技能"
-              confirmLabel="确认删除"
-              pendingLabel="正在删除…"
-              disabled={!selectedSessionIsVerified || !profiles.some((item) => String(item.id) === String(profileId))}
-              impact={(
-                <dl>
-                  <div><dt>配置 ID</dt><dd><code>{profileId || "未选择"}</code></dd></div>
-                  <div><dt>名称</dt><dd>{profileName || "未命名"}</dd></div>
-                  <div><dt>目标人物</dt><dd>{targetName || targetUserId || "未填写"}</dd></div>
-                  <div><dt>技能标识</dt><dd><code>{profileSkillSlug || "未生成"}</code></dd></div>
-                  <div><dt>影响</dt><dd>删除后该配置不再参与回复风格选择；已生成的蒸馏任务记录不会自动删除。</dd></div>
-                </dl>
-              )}
-              onConfirm={deleteProfile}
-            />
-          </div>
-          <div
-            className="table-scroll compact-table-scroll"
-            role="region"
-            aria-label="当前群已应用回复风格表格"
-            tabIndex={0}
-          >
+          <p className="muted-copy">
+            画像编译出的风格档案按群启用，每个群同一渠道最多一个启用中的档案；画像热更新后，后台会自动重编译并同步这些档案。
+          </p>
+          <div className="table-scroll">
             <table>
-              <caption className="sr-only">当前群已应用回复风格</caption>
+              <caption className="sr-only">当前群回复风格档案</caption>
               <thead>
                 <tr>
-                  <th scope="col">ID</th>
                   <th scope="col">名称</th>
-                  <th scope="col">目标人物</th>
-                  <th scope="col">技能标识</th>
-                  <th scope="col">状态</th>
+                  <th scope="col">标识</th>
+                  <th scope="col">启用</th>
+                  <th scope="col">更新时间</th>
                   <th scope="col">操作</th>
                 </tr>
               </thead>
               <tbody>
                 {profiles.map((item) => (
                   <tr key={item.id}>
-                    <th scope="row" className="mono">
-                      <button type="button" className="table-cell-action mono" onClick={() => hydrateProfileForm(item, { syncJobId: true })}>
-                        {item.id}
-                      </button>
-                    </th>
-                    <td>{item.profile_name || "-"}</td>
-                    <td>{item.target_name || item.target_user_id || "-"}</td>
+                    <th scope="row">{item.profile_name || item.target_name || `#${item.id}`}</th>
                     <td className="mono">{item.skill_slug || "-"}</td>
+                    <td>{item.enabled ? "启用中" : "已停用"}</td>
+                    <td>{item.updated_at || "-"}</td>
                     <td>
-                      <span className={item.enabled ? "pill pill-ok" : "pill pill-muted"}>
-                        {item.enabled ? "当前启用" : "已保存"}
-                      </span>
-                    </td>
-                    <td>
-                      {item.enabled ? (
-                        <span className="muted-copy">使用中</span>
-                      ) : (
+                      <div className="action-row action-row-compact">
+                        <button
+                          className="button button-secondary"
+                          onClick={() => void activateProfile(item)}
+                          disabled={Boolean(item.enabled)}
+                        >
+                          启用
+                        </button>
                         <DangerAction
-                          label="启用"
-                          title="确认切换当前群回复风格"
-                          confirmLabel="确认启用"
-                          className="button-compact"
-                          impact={<p>启用“{item.profile_name || item.target_name || item.skill_slug}”，当前同范围风格会保留但停用。</p>}
-                          onConfirm={() => activateProfile(item)}
+                          label="删除"
+                          title={`删除风格档案 ${item.profile_name || item.id}`}
+                          impact="删除后该群将不再注入此回复风格。"
+                          confirmLabel="确认删除"
+                          onConfirm={() => deleteProfile(item)}
                         />
-                      )}
+                      </div>
                     </td>
                   </tr>
                 ))}
                 {!profiles.length && (
                   <tr>
-                    <td colSpan={6}>当前群还没有已应用的回复风格技能</td>
+                    <td colSpan={5}>当前群还没有风格档案；先创建画像再应用。</td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
+          <div className="action-row">
+            <button className="button button-secondary" onClick={() => void listProfiles()}>
+              刷新档案
+            </button>
+          </div>
         </section>
       </div>
 
-      <section className="panel span-2 panel-scroll">
+      <section className="panel span-3">
         <div className="panel-header">
           <div>
-            <p className="section-kicker">产物</p>
-            <h3>蒸馏产物编辑器</h3>
+            <p className="section-kicker">画像结果</p>
+            <h3>{selectedMemberName ? `${selectedMemberName} 的画像` : "画像"}</h3>
           </div>
         </div>
-        <div className="persona-artifact-summary">
-          <div>
-            <span>技能标识</span>
-            <strong>{artifactSummary.slug}</strong>
-          </div>
-          <div>
-            <span>生成模式</span>
-            <strong>{personaArtifactModeLabel(artifactSummary.mode)}</strong>
-          </div>
-          <div>
-            <span>消息数</span>
-            <strong>{artifactSummary.messages}</strong>
-          </div>
-          <div>
-            <span>时间范围</span>
-            <strong>{`${artifactSummary.first} ~ ${artifactSummary.last}`}</strong>
-          </div>
-        </div>
-        <div className="form-grid">
-          <label className="field span-2">
-            <span>技能提示词正文（运行时注入）</span>
-            <textarea
-              rows={8}
-              value={artifactSkillPrompt}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactSkillPrompt(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field span-2">
-            <span>SKILL.md</span>
-            <textarea
-              rows={10}
-              value={artifactSkillMd}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactSkillMd(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field span-2">
-            <span>persona.md</span>
-            <textarea
-              rows={10}
-              value={artifactPersonaMd}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactPersonaMd(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field span-2">
-            <span>work.md</span>
-            <textarea
-              rows={10}
-              value={artifactWorkMd}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactWorkMd(event.target.value);
-              }}
-            />
-          </label>
-          <details className="technical-details span-2">
-            <summary>技术详情：meta.json</summary>
-            <label className="field">
-              <span>结构化元数据 JSON</span>
-              <textarea
-                rows={10}
-                value={artifactMetaJson}
-                onChange={(event) => {
-                  artifactEditorDirtyRef.current = true;
-                  setArtifactMetaJson(event.target.value);
-                }}
+        {portrait ? (
+          <>
+            <div className="form-grid">
+              <div className="field">
+                <span>画像概要</span>
+                <strong>{portraitPayload?.summary || "-"}</strong>
+              </div>
+              <div className="field">
+                <span>置信度 / 覆盖</span>
+                <strong>
+                  {portraitConfidenceLabel(portraitPayload, freshness)} · {portraitCoverageLabel(portraitPayload, freshness)}
+                </strong>
+                <small>{portraitFreshnessHint(freshness) || "以当前名册发言数对照上次蒸馏覆盖"}</small>
+              </div>
+              <div className="field">
+                <span>最近蒸馏</span>
+                <strong>{portrait.revision_created_at || portrait.updated_at || "-"}</strong>
+                <small>
+                  {portrait.last_message_at ? `最近发言 ${portrait.last_message_at}` : "尚无新发言时间"}
+                  {" · "}
+                  热更新{portrait.hot_update_enabled === false ? "已关闭" : "开启"}
+                  {typeof portrait.pending_messages === "number"
+                    ? ` · 待处理新消息 ${portrait.pending_messages} 条`
+                    : ""}
+                </small>
+              </div>
+            </div>
+            <div className="form-grid">
+              {claimSections.map((section) => (
+                <div className="field" key={String(section.key)}>
+                  <span>{section.label}</span>
+                  <ul className="plain-list">
+                    {section.claims.slice(0, 8).map((claim, index) => (
+                      <li key={`${String(section.key)}-${index}`}>
+                        {String((claim as { text?: string }).text || "")}
+                        {Number((claim as { count?: number }).count) > 1
+                          ? `（${Number((claim as { count?: number }).count)} 次）`
+                          : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              {portraitPayload?.unknowns?.length ? (
+                <div className="field">
+                  <span>未知信息</span>
+                  <ul className="plain-list">
+                    {portraitPayload.unknowns.slice(0, 8).map((item, index) => (
+                      <li key={`unknown-${index}`}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          </>
+        ) : (
+          <p className="muted-copy">
+            {selectedMemberWxid
+              ? "该成员还没有画像；创建画像任务完成后这里会显示画像内容。"
+              : "请先从上方名册选择群成员。"}
+          </p>
+        )}
+        <div className="persona-style-actions">
+          <p className="muted-copy">
+            风格由画像即时编译（第一人称 COS 提示词），应用后写入本群风格档案并参与群聊回复。
+            {appliedProfile
+              ? ` 当前成员已应用：${appliedProfile.profile_name || appliedProfile.skill_slug}（${appliedProfile.enabled ? "启用中" : "已停用"}）。`
+              : " 当前成员尚未应用回复风格。"}
+          </p>
+          <div className="action-row">
+            <button
+              className="button button-secondary"
+              onClick={() => void previewStyle()}
+              disabled={!selectedMemberWxid || !portrait}
+            >
+              预览风格提示词
+            </button>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={styleEnabled}
+                onChange={(event) => setStyleEnabled(event.target.checked)}
               />
+              <strong>应用后立即启用</strong>
             </label>
-          </details>
-          <label className="field">
-            <span>知识消息最早时间</span>
-            <input
-              value={artifactFirstTimestamp}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactFirstTimestamp(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field">
-            <span>知识消息最晚时间</span>
-            <input
-              value={artifactLastTimestamp}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactLastTimestamp(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field">
-            <span>知识消息数量</span>
-            <input
-              value={artifactMessageCount}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactMessageCount(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field">
-            <span>产物生成模式</span>
-            <input
-              value={artifactMode}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactMode(event.target.value);
-              }}
-            />
-          </label>
-          <label className="field span-2">
-            <span>knowledge/messages.txt</span>
-            <textarea
-              rows={8}
-              value={artifactKnowledgeText}
-              onChange={(event) => {
-                artifactEditorDirtyRef.current = true;
-                setArtifactKnowledgeText(event.target.value);
-              }}
-            />
-          </label>
+            <button
+              className="button button-primary"
+              onClick={() => void applyStyle()}
+              disabled={!selectedSessionIsVerified || !selectedMemberWxid || !portrait}
+            >
+              应用为本群回复风格
+            </button>
+          </div>
+          {stylePreview?.prompt ? (
+            <label className="field span-2">
+              <span>
+                风格提示词（{stylePreview.name || selectedMemberName || "-"} · {stylePreview.prompt_chars ?? stylePreview.prompt.length} 字）
+              </span>
+              <textarea rows={8} value={stylePreview.prompt} readOnly />
+            </label>
+          ) : null}
         </div>
       </section>
 
-      <OutputPanel title="群会话 / 成员响应" value={selectionOutput} />
-      <OutputPanel title="蒸馏任务响应" value={output} />
-      <OutputPanel title="风格技能管理响应" value={profileOutput} />
+      <section className="panel span-3">
+        <OutputPanel flush title="任务响应" value={jobOutput} />
+        <OutputPanel flush title="档案响应" value={profileOutput} />
+        <OutputPanel flush title="画像数据" value={portraitOutput} />
+        <OutputPanel flush title="选择过程" value={selectionOutput} />
+      </section>
     </div>
   );
 }

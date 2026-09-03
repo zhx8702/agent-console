@@ -59,9 +59,6 @@ export function ConnectionList({
           <p className="section-kicker">连接实例</p>
           <h2 id="connection-list-title">已配置连接</h2>
         </div>
-        <button className="button button-primary button-compact" type="button" onClick={onAdd} disabled={readOnly}>
-          添加连接
-        </button>
       </div>
 
       <div className="connection-list-filters" aria-label="连接筛选">

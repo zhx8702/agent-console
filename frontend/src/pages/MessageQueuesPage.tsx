@@ -668,14 +668,44 @@ export function MessageQueuesPage() {
 
   return (
     <div className="page-grid queue-page">
-      <section className="panel panel-hero span-2">
+      <section className="panel panel-hero span-3">
         <PageHeader
           eyebrow="消息总线"
           title="全局消息队列"
-          description="统一查看全局入站、出站和死信流，确认消息有没有真正进队、出队，以及消费者是否积压。"
+          description="查看入站、出站和死信流，确认进队、出队与积压。"
+          actions={
+            <div className="action-row">
+              <button className="button button-primary" type="button" onClick={() => void refreshAll()} disabled={loading}>
+                {loading ? "刷新中..." : "立即刷新"}
+              </button>
+              {pageCursor && (
+                <button
+                  className="button button-secondary"
+                  type="button"
+                  onClick={() => {
+                    setPageCursor("");
+                    setAutoRefresh(true);
+                    void refreshAll();
+                  }}
+                  disabled={loading}
+                >
+                  回到最新
+                </button>
+              )}
+              <label className="queue-auto-refresh-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoRefresh && !pageCursor}
+                  disabled={Boolean(pageCursor)}
+                  onChange={(event) => setAutoRefresh(event.target.checked)}
+                />
+                <span>自动刷新</span>
+              </label>
+            </div>
+          }
         />
         <form
-          className="form-grid"
+          className="page-ops-bar"
           onSubmit={(event) => {
             event.preventDefault();
             void refreshAll();
@@ -714,36 +744,6 @@ export function MessageQueuesPage() {
             <input value={traceFilter} onChange={(event) => setTraceFilter(event.target.value)} placeholder="可选" />
           </label>
         </form>
-        <div className="queue-refresh-toolbar">
-          <div className="action-row">
-            <button className="button button-primary" type="button" onClick={() => void refreshAll()} disabled={loading}>
-              {loading ? "刷新中..." : "立即刷新"}
-            </button>
-            {pageCursor && (
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => {
-                  setPageCursor("");
-                  setAutoRefresh(true);
-                  void refreshAll();
-                }}
-                disabled={loading}
-              >
-                回到最新
-              </button>
-            )}
-          </div>
-          <label className="queue-auto-refresh-toggle">
-            <input
-              type="checkbox"
-              checked={autoRefresh && !pageCursor}
-              disabled={Boolean(pageCursor)}
-              onChange={(event) => setAutoRefresh(event.target.checked)}
-            />
-            <span>自动刷新</span>
-          </label>
-        </div>
         <div className="queue-live-status" role="status" aria-live="polite">
           <span className={`queue-live-dot${autoRefresh && !pageCursor ? " active" : ""}`} aria-hidden="true" />
           <span>{refreshStatus}</span>
@@ -756,16 +756,7 @@ export function MessageQueuesPage() {
           <StatusTile label="消息总数" value={String(currentSummary?.length ?? 0)} />
           <StatusTile label="待确认" value={String(currentSummary?.pending_total ?? 0)} />
         </div>
-      </section>
-
-      <section className="panel panel-scroll">
-        <div className="panel-header">
-          <div>
-            <p className="section-kicker">队列流</p>
-            <h3>流摘要</h3>
-          </div>
-        </div>
-        <div className="queue-summary-list">
+        <div className="queue-summary-list" aria-label="流摘要">
           {summary.map((item) => (
             <button
               key={item.stream_key}
@@ -775,7 +766,6 @@ export function MessageQueuesPage() {
             >
               <div className="queue-summary-card-top">
                 <strong>{streamLabel(item.stream_key)}</strong>
-                <span>消息流摘要</span>
               </div>
               <div className="queue-summary-card-stats">
                 <span>总量 {item.length}</span>
@@ -787,31 +777,34 @@ export function MessageQueuesPage() {
           {!summary.length && <p className="muted-copy">暂无队列摘要</p>}
         </div>
         {!!currentSummary?.groups?.length && (
-          <div className="table-wrap compact-table-scroll u-mt-4">
-            <table>
-              <caption className="sr-only">当前消息流消费组摘要</caption>
-              <thead>
-                <tr>
-                  <th scope="col">消费组</th>
-                  <th scope="col">消费者</th>
-                  <th scope="col">待处理</th>
-                  <th scope="col">延迟</th>
-                  <th scope="col">投递状态</th>
-                </tr>
-              </thead>
-              <tbody>
-                {currentSummary.groups.map((group) => (
-                  <tr key={group.name}>
-                    <td>消费组</td>
-                    <td>{group.consumers}</td>
-                    <td>{group.pending}</td>
-                    <td>{group.lag ?? "-"}</td>
-                    <td>{group.last_delivered_id ? "已有投递" : "暂无投递"}</td>
+          <details className="queue-groups-disclosure">
+            <summary>当前流消费组</summary>
+            <div className="table-wrap compact-table-scroll">
+              <table>
+                <caption className="sr-only">当前消息流消费组摘要</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">消费组</th>
+                    <th scope="col">消费者</th>
+                    <th scope="col">待处理</th>
+                    <th scope="col">延迟</th>
+                    <th scope="col">投递状态</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {currentSummary.groups.map((group) => (
+                    <tr key={group.name}>
+                      <td>消费组</td>
+                      <td>{group.consumers}</td>
+                      <td>{group.pending}</td>
+                      <td>{group.lag ?? "-"}</td>
+                      <td>{group.last_delivered_id ? "已有投递" : "暂无投递"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
         )}
       </section>
 
@@ -1032,7 +1025,7 @@ export function MessageQueuesPage() {
       </section>
 
       <div className="span-3">
-        <OutputPanel title="最近响应" value={output} />
+        <OutputPanel flush title="最近响应" value={output} />
       </div>
     </div>
   );

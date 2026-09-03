@@ -588,3 +588,89 @@ async def test_capabilities_endpoint_enforces_authentication_and_tenant_scope(
     assert allowed.status_code == 200
     assert forbidden.status_code == 403
     assert forbidden.json()["detail"] == "tenant_scope_forbidden"
+
+
+@pytest.mark.asyncio
+async def test_tibo_reset_reports_unconfigured_when_api_url_is_missing() -> None:
+    registry = _Registry(
+        [
+            _Plugin("wxbot", version="0.2.0"),
+            _Plugin("tibo_reset", dependencies=["wxbot>=0.2.0"]),
+        ]
+    )
+    payload = await build_tenant_capabilities(
+        tenant_id="demo",
+        principal=_principal(),
+        settings=Settings(app_env="test", tibo_reset_api_url=""),
+        plugin_registry=registry,
+        plugin_manager=_ScopeManager(),
+        faq_store=object(),
+        kb_service=object(),
+        dlq_service=object(),
+        stream_service=object(),
+        orchestrator=object(),
+    )
+    tibo = _capability(payload, "plugin.tibo_reset")
+    assert tibo["enabled"] is True
+    assert tibo["health"] == "action_required"
+    assert tibo["status_reason"] == "plugin_not_configured"
+    assert tibo["entry_route"] == "/plugins?plugin=tibo_reset"
+    assert tibo["recovery_actions"][0]["target"] == "/plugins?plugin=tibo_reset"
+    assert tibo["recovery_actions"][0]["label"] == "配置 Tibo Reset 接口地址"
+
+
+@pytest.mark.asyncio
+async def test_tibo_reset_is_ready_when_plugin_state_and_api_url_are_present() -> None:
+    registry = _Registry(
+        [
+            _Plugin("wxbot", version="0.2.0"),
+            _Plugin("tibo_reset", dependencies=["wxbot>=0.2.0"]),
+        ]
+    )
+    payload = await build_tenant_capabilities(
+        tenant_id="demo",
+        principal=_principal(),
+        settings=Settings(
+            app_env="test",
+            tibo_reset_api_url="https://reset-feed.example.invalid/api/resets",
+        ),
+        plugin_registry=registry,
+        plugin_manager=_ScopeManager(),
+        faq_store=object(),
+        kb_service=object(),
+        dlq_service=object(),
+        stream_service=object(),
+        orchestrator=object(),
+    )
+    tibo = _capability(payload, "plugin.tibo_reset")
+    assert tibo["enabled"] is True
+    assert tibo["health"] == "ready"
+    assert tibo["status_reason"] == "plugin_active_for_tenant"
+
+
+@pytest.mark.asyncio
+async def test_tibo_reset_inactive_plugin_state_is_not_unconfigured() -> None:
+    registry = _Registry(
+        [
+            _Plugin("wxbot", version="0.2.0"),
+            _Plugin("tibo_reset", dependencies=["wxbot>=0.2.0"]),
+        ],
+        active={"wxbot"},
+    )
+    payload = await build_tenant_capabilities(
+        tenant_id="demo",
+        principal=_principal(),
+        settings=Settings(app_env="test", tibo_reset_api_url=""),
+        plugin_registry=registry,
+        plugin_manager=_ScopeManager(),
+        faq_store=object(),
+        kb_service=object(),
+        dlq_service=object(),
+        stream_service=object(),
+        orchestrator=object(),
+    )
+    tibo = _capability(payload, "plugin.tibo_reset")
+    assert tibo["enabled"] is False
+    assert tibo["health"] == "action_required"
+    assert tibo["status_reason"] == "plugin_not_active"
+    assert tibo["recovery_actions"][0]["target"] == "/plugins?plugin=tibo_reset"

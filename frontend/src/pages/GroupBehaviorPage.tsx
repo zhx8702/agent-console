@@ -1,6 +1,6 @@
 import {
   Alert,
-  EmptyState,
+  GroupScopeEmpty,
   PageHeader,
   Tabs,
   UnsavedChangesGuard,
@@ -80,21 +80,11 @@ export function GroupBehaviorPage() {
 
   if (!groupId) {
     return (
-      <div className="page-grid group-behavior-page">
-        <section className="panel panel-hero span-3">
-          <PageHeader
-            eyebrow="群聊行为控制"
-            title="群参与与行为"
-            description="把机器人何时开口、说多少、用什么风格以及成员隐私边界，集中在一个可审计的群级控制面。"
-          />
-        </section>
-        <div className="span-3">
-          <EmptyState
-            title="先选择一个已验证群聊"
-            description="本页不接受手填群标识，也不会回退到全局范围。请使用页面上方的群聊选择器。"
-          />
-        </div>
-      </div>
+      <GroupScopeEmpty
+        eyebrow="群聊行为控制"
+        title="群参与与行为"
+        description="把机器人何时开口、说多少、用什么风格以及成员隐私边界，集中在一个可审计的群级控制面。"
+      />
     );
   }
 
@@ -210,9 +200,35 @@ export function GroupBehaviorPage() {
           eyebrow="群聊行为控制"
           title="群参与与行为"
           description="在当前群统一控制何时开口、参与预算、表达风格与成员隐私；所有写入都带版本保护、稳定重试标识和审计原因。"
+          actions={
+            <div className="action-row">
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => void savePolicy()}
+                disabled={
+                  !policyState.dirty
+                  || policyState.status === "saving"
+                  || Boolean(voiceValidationError)
+                }
+              >
+                {policyState.status === "saving" ? "保存中…" : "保存群策略"}
+              </button>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={reloadPolicy}
+                disabled={policyState.status === "loading"}
+              >
+                重新读取
+              </button>
+              <span className={`pill ${effectiveEnabled ? "pill-ok" : "pill-danger"}`}>
+                {effectiveEnabled ? "有效参与开启" : "有效参与关闭"}
+              </span>
+            </div>
+          }
         />
-        <div className="status-grid">
-          <article className="status-tile"><span>目标群</span><strong>{groupId}</strong></article>
+        <div className="status-grid page-hero-metrics">
           <article className="status-tile"><span>策略版本</span><strong>{policyDraft ? `v${policyDraft.version}` : "—"}</strong></article>
           <article className="status-tile"><span>同步状态</span><strong>{resourceStatus(policyState)}</strong></article>
         </div>
@@ -230,31 +246,6 @@ export function GroupBehaviorPage() {
                 )}
           </Alert>
         ) : null}
-        <div className="action-row">
-          <button
-            className="button button-primary"
-            type="button"
-            onClick={() => void savePolicy()}
-            disabled={
-              !policyState.dirty
-              || policyState.status === "saving"
-              || Boolean(voiceValidationError)
-            }
-          >
-            {policyState.status === "saving" ? "保存中…" : "保存群策略"}
-          </button>
-          <button
-            className="button button-secondary"
-            type="button"
-            onClick={reloadPolicy}
-            disabled={policyState.status === "loading"}
-          >
-            重新读取
-          </button>
-          <span className={`pill ${effectiveEnabled ? "pill-ok" : "pill-danger"}`}>
-            {effectiveEnabled ? "有效参与开启" : "有效参与关闭"}
-          </span>
-        </div>
         <TechnicalDetails
           summary="查看策略技术详情"
           label="群策略技术详情 JSON"

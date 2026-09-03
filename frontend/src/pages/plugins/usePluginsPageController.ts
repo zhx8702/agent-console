@@ -68,6 +68,8 @@ export function usePluginsPageController() {
   const [traceAggregateError, setTraceAggregateError] = useState("");
   const [flowLoading, setFlowLoading] = useState(false);
   const [flowError, setFlowError] = useState("");
+  const [restartRequired, setRestartRequired] = useState(false);
+  const selectedPluginName = searchParams.get("plugin")?.trim() || "";
 
   const pluginCards: InstalledPlugin[] = installed.length ? installed : (data?.plugins || []).map((plugin) => ({
     ...plugin,
@@ -98,6 +100,7 @@ export function usePluginsPageController() {
         await loadGroups();
       }
       await loadPluginEvents();
+      await loadRestartInstructions(installedResult.plugins || []);
       await loadFlowRuntimeStatus();
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
@@ -342,6 +345,27 @@ export function usePluginsPageController() {
       setPluginEvents(result.events || []);
     } catch {
       setPluginEvents([]);
+    }
+  };
+
+  const loadRestartInstructions = async (plugins: Array<{ restart_required?: boolean }>) => {
+    if (plugins.some((plugin) => plugin.restart_required)) {
+      setRestartRequired(true);
+      return;
+    }
+    if (!config.adminToken) {
+      setRestartRequired(false);
+      return;
+    }
+    try {
+      const result = await apiRequest<{ restart_required?: boolean }>(
+        config,
+        "/v1/admin/runtime/restart-instructions",
+        { auth: true, init: { method: "POST" } },
+      );
+      setRestartRequired(Boolean(result.restart_required));
+    } catch {
+      setRestartRequired(false);
     }
   };
 
@@ -605,6 +629,7 @@ export function usePluginsPageController() {
           await loadGroups();
         }
         await loadPluginEvents();
+        await loadRestartInstructions(installedResult.plugins || []);
         await loadFlowRuntimeStatus();
       })().catch((err: unknown) => {
         setError(err instanceof Error ? err.message : "加载失败");
@@ -626,6 +651,16 @@ export function usePluginsPageController() {
       setManagedGroupSessionId(nextGroupSessionId);
     }
   }, [config.sessionId, managedGroupSessionId]);
+
+  useEffect(() => {
+    if (!selectedPluginName) {
+      return;
+    }
+    const card = document.getElementById(`plugin-card-${selectedPluginName}`);
+    if (card && typeof card.scrollIntoView === "function") {
+      card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [selectedPluginName, pluginCards.length]);
 
   useEffect(() => {
     const nextTraceId = searchParams.get("trace_id")?.trim() || "";
@@ -736,6 +771,8 @@ export function usePluginsPageController() {
     traceAggregateError,
     flowLoading,
     flowError,
+    selectedPluginName,
+    restartRequired,
     refreshSummary: loadSummary,
     refreshFlowRuntime: loadFlowRuntimeStatus,
     selectEffectTrace,
