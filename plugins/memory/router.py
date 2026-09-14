@@ -466,6 +466,8 @@ class MemoryWindowRelationshipExtractionRequest(StrictRequestModel):
     max_windows: int | None = None
     cursor_event_id: int | None = None
     dry_run: bool = False
+    include_llm: bool = True
+    llm_timeout_seconds: int | None = None
 
     def extraction_controls(self) -> dict[str, int | bool]:
         return {
@@ -473,6 +475,10 @@ class MemoryWindowRelationshipExtractionRequest(StrictRequestModel):
             "max_windows": max(1, min(int(self.max_windows or 1), 10)),
             "cursor_event_id": max(0, int(self.cursor_event_id or 0)),
             "dry_run": bool(self.dry_run),
+            "include_llm": bool(self.include_llm),
+            "llm_timeout_seconds": max(
+                1, min(int(self.llm_timeout_seconds or 60), 180)
+            ),
         }
 
 
@@ -488,6 +494,7 @@ class MemoryWindowRelationshipCatchupRequest(StrictRequestModel):
     cursor_event_id: int | None = None
     dry_run: bool = False
     time_budget_seconds: int | None = None
+    include_llm: bool = True
 
     def extraction_controls(self) -> dict[str, int | bool]:
         return {
@@ -496,6 +503,7 @@ class MemoryWindowRelationshipCatchupRequest(StrictRequestModel):
             "cursor_event_id": max(0, int(self.cursor_event_id or 0)),
             "dry_run": bool(self.dry_run),
             "time_budget_seconds": max(1, min(int(self.time_budget_seconds or 60), 180)),
+            "include_llm": bool(self.include_llm),
         }
 
 
