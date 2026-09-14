@@ -74,7 +74,7 @@ export function InstalledPluginsSection({
               {plugin.last_error && (
                 <details className="technical-details">
                   <summary>技术详情：最近错误</summary>
-                  <p className="muted-copy">{plugin.last_error}</p>
+                  <p className="muted-copy plugin-card-error">{plugin.last_error}</p>
                 </details>
               )}
 

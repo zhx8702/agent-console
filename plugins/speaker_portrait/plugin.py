@@ -20,7 +20,7 @@ class SpeakerPortraitPlugin(Plugin):
     meta = PluginMeta(
         name="speaker_portrait",
         version="0.1.0",
-        description="Build speaker portraits from chat history via local CLI",
+        description="通过本地 CLI 从聊天记录生成成员画像",
     )
 
     def __init__(self) -> None:

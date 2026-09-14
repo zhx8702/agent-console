@@ -25,7 +25,7 @@ class LocalAgentPlugin(Plugin):
     meta = PluginMeta(
         name="local_agent",
         version="0.1.0",
-        description="Probe host grok / Codex CLIs, run /grok /codex, and overflow long prompts locally",
+        description="探测宿主机 grok / Codex CLI，执行 /grok /codex，并把超长提示词转到本地处理",
     )
 
     def __init__(self) -> None:

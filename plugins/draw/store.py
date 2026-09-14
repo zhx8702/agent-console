@@ -201,16 +201,16 @@ def _normalize_runtime_overrides(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     normalized: dict[str, str] = {}
-    for field in DRAW_RUNTIME_OVERRIDE_FIELDS:
-        if field not in value:
+    for field_name in DRAW_RUNTIME_OVERRIDE_FIELDS:
+        if field_name not in value:
             continue
-        text_value = str(value.get(field) or "").strip()
-        limit = _DRAW_RUNTIME_FIELD_LIMITS[field]
+        text_value = str(value.get(field_name) or "").strip()
+        limit = _DRAW_RUNTIME_FIELD_LIMITS[field_name]
         if len(text_value) > limit:
-            raise ValueError(f"{field}_too_long")
-        if field in _DRAW_RUNTIME_URL_FIELDS:
-            text_value = _validate_runtime_url(text_value, field=field)
-        normalized[field] = text_value
+            raise ValueError(f"{field_name}_too_long")
+        if field_name in _DRAW_RUNTIME_URL_FIELDS:
+            text_value = _validate_runtime_url(text_value, field=field_name)
+        normalized[field_name] = text_value
     return normalized
 
 
@@ -1738,12 +1738,12 @@ class DrawStore:
                 current=int(current.version),
             )
         next_overrides = dict(current.overrides)
-        for field, value in updates.items():
-            if field not in DRAW_RUNTIME_OVERRIDE_FIELDS:
+        for field_name, value in updates.items():
+            if field_name not in DRAW_RUNTIME_OVERRIDE_FIELDS:
                 continue
             if value is None:
                 continue
-            next_overrides[field] = str(value)
+            next_overrides[field_name] = str(value)
         next_overrides = _normalize_runtime_overrides(next_overrides)
         actor = str(updated_by or "").strip()[:128]
         async with self._db() as db:
@@ -1813,13 +1813,13 @@ class DrawStore:
         overlay = dict(overrides if overrides is not None else (snapshot.overrides if snapshot else {}))
         sources: dict[str, str] = {}
         values: dict[str, str] = {}
-        for field in DRAW_RUNTIME_OVERRIDE_FIELDS:
-            if field in overlay:
-                values[field] = overlay[field]
-                sources[field] = "persisted_override"
+        for field_name in DRAW_RUNTIME_OVERRIDE_FIELDS:
+            if field_name in overlay:
+                values[field_name] = overlay[field_name]
+                sources[field_name] = "persisted_override"
             else:
-                values[field] = str(getattr(self.settings, field, "") or "").strip()
-                sources[field] = "environment"
+                values[field_name] = str(getattr(self.settings, field_name, "") or "").strip()
+                sources[field_name] = "environment"
         api_url = values["draw_api_url"]
         api_key = values["draw_api_key"]
         host = str(urlparse(self._normalize_generation_api_url(api_url) or api_url).hostname or "")

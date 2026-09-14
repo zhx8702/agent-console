@@ -28,7 +28,7 @@ class PersonaExtractPlugin(Plugin):
     meta = PluginMeta(
         name="persona_extract",
         version="0.2.0",
-        description="Extract and synthesize reply-style profiles from user message history",
+        description="从成员历史消息中提炼并合成回复风格",
     )
 
     def __init__(self) -> None:

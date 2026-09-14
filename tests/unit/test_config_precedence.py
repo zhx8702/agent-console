@@ -154,6 +154,26 @@ def test_production_ignores_unrelated_process_environment(
     assert settings.app_env == "prod"
 
 
+def test_production_ignores_macos_and_shell_process_environment(
+    monkeypatch,
+) -> None:
+    # launchd-started processes on macOS (including editor terminals) carry
+    # these names; ``XPC_SERVICE_NAME`` is a near-miss of ``APP_SERVICE_NAME``.
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.apple.xpc.launchd.oneshot.0x1.Cursor")
+    monkeypatch.setenv("XPC_FLAGS", "0x0")
+    monkeypatch.setenv("__CF_USER_TEXT_ENCODING", "0x1F5:0x19:0x34")
+    monkeypatch.setenv("__CFBundleIdentifier", "com.todesktop.230313mzl4w4u92")
+    monkeypatch.setenv("TERM_PROGRAM", "vscode")
+    monkeypatch.setenv("TERM_SESSION_ID", "w0t0p0")
+    monkeypatch.setenv("SHELL_SESSION_ID", "abc123")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/private/tmp/agent.sock")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/home/dev/.config")
+
+    settings = Settings(_env_file=None, app_env="prod")
+
+    assert settings.app_env == "prod"
+
+
 def test_production_rejects_unknown_name_in_owned_setting_namespace(
     monkeypatch,
 ) -> None:

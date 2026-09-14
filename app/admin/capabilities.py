@@ -268,6 +268,10 @@ async def build_tenant_capabilities(
         None,
     )
     if wxbot_capability is not None:
+        # Health and dependencies are inherited from the wxbot adapter because
+        # group participation cannot run without it, but the recovery actions
+        # must point at this capability's own page rather than the SDK console.
+        group_behavior_available = bool(wxbot_capability.get("available"))
         capabilities.append(
             {
                 **wxbot_capability,
@@ -276,6 +280,25 @@ async def build_tenant_capabilities(
                 "entry_route": "/group-behavior",
                 "permissions": [AdminPermission.WRITE.value],
                 "source": "derived",
+                "recovery_actions": (
+                    [
+                        _action(
+                            "configure",
+                            "打开群参与与行为",
+                            "/group-behavior",
+                            requires_admin=False,
+                        )
+                    ]
+                    if group_behavior_available
+                    else [
+                        _action(
+                            "configure",
+                            "先完成微信 SDK 连接",
+                            "/channels?adapter=wechat-sdk",
+                            requires_admin=True,
+                        )
+                    ]
+                ),
             }
         )
     capability_by_id = {item["id"]: item for item in capabilities}

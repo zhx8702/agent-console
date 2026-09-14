@@ -371,6 +371,17 @@ async def test_wechat_adapter_recovery_keeps_generic_and_extension_routes() -> N
     assert "/wxbot" in targets
     assert wxbot["extension_route"] == "/wxbot"
 
+    # The derived group-behavior capability must not inherit the SDK
+    # console's buttons; it points at its own page.
+    group_behavior = _capability(payload, "social.group_behavior")
+    group_targets = [item["target"] for item in group_behavior["recovery_actions"]]
+    assert "/wxbot" not in group_targets
+    assert group_targets == (
+        ["/group-behavior"]
+        if group_behavior["available"]
+        else ["/channels?adapter=wechat-sdk"]
+    )
+
 
 @pytest.mark.asyncio
 async def test_optional_scope_lookup_failure_degrades_but_does_not_hide_plugin() -> None:

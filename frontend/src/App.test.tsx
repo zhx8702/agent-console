@@ -101,7 +101,10 @@ describe("application routes and shell accessibility", () => {
   it("renders the plugin marketplace from a direct deep link and announces focus", async () => {
     renderRoute("/plugins/marketplace");
 
-    expect(await screen.findByRole("heading", { name: "插件市场" })).toBeInTheDocument();
+    // Feature pages are lazy chunks; allow the dynamic import to settle.
+    expect(
+      await screen.findByRole("heading", { name: "插件市场" }, { timeout: 5000 }),
+    ).toBeInTheDocument();
     await waitFor(() => expect(document.title).toBe("插件市场 · 智能体控制台"));
     await waitFor(() => expect(screen.getByRole("main")).toHaveFocus());
     expect(screen.getByText("插件市场页面已加载")).toBeInTheDocument();

@@ -26,6 +26,15 @@ type RepeaterConfig = {
 
 type ConfigStatus = "idle" | "loading" | "ready" | "saving" | "conflict" | "error";
 
+const CONFIG_STATUS_LABELS: Record<ConfigStatus, string> = {
+  idle: "未读取",
+  loading: "读取中",
+  ready: "已加载",
+  saving: "保存中",
+  conflict: "需重新读取",
+  error: "读取失败",
+};
+
 type RepeaterDraft = { enabled: boolean; cooldown_seconds: number | "" };
 
 const emptyDraft: RepeaterDraft = { enabled: false, cooldown_seconds: 300 };
@@ -203,7 +212,7 @@ export function RepeaterPage() {
           <Alert variant="warning" title="冷却时间无效">请输入 1–86400 秒之间的整数。</Alert>
         ) : null}
         <div className="action-row">
-          <span className="pill pill-muted">{status === "ready" ? "已加载" : status}</span>
+          <span className="pill pill-muted">{CONFIG_STATUS_LABELS[status]}</span>
           <span className="pill pill-muted">{dirty ? "有未保存修改" : "已同步"}</span>
           <span className="pill pill-muted">版本 {etag || "-"}</span>
         </div>

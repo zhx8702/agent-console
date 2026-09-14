@@ -36,7 +36,7 @@ class MemoryPlugin(Plugin):
     meta = PluginMeta(
         name="memory",
         version="0.1.0",
-        description="Per-user short-term and long-term memory keyed by channel/source/wxid",
+        description="按渠道 / 来源 / 微信号维护成员的短期与长期记忆",
     )
 
     def __init__(self) -> None:

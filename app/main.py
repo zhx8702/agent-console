@@ -73,7 +73,6 @@ from app.infra.runtime_schema import (
     verify_runtime_schema,
 )
 from app.ingress.router import build_router as build_ingress_router
-from plugins.wxbot.group_webhook_router import build_group_webhook_router
 from app.kb.ingest import IngestionService
 from app.kb.service import InMemoryKBStore, KnowledgeBaseService, SQLAlchemyKBStore
 from app.kb.vector.memory_store import InMemoryVectorStore
@@ -123,6 +122,7 @@ from app.workers.readiness import (
     probe_redis_semantics,
     required_dependencies_for_role,
 )
+from plugins.wxbot.group_webhook_router import build_group_webhook_router
 
 log = get_logger(__name__)
 

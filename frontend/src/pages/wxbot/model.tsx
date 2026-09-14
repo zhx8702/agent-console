@@ -747,6 +747,10 @@ export function wxbotBridgeModeLabel(mode?: string | null) {
     sse: "SSE 事件流",
     standby: "待机",
     polling: "轮询",
+    stopped: "已停止",
+    disabled: "已关闭",
+    offline: "离线",
+    unknown: "未知",
   };
   return labels[mode || ""] || mode || "-";
 }

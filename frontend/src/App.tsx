@@ -1,30 +1,54 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
 import { GlobalSessionBar } from "./components/GlobalSessionBar";
-import { AmapPage } from "./pages/AmapPage";
-import { CreditsPage } from "./pages/CreditsPage";
-import { CommandsPage } from "./pages/CommandsPage";
-import { ConnectionsPage } from "./pages/connections/ConnectionsPage";
-import { DlqPage } from "./pages/DlqPage";
-import { GroupBehaviorPage } from "./pages/GroupBehaviorPage";
-import { KnowledgePage } from "./pages/KnowledgePage";
 import { LoginPage } from "./pages/LoginPage";
-import { LlmConfigPage } from "./pages/LlmConfigPage";
-import { MessageQueuesPage } from "./pages/MessageQueuesPage";
-import { MessageStoryPage } from "./pages/message-story/MessageStoryPage";
-import { MemoryPage } from "./pages/MemoryPage";
-import { ModerationPage } from "./pages/ModerationPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OverviewPage } from "./pages/OverviewPage";
-import { PersonaPage } from "./pages/PersonaPage";
-import { PlaygroundPage } from "./pages/PlaygroundPage";
-import { PluginMarketplacePage } from "./pages/PluginMarketplacePage";
-import { PluginsPage } from "./pages/PluginsPage";
-import { RelationshipGraphPage } from "./pages/RelationshipGraphPage";
-import { RepeaterPage } from "./pages/RepeaterPage";
-import { WxbotPage } from "./pages/WxbotPage";
+
+// Login, overview, and 404 stay in the entry chunk because one of them is
+// always the first screen.  Every other page loads on first navigation so the
+// initial bundle is not the sum of all 20 feature pages.
+const AmapPage = lazy(() => import("./pages/AmapPage").then((m) => ({ default: m.AmapPage })));
+const CreditsPage = lazy(() => import("./pages/CreditsPage").then((m) => ({ default: m.CreditsPage })));
+const CommandsPage = lazy(() => import("./pages/CommandsPage").then((m) => ({ default: m.CommandsPage })));
+const ConnectionsPage = lazy(() =>
+  import("./pages/connections/ConnectionsPage").then((m) => ({ default: m.ConnectionsPage })),
+);
+const DlqPage = lazy(() => import("./pages/DlqPage").then((m) => ({ default: m.DlqPage })));
+const GroupBehaviorPage = lazy(() =>
+  import("./pages/GroupBehaviorPage").then((m) => ({ default: m.GroupBehaviorPage })),
+);
+const KnowledgePage = lazy(() => import("./pages/KnowledgePage").then((m) => ({ default: m.KnowledgePage })));
+const LlmConfigPage = lazy(() => import("./pages/LlmConfigPage").then((m) => ({ default: m.LlmConfigPage })));
+const MessageQueuesPage = lazy(() =>
+  import("./pages/MessageQueuesPage").then((m) => ({ default: m.MessageQueuesPage })),
+);
+const MessageStoryPage = lazy(() =>
+  import("./pages/message-story/MessageStoryPage").then((m) => ({ default: m.MessageStoryPage })),
+);
+const MemoryPage = lazy(() => import("./pages/MemoryPage").then((m) => ({ default: m.MemoryPage })));
+const ModerationPage = lazy(() => import("./pages/ModerationPage").then((m) => ({ default: m.ModerationPage })));
+const PersonaPage = lazy(() => import("./pages/PersonaPage").then((m) => ({ default: m.PersonaPage })));
+const PlaygroundPage = lazy(() => import("./pages/PlaygroundPage").then((m) => ({ default: m.PlaygroundPage })));
+const PluginMarketplacePage = lazy(() =>
+  import("./pages/PluginMarketplacePage").then((m) => ({ default: m.PluginMarketplacePage })),
+);
+const PluginsPage = lazy(() => import("./pages/PluginsPage").then((m) => ({ default: m.PluginsPage })));
+const RelationshipGraphPage = lazy(() =>
+  import("./pages/RelationshipGraphPage").then((m) => ({ default: m.RelationshipGraphPage })),
+);
+const RepeaterPage = lazy(() => import("./pages/RepeaterPage").then((m) => ({ default: m.RepeaterPage })));
+const WxbotPage = lazy(() => import("./pages/WxbotPage").then((m) => ({ default: m.WxbotPage })));
+
+function RouteLoading() {
+  return (
+    <section className="panel route-loading" role="status" aria-live="polite">
+      <p className="muted-copy">页面加载中…</p>
+    </section>
+  );
+}
 import {
   ApiError,
   apiDocumentUrl,
@@ -563,6 +587,12 @@ export function App() {
     if (!shouldFocus) {
       return;
     }
+    // A new page must start at its top; otherwise a long page's scroll offset
+    // carries over and the next page opens mid-way down.
+    window.scrollTo(0, 0);
+    if (mainContentRef.current) {
+      mainContentRef.current.scrollTop = 0;
+    }
     const frame = window.requestAnimationFrame(() => {
       mainContentRef.current?.focus({ preventScroll: true });
     });
@@ -714,6 +744,7 @@ export function App() {
         </div>
         {showGroupSelector && <GlobalSessionBar />}
         <div className="main-routes">
+          <Suspense fallback={<RouteLoading />}>
           <Routes>
             <Route
               path="/"
@@ -756,6 +787,7 @@ export function App() {
             <Route path="/dlq" element={<CapabilityRoute path="/dlq" state={capabilityState}><DlqPage /></CapabilityRoute>} />
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
+          </Suspense>
         </div>
       </main>
     </div>

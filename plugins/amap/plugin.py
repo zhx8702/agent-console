@@ -12,7 +12,7 @@ class AMapPlugin(Plugin):
     meta = PluginMeta(
         name="amap",
         version="0.1.0",
-        description="AMap personal map, POI search, and route planning agent tools",
+        description="高德个人地图、地点搜索与路线规划工具",
     )
 
     def __init__(self) -> None:

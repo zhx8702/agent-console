@@ -79,25 +79,63 @@ const CAPABILITY_STATE_LABELS: Record<CapabilityHealth, string> = {
   degraded: "已降级",
 };
 
+// Server reason codes → operator copy.  Anything not listed here is shown as
+// a generic hint and the raw code stays available under 技术详情.
 const CAPABILITY_REASON_LABELS: Record<string, string> = {
   plugin_not_active: "插件未启用",
   plugin_not_loaded: "插件未加载",
   plugin_not_configured: "未配置",
   plugin_disabled_for_tenant: "当前租户已停用",
   plugin_active_for_tenant: "当前租户已启用",
+  plugin_registry_available: "插件注册表可用",
+  plugin_registry_missing: "插件注册表未就绪",
+  dependency_not_loaded: "依赖插件未安装",
   tenant_scope_state_unavailable: "租户插件状态暂时不可用",
   required_plugin_dependency_unavailable: "必需依赖不可用",
   adapter_connection_verified: "连接已验证",
   adapter_connection_configured_unverified: "连接已配置，尚未验证",
   adapter_available_connection_unverified: "适配器可用，连接尚未验证",
+  adapter_registry_not_available: "适配器注册表不可用",
+  adapter_catalog_unavailable: "适配器目录不可用",
   connection_required: "需要完成平台连接",
+  connection_not_configured: "尚未配置消息平台连接",
+  connection_configured: "消息平台连接已配置",
+  connection_configured_but_unverified: "连接已配置，尚未验证",
+  connection_store_unavailable: "连接存储暂时不可用",
+  connection_probe_succeeded: "连接探测成功",
+  connection_status_requires_probe: "请先探测连接状态",
+  verified_connection_required: "需要一条已验证的消息平台连接",
+  participation_policy_requires_review: "请复核群参与策略",
+  llm_configuration_valid: "模型配置有效",
+  llm_configuration_invalid: "模型配置无效",
+  llm_ready: "模型已就绪",
+  llm_not_ready: "模型尚未就绪",
+  launch_prerequisites_ready: "上线前置条件已满足",
+  launch_prerequisites_blocked: "上线前置条件未满足",
   service_registered: "服务已注册",
+  service_not_registered: "服务未注册",
+  admin_router_mounted: "管理接口已挂载",
+  orchestrator_available: "编排器可用",
+  orchestrator_missing: "编排器未就绪",
+  stream_admin_available: "消息流管理可用",
+  stream_admin_missing: "消息流管理未就绪",
+  available_for_group_scope: "当前群可用",
+  unavailable_for_group_scope: "当前群不可用",
+  group_scope_denied: "当前身份无权访问该群",
+  permission_denied: "当前身份没有权限",
+  capability_disabled: "能力已停用",
+  capability_unavailable: "能力不可用",
+  configured: "已配置",
+  unverified: "尚未验证",
 };
 
 function capabilityReasonLabel(reason: string) {
   const exact = CAPABILITY_REASON_LABELS[reason];
   if (exact) return exact;
   if (reason.startsWith("plugin_initialization_failed")) return "插件初始化失败";
+  // Free-text reasons (e.g. joined LLM validation errors) already read as
+  // sentences; only bare snake_case codes are hidden behind the generic hint.
+  if (/[\s;\u3400-\u9fff]/.test(reason)) return reason;
   return "";
 }
 
@@ -163,8 +201,11 @@ function LaunchStep({
           <ul className="launch-blockers" aria-label={`${step.label}的依赖状态`}>
             {blockers.map((dependency) => (
               <li key={dependency.id}>
-                <span>{dependency.reason}</span>
-                <TechnicalDetails summary="查看依赖标识" value={dependency.id} />
+                <span>{capabilityReasonLabel(dependency.reason) || "依赖尚未就绪"}</span>
+                <TechnicalDetails
+                  summary="查看依赖标识"
+                  value={`${dependency.id}: ${dependency.reason}`}
+                />
               </li>
             ))}
           </ul>
@@ -212,10 +253,11 @@ function CapabilityDiagnostic({
           {dependencyIssues.map((dependency) => (
             <li key={dependency.id}>
               <strong>{dependency.required ? "必需" : "可选"}</strong>
-              {capabilityReasonLabel(dependency.reason) ? (
-                <span>{capabilityReasonLabel(dependency.reason)}</span>
-              ) : null}
-              <TechnicalDetails summary="查看依赖标识" value={dependency.id} />
+              <span>{capabilityReasonLabel(dependency.reason) || "依赖尚未就绪"}</span>
+              <TechnicalDetails
+                summary="查看依赖标识"
+                value={`${dependency.id}: ${dependency.reason}`}
+              />
             </li>
           ))}
         </ul>

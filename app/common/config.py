@@ -44,6 +44,16 @@ _NON_SETTINGS_ENV_KEYS = frozenset(
     }
 )
 _NON_SETTINGS_ENV_PREFIXES = (
+    # Operating-system and shell namespaces.  macOS launchd injects
+    # ``XPC_SERVICE_NAME`` / ``__CF_USER_TEXT_ENCODING`` into every process,
+    # and the fuzzy typo check would otherwise flag them as misspelled
+    # settings and refuse to construct a strict configuration.
+    "__cf",
+    "xpc_",
+    "term_",
+    "shell_",
+    "ssh_",
+    "xdg_",
     "compose_",
     "docker_",
     "github_",

@@ -78,9 +78,11 @@
   --space-10: 40px;
   --space-12: 48px;
 
-  /* Type scale */
-  --font-size-3xs: 0.625rem;
-  --font-size-2xs: 0.6875rem;
+  /* Type scale. 12px is the floor for any text an operator has to read;
+     the two smallest steps are kept as names so existing rules keep working,
+     but they no longer render below that floor. */
+  --font-size-3xs: 0.75rem;
+  --font-size-2xs: 0.75rem;
   --font-size-xs: 0.75rem;
   --font-size-sm: 0.8125rem;
   --font-size-base: 0.875rem;
