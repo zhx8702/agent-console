@@ -181,6 +181,35 @@ class SpeakerPortraitStore:
             result = await conn.execute(text(sql), params)
             return [dict(row) for row in result.mappings().all()]
 
+    async def reap_expired_jobs(self) -> list[int]:
+        """Fail ``running`` jobs whose lease lapsed without a terminal state.
+
+        A worker that restarts mid-job leaves the row in ``running`` forever;
+        nothing else would ever claim it, and ``due_hot_updates`` treats it as
+        in-flight, so the portrait it belongs to stops receiving updates. The
+        next hot-update sweep re-enqueues a fresh incremental job.
+        """
+
+        now = _now()
+        async with get_engine().begin() as conn:
+            result = await conn.execute(
+                text(
+                    f"""
+                    UPDATE {JOB_TABLE}
+                    SET status = 'failed',
+                        error = 'lease_expired',
+                        locked_by = '', locked_until = NULL,
+                        finished_at = :now, updated_at = :now
+                    WHERE status = 'running'
+                      AND locked_until IS NOT NULL
+                      AND locked_until < :now
+                    RETURNING id
+                    """
+                ),
+                {"now": now},
+            )
+            return [int(row[0]) for row in result.all()]
+
     async def claim_next_job(self, *, claim_owner: str, lease_seconds: float) -> dict[str, Any] | None:
         until = _now() + timedelta(seconds=max(30.0, lease_seconds))
         async with get_engine().begin() as conn:
@@ -572,7 +601,11 @@ class SpeakerPortraitStore:
                         SELECT 1 FROM {JOB_TABLE} j
                         WHERE j.portrait_id = p.id
                           AND (
-                            j.status IN ('queued', 'running')
+                            j.status = 'queued'
+                            OR (
+                              j.status = 'running'
+                              AND (j.locked_until IS NULL OR j.locked_until >= :now)
+                            )
                             OR (
                               j.mode = 'incremental'
                               AND j.created_at > :cutoff
@@ -586,6 +619,7 @@ class SpeakerPortraitStore:
                 {
                     "min_messages": max(1, int(min_messages)),
                     "cutoff": cutoff,
+                    "now": _now(),
                     "limit": max(1, min(limit, 20)),
                 },
             )

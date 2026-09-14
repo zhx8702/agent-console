@@ -80,6 +80,12 @@ class SpeakerPortraitPlugin(Plugin):
         assert self._store is not None
         while self._should_run_worker():
             try:
+                reaped = await self._store.reap_expired_jobs()
+                if reaped:
+                    logger.warning("speaker_portrait.jobs_lease_expired", job_ids=reaped)
+            except Exception:
+                logger.warning("speaker_portrait.reap_failed", exc_info=True)
+            try:
                 job = await self._store.claim_next_job(
                     claim_owner=self._worker_owner,
                     lease_seconds=float(
