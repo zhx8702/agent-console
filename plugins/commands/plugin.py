@@ -18,7 +18,7 @@ class CommandsPlugin(Plugin):
     meta = PluginMeta(
         name="commands",
         version="0.1.0",
-        description="Tenant-wide command center for intercepted slash commands",
+        description="租户级命令中心，统一接管斜杠命令",
     )
 
     def __init__(self) -> None:

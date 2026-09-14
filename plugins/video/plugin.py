@@ -17,7 +17,7 @@ class VideoPlugin(Plugin):
     meta = PluginMeta(
         name="video",
         version="0.1.0",
-        description="Slash-command and Agent video generation for wxbot chats",
+        description="群聊里用斜杠命令或智能体生成视频",
     )
 
     def __init__(self) -> None:

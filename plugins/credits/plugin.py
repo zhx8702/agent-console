@@ -39,7 +39,7 @@ class CreditsPlugin(Plugin):
     meta = PluginMeta(
         name="credits",
         version="0.1.0",
-        description="Credit balance, check-in rewards, and per-chat cost deduction",
+        description="群积分余额、签到奖励与按次扣费",
     )
 
     def __init__(self) -> None:

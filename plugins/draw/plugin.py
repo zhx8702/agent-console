@@ -28,7 +28,7 @@ class DrawPlugin(Plugin):
     meta = PluginMeta(
         name="draw",
         version="0.1.0",
-        description="Slash-command image generation for wxbot chats",
+        description="群聊里用斜杠命令生成图片",
     )
 
     def __init__(self) -> None:

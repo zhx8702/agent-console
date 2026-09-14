@@ -71,7 +71,7 @@ class TiboResetPlugin(Plugin):
     meta = PluginMeta(
         name="tibo_reset",
         version="0.2.3",
-        description="Persist confirmed Codex reset history, answer group queries, and forward new posts",
+        description="记录已确认的 Codex 重置历史，回答群内查询并转发新动态",
         dependencies=["wxbot>=0.2.0"],
     )
 

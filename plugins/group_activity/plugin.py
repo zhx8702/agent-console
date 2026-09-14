@@ -53,7 +53,7 @@ class GroupActivityPlugin(Plugin):
     meta = PluginMeta(
         name="group_activity",
         version="0.1.0",
-        description="Group idle activity starter using group Agent skill and wxbot outbound queue",
+        description="群聊冷场时由群智能体主动发起话题，经微信发送队列投递",
         dependencies=["wxbot>=0.2.0"],
     )
 

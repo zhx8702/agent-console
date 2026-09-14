@@ -468,7 +468,7 @@ class WxbotPlugin(Plugin):
     meta = PluginMeta(
         name="wxbot",
         version="0.2.0",
-        description="WeChat bot SDK bridge — polls inbound messages, dispatches replies",
+        description="微信机器人 SDK 桥接：拉取入站消息并投递回复",
     )
 
     def __init__(self) -> None:

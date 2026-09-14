@@ -27,7 +27,7 @@ class RepeaterPlugin(Plugin):
     meta = PluginMeta(
         name="repeater",
         version="0.1.0",
-        description="Per-session repeater with cooldown dedupe for group chats",
+        description="群聊复读，带冷却去重",
     )
 
     def __init__(self) -> None:

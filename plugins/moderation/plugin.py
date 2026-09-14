@@ -31,7 +31,7 @@ class ModerationPlugin(Plugin):
     meta = PluginMeta(
         name="moderation",
         version="0.1.0",
-        description="Per-session keyword moderation, audit logging, and webhook alerts",
+        description="按群关键词审核、审计记录与 webhook 告警",
     )
 
     def __init__(self) -> None:
