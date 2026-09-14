@@ -286,6 +286,7 @@ class SpeakerPortraitStore:
         message_count: int = 0,
         last_message_at: str = "",
         mode: str = "full",
+        pending_covered: int | None = None,
     ) -> dict[str, Any]:
         now = _now()
         async with get_engine().begin() as conn:
@@ -306,6 +307,10 @@ class SpeakerPortraitStore:
                 if job_row is not None
                 else 0
             )
+            # A full read of the backlog clears everything that was claimed; a
+            # split batch only clears the slice it actually covered.
+            if pending_covered is not None:
+                claimed_pending_messages = min(claimed_pending_messages, max(0, int(pending_covered)))
             existing = await conn.execute(
                 text(
                     f"""
