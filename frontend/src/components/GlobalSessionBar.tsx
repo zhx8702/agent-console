@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiRequest } from "../lib/api";
 import { useConsoleConfig } from "../state/console-config";
 import { SearchableSelect, type SearchableSelectOption } from "./SearchableSelect";
+import { friendlyErrorMessage } from "./TechnicalDetails";
 
 export type VerifiedGroupSession = {
   session_id: string;
@@ -80,7 +81,12 @@ export function GlobalSessionBar() {
         }
         setGroups([]);
         registerVerifiedGroups([]);
-        setError(caught instanceof Error ? caught.message : "群聊列表加载失败");
+        setError(
+          friendlyErrorMessage(
+            caught instanceof Error ? caught.message : "",
+            "群聊列表暂时无法读取，请稍后重试。",
+          ),
+        );
       } finally {
         if (!cancelled) {
           setLoading(false);

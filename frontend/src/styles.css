@@ -111,10 +111,9 @@ button {
   gap: var(--space-1-5);
   margin: 0 0 var(--space-1);
   color: var(--accent);
-  text-transform: uppercase;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-2xs);
-  letter-spacing: 0.14em;
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.06em;
   font-weight: 600;
 }
 
@@ -824,12 +823,11 @@ button {
 }
 
 .field span {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-2xs);
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
 }
 
 .field input,
@@ -1123,11 +1121,10 @@ button {
   display: block;
   margin-bottom: var(--space-2);
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-2xs);
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.02em;
 }
 
 .status-tile strong {
@@ -1644,11 +1641,10 @@ button {
   display: block;
   margin-bottom: var(--space-2);
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-2xs);
+  font-family: var(--font-body);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.02em;
 }
 
 .summary-card strong {
@@ -1961,12 +1957,11 @@ th {
   position: sticky;
   top: 0;
   z-index: 1;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  font-family: var(--font-body);
   font-weight: 600;
-  font-size: var(--font-size-2xs);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.02em;
   border-bottom-color: var(--line-strong);
   background: var(--panel-alt);
 }

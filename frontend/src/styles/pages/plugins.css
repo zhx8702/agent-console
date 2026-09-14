@@ -298,14 +298,19 @@
   word-break: break-word;
 }
 
+/* Plugin descriptions and group-scope hints are neutral copy; only an actual
+   error line gets the danger tone. */
 .plugins-page .plugin-card .muted-copy {
   margin: 0;
-  padding: var(--space-2) var(--space-2-5);
-  border: 1px solid var(--color-red-200);
-  border-radius: 10px;
-  background: var(--color-custom-fff7f7);
-  color: var(--color-red-700);
   overflow-wrap: anywhere;
+}
+
+.plugins-page .plugin-card .plugin-card-error {
+  padding: var(--space-2) var(--space-2-5);
+  border: 1px solid var(--tone-danger-border);
+  border-radius: 10px;
+  background: var(--tone-danger-bg);
+  color: var(--tone-danger-text);
 }
 
 .plugins-page .plugin-card-actions {

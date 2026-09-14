@@ -170,7 +170,10 @@
 
 .launch-step-list {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  /* Seven steps do not fit a fixed 7-column grid between ~1120px and ~1500px:
+     each card drops under 100px and error codes overflow into the neighbour.
+     Let the browser decide how many cards fit at a readable width. */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--space-2-5);
   margin: var(--space-6) 0 0;
   padding: 0 0 var(--space-1);
@@ -386,7 +389,7 @@ button.launch-action { cursor: pointer; }
 
 .launch-loading-lines {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--space-2-5);
   margin-top: var(--space-6);
 }
@@ -515,12 +518,7 @@ button.launch-action { cursor: pointer; }
 }
 
 @media (max-width: 1120px) {
-  .launch-step-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .capability-diagnostic-grid { grid-template-columns: 1fr; }
-}
-
-@media (max-width: 820px) {
-  .launch-step-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 680px) {

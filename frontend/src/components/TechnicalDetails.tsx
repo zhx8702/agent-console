@@ -53,5 +53,13 @@ export function friendlyErrorMessage(error: unknown, fallback: string) {
   if (normalized.includes("409") || normalized.includes("conflict")) {
     return "服务器已有更新，当前草稿已保留，请重新读取后核对。";
   }
+  if (
+    /\b50[234]\b/.test(normalized)
+    || normalized.includes("bad gateway")
+    || normalized.includes("sdk unavailable")
+    || normalized.includes("service unavailable")
+  ) {
+    return "依赖的服务暂时不可用（例如微信 SDK 未在线），请稍后重试。";
+  }
   return fallback;
 }

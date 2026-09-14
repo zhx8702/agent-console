@@ -121,7 +121,9 @@ describe("OverviewPage degraded loading", () => {
     expect(within(optionalTestStep as HTMLElement).getByText("可选")).toBeInTheDocument();
     expect(optionalTestStep).toHaveTextContent("已有正常收发记录时无需重复执行，也不影响上线");
     expect(items.length).toBeGreaterThanOrEqual(7);
-    expect(within(checklist as HTMLElement).getByText("connection_required")).toBeInTheDocument();
+    // Reason codes are mapped to operator copy; the raw code stays in 技术详情.
+    expect(within(checklist as HTMLElement).getByText("需要完成平台连接")).toBeInTheDocument();
+    expect(within(checklist as HTMLElement).queryByText("connection_required")).not.toBeInTheDocument();
     expect(within(checklist as HTMLElement).getByRole("link", { name: /添加平台连接/ })).toHaveAttribute(
       "href",
       "/channels",
