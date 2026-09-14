@@ -270,6 +270,7 @@ READ GET /plugins/credits/ledger/{tenant_id}/{session_id}
 READ GET /plugins/credits/member/{tenant_id}/{session_id}/{user_id}
 READ GET /plugins/credits/members/{tenant_id}/{session_id}
 READ GET /plugins/credits/top/{tenant_id}/{session_id}
+READ GET /plugins/draw/admin/config
 READ GET /plugins/draw/files/{file_name:path}
 READ GET /plugins/draw/images
 READ GET /plugins/draw/images/{image_id}
@@ -328,6 +329,7 @@ READ GET /plugins/wxbot/admin/agent-tools/audit
 READ GET /plugins/wxbot/admin/agent-tools/catalog
 READ GET /plugins/wxbot/admin/agent-tools/policy/{tenant_id}/{session_id:path}
 READ GET /plugins/wxbot/admin/event-subscriptions
+READ GET /plugins/wxbot/admin/group-webhooks
 READ GET /plugins/wxbot/admin/files/{media_id}
 READ GET /plugins/wxbot/admin/group-members/settings/{session_id:path}
 READ GET /plugins/wxbot/admin/images/{media_id}
@@ -384,6 +386,7 @@ WRITE PATCH /plugins/memory/items/{item_id}
 WRITE POST /plugins/commands/config/{tenant_id}
 WRITE POST /plugins/credits/checkin/{tenant_id}/{session_id}/{user_id}
 WRITE POST /plugins/credits/config/{tenant_id}/{session_id}
+WRITE POST /plugins/draw/admin/config
 WRITE POST /plugins/group_activity/config/{tenant_id}/{session_id:path}
 WRITE POST /plugins/memory/group-graph/edges/{edge_id:path}/acceptance-review
 WRITE POST /plugins/memory/group-graph/extract-daily
@@ -458,6 +461,9 @@ DANGER POST /plugins/repeater/config/{tenant_id}/{session_id:path}
 DANGER POST /plugins/tibo_reset/poll/run-once
 DANGER POST /plugins/wxbot/admin/agent-tools/policy/{tenant_id}/{session_id:path}
 DANGER POST /plugins/wxbot/admin/event-subscriptions
+DANGER POST /plugins/wxbot/admin/group-webhooks
+DANGER POST /plugins/wxbot/admin/group-webhooks/{webhook_id}/rotate
+DANGER DELETE /plugins/wxbot/admin/group-webhooks/{webhook_id}
 DANGER POST /plugins/wxbot/admin/group-members/settings/{session_id:path}
 DANGER POST /plugins/wxbot/admin/reply-policy/aggregate
 DANGER POST /plugins/wxbot/admin/reply-queue/clear

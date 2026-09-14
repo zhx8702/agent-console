@@ -92,8 +92,14 @@ def _scene_reply_rules(session: Session) -> str:
 
     if is_group:
         scene_name = "微信群聊" if is_wechat else "群聊或频道"
+        cadence = (
+            "断句跟这个人平时一样：该句号、问号或换行就断开，不要挤成一句没有标点的长串。\n"
+            if persona_cos_active(session)
+            else ""
+        )
         return (
             f"现在是{scene_name}。按这个人平时在群里的样子回，短、直接，别写成小作文。\n"
+            f"{cadence}"
             "回最后这条当前发言人；别人的话只当背景。"
             "标签里的“你”是你自己，明确 @ 了才是在叫你。\n"
             "群里转不了人工，被要求时如实说，别假装已经转接。\n"

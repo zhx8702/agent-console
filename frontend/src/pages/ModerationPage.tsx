@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { DangerAction } from "../components/DangerAction";
 import { GroupScopeEmpty } from "../components/GroupScopeEmpty";
@@ -14,6 +15,7 @@ import {
 } from "../lib/api";
 import { useStableIdempotencyKeys } from "../lib/idempotency";
 import { useConsoleConfig } from "../state/console-config";
+import { messageStoryPath } from "./message-story/path";
 
 type ModerationConfig = {
   tenant_id: string;
@@ -1170,7 +1172,15 @@ export function ModerationPage() {
                   <td>{(item.matched_keyword_list || []).join("、") || item.matched_keywords || "-"}</td>
                    <td>{webhookStatusLabel(item.webhook_status)}</td>
                   <td>{item.message_preview || "内容已在列表中隐藏"}</td>
-                   <td>{item.trace_id ? "可追踪" : "-"}</td>
+                   <td>
+                     {item.trace_id ? (
+                       <Link className="link-button" to={messageStoryPath(item.trace_id)}>
+                         查看这条消息
+                       </Link>
+                     ) : (
+                       "-"
+                     )}
+                   </td>
                 </tr>
               ))}
               {!events.length && (

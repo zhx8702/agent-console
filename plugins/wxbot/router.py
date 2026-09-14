@@ -2909,6 +2909,14 @@ def build_wxbot_router(
         return result
 
     from plugins.wxbot.admin_agent_event_routes import register_agent_event_routes
+    from plugins.wxbot.admin_group_webhook_routes import register_group_webhook_routes
+
+    register_group_webhook_routes(
+        router,
+        store=store,
+        bridge=bridge,
+        scope_execution_allowed=scope_execution_allowed,
+    )
 
     register_agent_event_routes(
         router,

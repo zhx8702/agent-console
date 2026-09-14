@@ -73,6 +73,7 @@ from app.infra.runtime_schema import (
     verify_runtime_schema,
 )
 from app.ingress.router import build_router as build_ingress_router
+from plugins.wxbot.group_webhook_router import build_group_webhook_router
 from app.kb.ingest import IngestionService
 from app.kb.service import InMemoryKBStore, KnowledgeBaseService, SQLAlchemyKBStore
 from app.kb.vector.memory_store import InMemoryVectorStore
@@ -1291,6 +1292,7 @@ def _flow_effect_commit_config_payload(settings: Settings) -> dict[str, object]:
 def _mount_routes(app: FastAPI, container: ApiContainer) -> None:
     settings = get_settings()
     app.include_router(build_ingress_router(container))
+    app.include_router(build_group_webhook_router(container))
     app.include_router(build_admin_auth_router(settings))
     # The API advertises only adapters contributed by currently loaded
     # plugins. A built-in descriptor without its plugin/provider would make an

@@ -9,10 +9,20 @@ import {
   evidenceCountsLabel,
   formatConfidence,
   formatTimestamp,
+  graphNodeLabel,
   readableRelationType,
-  safeNodeDisplayLabel,
   nodeTypeLabel,
   dateStatusClass,
+  edgeCanAccept,
+  edgeCanExpire,
+  edgeCanReject,
+  edgeCanReturnToReview,
+  evidenceQuality,
+  extractionMethodLabel,
+  counterpartEdges,
+  firstMemoryItemId,
+  formatAcceptanceScore,
+  safeNodeAliases,
 } from "./graphModel";
 import type { RelationshipGraphController } from "./useRelationshipGraphController";
 
@@ -33,6 +43,7 @@ export type RelationshipMutationController = Pick<
   | "runWindowExtraction"
   | "windowCatchupMaxWindowsValue"
   | "runWindowCatchup"
+  | "runRecentCoverage"
   | "loadGraphAndStatus"
   | "dateLoading"
   | "jobStatsLoading"
@@ -59,6 +70,7 @@ export function RelationshipMutationActions({
     runWindowExtraction,
     windowCatchupMaxWindowsValue,
     runWindowCatchup,
+    runRecentCoverage,
     loadGraphAndStatus,
     dateLoading,
     jobStatsLoading,
@@ -68,6 +80,21 @@ export function RelationshipMutationActions({
   return (
           <div className="relationship-action-group">
             <span>历史与抽取</span>
+            <DangerAction
+              label={syncing || extracting ? "覆盖中" : "同步并抽取近7天"}
+              title="确认同步并抽取近7天"
+              confirmLabel="确认覆盖"
+              pendingLabel="正在覆盖…"
+              disabled={syncing || extracting}
+              impact={(
+                <dl>
+                  <div><dt>目标群</dt><dd>{selectedGroupId ? "当前已验证群聊" : "未选择"}</dd></div>
+                  <div><dt>范围</dt><dd>最近 7 天历史导入，并按日追平窗口抽取。</dd></div>
+                  <div><dt>影响</dt><dd>会调用历史同步和语义抽取；新关系进入待审核，不展示聊天原文。</dd></div>
+                </dl>
+              )}
+              onConfirm={runRecentCoverage}
+            />
             <DangerAction
               label={syncing ? "同步中" : "同步日期并排队抽取"}
               title="确认同步群聊历史"
@@ -149,26 +176,35 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
     evidenceLoading,
     evidenceStatus,
     loadEdgeEvidence,
+    reviewing,
+    reviewEdge,
+    graphEdges,
+    pendingEdges,
+    anonymousGraphLabels,
   } = controller;
+  const replaceableEdges = selectedEdge
+    ? counterpartEdges(selectedEdge, [...(graphEdges || []), ...(pendingEdges || [])])
+    : [];
 
   return (
         <section className="panel relationship-detail-panel">
           <div className="panel-header">
             <div>
               <p className="section-kicker">详情</p>
-              <h3>{selection ? (selection.kind === "node" ? "节点详情" : "关系详情") : "选择关系图对象"}</h3>
+              <h3>{selection ? (selection.kind === "node" ? "这个人" : "这条互动") : "点一个人或一条线"}</h3>
             </div>
           </div>
           {!selection && (
             <div className="relationship-empty is-compact">
-              <strong>尚未选择对象</strong>
-              <span>选择一个节点或关系，即可查看安全摘要。</span>
+              <strong>还没选中谁</strong>
+              <span>在图上点人，或点一条线。名字优先用群里的称呼；wxid 只留在技术详情里。</span>
             </div>
           )}
           {selectedNode && (
             <>
               <dl className="relationship-detail-list">
-                <div><dt>名称</dt><dd>{safeNodeDisplayLabel(selectedNode)}</dd></div>
+                <div><dt>群里怎么叫</dt><dd>{graphNodeLabel(selectedNode, anonymousGraphLabels)}</dd></div>
+                <div><dt>也叫</dt><dd>{safeNodeAliases(selectedNode)}</dd></div>
                 <div><dt>类型</dt><dd>{nodeTypeLabel(selectedNode.type)}</dd></div>
                 <div><dt>审核状态</dt><dd><span className={acceptanceClass(selectedNode.acceptance_status)}>{acceptanceStatusLabel(selectedNode.acceptance_status)}</span></dd></div>
                 <div><dt>置信度</dt><dd>{formatConfidence(selectedNode.confidence)}</dd></div>
@@ -182,16 +218,121 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
           {selectedEdge && (
             <>
               <dl className="relationship-detail-list">
-                <div><dt>关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
-                <div><dt>起点</dt><dd>{safeNodeDisplayLabel(nodesById.get(displayEdgeSource(selectedEdge))) || "未命名节点"}</dd></div>
-                <div><dt>终点</dt><dd>{safeNodeDisplayLabel(nodesById.get(displayEdgeTarget(selectedEdge))) || "未命名节点"}</dd></div>
+                <div><dt>互动</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                <div><dt>谁</dt><dd>{nodesById.get(displayEdgeSource(selectedEdge)) ? graphNodeLabel(nodesById.get(displayEdgeSource(selectedEdge))!, anonymousGraphLabels) : "未知成员"}</dd></div>
+                <div><dt>和谁</dt><dd>{nodesById.get(displayEdgeTarget(selectedEdge)) ? graphNodeLabel(nodesById.get(displayEdgeTarget(selectedEdge))!, anonymousGraphLabels) : "未知成员"}</dd></div>
                 <div><dt>审核状态</dt><dd><span className={acceptanceClass(selectedEdge.acceptance_status)}>{acceptanceStatusLabel(selectedEdge.acceptance_status)}</span></dd></div>
+                <div><dt>抽取方式</dt><dd>{extractionMethodLabel(selectedEdge.extraction_method)}</dd></div>
+                <div><dt>验收分</dt><dd>{formatAcceptanceScore(selectedEdge.acceptance_score ?? evidenceQuality(evidence).score)}</dd></div>
+                <div><dt>验收原因</dt><dd>{selectedEdge.acceptance_reason || evidenceQuality(evidence).reason || "-"}</dd></div>
+                <div><dt>可能冲突</dt><dd>{evidenceQuality(evidence).conflicts || 0}</dd></div>
                 <div><dt>置信度</dt><dd>{formatConfidence(selectedEdge.confidence)}</dd></div>
                 <div><dt>证据数</dt><dd>{selectedEdge.evidence_count ?? 0}</dd></div>
                 <div><dt>消息数</dt><dd>{selectedEdge.source_message_count ?? "-"}</dd></div>
                 <div><dt>首次出现</dt><dd>{formatTimestamp(selectedEdge.first_seen)}</dd></div>
                 <div><dt>最近出现</dt><dd>{formatTimestamp(selectedEdge.last_seen)}</dd></div>
               </dl>
+              {(
+                edgeCanAccept(selectedEdge.acceptance_status)
+                || edgeCanReject(selectedEdge.acceptance_status)
+                || edgeCanExpire(selectedEdge.acceptance_status)
+                || edgeCanReturnToReview(selectedEdge.acceptance_status)
+                || replaceableEdges.some((item) => firstMemoryItemId(item) > 0)
+              ) && (
+                <div className="relationship-review-actions">
+                  <p className="relationship-review-note">审核只改这条关系的验收状态，不展示也不改写聊天原文。</p>
+                  {edgeCanAccept(selectedEdge.acceptance_status) && (
+                    <DangerAction
+                      label={reviewing ? "审核中" : "接受关系"}
+                      title="确认接受该关系"
+                      confirmLabel="确认接受"
+                      pendingLabel="正在接受…"
+                      disabled={reviewing}
+                      impact={(
+                        <dl>
+                          <div><dt>关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                          <div><dt>当前状态</dt><dd>{acceptanceStatusLabel(selectedEdge.acceptance_status)}</dd></div>
+                          <div><dt>影响</dt><dd>允许这条关系进入机器人召回。看图不需要接受。</dd></div>
+                        </dl>
+                      )}
+                      onConfirm={() => reviewEdge("accept")}
+                    />
+                  )}
+                  {edgeCanReject(selectedEdge.acceptance_status) && (
+                    <DangerAction
+                      label={reviewing ? "审核中" : "拒绝关系"}
+                      title="确认拒绝该关系"
+                      confirmLabel="确认拒绝"
+                      pendingLabel="正在拒绝…"
+                      disabled={reviewing}
+                      impact={(
+                        <dl>
+                          <div><dt>关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                          <div><dt>当前状态</dt><dd>{acceptanceStatusLabel(selectedEdge.acceptance_status)}</dd></div>
+                          <div><dt>影响</dt><dd>标记为已拒绝；默认关系图不再显示该边。</dd></div>
+                        </dl>
+                      )}
+                      onConfirm={() => reviewEdge("reject")}
+                    />
+                  )}
+                  {edgeCanReturnToReview(selectedEdge.acceptance_status) && (
+                    <DangerAction
+                      label={reviewing ? "审核中" : "退回待审"}
+                      title="确认退回待审核"
+                      confirmLabel="确认退回"
+                      pendingLabel="正在退回…"
+                      disabled={reviewing}
+                      impact={(
+                        <dl>
+                          <div><dt>关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                          <div><dt>当前状态</dt><dd>{acceptanceStatusLabel(selectedEdge.acceptance_status)}</dd></div>
+                          <div><dt>影响</dt><dd>该关系会离开默认图，重新进入待审核队列。</dd></div>
+                        </dl>
+                      )}
+                      onConfirm={() => reviewEdge("needs_review")}
+                    />
+                  )}
+                  {edgeCanExpire(selectedEdge.acceptance_status) && (
+                    <DangerAction
+                      label={reviewing ? "审核中" : "标记过期"}
+                      title="确认将该关系标记为过期"
+                      confirmLabel="确认过期"
+                      pendingLabel="正在过期…"
+                      disabled={reviewing}
+                      impact={(
+                        <dl>
+                          <div><dt>关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                          <div><dt>当前状态</dt><dd>{acceptanceStatusLabel(selectedEdge.acceptance_status)}</dd></div>
+                          <div><dt>影响</dt><dd>标记为已过期；默认关系图不再显示该边。</dd></div>
+                        </dl>
+                      )}
+                      onConfirm={() => reviewEdge("expire")}
+                    />
+                  )}
+                  {replaceableEdges.map((other) => {
+                    const otherItemId = firstMemoryItemId(other);
+                    if (!otherItemId) return null;
+                    return (
+                      <DangerAction
+                        key={other.id}
+                        label={reviewing ? "审核中" : `替代 ${readableRelationType(other.label || other.type)}`}
+                        title="确认用当前关系替代另一条"
+                        confirmLabel="确认替代"
+                        pendingLabel="正在替代…"
+                        disabled={reviewing}
+                        impact={(
+                          <dl>
+                            <div><dt>当前关系</dt><dd>{readableRelationType(selectedEdge.label || selectedEdge.type)}</dd></div>
+                            <div><dt>被替代</dt><dd>{readableRelationType(other.label || other.type)} · {acceptanceStatusLabel(other.acceptance_status)}</dd></div>
+                            <div><dt>影响</dt><dd>当前关系保持有效，被替代关系标记为已被替代，不再进入默认图。</dd></div>
+                          </dl>
+                        )}
+                        onConfirm={() => reviewEdge("supersede", selectedEdge, { supersedes_item_id: otherItemId })}
+                      />
+                    );
+                  })}
+                </div>
+              )}
               <TechnicalDetails summary="查看关系技术详情" value={selectedEdge} />
 
               <div className="relationship-evidence-panel" aria-live="polite">

@@ -176,20 +176,9 @@ def evaluate_speech_budget(
         )
 
     # A direct address, command, safety/privacy control or quoted reply is a
-    # conversation obligation.  It bypasses volume and ratio budgets, but it
-    # may not create a third consecutive bot message.  The durable queue keeps
-    # that obligation pending until a human turn breaks the run.
+    # conversation obligation.  It bypasses volume, ratio, and consecutive-bot
+    # budgets so an @ / quote / command is not dropped after the bot just spoke.
     if normalized_class == "obligation":
-        if (
-            active.max_consecutive_bot_messages > 0
-            and consecutive >= active.max_consecutive_bot_messages
-        ):
-            return SpeechBudgetDecision(
-                False,
-                "third_consecutive_bot_message",
-                ratio,
-                consecutive,
-            )
         return SpeechBudgetDecision(True, "obligation_bypass", ratio, consecutive)
 
     if snapshot.bot_messages_10m >= active.max_bot_messages_10m:

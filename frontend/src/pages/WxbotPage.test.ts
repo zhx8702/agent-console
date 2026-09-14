@@ -34,6 +34,11 @@ describe("wxbot deep-link routing", () => {
     expect(readWxbotTabFromLocation("?tab=reports&onboarding=connect", "")).toBe("reports");
   });
 
+  it("opens the group webhook tab from an explicit deep link", () => {
+    expect(readWxbotTabFromLocation("?tab=webhooks", "")).toBe("webhooks");
+    expect(readWxbotTabFromLocation("", "#tab=webhooks")).toBe("webhooks");
+  });
+
   it("falls back safely for an unknown onboarding step", () => {
     expect(readWxbotTabFromLocation("?onboarding=unknown", "")).toBe("overview");
   });

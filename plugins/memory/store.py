@@ -2073,6 +2073,8 @@ def _group_graph_label_is_technical(value: Any) -> bool:
     label = _normalize_line(str(value or ""))
     if not label:
         return True
+    if _looks_like_wechat_username(label):
+        return True
     return bool(
         re.match(r"(?i)^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?)", label)
         or re.match(r"(?i)^[a-z0-9_@.\-]{24,}$", label)
@@ -2111,7 +2113,7 @@ def _looks_like_wechat_username(value: Any) -> bool:
 def _wechat_contact_display_label(metadata: dict[str, Any]) -> str:
     for key in ("remark", "nick_name", "alias"):
         label = _normalize_line(_sanitize_db_text(metadata.get(key)))[:80]
-        if label:
+        if label and not _group_graph_label_is_technical(label):
             return label
     return ""
 

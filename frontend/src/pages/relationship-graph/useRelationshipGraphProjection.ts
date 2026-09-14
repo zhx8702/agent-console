@@ -90,9 +90,10 @@ export function useRelationshipGraphProjection({
   const nodes = graph?.nodes || [];
   const edges = graph?.edges || [];
   const nodesById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const anonymousGraphLabels = useMemo(() => buildAnonymousGraphLabels(nodes), [nodes]);
   const filteredEdges = useMemo(
-    () => edges.filter((edge) => matchesGraphText(relationLabel(edge, nodesById), edgeSearch)),
-    [edgeSearch, edges, nodesById],
+    () => edges.filter((edge) => matchesGraphText(relationLabel(edge, nodesById, anonymousGraphLabels), edgeSearch)),
+    [anonymousGraphLabels, edgeSearch, edges, nodesById],
   );
   const edgeNodeIds = useMemo(() => {
     const ids = new Set<string>();
@@ -163,10 +164,6 @@ export function useRelationshipGraphProjection({
     () => rankedGraphEdges.filter((edge) => graphNodeIds.has(displayEdgeSource(edge)) && graphNodeIds.has(displayEdgeTarget(edge))),
     [graphNodeIds, rankedGraphEdges],
   );
-  const anonymousGraphLabels = useMemo(
-    () => buildAnonymousGraphLabels(graphNodes),
-    [graphNodes],
-  );
   const layout = useMemo(() => buildGraphLayout(graphNodes, graphEdges), [graphEdges, graphNodes]);
   const visibleGraphEdges = useMemo(
     () => graphEdges
@@ -191,8 +188,8 @@ export function useRelationshipGraphProjection({
   const modeHiddenNodeCount = Math.max(0, filteredNodes.length - modeFilteredNodes.length);
   const modeHiddenEdgeCount = Math.max(0, visibleEdges.length - rankedGraphEdges.length);
   const graphSummaryText = graphViewMode === "all"
-    ? `调试视图：显示 ${graphNodes.length} 个节点 / ${visibleGraphEdges.length} 条关系。`
-    : `摘要视图：显示 ${graphNodes.length} 个核心节点 / ${visibleGraphEdges.length} 条高信号关系；另隐藏 ${modeHiddenNodeCount + hiddenGraphNodeCount} 节点 / ${modeHiddenEdgeCount + hiddenGraphEdgeCount} 关系。`;
+    ? `现在能看到 ${graphNodes.length} 个人或主题，${visibleGraphEdges.length} 条互动。`
+    : `先看最常一起出现的 ${graphNodes.length} 个人或主题、${visibleGraphEdges.length} 条互动；其余 ${modeHiddenNodeCount + hiddenGraphNodeCount} 人 / ${modeHiddenEdgeCount + hiddenGraphEdgeCount} 条被收进摘要。`;
   const selectedDateStatus = useMemo(
     () => dateRows.find((row) => row.date === targetDate),
     [dateRows, targetDate],
@@ -270,7 +267,7 @@ export function useRelationshipGraphProjection({
     : graph === null
       ? "尚未加载关系图：填写范围和过滤条件后点击“加载关系图”。"
       : nodes.length === 0
-        ? "当前范围没有关系图数据；可放宽状态、类型或时间范围后重试。"
+        ? "当前范围没有关系图数据。可点“显示全部关系”、放宽审核状态，或打开抽取控制同步近 7 天。"
         : !filteredNodes.length && (nodeSearch.trim() || edgeSearch.trim())
           ? "当前搜索没有匹配节点或关系；请调整节点/关系关键词。"
           : !graphNodes.length
@@ -287,6 +284,7 @@ export function useRelationshipGraphProjection({
     modeFilteredNodes,
     graphNodes,
     graphEdges,
+    anonymousGraphLabels,
     layout,
     visibleGraphEdges,
     visibleLabels,

@@ -3270,6 +3270,125 @@ async def test_group_relationship_graph_maps_wxbot_contact_display_metadata(
 
 
 @pytest.mark.asyncio
+async def test_group_relationship_graph_uses_observation_sender_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace())
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_entity" in sql:
+            return [
+                {
+                    "id": 1,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "wxid_a",
+                    "entity_type": "person",
+                    "name": "wxid_qn03yvirz4a722",
+                    "normalized_name": "wxid_qn03yvirz4a722",
+                    "aliases_json": "[]",
+                    "confidence": 0.9,
+                    "status": "active",
+                    "created_at": "2026-08-01T00:00:00",
+                    "updated_at": "2026-08-10T00:00:00",
+                },
+                {
+                    "id": 2,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "wxid_b",
+                    "entity_type": "person",
+                    "name": "lyencom",
+                    "normalized_name": "lyencom",
+                    "aliases_json": "[]",
+                    "confidence": 0.88,
+                    "status": "active",
+                    "created_at": "2026-08-01T00:00:00",
+                    "updated_at": "2026-08-10T00:00:00",
+                },
+            ]
+        if "FROM plugin_memory_fact fact" in sql:
+            return [
+                {
+                    "id": 10,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "wxid_a",
+                    "subject_entity_id": 1,
+                    "subject_name": "wxid_qn03yvirz4a722",
+                    "predicate": "co_participated",
+                    "object_entity_id": 2,
+                    "object_name": "lyencom",
+                    "object_value": "",
+                    "memory_item_id": 100,
+                    "source_event_id": 500,
+                    "confidence": 0.7,
+                    "status": "active",
+                    "valid_at": "2026-08-09T00:00:00",
+                    "invalid_at": None,
+                    "created_at": "2026-08-09T00:00:00",
+                    "updated_at": "2026-08-09T00:00:00",
+                }
+            ]
+        if "FROM plugin_memory_item WHERE id = ANY" in sql:
+            return [
+                {
+                    "id": 100,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "wxid_a",
+                    "session_id": "group-1@chatroom",
+                    "scope_type": "session",
+                    "source_type": "auto",
+                    "memory_type": "note",
+                    "value_json": '{"acceptance":{"status":"needs_review"}}',
+                    "normalized_key": "relation:co_participated",
+                    "confidence": 0.7,
+                    "status": "pending",
+                    "pinned": False,
+                    "priority": 0,
+                    "sensitivity": "normal",
+                    "source_event_id": 500,
+                    "source_trace_id": "",
+                    "occurrence_count": 1,
+                    "first_seen_at": "2026-08-09T00:00:00",
+                    "last_seen_at": "2026-08-09T00:00:00",
+                    "created_at": "2026-08-09T00:00:00",
+                    "updated_at": "2026-08-09T00:00:00",
+                    "deleted_at": None,
+                }
+            ]
+        if "FROM plugin_wxbot_group_membership" in sql:
+            return [{"user_wxid": "lyencom", "user_name": "老林"}]
+        if "FROM plugin_wxbot_group_observations" in sql:
+            return [{"sender_wxid": "wxid_qn03yvirz4a722", "sender_name": "小七"}]
+        return []
+
+    async def fake_display_map(**kwargs: Any) -> dict[str, dict[str, str]]:
+        return {}
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_load_wechat_group_contact_display_map", fake_display_map)
+
+    graph = await store.get_group_relationship_graph(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="group-1@chatroom",
+        acceptance_status="accepted,needs_review,candidate",
+        limit=10,
+    )
+
+    labels = {node["technical_label"]: node["display_label"] for node in graph["nodes"]}
+    assert labels["wxid_qn03yvirz4a722"] == "小七"
+    assert labels["lyencom"] == "老林"
+
+
+@pytest.mark.asyncio
 async def test_load_wechat_group_contact_display_map_falls_back_on_sdk_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

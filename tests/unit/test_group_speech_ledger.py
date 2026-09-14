@@ -434,14 +434,16 @@ async def test_idempotency_replay_rejects_a_different_output_payload() -> None:
         )
 
 
-def test_obligation_bypasses_volume_budgets_but_not_consecutive_limit() -> None:
+def test_obligation_bypasses_volume_and_consecutive_limits() -> None:
     saturated = SpeechBudgetSnapshot(
         recent_author_kinds=("human", "bot", "bot") + ("human",) * 36,
         bot_messages_10m=2,
         bot_messages_hour=6,
     )
 
-    assert evaluate_speech_budget(saturated, speech_class="obligation").allowed is True
+    obligation = evaluate_speech_budget(saturated, speech_class="obligation")
+    assert obligation.allowed is True
+    assert obligation.reason == "obligation_bypass"
     assert evaluate_speech_budget(saturated, speech_class="soft").allowed is False
     assert evaluate_speech_budget(saturated, speech_class="scheduled").allowed is False
 
@@ -450,9 +452,12 @@ def test_obligation_bypasses_volume_budgets_but_not_consecutive_limit() -> None:
         bot_messages_10m=2,
         bot_messages_hour=6,
     )
-    obligation = evaluate_speech_budget(consecutive, speech_class="obligation")
-    assert obligation.allowed is False
-    assert obligation.reason == "third_consecutive_bot_message"
+    consecutive_obligation = evaluate_speech_budget(
+        consecutive,
+        speech_class="obligation",
+    )
+    assert consecutive_obligation.allowed is True
+    assert consecutive_obligation.reason == "obligation_bypass"
 
     required = evaluate_speech_budget(
         consecutive,

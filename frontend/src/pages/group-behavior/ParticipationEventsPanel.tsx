@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Link } from "react-router-dom";
 
 import { Alert, DataTable, type DataTableColumn } from "../../components";
 import type {
@@ -15,6 +16,7 @@ import {
   reasonLabel,
   runtimeStageLabel,
 } from "./presentation";
+import { messageStoryPath } from "../message-story/path";
 
 export type ParticipationEventFilters = {
   source: "" | ParticipationEventDocument["event_kind"];
@@ -111,6 +113,19 @@ export function ParticipationEventsPanel({
             .map(([key]) => reasonLabel(key));
           return activeSignals.length ? activeSignals.join("、") : "无活跃信号";
         },
+      },
+      {
+        id: "message",
+        header: "消息",
+        width: "108px",
+        cell: (row) =>
+          row.trace_id ? (
+            <Link className="link-button" to={messageStoryPath(row.trace_id)}>
+              查看这条消息
+            </Link>
+          ) : (
+            "—"
+          ),
       },
       {
         id: "technical-details",

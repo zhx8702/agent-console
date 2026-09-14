@@ -1040,6 +1040,9 @@ class WxbotStore(WxbotReportStoreMixin):
                         if isinstance(initial_delivery.get("voice_profile"), dict)
                         else None
                     ),
+                    preserve_persona_style=bool(
+                        initial_delivery.get("preserve_persona_style")
+                    ),
                 )
                 reply_text = style_result.text
                 initial_delivery["style_guard"] = {

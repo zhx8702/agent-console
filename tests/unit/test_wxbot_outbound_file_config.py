@@ -44,6 +44,8 @@ def test_wxbot_outbound_file_settings_have_bounded_safe_defaults() -> None:
 
     assert settings.wxbot_outbound_file_dir == DEFAULT_CONTAINER_DIR
     assert settings.wxbot_outbound_file_max_bytes == 10 * 1024 * 1024
+    assert settings.wxbot_outbound_image_max_bytes == 700 * 1024
+    assert settings.wxbot_outbound_image_max_edge == 1600
     assert settings.wxbot_outbound_file_retention_seconds == 7 * 24 * 60 * 60
     assert settings.wxbot_outbound_file_cleanup_grace_seconds == 5 * 60
 

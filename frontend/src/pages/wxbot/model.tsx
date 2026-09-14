@@ -378,11 +378,11 @@ export type AgentToolAuditItem = {
   created_at?: string | null;
 };
 
-export type WxbotTab = "overview" | "policy" | "agent" | "events" | "reports" | "send";
+export type WxbotTab = "overview" | "policy" | "agent" | "events" | "webhooks" | "reports" | "send";
 
 export type ReportType = "daily" | "weekly" | "monthly";
 
-export const WXBOT_TABS: WxbotTab[] = ["overview", "policy", "agent", "events", "reports", "send"];
+export const WXBOT_TABS: WxbotTab[] = ["overview", "policy", "agent", "events", "webhooks", "reports", "send"];
 
 export const DEFAULT_GROUP_PARTICIPATION_POLICY: GroupParticipationPolicy = {
   threshold: 60,

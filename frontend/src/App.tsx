@@ -13,6 +13,7 @@ import { KnowledgePage } from "./pages/KnowledgePage";
 import { LoginPage } from "./pages/LoginPage";
 import { LlmConfigPage } from "./pages/LlmConfigPage";
 import { MessageQueuesPage } from "./pages/MessageQueuesPage";
+import { MessageStoryPage } from "./pages/message-story/MessageStoryPage";
 import { MemoryPage } from "./pages/MemoryPage";
 import { ModerationPage } from "./pages/ModerationPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
@@ -105,6 +106,9 @@ export function routeTitleForPath(pathname: string) {
   if (pathname === "/wxbot") {
     return "微信扩展控制台";
   }
+  if (pathname.startsWith("/queues/traces/")) {
+    return "这条消息";
+  }
   return routeMetadataForPath(pathname)?.label || "页面不存在";
 }
 
@@ -140,6 +144,47 @@ function CapabilityRoute({
   }
   const decision = state.data?.navigation.find((item) => item.path === capabilityPath);
   if (!decision?.visible) {
+    return (
+      <section className="not-found-panel" aria-labelledby="route-access-denied-title">
+        <div className="not-found-code" aria-hidden="true">403</div>
+        <div>
+          <p className="section-kicker">入口不可用</p>
+          <h1 id="route-access-denied-title">当前入口不可用</h1>
+          <p>这个功能不在当前身份与群聊范围内，或其运行依赖尚未就绪。</p>
+          <div className="action-row">
+            <Link className="button button-primary" to="/">返回控制台概览</Link>
+          </div>
+        </div>
+      </section>
+    );
+  }
+  return children;
+}
+
+function AnyVisibleRoute({
+  paths,
+  state,
+  children,
+}: {
+  paths: string[];
+  state: CapabilityLoadState;
+  children: ReactNode;
+}) {
+  if (state.status === "idle" || state.status === "loading") {
+    return (
+      <section className="panel" aria-busy="true" aria-label="正在校验入口权限">
+        <p className="section-kicker">入口校验</p>
+        <h1>正在校验入口权限</h1>
+        <p>控制台正在读取服务端能力与当前身份范围。</p>
+      </section>
+    );
+  }
+  const visible = new Set(
+    (state.data?.navigation || [])
+      .filter((item) => item.visible)
+      .map((item) => item.path),
+  );
+  if (!paths.some((path) => visible.has(path))) {
     return (
       <section className="not-found-panel" aria-labelledby="route-access-denied-title">
         <div className="not-found-code" aria-hidden="true">403</div>
@@ -689,6 +734,17 @@ export function App() {
             <Route path="/playground" element={<CapabilityRoute path="/playground" state={capabilityState}><PlaygroundPage /></CapabilityRoute>} />
             <Route path="/channels" element={<CapabilityRoute path="/channels" state={capabilityState}><ConnectionsPage /></CapabilityRoute>} />
             <Route path="/queues" element={<CapabilityRoute path="/queues" state={capabilityState}><MessageQueuesPage /></CapabilityRoute>} />
+            <Route
+              path="/queues/traces/:traceId"
+              element={(
+                <AnyVisibleRoute
+                  paths={["/queues", "/playground", "/group-behavior", "/channels", "/plugins", "/moderation"]}
+                  state={capabilityState}
+                >
+                  <MessageStoryPage />
+                </AnyVisibleRoute>
+              )}
+            />
             <Route path="/knowledge" element={<CapabilityRoute path="/knowledge" state={capabilityState}><KnowledgePage /></CapabilityRoute>} />
             <Route path="/memory" element={<CapabilityRoute path="/memory" state={capabilityState}><MemoryPage /></CapabilityRoute>} />
             <Route path="/relationship-graph" element={<CapabilityRoute path="/relationship-graph" state={capabilityState}><RelationshipGraphPage /></CapabilityRoute>} />

@@ -7,6 +7,7 @@ import { WxbotAgentTab } from "./WxbotAgentTab";
 import { WxbotEventsTab } from "./WxbotEventsTab";
 import { WxbotReportsTab } from "./WxbotReportsTab";
 import { WxbotSendTab } from "./WxbotSendTab";
+import { WxbotWebhookTab } from "./WxbotWebhookTab";
 import { useWxbotPageController } from "./useWxbotPageController";
 import { wxbotBridgeModeLabel } from "./model";
 
@@ -49,7 +50,7 @@ export function WxbotPageView() {
         <PageHeader
           eyebrow="微信机器人"
           title="微信机器人桥接"
-          description="桥接状态、回复策略、群成员事件和报表订阅；报表由本地微信解密库生成。"
+          description="桥接状态、回复策略、群推送 webhook、群成员事件和报表订阅；报表由本地微信解密库生成。"
           actions={
             <div className="action-row">
               <button className="button button-primary" onClick={() => void refresh()} disabled={loading}>
@@ -175,6 +176,11 @@ export function WxbotPageView() {
               id: "events",
               label: <>群成员事件 <span className="tab-count">{memberEvents.length}</span></>,
               content: <WxbotEventsTab controller={controller} />,
+            },
+            {
+              id: "webhooks",
+              label: <>群推送 <span className="tab-count">{controller.groupWebhooks.length}</span></>,
+              content: <WxbotWebhookTab controller={controller} />,
             },
             {
               id: "reports",

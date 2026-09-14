@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.common.types import ChatMessage, ChatRequest, Role
@@ -33,6 +34,7 @@ from plugins.memory.store import (
     _group_graph_edge_id,
     _group_graph_entity_aliases,
     _group_graph_entity_display_label,
+    _group_graph_label_is_technical,
     _group_graph_node_id,
     _group_graph_scope,
     _group_graph_timestamp,
@@ -40,6 +42,7 @@ from plugins.memory.store import (
     _is_group_session_id,
     _loads_json_object_or_array,
     _looks_like_wechat_username,
+    _memory_status_for_acceptance,
     _merge_group_graph_aliases,
     _merge_int_lists,
     _normalize_key,
@@ -64,6 +67,91 @@ def monotonic() -> float:
     return _store_runtime.monotonic()
 
 
+def _group_graph_item_value(item: dict[str, Any] | None) -> dict[str, Any]:
+    if not item:
+        return {}
+    value = item.get("value")
+    if isinstance(value, dict):
+        return value
+    loaded = _safe_json_loads(item.get("value_json"), {})
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _group_graph_edge_quality(item: dict[str, Any] | None) -> dict[str, Any]:
+    value = _group_graph_item_value(item)
+    acceptance = value.get("acceptance") if isinstance(value.get("acceptance"), dict) else {}
+    dates = value.get("evidence_dates")
+    evidence_dates = (
+        [str(entry).strip()[:10] for entry in dates if str(entry).strip()]
+        if isinstance(dates, list)
+        else []
+    )
+    score = acceptance.get("score")
+    if score is None:
+        score = item.get("acceptance_score") if item else None
+    reason = str(acceptance.get("reason") or (item or {}).get("acceptance_reason") or "").strip()
+    return {
+        "evidence_dates": list(dict.fromkeys(evidence_dates))[:90],
+        "acceptance_score": _clamp_score(score) if score is not None else None,
+        "acceptance_reason": reason[:80] or None,
+    }
+
+
+def _group_graph_auto_cursor_key(
+    *,
+    tenant_id: str,
+    channel: str,
+    source_key: str,
+    session_id: str,
+    target_date: str,
+) -> str:
+    scope = "\x1f".join((tenant_id, channel, source_key, session_id, target_date))
+    return f"group-graph-auto-cursor:v1:{_normalize_key(scope)}"
+
+
+def _clean_session_ids(*values: Any) -> list[str]:
+    cleaned: list[str] = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            cleaned.extend(_clean_session_ids(*value))
+            continue
+        text = str(value or "").strip()
+        if text:
+            cleaned.append(text)
+    return list(dict.fromkeys(cleaned))
+
+
+def _scope_session_ids(
+    session_id: str | None,
+    session_ids: list[str] | None,
+) -> list[str] | None:
+    if session_ids is not None:
+        cleaned = _clean_session_ids(session_ids)
+        if cleaned:
+            return cleaned
+    if session_id is None:
+        return None
+    return [str(session_id).strip()]
+
+
+def _prefer_operator_group_session_id(
+    session_ids: Iterable[str],
+    fallback: str = "",
+) -> str:
+    ids = _clean_session_ids(list(session_ids), fallback)
+    external = [
+        item
+        for item in ids
+        if not item.startswith("cx1:") and _is_group_session_id(item)
+    ]
+    if external:
+        return external[0]
+    group_ids = [item for item in ids if _is_group_session_id(item)]
+    if group_ids:
+        return group_ids[0]
+    return ids[0] if ids else str(fallback or "").strip()
+
+
 class MemoryGroupGraphStoreMixin:
     async def list_memory_graph_entities(
         self,
@@ -73,6 +161,7 @@ class MemoryGroupGraphStoreMixin:
         source_key: str | None = None,
         user_id: str | None = None,
         session_id: str | None = None,
+        session_ids: list[str] | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -87,7 +176,14 @@ class MemoryGroupGraphStoreMixin:
         if user_id is not None:
             conditions.append("entity.user_id = :uid")
             params["uid"] = user_id
-        if session_id is not None:
+        scoped_session_ids = _scope_session_ids(session_id, session_ids)
+        if scoped_session_ids is not None:
+            if len(scoped_session_ids) == 1:
+                session_clause = "scope_item.session_id = :sid"
+                params["sid"] = scoped_session_ids[0]
+            else:
+                session_clause = "scope_item.session_id = ANY(:sids)"
+                params["sids"] = scoped_session_ids
             conditions.append(
                 "EXISTS ("
                 "SELECT 1 FROM plugin_memory_fact scope_fact "
@@ -103,12 +199,11 @@ class MemoryGroupGraphStoreMixin:
                 "AND scope_fact.user_id = entity.user_id "
                 "AND (scope_fact.subject_entity_id = entity.id "
                 "OR scope_fact.object_entity_id = entity.id) "
-                "AND scope_item.session_id = :sid "
+                f"AND {session_clause} "
                 "AND scope_item.deleted_at IS NULL "
                 "AND scope_item.status NOT IN ('deleted', 'invalidated')"
                 ")"
             )
-            params["sid"] = session_id
         if status is not None:
             conditions.append("entity.status = :status")
             params["status"] = status
@@ -135,6 +230,7 @@ class MemoryGroupGraphStoreMixin:
         source_key: str | None = None,
         user_id: str | None = None,
         session_id: str | None = None,
+        session_ids: list[str] | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -149,7 +245,14 @@ class MemoryGroupGraphStoreMixin:
         if user_id is not None:
             conditions.append("fact.user_id = :uid")
             params["uid"] = user_id
-        if session_id is not None:
+        scoped_session_ids = _scope_session_ids(session_id, session_ids)
+        if scoped_session_ids is not None:
+            if len(scoped_session_ids) == 1:
+                session_clause = "scope_item.session_id = :sid"
+                params["sid"] = scoped_session_ids[0]
+            else:
+                session_clause = "scope_item.session_id = ANY(:sids)"
+                params["sids"] = scoped_session_ids
             conditions.append(
                 "EXISTS ("
                 "SELECT 1 FROM plugin_memory_item scope_item "
@@ -158,12 +261,11 @@ class MemoryGroupGraphStoreMixin:
                 "AND scope_item.channel = fact.channel "
                 "AND scope_item.source_key = fact.source_key "
                 "AND scope_item.user_id = fact.user_id "
-                "AND scope_item.session_id = :sid "
+                f"AND {session_clause} "
                 "AND scope_item.deleted_at IS NULL "
                 "AND scope_item.status NOT IN ('deleted', 'invalidated')"
                 ")"
             )
-            params["sid"] = session_id
         if status is not None:
             conditions.append("fact.status = :status")
             params["status"] = status
@@ -196,6 +298,7 @@ class MemoryGroupGraphStoreMixin:
         source_key: str | None = None,
         user_id: str | None = None,
         session_id: str | None = None,
+        session_ids: list[str] | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -210,9 +313,14 @@ class MemoryGroupGraphStoreMixin:
         if user_id is not None:
             conditions.append("user_id = :uid")
             params["uid"] = user_id
-        if session_id is not None:
-            conditions.append("session_id = :sid")
-            params["sid"] = session_id
+        scoped_session_ids = _scope_session_ids(session_id, session_ids)
+        if scoped_session_ids is not None:
+            if len(scoped_session_ids) == 1:
+                conditions.append("session_id = :sid")
+                params["sid"] = scoped_session_ids[0]
+            else:
+                conditions.append("session_id = ANY(:sids)")
+                params["sids"] = scoped_session_ids
         if status is not None:
             conditions.append("status = :status")
             params["status"] = status
@@ -279,11 +387,22 @@ class MemoryGroupGraphStoreMixin:
             "limit": safe_limit,
         }
 
+        scoped_session_ids = (
+            await self._resolve_group_graph_session_ids(
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            if session_id is not None
+            else []
+        )
+        scoped_session_set = set(scoped_session_ids)
         entities = await self.list_memory_graph_entities(
             tenant_id=tenant_id,
             channel=channel,
             source_key=source_key,
             user_id=None,
+            session_id=session_id,
+            session_ids=scoped_session_ids or None,
             status=status_filter,
             limit=fetch_limit,
         )
@@ -292,6 +411,8 @@ class MemoryGroupGraphStoreMixin:
             channel=channel,
             source_key=source_key,
             user_id=None,
+            session_id=session_id,
+            session_ids=scoped_session_ids or None,
             status=status_filter,
             limit=fetch_limit,
         )
@@ -301,6 +422,7 @@ class MemoryGroupGraphStoreMixin:
             source_key=source_key,
             user_id=None,
             session_id=session_id,
+            session_ids=scoped_session_ids or None,
             status=status_filter,
             limit=fetch_limit,
         )
@@ -392,7 +514,8 @@ class MemoryGroupGraphStoreMixin:
             backing_item = item_by_id.get(memory_item_id) if memory_item_id is not None else None
             if session_id is not None:
                 fact_session_matches = False
-                if backing_item and str(backing_item.get("session_id") or "") == str(session_id):
+                backing_session = str((backing_item or {}).get("session_id") or "")
+                if backing_session and backing_session in scoped_session_set:
                     fact_session_matches = True
                 event_ids_for_fact = set(_coerce_int_set([fact.get("source_event_id")]))
                 if backing_item:
@@ -400,7 +523,7 @@ class MemoryGroupGraphStoreMixin:
                         _coerce_int_set([backing_item.get("source_event_id")])
                     )
                 if any(
-                    event_session_by_id.get(event_id) == str(session_id)
+                    event_session_by_id.get(event_id) in scoped_session_set
                     for event_id in event_ids_for_fact
                 ):
                     fact_session_matches = True
@@ -473,6 +596,10 @@ class MemoryGroupGraphStoreMixin:
                     _append_unique_int(memory_item_ids_for_edge, evidence_item_id)
 
             source_ref_count = len(set(source_event_ids)) + len(set(memory_item_ids_for_edge))
+            quality = _group_graph_edge_quality(backing_item)
+            evidence_dates = quality["evidence_dates"]
+            if not evidence_dates and timestamp:
+                evidence_dates = [str(timestamp)[:10]]
             edge = {
                 "id": _group_graph_edge_id(fact),
                 "source": source_node_id,
@@ -481,7 +608,10 @@ class MemoryGroupGraphStoreMixin:
                 "label": predicate,
                 "confidence": confidence,
                 "acceptance_status": edge_acceptance,
+                "acceptance_score": quality["acceptance_score"],
+                "acceptance_reason": quality["acceptance_reason"],
                 "evidence_count": max(1, source_ref_count),
+                "evidence_dates": evidence_dates,
                 "first_seen": timestamp,
                 "last_seen": _group_graph_timestamp(fact, "updated_at", "valid_at", "created_at"),
                 "source_event_ids": source_event_ids,
@@ -510,50 +640,12 @@ class MemoryGroupGraphStoreMixin:
             and session_id
             and _is_group_session_id(session_id)
         ):
-            username_candidates: dict[str, str] = {}
-            for node in nodes.values():
-                if str(node.get("type") or "") != "person":
-                    continue
-                for candidate in (
-                    node.get("technical_label"),
-                    node.get("label"),
-                    *(node.get("aliases") or []),
-                ):
-                    username = _normalize_line(_sanitize_db_text(candidate))
-                    if username and _looks_like_wechat_username(username):
-                        username_candidates.setdefault(username, str(node.get("id") or ""))
-            contact_kwargs: dict[str, Any] = {
-                "session_id": session_id,
-                "usernames": username_candidates.keys(),
-            }
-            if bool(getattr(self, "runtime_scope_gates_required", False)):
-                contact_kwargs["tenant_id"] = str(tenant_id or "")
-            contact_map = await self._load_wechat_group_contact_display_map(
-                **contact_kwargs,
+            await self._apply_group_graph_person_display_names(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                session_ids=scoped_session_ids or [str(session_id)],
+                nodes=nodes,
             )
-            for node in nodes.values():
-                if str(node.get("type") or "") != "person":
-                    continue
-                matched_username = ""
-                for candidate in (
-                    node.get("technical_label"),
-                    node.get("label"),
-                    *(node.get("aliases") or []),
-                ):
-                    username = _normalize_line(_sanitize_db_text(candidate))
-                    if username in contact_map:
-                        matched_username = username
-                        break
-                if not matched_username:
-                    continue
-                metadata = contact_map.get(matched_username) or {}
-                contact_display = _wechat_contact_display_label(metadata)
-                if contact_display:
-                    node["display_label"] = contact_display
-                    node["aliases"] = _merge_group_graph_aliases(
-                        node.get("aliases") or [],
-                        (metadata.get("remark"), metadata.get("nick_name"), metadata.get("alias")),
-                    )
 
         node_items = list(nodes.values())[:safe_limit]
         return {
@@ -572,6 +664,179 @@ class MemoryGroupGraphStoreMixin:
             },
             "generated_from": generated_from,
         }
+
+    def _group_graph_person_usernames(self, nodes: dict[str, dict[str, Any]]) -> dict[str, str]:
+        usernames: dict[str, str] = {}
+        for node in nodes.values():
+            if str(node.get("type") or "") != "person":
+                continue
+            for candidate in (
+                node.get("technical_label"),
+                node.get("label"),
+                *(node.get("aliases") or []),
+            ):
+                username = _normalize_line(_sanitize_db_text(candidate))
+                if username.startswith("user:"):
+                    username = username[5:]
+                if username and _looks_like_wechat_username(username):
+                    usernames.setdefault(username, str(node.get("id") or ""))
+        return usernames
+
+    def _apply_group_graph_person_metadata(
+        self,
+        node: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        overwrite_technical: bool = False,
+    ) -> None:
+        display = _wechat_contact_display_label(metadata)
+        if not display or _group_graph_label_is_technical(display):
+            return
+        current = _normalize_line(_sanitize_db_text(node.get("display_label")))
+        if current and not _group_graph_label_is_technical(current) and not overwrite_technical:
+            node["aliases"] = _merge_group_graph_aliases(
+                node.get("aliases") or [],
+                (display, metadata.get("remark"), metadata.get("nick_name"), metadata.get("alias")),
+            )
+            return
+        node["display_label"] = display
+        node["aliases"] = _merge_group_graph_aliases(
+            node.get("aliases") or [],
+            (display, metadata.get("remark"), metadata.get("nick_name"), metadata.get("alias")),
+        )
+
+    async def _load_group_local_person_display_map(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: list[str],
+        usernames: Iterable[str],
+    ) -> dict[str, dict[str, str]]:
+        unique_usernames = sorted(
+            {
+                _normalize_line(_sanitize_db_text(username))
+                for username in usernames
+                if _looks_like_wechat_username(username)
+            }
+        )[:500]
+        rooms = [
+            _normalize_line(_sanitize_db_text(session_id))
+            for session_id in session_ids
+            if _is_group_session_id(session_id)
+        ]
+        if not unique_usernames or not rooms:
+            return {}
+        display_map: dict[str, dict[str, str]] = {}
+        try:
+            member_rows = await _exec(
+                "SELECT user_wxid, user_name "
+                "FROM plugin_wxbot_group_membership "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND user_wxid = ANY(:wxids) "
+                "AND user_name <> '' AND user_name IS DISTINCT FROM user_wxid",
+                {
+                    "tid": str(tenant_id or "").strip(),
+                    "sids": rooms,
+                    "wxids": unique_usernames,
+                },
+            )
+        except Exception:
+            member_rows = []
+        for row in member_rows or []:
+            username = _normalize_line(_sanitize_db_text(row.get("user_wxid")))
+            name = _normalize_line(_sanitize_db_text(row.get("user_name")))[:80]
+            if username and name and not _group_graph_label_is_technical(name):
+                display_map[username] = {"nick_name": name}
+        try:
+            observation_rows = await _exec(
+                "SELECT DISTINCT ON (sender_wxid) sender_wxid, sender_name "
+                "FROM plugin_wxbot_group_observations "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND sender_wxid = ANY(:wxids) "
+                "AND sender_name <> '' AND sender_name IS DISTINCT FROM sender_wxid "
+                "ORDER BY sender_wxid, occurred_ts DESC, id DESC",
+                {
+                    "tid": str(tenant_id or "").strip(),
+                    "sids": rooms,
+                    "wxids": unique_usernames,
+                },
+            )
+        except Exception:
+            observation_rows = []
+        for row in observation_rows or []:
+            username = _normalize_line(_sanitize_db_text(row.get("sender_wxid")))
+            name = _normalize_line(_sanitize_db_text(row.get("sender_name")))[:80]
+            if username and name and not _group_graph_label_is_technical(name):
+                display_map[username] = {"nick_name": name}
+        return display_map
+
+    async def _apply_group_graph_person_display_names(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        session_ids: list[str],
+        nodes: dict[str, dict[str, Any]],
+    ) -> None:
+        username_candidates = self._group_graph_person_usernames(nodes)
+        if not username_candidates:
+            return
+        contact_map: dict[str, dict[str, str]] = {}
+        rooms = [str(session_id), *[item for item in session_ids if item != session_id]]
+        for room in rooms:
+            if not _is_group_session_id(room):
+                continue
+            contact_kwargs: dict[str, Any] = {
+                "session_id": room,
+                "usernames": username_candidates.keys(),
+            }
+            if bool(getattr(self, "runtime_scope_gates_required", False)):
+                contact_kwargs["tenant_id"] = str(tenant_id or "")
+            try:
+                mapped = await self._load_wechat_group_contact_display_map(**contact_kwargs)
+            except Exception:
+                mapped = {}
+            for username, metadata in (mapped or {}).items():
+                current = contact_map.get(username) or {}
+                contact_map[username] = {
+                    "remark": current.get("remark") or metadata.get("remark") or "",
+                    "nick_name": current.get("nick_name") or metadata.get("nick_name") or "",
+                    "alias": current.get("alias") or metadata.get("alias") or "",
+                }
+        local_map = await self._load_group_local_person_display_map(
+            tenant_id=tenant_id,
+            session_ids=rooms,
+            usernames=username_candidates.keys(),
+        )
+        for node in nodes.values():
+            if str(node.get("type") or "") != "person":
+                continue
+            matched_username = ""
+            for candidate in (
+                node.get("technical_label"),
+                node.get("label"),
+                *(node.get("aliases") or []),
+            ):
+                username = _normalize_line(_sanitize_db_text(candidate))
+                if username.startswith("user:"):
+                    username = username[5:]
+                if username in contact_map or username in local_map:
+                    matched_username = username
+                    break
+            if not matched_username:
+                continue
+            if matched_username in contact_map:
+                self._apply_group_graph_person_metadata(
+                    node,
+                    contact_map[matched_username],
+                    overwrite_technical=True,
+                )
+            if matched_username in local_map:
+                self._apply_group_graph_person_metadata(
+                    node,
+                    local_map[matched_username],
+                    overwrite_technical=True,
+                )
 
     async def get_group_relationship_edge_evidence(
         self,
@@ -648,7 +913,13 @@ class MemoryGroupGraphStoreMixin:
             (item for item in backing_items if int(item.get("id") or 0) == memory_item_id), None
         )
         if session_id is not None:
-            if not backing_item or str(backing_item.get("session_id") or "") != str(session_id):
+            scoped_session_ids = set(
+                await self._resolve_group_graph_session_ids(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
+            )
+            if not backing_item or str(backing_item.get("session_id") or "") not in scoped_session_ids:
                 return None
 
         episodes = await self.list_memory_graph_episodes(
@@ -1060,6 +1331,8 @@ class MemoryGroupGraphStoreMixin:
         relation_payload = dict(candidate)
         relation_payload["evidence_event_ids"] = evidence_event_ids
         evidence_dates = [target_date]
+        existing_item: dict[str, Any] | None = None
+        existing_acceptance: dict[str, Any] = {}
 
         existing_items = await self._find_memory_item_by_normalized_key(
             tenant_id=tenant_id,
@@ -1072,11 +1345,17 @@ class MemoryGroupGraphStoreMixin:
             limit=1,
         )
         if existing_items:
-            existing_value = existing_items[0].get("value")
+            existing_item = existing_items[0]
+            existing_value = existing_item.get("value")
             if not isinstance(existing_value, dict):
-                existing_value = _safe_json_loads(existing_items[0].get("value_json"), {})
+                existing_value = _safe_json_loads(existing_item.get("value_json"), {})
             if not isinstance(existing_value, dict):
                 existing_value = {}
+            existing_acceptance = (
+                dict(existing_value.get("acceptance"))
+                if isinstance(existing_value.get("acceptance"), dict)
+                else {}
+            )
             existing_relation = (
                 existing_value.get("relation")
                 if isinstance(existing_value.get("relation"), dict)
@@ -1107,17 +1386,48 @@ class MemoryGroupGraphStoreMixin:
             )[-90:]
 
         relation_source_type = str(
-            relation_payload.get("extraction_method") or LLM_GROUP_WINDOW_SOURCE_TYPE
+            (existing_item or {}).get("source_type")
+            or relation_payload.get("extraction_method")
+            or LLM_GROUP_WINDOW_SOURCE_TYPE
         )
         if relation_source_type not in {
             LLM_GROUP_WINDOW_SOURCE_TYPE,
             DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE,
         }:
             relation_source_type = LLM_GROUP_WINDOW_SOURCE_TYPE
-        # Deterministic means reproducible, not necessarily true. Adjacency and
-        # same-window co-participation are weak evidence and must not enter the
-        # prompt graph without review.
-        acceptance_status = "needs_review"
+        # Keep a human reject/accept. Otherwise auto-accept so the graph
+        # and recall do not wait on a manual queue.
+        prior_acceptance_status = str(
+            existing_acceptance.get("status")
+            or (existing_item or {}).get("acceptance_status")
+            or ""
+        ).strip().lower()
+        auto_accept = bool(getattr(self.settings, "memory_group_graph_auto_accept", True))
+        if prior_acceptance_status in {"accepted", "rejected"}:
+            acceptance_status = prior_acceptance_status
+        else:
+            acceptance_status = "accepted" if auto_accept else "needs_review"
+        acceptance_reason = str(
+            existing_acceptance.get("reason")
+            or relation_payload.get("reason")
+            or ("group_window_auto_accept" if acceptance_status == "accepted" else "group_window_relation")
+        )[:80]
+        acceptance_payload = {
+            **existing_acceptance,
+            "status": acceptance_status,
+            "score": max(
+                _clamp_score(existing_acceptance.get("score"), 0.0),
+                _clamp_score(relation_payload.get("confidence"), 0.0),
+            ),
+            "reason": acceptance_reason,
+            "extraction_confidence": max(
+                _clamp_score(existing_acceptance.get("extraction_confidence"), 0.0),
+                _clamp_score(relation_payload.get("confidence"), 0.0),
+            ),
+        }
+        if acceptance_status == "accepted" and prior_acceptance_status != "accepted":
+            acceptance_payload.setdefault("reviewed_by", "system/auto")
+            acceptance_payload.setdefault("review_reason", "group_window_auto_accept")
         value_payload = {
             "kind": "group_window_relation",
             "date": target_date,
@@ -1131,12 +1441,7 @@ class MemoryGroupGraphStoreMixin:
             },
             "relation": relation_payload,
             "source_event_ids": evidence_event_ids,
-            "acceptance": {
-                "status": acceptance_status,
-                "score": relation_payload["confidence"],
-                "reason": str(relation_payload.get("reason") or "group_window_relation")[:80],
-                "extraction_confidence": relation_payload["confidence"],
-            },
+            "acceptance": acceptance_payload,
         }
         is_group_history_scope = user_id == GROUP_HISTORY_USER_ID_SCOPE
         return await self._insert_or_touch_memory_item(
@@ -1155,7 +1460,12 @@ class MemoryGroupGraphStoreMixin:
             value_json=value_payload,
             normalized_key=normalized_key,
             confidence=relation_payload["confidence"],
-            status="active" if acceptance_status == "accepted" else "pending",
+            status=(
+                str(existing_item.get("status") or "pending")
+                if existing_item is not None
+                and acceptance_status in {"accepted", "rejected"}
+                else _memory_status_for_acceptance(acceptance_status, sensitivity="normal")
+            ),
             pinned=False,
             priority=0,
             sensitivity="normal",
@@ -1182,6 +1492,8 @@ class MemoryGroupGraphStoreMixin:
         max_windows: int | None = None,
         cursor_event_id: int | None = None,
         dry_run: bool = False,
+        include_llm: bool = True,
+        llm_timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         session_id = str(session_id or "").strip()
         if not session_id:
@@ -1193,36 +1505,36 @@ class MemoryGroupGraphStoreMixin:
         effective_window_size = _clamp_int(window_size, 50, minimum=10, maximum=100)
         effective_max_windows = _clamp_int(max_windows, 1, minimum=1, maximum=10)
         effective_cursor = max(0, int(cursor_event_id or 0))
+        effective_llm_timeout = _clamp_int(
+            llm_timeout_seconds, 60, minimum=1, maximum=180
+        )
         user_id_scope, user_id_auto = _group_history_user_scope(session_id, user_id)
         if not user_id_scope:
             raise RuntimeError("user_id required")
 
         fetch_limit = effective_window_size * effective_max_windows + 1
-        event_rows = await _exec(
-            "SELECT id, tenant_id, channel, source_key, user_id, session_id, user_text, "
-            "assistant_text, trace_id, event_key, created_at "
-            "FROM plugin_memory_event "
-            "WHERE tenant_id = :tid AND channel = :channel "
-            "AND source_key IN (:source_key, '*') "
-            "AND user_id = :uid AND session_id = :sid "
-            "AND created_at >= :start_at AND created_at < :end_at "
-            "AND id > :cursor_event_id "
-            "ORDER BY created_at ASC, id ASC "
-            "LIMIT :lim",
-            {
-                "tid": tenant_id,
-                "channel": channel,
-                "source_key": source_key,
-                "uid": user_id_scope,
-                "sid": session_id,
-                "start_at": start_at,
-                "end_at": end_at,
-                "cursor_event_id": effective_cursor,
-                "lim": fetch_limit,
-            },
+        event_rows = await self._load_group_relationship_events(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_id=session_id,
+            user_id_scope=user_id_scope,
+            start_at=start_at,
+            end_at=end_at,
+            columns=(
+                "id, tenant_id, channel, source_key, user_id, session_id, user_text, "
+                "assistant_text, trace_id, event_key, created_at"
+            ),
+            cursor_event_id=effective_cursor,
+            limit=fetch_limit,
         )
         more_remain = len(event_rows) > effective_window_size * effective_max_windows
         event_rows = event_rows[: effective_window_size * effective_max_windows]
+        observation_event_ids = {
+            int(row.get("id") or 0)
+            for row in event_rows
+            if str(row.get("_graph_source") or "") == "observation" and int(row.get("id") or 0)
+        }
         windows = self._build_group_relationship_windows(
             event_rows, window_size=effective_window_size
         )
@@ -1260,6 +1572,8 @@ class MemoryGroupGraphStoreMixin:
                 "max_windows": effective_max_windows,
                 "cursor_event_id": effective_cursor,
                 "dry_run": bool(dry_run),
+                "include_llm": bool(include_llm),
+                "llm_timeout_seconds": effective_llm_timeout,
             },
             "windows": window_summaries,
             "totals": {
@@ -1271,7 +1585,11 @@ class MemoryGroupGraphStoreMixin:
             },
             "next_cursor_event_id": next_cursor_event_id,
             "more_remain": more_remain,
-            "generated_from": ["plugin_memory_event"],
+            "generated_from": (
+                ["plugin_wxbot_group_observations"]
+                if observation_event_ids
+                else ["plugin_memory_event"]
+            ),
         }
         if dry_run or not windows:
             if not windows:
@@ -1279,7 +1597,9 @@ class MemoryGroupGraphStoreMixin:
             return base_payload
 
         llm_available = bool(
-            self.graph_extractor.config.enabled and self.graph_extractor.llm_service is not None
+            include_llm
+            and self.graph_extractor.config.enabled
+            and self.graph_extractor.llm_service is not None
         )
 
         total_candidates = 0
@@ -1293,13 +1613,16 @@ class MemoryGroupGraphStoreMixin:
             llm_candidates: list[dict[str, Any]] = []
             if llm_available:
                 try:
-                    raw_payload = await self._extract_group_relationship_window_candidates(
-                        tenant_id=tenant_id,
-                        trace_id=f"group-window:{target_date}:{window['first_event_id']}:{window['last_event_id']}",
-                        target_date=target_date,
-                        session_id=session_id,
-                        event_ids=window["event_ids"],
-                        transcript=window["transcript"],
+                    raw_payload = await asyncio.wait_for(
+                        self._extract_group_relationship_window_candidates(
+                            tenant_id=tenant_id,
+                            trace_id=f"group-window:{target_date}:{window['first_event_id']}:{window['last_event_id']}",
+                            target_date=target_date,
+                            session_id=session_id,
+                            event_ids=window["event_ids"],
+                            transcript=window["transcript"],
+                        ),
+                        timeout=float(effective_llm_timeout),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1332,6 +1655,15 @@ class MemoryGroupGraphStoreMixin:
             summary["candidate_count"] = len(candidates)
             total_candidates += len(candidates)
             for candidate in candidates:
+                if observation_event_ids:
+                    candidate = {
+                        **candidate,
+                        "evidence_event_ids": [
+                            event_id
+                            for event_id in (candidate.get("evidence_event_ids") or [])
+                            if int(event_id or 0) not in observation_event_ids
+                        ],
+                    }
                 item = await self._apply_group_relationship_window_candidate(
                     tenant_id=tenant_id,
                     channel=channel,
@@ -1382,11 +1714,15 @@ class MemoryGroupGraphStoreMixin:
         cursor_event_id: int | None = None,
         dry_run: bool = False,
         time_budget_seconds: int | None = None,
+        include_llm: bool = True,
     ) -> dict[str, Any]:
         effective_window_size = _clamp_int(window_size, 50, minimum=10, maximum=100)
         effective_max_windows = _clamp_int(max_windows_per_run, 20, minimum=1, maximum=100)
         effective_cursor = max(0, int(cursor_event_id or 0))
         effective_time_budget = _clamp_int(time_budget_seconds, 60, minimum=1, maximum=180)
+        per_window_llm_timeout = max(
+            1, effective_time_budget // effective_max_windows
+        )
         started_at = monotonic()
         totals = {"events": 0, "windows": 0, "candidates": 0, "applied": 0, "skipped": 0}
         controls = {
@@ -1395,6 +1731,8 @@ class MemoryGroupGraphStoreMixin:
             "cursor_event_id": effective_cursor,
             "dry_run": bool(dry_run),
             "time_budget_seconds": effective_time_budget,
+            "include_llm": bool(include_llm),
+            "llm_timeout_seconds": per_window_llm_timeout,
         }
         windows_processed = 0
         more_remain = False
@@ -1403,23 +1741,45 @@ class MemoryGroupGraphStoreMixin:
         next_cursor_event_id = effective_cursor
 
         while windows_processed < effective_max_windows:
-            if monotonic() - started_at >= effective_time_budget:
+            elapsed = monotonic() - started_at
+            if elapsed >= effective_time_budget:
                 stop_reason = "time_budget_reached"
                 more_remain = True
                 break
-            batch_limit = min(effective_max_windows - windows_processed, 10)
-            result = await self.run_group_relationship_window_extraction(
-                tenant_id=tenant_id,
-                channel=channel,
-                source_key=source_key,
-                session_id=session_id,
-                user_id=user_id,
-                date=date,
-                window_size=effective_window_size,
-                max_windows=batch_limit,
-                cursor_event_id=next_cursor_event_id,
-                dry_run=dry_run,
+            remaining_budget = max(0.001, effective_time_budget - elapsed)
+            # Keep LLM-backed calls to one window so each successful return is
+            # also a durable checkpoint for the automatic runner.
+            batch_limit = (
+                1
+                if include_llm
+                else min(effective_max_windows - windows_processed, 10)
             )
+            try:
+                result = await asyncio.wait_for(
+                    self.run_group_relationship_window_extraction(
+                        tenant_id=tenant_id,
+                        channel=channel,
+                        source_key=source_key,
+                        session_id=session_id,
+                        user_id=user_id,
+                        date=date,
+                        window_size=effective_window_size,
+                        max_windows=batch_limit,
+                        cursor_event_id=next_cursor_event_id,
+                        dry_run=dry_run,
+                        include_llm=include_llm,
+                        llm_timeout_seconds=max(
+                            1,
+                            min(per_window_llm_timeout, int(remaining_budget)),
+                        ),
+                    ),
+                    timeout=remaining_budget,
+                )
+            except TimeoutError:
+                stop_reason = "time_budget_reached"
+                more_remain = True
+                status = "partial"
+                break
             result_totals = result.get("totals") if isinstance(result.get("totals"), dict) else {}
             processed = int(result_totals.get("windows") or 0)
             for key in totals:
@@ -1621,23 +1981,15 @@ class MemoryGroupGraphStoreMixin:
             target_date=target_date,
         )
 
-        event_rows = await _exec(
-            "SELECT id, user_text, trace_id, event_key, created_at "
-            "FROM plugin_memory_event "
-            "WHERE tenant_id = :tid AND channel = :channel "
-            "AND source_key IN (:source_key, '*') "
-            "AND user_id = :uid AND session_id = :sid "
-            "AND created_at >= :start_at AND created_at < :end_at "
-            "ORDER BY created_at ASC, id ASC",
-            {
-                "tid": tenant_id,
-                "channel": channel,
-                "source_key": source_key,
-                "uid": user_id_scope,
-                "sid": session_id,
-                "start_at": start_at,
-                "end_at": end_at,
-            },
+        event_rows = await self._load_group_relationship_events(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_id=session_id,
+            user_id_scope=user_id_scope,
+            start_at=start_at,
+            end_at=end_at,
+            columns="id, user_text, trace_id, event_key, created_at",
         )
         source_event_ids = sorted(_coerce_int_set(row.get("id") for row in event_rows))
         sender_ids = sorted(
@@ -1891,6 +2243,102 @@ class MemoryGroupGraphStoreMixin:
             "generated_from": ["plugin_memory_event", "plugin_memory_item"],
         }
 
+    async def auto_accept_pending_group_window_relations(
+        self,
+        *,
+        tenant_id: str,
+        channel: str | None = None,
+        source_key: str | None = None,
+        session_id: str | None = None,
+        limit: int = 2000,
+    ) -> dict[str, Any]:
+        session_ids = (
+            await self._resolve_group_graph_session_ids(
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            if session_id
+            else []
+        )
+        params: dict[str, Any] = {
+            "tid": str(tenant_id or "").strip(),
+            "lim": max(1, min(int(limit or 2000), 5000)),
+        }
+        conditions = [
+            "pending.tenant_id = :tid",
+            "pending.deleted_at IS NULL",
+            "pending.value_json::jsonb->>'kind' = 'group_window_relation'",
+            "COALESCE(pending.value_json::jsonb->'acceptance'->>'status', '') "
+            "IN ('needs_review', 'candidate', '')",
+        ]
+        if channel is not None:
+            conditions.append("pending.channel = :channel")
+            params["channel"] = channel
+        if source_key is not None:
+            conditions.append("pending.source_key = :source_key")
+            params["source_key"] = source_key
+        if session_ids:
+            conditions.append("pending.session_id = ANY(:sids)")
+            params["sids"] = session_ids
+        rows = await _exec(
+            "UPDATE plugin_memory_item AS item "
+            "SET status = 'active', "
+            "value_json = jsonb_set("
+            "jsonb_set("
+            "jsonb_set("
+            "COALESCE(item.value_json::jsonb, '{}'::jsonb), "
+            "'{acceptance,status}', '\"accepted\"'), "
+            "'{acceptance,reason}', '\"group_window_auto_accept\"'), "
+            "'{acceptance,reviewed_by}', '\"system/auto\"'"
+            ")::text, "
+            "updated_at = NOW() "
+            "WHERE item.id IN ("
+            "SELECT pending.id FROM plugin_memory_item AS pending "
+            f"WHERE {' AND '.join(conditions)} "
+            "ORDER BY pending.id ASC LIMIT :lim"
+            ") "
+            "RETURNING item.id",
+            params,
+        )
+        accepted = len(rows or [])
+        item_ids = [int(row["id"]) for row in (rows or []) if row.get("id") is not None]
+        facts_activated = 0
+        entities_activated = 0
+        if item_ids:
+            fact_rows = await _exec(
+                "UPDATE plugin_memory_fact AS fact "
+                "SET status = 'active', updated_at = NOW() "
+                "WHERE fact.memory_item_id = ANY(:ids) "
+                "AND fact.status <> 'active' "
+                "RETURNING fact.id",
+                {"ids": item_ids},
+            )
+            facts_activated = len(fact_rows or [])
+            entity_rows = await _exec(
+                "UPDATE plugin_memory_entity AS entity "
+                "SET status = 'active', updated_at = NOW() "
+                "WHERE entity.status <> 'active' "
+                "AND entity.id IN ("
+                "SELECT fact.subject_entity_id FROM plugin_memory_fact AS fact "
+                "WHERE fact.memory_item_id = ANY(:ids) AND fact.subject_entity_id IS NOT NULL "
+                "UNION "
+                "SELECT fact.object_entity_id FROM plugin_memory_fact AS fact "
+                "WHERE fact.memory_item_id = ANY(:ids) AND fact.object_entity_id IS NOT NULL"
+                ") "
+                "RETURNING entity.id",
+                {"ids": item_ids},
+            )
+            entities_activated = len(entity_rows or [])
+        return {
+            "ok": True,
+            "pending_found": accepted,
+            "accepted": accepted,
+            "failed": 0,
+            "facts_activated": facts_activated,
+            "entities_activated": entities_activated,
+            "session_ids": session_ids,
+        }
+
     async def review_group_relationship_edge(
         self,
         *,
@@ -1965,6 +2413,651 @@ class MemoryGroupGraphStoreMixin:
                 "evidence_counts": evidence.get("evidence_counts") or {},
             },
             "evidence_ids": evidence.get("evidence_ids") or {},
+        }
+
+    async def _resolve_group_graph_session_ids(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str | None,
+    ) -> list[str]:
+        requested = str(session_id or "").strip()
+        if not requested:
+            return []
+        aliases = {requested}
+        try:
+            rows = await _exec(
+                "SELECT session_id, "
+                "COALESCE(metadata->>'external_conversation_id', '') AS external_id, "
+                "COALESCE(metadata->>'external_session_id', '') AS external_session_id, "
+                "COALESCE(metadata->>'canonical_conversation_id', '') AS canonical_id "
+                "FROM sessions "
+                "WHERE tenant_id = :tid "
+                "AND ("
+                "session_id = :sid "
+                "OR COALESCE(metadata->>'external_conversation_id', '') = :sid "
+                "OR COALESCE(metadata->>'external_session_id', '') = :sid "
+                "OR COALESCE(metadata->>'canonical_conversation_id', '') = :sid"
+                ")",
+                {"tid": str(tenant_id or "").strip(), "sid": requested},
+            )
+        except Exception:
+            logger.warning(
+                "memory.group_graph_session_alias_failed",
+                tenant_id=tenant_id,
+                session_id=requested,
+                exc_info=True,
+            )
+            return [requested]
+        for row in rows or []:
+            for key in ("session_id", "external_id", "external_session_id", "canonical_id"):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    aliases.add(value)
+        extras = sorted(item for item in aliases if item != requested)
+        return [requested, *extras]
+
+    async def _operator_group_session_id(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+    ) -> str:
+        aliases = await self._resolve_group_graph_session_ids(
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        return _prefer_operator_group_session_id(aliases, session_id)
+
+    async def _load_group_relationship_events(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        source_key: str,
+        session_id: str,
+        user_id_scope: str,
+        start_at: datetime,
+        end_at: datetime,
+        columns: str,
+        cursor_event_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        session_ids = await self._resolve_group_graph_session_ids(
+            tenant_id=tenant_id,
+            session_id=session_id,
+        ) or [session_id]
+        params: dict[str, Any] = {
+            "tid": tenant_id,
+            "channel": channel,
+            "source_key": source_key,
+            "uid": user_id_scope,
+            "sids": session_ids,
+            "start_at": start_at,
+            "end_at": end_at,
+        }
+        cursor_sql = ""
+        if cursor_event_id is not None:
+            cursor_sql = "AND id > :cursor_event_id "
+            params["cursor_event_id"] = int(cursor_event_id)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT :lim"
+            params["lim"] = int(limit)
+        scoped_rows = await _exec(
+            f"SELECT {columns} "
+            "FROM plugin_memory_event "
+            "WHERE tenant_id = :tid AND channel = :channel "
+            "AND source_key IN (:source_key, '*') "
+            "AND user_id = :uid AND session_id = ANY(:sids) "
+            "AND created_at >= :start_at AND created_at < :end_at "
+            f"{cursor_sql}"
+            "ORDER BY created_at ASC, id ASC "
+            f"{limit_sql}",
+            params,
+        )
+        if scoped_rows:
+            return scoped_rows
+        live_params = dict(params)
+        live_params.pop("uid", None)
+        live_rows = await _exec(
+            f"SELECT {columns} "
+            "FROM plugin_memory_event "
+            "WHERE tenant_id = :tid AND channel = :channel "
+            "AND source_key IN (:source_key, '*') "
+            "AND session_id = ANY(:sids) "
+            "AND created_at >= :start_at AND created_at < :end_at "
+            f"{cursor_sql}"
+            "ORDER BY created_at ASC, id ASC "
+            f"{limit_sql}",
+            live_params,
+        )
+        if live_rows:
+            return live_rows
+        return await self._load_group_relationship_events_from_observations(
+            tenant_id=tenant_id,
+            session_ids=session_ids,
+            start_at=start_at,
+            end_at=end_at,
+            cursor_event_id=cursor_event_id,
+            limit=limit,
+        )
+
+    async def _load_group_relationship_events_from_observations(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+        cursor_event_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        start_dt = start_at if isinstance(start_at, datetime) else datetime.combine(start_at, datetime.min.time())
+        end_dt = end_at if isinstance(end_at, datetime) else datetime.combine(end_at, datetime.min.time())
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        if end_ts <= start_ts or not session_ids:
+            return []
+        params: dict[str, Any] = {
+            "tid": tenant_id,
+            "sids": session_ids,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+        }
+        cursor_sql = ""
+        if cursor_event_id is not None:
+            cursor_sql = "AND id > :cursor_event_id "
+            params["cursor_event_id"] = int(cursor_event_id)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT :lim"
+            params["lim"] = int(limit)
+        rows = await _exec(
+            "SELECT id, tenant_id, session_id, sender_wxid, content, occurred_ts "
+            "FROM plugin_wxbot_group_observations "
+            "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+            "AND occurred_ts >= :start_ts AND occurred_ts < :end_ts "
+            f"{cursor_sql}"
+            "ORDER BY occurred_ts ASC, id ASC "
+            f"{limit_sql}",
+            params,
+        )
+        events: list[dict[str, Any]] = []
+        for row in rows or []:
+            sender = str(row.get("sender_wxid") or "").strip()
+            content = str(row.get("content") or "").strip()
+            if not sender or not content:
+                continue
+            occurred = int(row.get("occurred_ts") or 0)
+            created_at = (
+                datetime.fromtimestamp(occurred, UTC).replace(tzinfo=None)
+                if occurred > 0
+                else start_at
+            )
+            events.append(
+                {
+                    "id": int(row.get("id") or 0),
+                    "tenant_id": str(row.get("tenant_id") or tenant_id),
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": sender,
+                    "session_id": str(row.get("session_id") or ""),
+                    "user_text": f"{sender}: {content}"[:1000],
+                    "assistant_text": "",
+                    "trace_id": "",
+                    "event_key": f"observation:{row.get('id')}",
+                    "created_at": created_at,
+                    "_graph_source": "observation",
+                }
+            )
+        return events
+
+    async def _group_graph_auto_extract_scope_allowed(
+        self,
+        tenant_id: str,
+        session_id: str,
+    ) -> bool:
+        if not bool(getattr(self, "runtime_scope_gates_required", False)):
+            return True
+        gate = getattr(self, "combined_history_scope_execution_allowed", None)
+        if not callable(gate):
+            return False
+        try:
+            return await gate(str(tenant_id or ""), str(session_id or "")) is True
+        except Exception:
+            logger.warning(
+                "memory.group_graph_auto_extract_scope_failed",
+                tenant_id=tenant_id,
+                session_id=session_id,
+                exc_info=True,
+            )
+            return False
+
+    async def list_known_group_graph_sessions(
+        self,
+        *,
+        lookback_days: int = 30,
+        max_sessions: int = 10,
+        start_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        effective_lookback = _clamp_int(lookback_days, 30, minimum=1, maximum=90)
+        effective_max_sessions = _clamp_int(max_sessions, 10, minimum=1, maximum=20)
+        cutoff = start_at or (
+            datetime.now(UTC).replace(tzinfo=None) - timedelta(days=effective_lookback)
+        )
+        rows = await _exec(
+            "SELECT tenant_id, channel, source_key, session_id, "
+            "COUNT(*) AS event_count, MAX(created_at) AS last_seen "
+            "FROM plugin_memory_event "
+            "WHERE created_at >= :start_at "
+            "AND session_id LIKE '%@chatroom' "
+            "GROUP BY tenant_id, channel, source_key, session_id "
+            "ORDER BY last_seen DESC, event_count DESC "
+            "LIMIT :lim",
+            {
+                "start_at": cutoff,
+                "lim": effective_max_sessions,
+            },
+        )
+        activity_rows = await _exec(
+            "SELECT tenant_id, channel, session_id "
+            "FROM sessions "
+            "WHERE updated_at >= :start_at "
+            "AND session_id LIKE '%@chatroom' "
+            "ORDER BY updated_at DESC "
+            "LIMIT :lim",
+            {
+                "start_at": cutoff,
+                "lim": effective_max_sessions,
+            },
+        )
+        sessions: list[dict[str, Any]] = []
+        merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for row in list(rows or []) + [
+            {
+                **item,
+                "source_key": "wxbot",
+                "event_count": 0,
+            }
+            for item in (activity_rows or [])
+        ]:
+            session_id = str(row.get("session_id") or "").strip()
+            if not _is_group_session_id(session_id):
+                continue
+            tenant_id = str(row.get("tenant_id") or "").strip()
+            channel = str(row.get("channel") or "").strip() or "wechat"
+            source_key = str(row.get("source_key") or "").strip() or "wxbot"
+            operator_session = await self._operator_group_session_id(
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            key = (tenant_id, channel, source_key, operator_session)
+            current = merged.get(key)
+            event_count = int(row.get("event_count") or 0)
+            if current is None:
+                merged[key] = {
+                    "tenant_id": tenant_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "session_id": operator_session,
+                    "event_count": event_count,
+                }
+                continue
+            current["event_count"] = int(current.get("event_count") or 0) + event_count
+        sessions = list(merged.values())
+        sessions.sort(key=lambda item: int(item.get("event_count") or 0), reverse=True)
+        return sessions[:effective_max_sessions]
+
+    async def list_imported_group_graph_targets(
+        self,
+        *,
+        lookback_days: int = 7,
+        max_targets: int = 3,
+        start_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        effective_lookback = _clamp_int(lookback_days, 7, minimum=1, maximum=14)
+        effective_max_targets = _clamp_int(max_targets, 3, minimum=1, maximum=200)
+        cutoff = start_at or (
+            datetime.now(UTC).replace(tzinfo=None) - timedelta(days=effective_lookback)
+        )
+        fetch_limit = _clamp_int(
+            effective_max_targets * max(effective_lookback, 1) * 4,
+            40,
+            minimum=10,
+            maximum=200,
+        )
+        rows = await _exec(
+            "SELECT tenant_id, channel, source_key, session_id, "
+            "CAST(created_at AS date) AS day, COUNT(*) AS event_count, MAX(id) AS last_event_id "
+            "FROM plugin_memory_event "
+            "WHERE created_at >= :start_at "
+            "AND session_id LIKE '%@chatroom' "
+            "GROUP BY tenant_id, channel, source_key, session_id, CAST(created_at AS date) "
+            "ORDER BY day DESC, event_count DESC "
+            "LIMIT :lim",
+            {
+                "start_at": cutoff,
+                "lim": fetch_limit,
+            },
+        )
+        targets: list[dict[str, Any]] = []
+        merged: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            session_id = str(row.get("session_id") or "").strip()
+            if not _is_group_session_id(session_id):
+                continue
+            day = row.get("day")
+            if hasattr(day, "isoformat"):
+                date_value = day.isoformat()
+            else:
+                date_value = str(day or "")[:10]
+            if not date_value:
+                continue
+            tenant_id = str(row.get("tenant_id") or "").strip()
+            channel = str(row.get("channel") or "").strip() or "wechat"
+            source_key = str(row.get("source_key") or "").strip() or "wxbot"
+            operator_session = await self._operator_group_session_id(
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            key = (tenant_id, channel, source_key, operator_session, date_value)
+            event_count = int(row.get("event_count") or 0)
+            last_event_id = int(row.get("last_event_id") or 0)
+            current = merged.get(key)
+            if current is None:
+                merged[key] = {
+                    "tenant_id": tenant_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "session_id": operator_session,
+                    "date": date_value,
+                    "event_count": event_count,
+                    "last_event_id": last_event_id,
+                }
+                continue
+            current["event_count"] = int(current.get("event_count") or 0) + event_count
+            current["last_event_id"] = max(int(current.get("last_event_id") or 0), last_event_id)
+        targets = list(merged.values())
+        targets.sort(
+            key=lambda item: (str(item.get("date") or ""), int(item.get("event_count") or 0)),
+            reverse=True,
+        )
+        return targets[:effective_max_targets]
+
+    async def _load_group_graph_auto_extract_cursor(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        source_key: str,
+        session_id: str,
+        target_date: str,
+    ) -> int:
+        cursor_key = _group_graph_auto_cursor_key(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_id=session_id,
+            target_date=target_date,
+        )
+        rows = await _exec(
+            "SELECT result_json FROM plugin_memory_extraction_job "
+            "WHERE idempotency_key = :cursor_key LIMIT 1",
+            {"cursor_key": cursor_key},
+        )
+        if not rows:
+            return 0
+        raw_payload = rows[0].get("result_json")
+        payload = (
+            raw_payload
+            if isinstance(raw_payload, dict)
+            else _safe_json_loads(raw_payload, {})
+        )
+        if not isinstance(payload, dict) or payload.get("kind") != "group_graph_auto_cursor":
+            return 0
+        expected_scope = {
+            "tenant_id": tenant_id,
+            "channel": channel,
+            "source_key": source_key,
+            "session_id": session_id,
+            "date": target_date,
+        }
+        if payload.get("scope") != expected_scope:
+            return 0
+        return max(0, _safe_int(payload.get("cursor_event_id"), 0))
+
+    async def _save_group_graph_auto_extract_cursor(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        source_key: str,
+        session_id: str,
+        target_date: str,
+        cursor_event_id: int,
+    ) -> None:
+        cursor = max(0, int(cursor_event_id or 0))
+        cursor_key = _group_graph_auto_cursor_key(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_id=session_id,
+            target_date=target_date,
+        )
+        payload = json.dumps(
+            {
+                "kind": "group_graph_auto_cursor",
+                "version": 1,
+                "scope": {
+                    "tenant_id": tenant_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "session_id": session_id,
+                    "date": target_date,
+                },
+                "cursor_event_id": cursor,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        await _exec(
+            "INSERT INTO plugin_memory_extraction_job "
+            "(tenant_id, channel, source_key, user_id, session_id, source_event_id, "
+            "source_trace_id, status, attempts, max_attempts, next_run_at, result_json, "
+            "idempotency_key, created_at, updated_at) "
+            "VALUES (:tid, :channel, :source_key, :group_uid, :sid, NULL, :trace, "
+            "'succeeded', 0, 1, NOW(), :result_json, :cursor_key, NOW(), NOW()) "
+            "ON CONFLICT (idempotency_key) DO UPDATE SET "
+            "result_json = CASE WHEN COALESCE(NULLIF("
+            "plugin_memory_extraction_job.result_json, '')::jsonb ->> 'cursor_event_id', '0')::bigint "
+            "< :cursor_event_id THEN EXCLUDED.result_json "
+            "ELSE plugin_memory_extraction_job.result_json END, "
+            "status = 'succeeded', locked_until = NULL, locked_by = '', updated_at = NOW()",
+            {
+                "tid": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                "sid": session_id,
+                "trace": cursor_key[:128],
+                "result_json": payload,
+                "cursor_key": cursor_key,
+                "cursor_event_id": cursor,
+            },
+        )
+
+    async def run_group_graph_auto_extract_tick(
+        self,
+        *,
+        lookback_days: int = 7,
+        max_sessions: int = 10,
+        max_windows_per_session: int = 20,
+        window_size: int = 50,
+        time_budget_seconds: int = 180,
+        include_llm: bool = True,
+        sync_missing_history: bool = False,
+        sync_max_messages: int = 200,
+    ) -> dict[str, Any]:
+        effective_time_budget = _clamp_int(
+            time_budget_seconds, 180, minimum=1, maximum=180
+        )
+        skipped: list[dict[str, Any]] = []
+        synced: list[dict[str, Any]] = []
+        if sync_missing_history:
+            known_sessions = await self.list_known_group_graph_sessions(
+                lookback_days=max(lookback_days, 14),
+                max_sessions=max_sessions,
+            )
+            for session in known_sessions:
+                tenant_id = str(session.get("tenant_id") or "")
+                session_id = str(session.get("session_id") or "")
+                if not tenant_id or not session_id:
+                    skipped.append({**session, "reason": "incomplete_scope"})
+                    continue
+                if not await self._group_graph_auto_extract_scope_allowed(tenant_id, session_id):
+                    skipped.append({**session, "reason": "scope_disabled"})
+                    continue
+                try:
+                    backfill = await asyncio.wait_for(
+                        self.backfill_from_sdk(
+                            tenant_id=tenant_id,
+                            channel=str(session.get("channel") or "wechat"),
+                            source_key=str(session.get("source_key") or "wxbot"),
+                            user_id=None,
+                            session_ids=[session_id],
+                            connection_id="legacy-wechat-default",
+                            days_limit=lookback_days,
+                            max_messages_per_session=_clamp_int(
+                                sync_max_messages, 200, minimum=20, maximum=500
+                            ),
+                            enqueue_llm_jobs=bool(include_llm),
+                        ),
+                        timeout=float(effective_time_budget),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "memory.group_graph_auto_extract_sync_failed",
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        error_type=exc.__class__.__name__,
+                        error=_truncate_error(exc),
+                    )
+                    skipped.append(
+                        {
+                            **session,
+                            "reason": "sync_failed",
+                            "error_type": exc.__class__.__name__,
+                        }
+                    )
+                    continue
+                synced.append(
+                    {
+                        **session,
+                        "imported_count": backfill.get("imported_count"),
+                        "events_inserted": backfill.get("events_inserted"),
+                        "ok": backfill.get("ok"),
+                    }
+                )
+        targets = await self.list_imported_group_graph_targets(
+            lookback_days=lookback_days,
+            max_targets=min(
+                200,
+                max(1, int(max_sessions or 10)) * max(1, int(lookback_days or 7)) * 4,
+            ),
+        )
+        results: list[dict[str, Any]] = []
+        attempted = 0
+        for target in targets:
+            tenant_id = str(target.get("tenant_id") or "")
+            session_id = str(target.get("session_id") or "")
+            if not tenant_id or not session_id:
+                skipped.append({**target, "reason": "incomplete_scope"})
+                continue
+            if not await self._group_graph_auto_extract_scope_allowed(tenant_id, session_id):
+                skipped.append({**target, "reason": "scope_disabled"})
+                continue
+            channel = str(target.get("channel") or "wechat")
+            source_key = str(target.get("source_key") or "wxbot")
+            target_date = str(target.get("date") or "")
+            cursor_event_id = await self._load_group_graph_auto_extract_cursor(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                target_date=target_date,
+            )
+            last_event_id = max(0, int(target.get("last_event_id") or 0))
+            if last_event_id > 0 and cursor_event_id >= last_event_id:
+                skipped.append({**target, "reason": "up_to_date"})
+                continue
+            if attempted >= _clamp_int(max_sessions, 10, minimum=1, maximum=20):
+                break
+            attempted += 1
+            try:
+                catchup = await self.run_group_relationship_window_catchup(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    date=target_date,
+                    window_size=window_size,
+                    max_windows_per_run=max_windows_per_session,
+                    cursor_event_id=cursor_event_id,
+                    time_budget_seconds=effective_time_budget,
+                    include_llm=include_llm,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "memory.group_graph_auto_extract_target_failed",
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    date=target.get("date"),
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+                results.append(
+                    {
+                        **target,
+                        "status": "failed",
+                        "error_type": exc.__class__.__name__,
+                    }
+                )
+                continue
+            next_cursor_event_id = max(
+                cursor_event_id,
+                int(catchup.get("next_cursor_event_id") or cursor_event_id),
+            )
+            if next_cursor_event_id > cursor_event_id:
+                await self._save_group_graph_auto_extract_cursor(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    target_date=target_date,
+                    cursor_event_id=next_cursor_event_id,
+                )
+            results.append(
+                {
+                    **target,
+                    "status": str(catchup.get("status") or ""),
+                    "stop_reason": catchup.get("stop_reason"),
+                    "totals": catchup.get("totals") or {},
+                    "more_remain": bool(catchup.get("more_remain")),
+                    "cursor_event_id": cursor_event_id,
+                    "next_cursor_event_id": next_cursor_event_id,
+                }
+            )
+        return {
+            "ok": True,
+            "lookback_days": _clamp_int(lookback_days, 7, minimum=1, maximum=14),
+            "include_llm": bool(include_llm),
+            "sync_missing_history": bool(sync_missing_history),
+            "target_count": len(targets),
+            "ran": len([item for item in results if item.get("status") != "failed"]),
+            "synced": synced,
+            "skipped": skipped,
+            "results": results,
         }
 
     async def sync_memory_graph(

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { apiRequest } from "../lib/api";
@@ -43,9 +44,11 @@ describe("PlaygroundPage", () => {
 
   it("keeps send disabled until a backend-verified group is selected", () => {
     render(
-      <ConsoleConfigProvider>
-        <PlaygroundPage />
-      </ConsoleConfigProvider>,
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ConsoleConfigProvider>
+          <PlaygroundPage />
+        </ConsoleConfigProvider>
+      </MemoryRouter>,
     );
 
     expect(screen.getByRole("heading", { name: "先选择一个已验证群聊" })).toBeInTheDocument();
@@ -61,10 +64,12 @@ describe("PlaygroundPage", () => {
       session_name: "测试群",
     });
     render(
-      <ConsoleConfigProvider>
-        <VerifiedGroupSeed />
-        <PlaygroundPage />
-      </ConsoleConfigProvider>,
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ConsoleConfigProvider>
+          <VerifiedGroupSeed />
+          <PlaygroundPage />
+        </ConsoleConfigProvider>
+      </MemoryRouter>,
     );
 
     const input = screen.getByRole("textbox", { name: /^模拟群消息/ });
@@ -87,5 +92,9 @@ describe("PlaygroundPage", () => {
     expect(options?.init?.body).toBe(JSON.stringify({ message: "@机器人 帮我总结一下" }));
     expect(JSON.stringify(config)).not.toContain("secret");
     expect(await screen.findByText(/已进入消息处理队列/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看这条消息" })).toHaveAttribute(
+      "href",
+      "/queues/traces/trace-1",
+    );
   });
 });

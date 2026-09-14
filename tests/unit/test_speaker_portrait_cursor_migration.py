@@ -34,10 +34,9 @@ def test_speaker_portrait_cursor_upgrade_is_runtime_head(monkeypatch) -> None:
 
     assert migration.revision == "0050_speaker_portrait_cursor"
     assert migration.down_revision == "0049_speaker_portrait_hot_update"
-    assert RUNTIME_SCHEMA_REVISION == migration.revision
-    assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
-        RUNTIME_SCHEMA_REVISION
-    ]
+    assert ScriptDirectory.from_config(Config("alembic.ini")).get_revision(
+        "0051_draw_runtime_config"
+    ).down_revision == migration.revision
     assert "ADD COLUMN IF NOT EXISTS last_distilled_message_at" in rendered
     assert "ADD COLUMN IF NOT EXISTS claimed_pending_messages" in rendered
     assert "CREATE INDEX IF NOT EXISTS idx_speaker_portrait_job_attempt" in rendered

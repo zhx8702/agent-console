@@ -228,3 +228,39 @@ def test_custom_phrase_history_and_identity_disclosure_use_the_real_guard() -> N
     assert always.identity_disclosed is True
     assert "identity_prefix_added" in always.reason_codes
     assert len(always.text) <= 70
+
+
+def test_line_breaks_are_kept_as_sentence_boundaries() -> None:
+    guard = NaturalReplyStyleGuard()
+    result = guard.apply(
+        "是啊\nflutter调ui怎么调都怪\n还是扔给ai写rn得了",
+        deterministic_key="newline-two",
+        eligible=True,
+    )
+
+    assert result.text.splitlines()[0] == "是啊"
+    if result.mode == "one_sentence":
+        assert result.text == "是啊"
+    else:
+        assert "\n" in result.text
+        assert "flutter调ui怎么调都怪" in result.text
+
+
+def test_persona_style_keeps_portrait_cadence_and_line_breaks() -> None:
+    guard = NaturalReplyStyleGuard()
+    text = "第一句完整意思。\n第二句接着说。\n第三句也按画像留下。"
+    result = guard.apply(
+        text,
+        deterministic_key="persona-keep",
+        eligible=True,
+        preserve_persona_style=True,
+    )
+
+    assert result.mode == "persona"
+    assert "第三句也按画像留下。" in result.text
+    assert result.text.splitlines() == [
+        "第一句完整意思。",
+        "第二句接着说。",
+        "第三句也按画像留下。",
+    ]
+    assert "length_shaped" not in result.reason_codes

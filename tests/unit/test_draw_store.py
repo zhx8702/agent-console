@@ -19,6 +19,7 @@ from plugins.draw.store import (
     DrawApiError,
     DrawConfigError,
     DrawResult,
+    DrawRuntimeConfigVersionConflict,
     DrawStore,
     DrawTaskCreate,
     _timestamp_param,
@@ -1135,6 +1136,77 @@ def test_draw_store_stages_image_for_wxbot_delivery(tmp_path) -> None:
     assert staged.read_bytes() == source.read_bytes()
 
 
+def test_draw_store_transcodes_large_png_for_wxbot_delivery(tmp_path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "draw-cache" / "generated.png"
+    outbound = tmp_path / "wxbot-outbound"
+    source.parent.mkdir()
+    Image.new("RGB", (2200, 1800), (30, 80, 140)).save(source, format="PNG")
+    settings = _draw_settings(
+        tmp_path,
+        draw_storage_dir=str(source.parent),
+        wxbot_outbound_file_dir=str(outbound),
+        wxbot_outbound_image_max_bytes=200 * 1024,
+        wxbot_outbound_image_max_edge=640,
+    )
+    store = DrawStore(settings)
+
+    media = store.stage_wxbot_delivery_media(source, "img_png")
+    staged = Path(media.image_path)
+    original = Path(media.original_path)
+
+    assert staged.parent == outbound.resolve()
+    assert staged.suffix == ".jpg"
+    assert staged.stat().st_size <= 200 * 1024
+    assert staged.stat().st_size < source.stat().st_size
+    with Image.open(staged) as image:
+        assert image.format == "JPEG"
+        assert max(image.size) <= 640
+    assert source.read_bytes() != staged.read_bytes()
+    assert media.transcoded is True
+    assert original.parent == outbound.resolve()
+    assert original.suffix == ".png"
+    assert original.name.startswith("pic")
+    assert len(original.name) <= 12
+    assert original.read_bytes() == source.read_bytes()
+    assert media.original_name == original.name
+    zipped = Path(media.file_path)
+    assert zipped.parent == outbound.resolve()
+    assert zipped.suffix == ".zip"
+    assert media.file_name == zipped.name
+    import zipfile
+
+    with zipfile.ZipFile(zipped) as archive:
+        assert archive.namelist() == [original.name]
+        assert archive.read(original.name) == source.read_bytes()
+        assert archive.getinfo(original.name).compress_type == zipfile.ZIP_STORED
+    assert media.original_bytes == source.stat().st_size
+    assert Path(store.stage_for_wxbot_delivery(source, "img_png2")).suffix == ".jpg"
+
+
+def test_draw_store_keeps_small_jpeg_for_wxbot_delivery(tmp_path) -> None:
+    from PIL import Image
+
+    source = tmp_path / "draw-cache" / "generated.jpg"
+    outbound = tmp_path / "wxbot-outbound"
+    source.parent.mkdir()
+    Image.new("RGB", (320, 240), (200, 40, 40)).save(source, format="JPEG", quality=80)
+    original = source.read_bytes()
+    settings = _draw_settings(
+        tmp_path,
+        draw_storage_dir=str(source.parent),
+        wxbot_outbound_file_dir=str(outbound),
+        wxbot_outbound_image_max_bytes=200 * 1024,
+        wxbot_outbound_image_max_edge=640,
+    )
+    store = DrawStore(settings)
+
+    staged = Path(store.stage_for_wxbot_delivery(source, "img_jpg"))
+
+    assert staged.read_bytes() == original
+
+
 @pytest.mark.asyncio
 async def test_draw_store_does_not_forward_api_key_to_cross_origin_image(
     tmp_path,
@@ -1618,3 +1690,92 @@ async def test_draw_store_waits_for_reference_preview_before_thumbnail_fallback(
     assert source_bytes in captured["edit_body"]
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_runtime_url_overlay_disables_env_and_fallback(tmp_path) -> None:
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://airgate.example/v1",
+        draw_api_key="sk-env",
+        draw_fallback_api_url="https://fallback.example/v1",
+        draw_fallback_api_key="sk-fallback",
+    )
+    store = DrawStore(settings)
+    store._runtime_overrides = {"draw_api_url": ""}
+
+    with pytest.raises(DrawConfigError, match="DRAW_API_URL"):
+        await store.generate_image("停用后不应出图", trace_id="trace-disabled")
+
+    document = store.runtime_config_document(overrides={"draw_api_url": ""})
+    assert document["enabled"] is False
+    assert document["api_url"] == ""
+    assert "sk-env" not in json.dumps(document, ensure_ascii=False)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_overlay_url_and_key_win_over_environment(
+    draw_task_store,
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("authorization", "")
+        return httpx.Response(
+            200,
+            content=b"\x89PNG\r\n\x1a\nfake-png",
+            headers={"content-type": "image/png"},
+        )
+
+    draw_task_store.settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://airgate.example/v1",
+        draw_api_key="sk-env-secret",
+        draw_api_model="env-model",
+        app_env="test",
+    )
+    draw_task_store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+
+    before = await draw_task_store.get_runtime_config()
+    assert before.version == 0
+    snapshot = await draw_task_store.set_runtime_config(
+        expected_version=0,
+        updates={
+            "draw_api_url": "https://live.example/v1",
+            "draw_api_key": "sk-live-key",
+            "draw_api_model": "grok-imagine-image",
+        },
+        updated_by="admin",
+    )
+    assert snapshot.version == 1
+    document = draw_task_store.runtime_config_document(snapshot)
+    assert document["enabled"] is True
+    assert document["api_url"] == "https://live.example/v1"
+    assert document["api_key_configured"] is True
+    assert document["api_key_hint"] == "-key"
+    assert "sk-live-key" not in json.dumps(document, ensure_ascii=False)
+    assert "sk-env-secret" not in json.dumps(document, ensure_ascii=False)
+
+    await draw_task_store.generate_image("覆盖后应走新地址", trace_id="trace-overlay")
+    assert captured["url"] == "https://live.example/v1/images/generations"
+    assert captured["authorization"] == "Bearer sk-live-key"
+
+    with pytest.raises(DrawRuntimeConfigVersionConflict):
+        await draw_task_store.set_runtime_config(
+            expected_version=0,
+            updates={"draw_api_url": ""},
+            updated_by="admin",
+        )
+
+    disabled = await draw_task_store.set_runtime_config(
+        expected_version=1,
+        updates={"draw_api_url": ""},
+        updated_by="admin",
+    )
+    assert disabled.version == 2
+    assert draw_task_store.runtime_config_document(disabled)["enabled"] is False
+    with pytest.raises(DrawConfigError, match="DRAW_API_URL"):
+        await draw_task_store.generate_image("停用后不应出图", trace_id="trace-overlay-off")

@@ -12,6 +12,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { useWxbotAgentAdmin } from "./useWxbotAgentAdmin";
 import { useWxbotEventAdmin } from "./useWxbotEventAdmin";
+import { useWxbotGroupWebhookAdmin } from "./useWxbotGroupWebhookAdmin";
 import { useWxbotQueueAdmin } from "./useWxbotQueueAdmin";
 
 import { BridgeStatus, GlobalReplyPolicy, GroupActivityConfig, GroupActivityDecision, GroupActivityEvent, GroupParticipationPolicy, QueueStats, ReplyPolicy, ReplyPolicyAggregate, ReportMessagesPayload, ReportPreview, ReportSubscription, ReportType, SdkTriggerDebugConfig, SelfReviewJob, SelfReviewPreview, SelfReviewPublishResult, SelfReviewSubscription, SessionStateSnapshot, WxbotSession, WxbotTab, createDefaultGroupActivityConfig, groupActivityValidationError, isGroupSession, normalizeGroupActivityConfig, normalizeGroupParticipationPolicy, normalizeGroupReplyMode, normalizeSessionReplyMode, readWxbotTabFromLocation, resolveExplicitVerifiedGroupSessionId, sessionDisplayName } from "./model";
@@ -299,6 +300,12 @@ const eventAdmin = useWxbotEventAdmin({
     effectiveGroupSessionId,
     groupSessions,
     keyFor,
+  });
+
+const webhookAdmin = useWxbotGroupWebhookAdmin({
+    activeTab,
+    config,
+    groupSessions,
   });
 
 const refresh = useCallback(async () => {
@@ -1710,6 +1717,7 @@ const selectTab = (tab: WxbotTab) => {
     ...agentAdmin,
     ...eventAdmin,
     ...queueAdmin,
+    ...webhookAdmin,
     actionOutput,
     activeTab,
     adminConfigDirty,

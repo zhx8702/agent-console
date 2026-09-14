@@ -59,6 +59,7 @@ from plugins.draw.hooks import (
     build_draw_command_definitions,
     drain_queued_draw_tasks,
     recover_stale_draw_tasks,
+    send_channel_draw_picture,
 )
 from plugins.draw.router import build_draw_router
 from plugins.draw.store import (
@@ -67,6 +68,7 @@ from plugins.draw.store import (
     DrawConfigError,
     DrawResult,
     DrawTaskRecord,
+    WxbotDeliveryMedia,
 )
 
 
@@ -689,6 +691,8 @@ class _FakeChannelOutbound:
         self.calls: list[dict[str, object]] = []
         self.fail_send_text = False
         self.fail_send_image = False
+        self.fail_send_file = False
+        self.suppress_send_file = False
 
     async def get_session_policy(self, target: ChannelTarget) -> dict[str, object]:
         return {
@@ -750,6 +754,31 @@ class _FakeChannelOutbound:
             }
         )
         return ChannelSendResult(provider="fake")
+
+    async def send_file(
+        self,
+        target: ChannelTarget,
+        file,
+        options: ChannelSendOptions | None = None,
+    ) -> ChannelSendResult:
+        if self.fail_send_file:
+            raise RuntimeError("send file failed")
+        if self.suppress_send_file:
+            return ChannelSendResult(
+                provider="fake",
+                metadata={"suppressed": True, "reason": "group_file_send_disabled"},
+            )
+        self.calls.append(
+            {
+                "msg_type": "file",
+                "file_path": file.file_path,
+                "file_name": file.file_name,
+                "file_size": file.file_size,
+                "target": target,
+                "options": options,
+            }
+        )
+        return ChannelSendResult(message_id="file-1", provider="fake")
 
 
 class _BlockingImageAckOutbound(_FakeChannelOutbound):
@@ -3474,3 +3503,104 @@ async def test_draw_agent_tool_failure_releases_billing_reservation() -> None:
     assert len(outbound.calls) == 1
     assert outbound.calls[0]["msg_type"] == "text"
     assert outbound.calls[0]["reply_text"] == DRAW_API_ERROR_TEXT
+
+
+@pytest.mark.asyncio
+async def test_send_channel_draw_picture_sends_original_file_when_transcoded() -> None:
+    outbound = _FakeChannelOutbound()
+    target = ChannelTarget(
+        tenant_id="demo",
+        channel="wechat",
+        session_id="room@chatroom",
+    )
+
+    await send_channel_draw_picture(
+        outbound,
+        target,
+        image_path="/data/wxbot-outbound/draw.jpg",
+        delivery_media=WxbotDeliveryMedia(
+            image_path="/data/wxbot-outbound/draw.jpg",
+            original_path="/data/wxbot-outbound/pic2d27.png",
+            original_name="pic2d27.png",
+            file_path="/data/wxbot-outbound/pic2d27.zip",
+            file_name="pic2d27.zip",
+            transcoded=True,
+            original_bytes=4_792_533,
+        ),
+        trace_id="trace-file",
+        source_message={"prompt": "x"},
+        command_id="channel-reply:demo:trace-file:draw-image",
+        file_command_id="channel-reply:demo:trace-file:draw-file",
+        delivery_contract={},
+    )
+
+    assert [call["msg_type"] for call in outbound.calls] == ["file"]
+    assert outbound.calls[0]["file_path"] == "/data/wxbot-outbound/pic2d27.zip"
+    assert outbound.calls[0]["file_name"] == "pic2d27.zip"
+
+
+@pytest.mark.asyncio
+async def test_send_channel_draw_picture_falls_back_to_jpeg_when_file_denied() -> None:
+    outbound = _FakeChannelOutbound()
+    outbound.suppress_send_file = True
+    target = ChannelTarget(
+        tenant_id="demo",
+        channel="wechat",
+        session_id="room@chatroom",
+    )
+
+    await send_channel_draw_picture(
+        outbound,
+        target,
+        image_path="/data/wxbot-outbound/draw.jpg",
+        delivery_media=WxbotDeliveryMedia(
+            image_path="/data/wxbot-outbound/draw.jpg",
+            original_path="/data/wxbot-outbound/draw_orig.png",
+            original_name="generated.png",
+            transcoded=True,
+            original_bytes=4_792_533,
+        ),
+        trace_id="trace-file",
+        source_message={"prompt": "x"},
+        command_id="channel-reply:demo:trace-file:draw-image",
+        file_command_id="channel-reply:demo:trace-file:draw-file",
+        delivery_contract={},
+    )
+
+    assert [call["msg_type"] for call in outbound.calls] == ["image"]
+    assert outbound.calls[0]["image_path"] == "/data/wxbot-outbound/draw.jpg"
+
+
+@pytest.mark.asyncio
+async def test_draw_agent_tool_sends_original_file_when_image_is_transcoded() -> None:
+    draw_store = _FakeDrawStore()
+    draw_store.stage_wxbot_delivery_media = (  # type: ignore[method-assign]
+        lambda image_path, image_id="": WxbotDeliveryMedia(
+            image_path="/data/wxbot-outbound/draw.jpg",
+            original_path="/data/wxbot-outbound/pic2d27.png",
+            original_name="pic2d27.png",
+            file_path="/data/wxbot-outbound/pic2d27.zip",
+            file_name="pic2d27.zip",
+            transcoded=True,
+            original_bytes=4_792_533,
+        )
+    )
+    outbound = _FakeChannelOutbound()
+    spawned: list[asyncio.Task[None]] = []
+    service = DrawAgentToolService(
+        store=draw_store,
+        channel_registry=_fake_channel_registry(outbound),
+        register_background_task=spawned.append,
+        scope_execution_allowed=_allow_draw_scope,
+    )
+
+    result = await service.generate_group_image(
+        _agent_session(),
+        {"prompt": "一只戴墨镜的橘猫"},
+    )
+    assert result["accepted"] is True
+    await spawned[0]
+
+    assert [call["msg_type"] for call in outbound.calls] == ["text", "file"]
+    assert outbound.calls[1]["file_path"] == "/data/wxbot-outbound/pic2d27.zip"
+    assert outbound.calls[1]["file_name"] == "pic2d27.zip"

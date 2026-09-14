@@ -1222,6 +1222,7 @@ class SocialPolicyStore:
         reason: str | None = None,
         runtime_stage: str | None = None,
         delivery_stage: str | None = None,
+        trace_id: str | None = None,
     ) -> ParticipationEventPage:
         statement = select(SocialParticipationEventRow).where(
             SocialParticipationEventRow.tenant_id == tenant_id,
@@ -1264,6 +1265,10 @@ class SocialPolicyStore:
         if delivery_stage:
             statement = statement.where(
                 SocialParticipationEventRow.delivery_stage == delivery_stage
+            )
+        if trace_id:
+            statement = statement.where(
+                SocialParticipationEventRow.trace_id == trace_id
             )
         fetch_limit = max(1, min(int(limit or 50), 200))
         statement = statement.order_by(
