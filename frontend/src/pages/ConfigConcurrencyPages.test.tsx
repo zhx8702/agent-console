@@ -1,5 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -160,7 +161,11 @@ describe("versioned plugin configuration pages", () => {
       throw new Error(`unexpected versioned request: ${path}`);
     });
 
-    render(<ModerationPage />);
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ModerationPage />
+      </MemoryRouter>,
+    );
     const reminder = await screen.findByLabelText("提醒文案");
     await waitFor(() => expect(reminder).toBeEnabled());
     expect(reminder).toHaveValue("原提醒");
@@ -222,7 +227,11 @@ describe("versioned plugin configuration pages", () => {
       throw new Error(`unexpected versioned request: ${path}`);
     });
 
-    render(<ModerationPage />);
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ModerationPage />
+      </MemoryRouter>,
+    );
     await screen.findAllByText("alpha");
     await user.click(screen.getByRole("button", { name: "删除" }));
     const dialog = screen.getByRole("dialog", { name: "删除关键词“alpha”" });

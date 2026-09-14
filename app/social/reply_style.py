@@ -80,6 +80,7 @@ class NaturalReplyStyleGuard:
         explicitly_detailed: bool | None = None,
         history: ReplyStyleHistory | None = None,
         voice_profile: Mapping[str, Any] | None = None,
+        preserve_persona_style: bool = False,
     ) -> ReplyStyleResult:
         original = str(text or "")
         if not eligible or not original.strip():
@@ -102,7 +103,13 @@ class NaturalReplyStyleGuard:
         profile_phrases = _profile_phrase_preferences(profile)
         verbosity = str(profile.get("verbosity") or "concise").strip().lower()
         bucket = _bucket(deterministic_key, "length", 100)
-        if (
+        if preserve_persona_style:
+            # Distilled group portraits already own cadence and line breaks.
+            # Length shaping here would flatten them into a generic one-liner.
+            mode = "persona"
+            sentence_limit = 0
+            char_limit = 0
+        elif (
             verbosity == "terse"
             or (verbosity == "concise" and bucket < 65)
             or (verbosity == "balanced" and bucket < 35)
@@ -276,10 +283,21 @@ def _flatten_list(text: str) -> str:
     return "；".join(parts) + ("。" if parts else "")
 
 
-def _limit_sentences(text: str, count: int, char_limit: int) -> str:
+def _split_sentences(text: str) -> list[str]:
     value = _normalize_spacing(text)
-    sentences = [part.strip() for part in _SENTENCE_SPLIT_RE.split(value) if part.strip()]
-    selected = "".join(sentences[:count]) if sentences else value
+    parts: list[str] = []
+    for block in value.split("\n"):
+        block = block.strip()
+        if not block:
+            continue
+        sentences = [part.strip() for part in _SENTENCE_SPLIT_RE.split(block) if part.strip()]
+        parts.extend(sentences or [block])
+    return parts
+
+
+def _limit_sentences(text: str, count: int, char_limit: int) -> str:
+    sentences = _split_sentences(text)
+    selected = "\n".join(sentences[:count]) if sentences else _normalize_spacing(text)
     if len(selected) <= char_limit:
         return selected
     # Only soft, non-factual replies reach this guard. Prefer a nearby natural
@@ -288,7 +306,7 @@ def _limit_sentences(text: str, count: int, char_limit: int) -> str:
     prefix = selected[: max(1, char_limit - 1)]
     minimum_boundary = max(1, int(char_limit * 0.6))
     boundary = max(
-        (prefix.rfind(marker) for marker in "，、；;：:,. "),
+        (prefix.rfind(marker) for marker in "\n，、；;：:,. "),
         default=-1,
     )
     if boundary >= minimum_boundary:
@@ -305,7 +323,9 @@ def _bounded_float(value: Any, *, default: float, maximum: float = 1.0) -> float
 
 
 def _normalize_spacing(text: str) -> str:
-    value = re.sub(r"[ \t]+", " ", str(text or ""))
-    value = re.sub(r"\s*\n\s*", "", value)
-    value = re.sub(r"\s+([，。！？；：,.!?;:])", r"\1", value)
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"[ \t]*\n[ \t]*", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", value)
     return value.strip()

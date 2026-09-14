@@ -75,6 +75,7 @@ describe("application routes and shell accessibility", () => {
       groupScoped: false,
     });
     expect(routeTitleForPath("/wxbot")).toBe("微信扩展控制台");
+    expect(routeTitleForPath("/queues/traces/trace-1")).toBe("这条消息");
     expect(routeMetadataForPath("/queues")).toMatchObject({
       domain: "系统运维",
       groupScoped: false,

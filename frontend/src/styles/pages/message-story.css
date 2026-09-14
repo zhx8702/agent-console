@@ -1,0 +1,144 @@
+.message-story-page {
+  align-content: start;
+}
+
+.message-story-panel {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.message-story-verdict {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  align-items: flex-start;
+  padding: var(--space-5);
+  border: 1px solid var(--line);
+  background: var(--panel-alt);
+}
+
+.message-story-verdict.is-ok {
+  border-color: var(--tone-success-border);
+  background: var(--tone-success-bg);
+}
+
+.message-story-verdict.is-danger {
+  border-color: var(--tone-danger-border);
+  background: var(--tone-danger-bg);
+}
+
+.message-story-verdict.is-warning {
+  border-color: var(--tone-warning-border);
+  background: var(--tone-warning-bg);
+}
+
+.message-story-verdict h2 {
+  margin: var(--space-1) 0 var(--space-2);
+  font-size: var(--font-size-xl);
+}
+
+.message-story-verdict-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+.message-story-speech {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+}
+
+.message-story-bubble {
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.message-story-bubble h3,
+.message-story-reason h3,
+.message-story-timeline h3 {
+  margin: var(--space-1) 0 var(--space-3);
+  font-size: var(--font-size-lg);
+}
+
+.message-story-copy {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-base);
+  line-height: 1.65;
+}
+
+.message-story-bubble.is-bot {
+  border-color: var(--tone-accent-border);
+  background: var(--tone-accent-bg);
+}
+
+.message-story-reason,
+.message-story-timeline {
+  padding-top: var(--space-1);
+}
+
+.message-story-reason p {
+  margin: 0;
+}
+
+.message-story-timeline-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0;
+}
+
+.message-story-timeline-item {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--line-light);
+}
+
+.message-story-timeline-item:first-child {
+  border-top: 0;
+}
+
+.message-story-timeline-item time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.message-story-timeline-item p {
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+}
+
+.message-story-timeline-item.is-danger strong {
+  color: var(--tone-danger-text);
+}
+
+.message-story-advanced {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  align-items: center;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line-light);
+}
+
+@media (max-width: 820px) {
+  .message-story-verdict,
+  .message-story-speech,
+  .message-story-timeline-item,
+  .message-story-advanced {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .message-story-verdict-pills,
+  .message-story-advanced {
+    justify-content: flex-start;
+  }
+}

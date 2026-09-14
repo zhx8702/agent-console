@@ -79,7 +79,7 @@ describe("scoped domain pages with HttpOnly authentication", () => {
     await waitFor(() => expect(action).toBeEnabled());
     const writeCall = apiRequestMock.mock.calls.find(([, path]) => path === "/plugins/memory/group-graph/extract-daily");
     expect(writeCall?.[2]?.auth).toBe(true);
-    expect((writeCall?.[2]?.init?.headers as Record<string, string>)["Idempotency-Key"]).toMatch(/^agent-console:/);
+    expect((writeCall?.[2]?.init?.headers as Record<string, string>)["Idempotency-Key"]).toBeUndefined();
     unmount();
   });
 

@@ -269,18 +269,18 @@ def test_must_reply_revalidation_cancels_only_tied_answer_or_supersession() -> N
     assert superseded.reason_codes[-1] == "obligation_superseded_before_send"
 
 
-def test_must_reply_waits_for_a_human_turn_before_third_bot_message() -> None:
+def test_must_reply_is_not_deferred_by_consecutive_bot_limit() -> None:
     service = SocialParticipationService()
     decision = ParticipationDecision(
         status=ParticipationStatus.MUST_REPLY,
         score=85,
         reason_codes=("direct_mention",),
     )
-    policy = ParticipationPolicy(max_consecutive_bot_messages=2)
+    policy = ParticipationPolicy(max_consecutive_bot_messages=1)
 
-    waiting = service.revalidate(
+    after_bot_run = service.revalidate(
         decision,
-        _ctx(consecutive_bot_messages=2),
+        _ctx(consecutive_bot_messages=4),
         policy,
     )
     after_human = service.revalidate(
@@ -289,10 +289,8 @@ def test_must_reply_waits_for_a_human_turn_before_third_bot_message() -> None:
         policy,
     )
 
-    assert waiting.status == ParticipationStatus.DEFER
-    assert waiting.not_before == NOW + timedelta(seconds=45)
-    assert waiting.expires_at == datetime.max.replace(tzinfo=UTC)
-    assert waiting.reason_codes[-1] == "obligation_waiting_for_human_turn"
+    assert after_bot_run.status == ParticipationStatus.MUST_REPLY
+    assert after_bot_run.reason_codes == ("direct_mention",)
     assert after_human.status == ParticipationStatus.MUST_REPLY
 
 

@@ -376,25 +376,6 @@ class SocialParticipationService:
                         "obligation_superseded_before_send",
                     ),
                 )
-            if (
-                active_policy.max_consecutive_bot_messages > 0
-                and context.consecutive_bot_messages
-                >= active_policy.max_consecutive_bot_messages
-            ):
-                return replace(
-                    decision,
-                    status=ParticipationStatus.DEFER,
-                    not_before=now + timedelta(seconds=45),
-                    # Keep the obligation durable while waiting for a human
-                    # turn to break the bot-message run.  Each send attempt is
-                    # still fenced by policy version, kill switch, self-send,
-                    # answer and supersession checks.
-                    expires_at=datetime.max.replace(tzinfo=UTC),
-                    reason_codes=(
-                        *decision.reason_codes,
-                        "obligation_waiting_for_human_turn",
-                    ),
-                )
         if (
             decision.status is not ParticipationStatus.MUST_REPLY
             and context.valid_member_answer_exists

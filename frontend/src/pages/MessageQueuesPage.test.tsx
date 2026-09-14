@@ -21,6 +21,7 @@ vi.mock("../components/AuthenticatedImage", () => ({
     alt: string;
     className: string;
   }) => <img src={source} alt={alt} className={className} data-media-source={source} />,
+  mediaStableKey: (source: string) => source,
   sdkImageProxyPath: (source: string) =>
     source.startsWith("media:") ? `/plugins/wxbot/admin/images/${source.slice(6)}` : "",
   sdkImageDisplayPath: (source: string) =>
@@ -177,6 +178,10 @@ describe("MessageQueuesPage live browser", () => {
 
     const inspector = await screen.findByRole("complementary");
     expect(within(inspector).getByText("第一条自动展示")).toBeInTheDocument();
+    expect(within(inspector).getByRole("link", { name: "查看这条消息" })).toHaveAttribute(
+      "href",
+      "/queues/traces/trace-300-0",
+    );
     const secondCard = screen.getByRole("button", { name: /选择消息 2：第二条无需点查看按钮/ });
     await user.click(secondCard);
     expect(within(inspector).getByText("第二条无需点查看按钮")).toBeInTheDocument();

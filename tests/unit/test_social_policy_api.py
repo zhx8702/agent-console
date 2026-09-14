@@ -674,6 +674,7 @@ async def test_event_api_filters_exact_reason_and_paginates_with_cursor(social_a
                         score=65,
                         reason_codes_json=["quiet_hours_at_send"],
                         signal_summary_json={"quiet": True},
+                        trace_id="trace-quiet-send",
                     ),
                     SocialParticipationEventRow(
                         id="event-2",
@@ -687,6 +688,7 @@ async def test_event_api_filters_exact_reason_and_paginates_with_cursor(social_a
                         score=65,
                         reason_codes_json=["quiet_hours"],
                         signal_summary_json={"quiet": True},
+                        trace_id="trace-quiet-decision",
                     ),
                     SocialParticipationEventRow(
                         id="event-3",
@@ -709,8 +711,10 @@ async def test_event_api_filters_exact_reason_and_paginates_with_cursor(social_a
     )
     first = await client.get(base, params={"limit": 1})
 
+    by_trace = await client.get(base, params={"trace_id": "trace-quiet-decision"})
     assert [item["event_id"] for item in exact.json()["items"]] == ["event-2"]
     assert [item["event_id"] for item in stage.json()["items"]] == ["event-1"]
+    assert [item["event_id"] for item in by_trace.json()["items"]] == ["event-2"]
     assert len(first.json()["items"]) == 1
     assert first.json()["next_cursor"]
     second = await client.get(

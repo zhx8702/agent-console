@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 
 import { GroupScopeEmpty } from "../components/GroupScopeEmpty";
 import { OutputPanel } from "../components/OutputPanel";
@@ -10,6 +11,7 @@ import {
   requireSelectedGroup,
   useConsoleConfig,
 } from "../state/console-config";
+import { messageStoryPath } from "./message-story/path";
 
 type SimulationResponse = {
   status: "accepted";
@@ -25,6 +27,7 @@ export function PlaygroundPage() {
   const [message, setMessage] = useState("");
   const [output, setOutput] = useState('{\n  "status": "waiting"\n}');
   const [sending, setSending] = useState(false);
+  const [lastTraceId, setLastTraceId] = useState("");
 
   const selectedGroupIsVerified = Boolean(
     config.sessionId && verifiedGroupIds.has(config.sessionId),
@@ -71,6 +74,7 @@ export function PlaygroundPage() {
           },
         },
       );
+      setLastTraceId(result.trace_id);
       setOutput(
         formatJson({
           status: "已进入消息处理队列",
@@ -132,6 +136,11 @@ export function PlaygroundPage() {
           >
             {sending ? "正在进入队列…" : "发送模拟消息"}
           </button>
+          {lastTraceId ? (
+            <Link className="button button-secondary" to={messageStoryPath(lastTraceId)}>
+              查看这条消息
+            </Link>
+          ) : null}
         </div>
         <OutputPanel flush title="处理结果（技术详情）" value={output} />
       </section>

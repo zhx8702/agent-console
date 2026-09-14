@@ -534,6 +534,10 @@ def build_social_admin_router(
             str | None,
             Query(max_length=32, pattern=r"^[a-z0-9_.\-]+$"),
         ] = None,
+        trace_id: Annotated[
+            str | None,
+            Query(max_length=128, pattern=r"^[A-Za-z0-9_.:\-]+$"),
+        ] = None,
     ) -> ParticipationEventPage:
         _require_tenant(principal, tenant)
         try:
@@ -549,6 +553,7 @@ def build_social_admin_router(
                 reason=reason,
                 runtime_stage=runtime_stage,
                 delivery_stage=delivery_stage,
+                trace_id=trace_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="invalid_cursor") from exc

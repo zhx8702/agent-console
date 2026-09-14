@@ -2,6 +2,7 @@ import axe from "axe-core";
 import { useEffect, type PropsWithChildren } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -211,6 +212,7 @@ function VerifiedGroupBootstrap({ children }: PropsWithChildren) {
 
 function renderPage({ selected = true }: { selected?: boolean } = {}) {
   return render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
     <ConsoleConfigProvider>
       {selected ? (
         <VerifiedGroupBootstrap>
@@ -223,7 +225,8 @@ function renderPage({ selected = true }: { selected?: boolean } = {}) {
           <GroupBehaviorPage />
         </main>
       )}
-    </ConsoleConfigProvider>,
+    </ConsoleConfigProvider>
+    </MemoryRouter>,
   );
 }
 
