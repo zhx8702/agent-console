@@ -359,6 +359,8 @@ export type TraceReplyQueueItem = {
   created_at?: string;
   queued_at?: string;
   sent_at?: string;
+  source_message?: Record<string, unknown>;
+  participation_status?: string;
 };
 
 export type TraceAggregate = {
@@ -503,6 +505,8 @@ const PLUGIN_RUNTIME_FIELD_LABELS: Record<string, string> = {
   api_url_configured: "接口地址",
   api_key_configured: "API 密钥",
   configured: "接口配置",
+  api_host: "接口主机",
+  api_model: "绘图模型",
   fallback_configured: "备用接口",
   scheduler_enabled: "调度器",
   running: "运行中",

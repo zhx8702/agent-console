@@ -11,6 +11,7 @@ import {
   wxbotMessageTypeLabel,
   wxbotQueueStatusLabel,
 } from "./model";
+import { messageStoryPath } from "../message-story/path";
 
 export function WxbotSendTab({ controller }: { controller: WxbotPageController }) {
   const {
@@ -117,7 +118,15 @@ export function WxbotSendTab({ controller }: { controller: WxbotPageController }
                       <td className="mono">{item.reply_to_msg_svr_id || "-"}</td>
                       <td>{wxbotMessageTypeLabel(item.msg_type || "text")}</td>
                       <td className="mono">{item.file_name || item.reply_text || item.media_id || "-"}</td>
-                      <td className="mono">{item.trace_id || "-"}</td>
+                      <td className="mono">
+                        {item.trace_id ? (
+                          <Link className="link-button" to={messageStoryPath(item.trace_id)}>
+                            查看这条消息
+                          </Link>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
                       <td className="mono">{replyParticipationSummary(item)}</td>
                       <td>{wxbotQueueStatusLabel(item.status)}</td>
                       <td>{formatDateValue(item.created_at)}</td>

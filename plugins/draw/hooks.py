@@ -5,12 +5,19 @@ import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urljoin
 from uuid import uuid4
 
 from app.billing import BillingCoordinator, BillingReservation
-from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, ChannelTarget
+from app.channel import (
+    ChannelFile,
+    ChannelMedia,
+    ChannelRegistry,
+    ChannelSendOptions,
+    ChannelTarget,
+)
 from app.commands import CommandDefinition
 from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
@@ -35,6 +42,7 @@ from plugins.draw.store import (
     DrawStore,
     DrawTaskCreate,
     DrawTaskRecord,
+    WxbotDeliveryMedia,
     normalize_draw_quality,
 )
 
@@ -1000,6 +1008,112 @@ def _ensure_draw_storage_ready(store: DrawStore) -> None:
     ensure_storage_dir()
 
 
+def _channel_send_accepted(result: object) -> bool:
+    metadata = getattr(result, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get("suppressed"):
+        return False
+    return True
+
+
+async def send_channel_draw_picture(
+    outbound: Any,
+    target: ChannelTarget,
+    *,
+    image_path: str,
+    image_url: str = "",
+    delivery_media: WxbotDeliveryMedia | None = None,
+    trace_id: str,
+    source_message: dict[str, Any],
+    command_id: str,
+    file_command_id: str = "",
+    delivery_contract: dict[str, Any],
+) -> None:
+    if await _try_send_original_draw_file(
+        outbound,
+        target,
+        delivery_media=delivery_media,
+        trace_id=trace_id,
+        source_message=source_message,
+        command_id=file_command_id or command_id,
+        delivery_contract=delivery_contract,
+    ):
+        return
+    clean_image_url = image_url.strip()
+    await outbound.send_image(
+        target,
+        ChannelMedia(
+            image_path="" if clean_image_url else image_path.strip(),
+            image_url=clean_image_url,
+        ),
+        ChannelSendOptions(
+            trace_id=trace_id,
+            source_message=source_message,
+            idempotency_key=command_id,
+            delivery_metadata={
+                "command_id": command_id,
+                "idempotency_key": command_id,
+                **delivery_contract,
+            },
+        ),
+    )
+
+
+async def _try_send_original_draw_file(
+    outbound: Any,
+    target: ChannelTarget,
+    *,
+    delivery_media: WxbotDeliveryMedia | None,
+    trace_id: str,
+    source_message: dict[str, Any],
+    command_id: str,
+    delivery_contract: dict[str, Any],
+) -> bool:
+    if delivery_media is None or not delivery_media.transcoded:
+        return False
+    send_path = str(
+        delivery_media.file_path or delivery_media.original_path or ""
+    ).strip()
+    if not send_path:
+        return False
+    send_file = getattr(outbound, "send_file", None)
+    if not callable(send_file):
+        return False
+    send_name = str(
+        delivery_media.file_name or delivery_media.original_name or ""
+    ).strip() or Path(send_path).name
+    result = await send_file(
+        target,
+        ChannelFile(
+            file_path=send_path,
+            file_name=send_name,
+        ),
+        ChannelSendOptions(
+            trace_id=trace_id,
+            source_message=source_message,
+            idempotency_key=command_id,
+            delivery_metadata={
+                "command_id": command_id,
+                "idempotency_key": command_id,
+                **delivery_contract,
+            },
+        ),
+    )
+    if _channel_send_accepted(result):
+        logger.info(
+            "draw.original_file_sent",
+            file_name=send_name,
+            original_bytes=delivery_media.original_bytes,
+        )
+        return True
+    metadata = getattr(result, "metadata", None)
+    logger.info(
+        "draw.original_file_fallback_to_jpeg",
+        reason=(metadata.get("reason") if isinstance(metadata, dict) else ""),
+        file_name=send_name,
+    )
+    return False
+
+
 async def _send_channel_draw_messages(
     channel_registry: ChannelRegistry,
     task_ctx: DrawTaskContext,
@@ -1007,6 +1121,7 @@ async def _send_channel_draw_messages(
     text: str,
     image_path: str = "",
     image_url: str = "",
+    delivery_media: WxbotDeliveryMedia | None = None,
     idempotency_suffix: str = "",
     scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None = None,
 ) -> None:
@@ -1045,23 +1160,21 @@ async def _send_channel_draw_messages(
             raise _DrawScopeExecutionDenied("draw callback image scope denied")
         command_id = f"channel-reply:{target.tenant_id}:{task_ctx.original_message_id or task_ctx.request_id}:draw-image"
         command_id = f"{command_id}:{idempotency_suffix}" if idempotency_suffix else command_id
-        clean_image_url = image_url.strip()
-        await outbound.send_image(
+        file_command_id = f"channel-reply:{target.tenant_id}:{task_ctx.original_message_id or task_ctx.request_id}:draw-file"
+        file_command_id = (
+            f"{file_command_id}:{idempotency_suffix}" if idempotency_suffix else file_command_id
+        )
+        await send_channel_draw_picture(
+            outbound,
             target,
-            ChannelMedia(
-                image_path="" if clean_image_url else image_path.strip(),
-                image_url=clean_image_url,
-            ),
-            ChannelSendOptions(
-                trace_id=task_ctx.trace_id,
-                source_message=source_message,
-                idempotency_key=command_id,
-                delivery_metadata={
-                    "command_id": command_id,
-                    "idempotency_key": command_id,
-                    **delivery_contract,
-                },
-            ),
+            image_path=image_path,
+            image_url=image_url,
+            delivery_media=delivery_media,
+            trace_id=task_ctx.trace_id,
+            source_message=source_message,
+            command_id=command_id,
+            file_command_id=file_command_id,
+            delivery_contract=delivery_contract,
         )
 
 
@@ -1094,14 +1207,24 @@ async def _send_task_callback_once(
         )
         return False
 
+    delivery_media: WxbotDeliveryMedia | None = None
     if image_path.strip() and task_ctx.target.channel == Channel.WECHAT.value:
-        stage_for_delivery = getattr(store, "stage_for_wxbot_delivery", None)
-        if callable(stage_for_delivery):
-            image_path = stage_for_delivery(
+        stage_media = getattr(store, "stage_wxbot_delivery_media", None)
+        if callable(stage_media):
+            delivery_media = stage_media(
                 image_path,
                 task_ctx.task_id or task_ctx.trace_id,
             )
+            image_path = delivery_media.image_path
             image_url = ""
+        else:
+            stage_for_delivery = getattr(store, "stage_for_wxbot_delivery", None)
+            if callable(stage_for_delivery):
+                image_path = stage_for_delivery(
+                    image_path,
+                    task_ctx.task_id or task_ctx.trace_id,
+                )
+                image_url = ""
 
     async def _claim_send_and_ack() -> bool:
         claimed_callback = False
@@ -1134,6 +1257,7 @@ async def _send_task_callback_once(
                 text=text,
                 image_path=image_path,
                 image_url=image_url,
+                delivery_media=delivery_media,
                 idempotency_suffix=stable_suffix if force else "",
                 scope_execution_allowed=scope_execution_allowed,
             )

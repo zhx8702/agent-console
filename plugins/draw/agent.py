@@ -7,7 +7,7 @@ from typing import Any
 from app.agent.registry import AgentToolDefinition
 from app.agent.scopes import GROUP_DRAW_GENERATION_SCOPE
 from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
-from app.channel import ChannelMedia, ChannelRegistry, ChannelSendOptions, ChannelTarget
+from app.channel import ChannelRegistry, ChannelSendOptions, ChannelTarget
 from app.common.context import get_trace_id
 from app.common.ids import new_trace_id
 from app.common.intent_runtime import decision_from_session
@@ -25,6 +25,7 @@ from plugins.draw.hooks import (
     _finish_persistent_operation,
     _resolve_draw_public_url,
     _resolve_persistent_operation,
+    send_channel_draw_picture,
 )
 from plugins.draw.store import (
     DRAW_DEFAULT_QUALITY,
@@ -32,6 +33,7 @@ from plugins.draw.store import (
     DrawApiError,
     DrawConfigError,
     DrawStore,
+    WxbotDeliveryMedia,
     normalize_draw_quality,
 )
 
@@ -228,16 +230,26 @@ class DrawAgentToolService:
             )
             delivery_image_path = ""
             delivery_image_url = image_url
+            delivery_media: WxbotDeliveryMedia | None = None
             target = self._target(session)
-            stage_for_delivery = getattr(
-                self._store, "stage_for_wxbot_delivery", None
-            )
-            if target.channel == "wechat" and callable(stage_for_delivery):
-                delivery_image_path = stage_for_delivery(
+            stage_media = getattr(self._store, "stage_wxbot_delivery_media", None)
+            if target.channel == "wechat" and callable(stage_media):
+                delivery_media = stage_media(
                     result.local_path,
                     result.image_id,
                 )
+                delivery_image_path = delivery_media.image_path
                 delivery_image_url = ""
+            else:
+                stage_for_delivery = getattr(
+                    self._store, "stage_for_wxbot_delivery", None
+                )
+                if target.channel == "wechat" and callable(stage_for_delivery):
+                    delivery_image_path = stage_for_delivery(
+                        result.local_path,
+                        result.image_id,
+                    )
+                    delivery_image_url = ""
             async def _capture_and_deliver() -> None:
                 await self._require_scope(session)
                 if self._billing is not None and reservation is not None:
@@ -248,6 +260,7 @@ class DrawAgentToolService:
                     text=_draw_success_text(result.image_id),
                     image_path=delivery_image_path,
                     image_url=delivery_image_url,
+                    delivery_media=delivery_media,
                     trace_id=trace_id,
                 )
 
@@ -388,6 +401,7 @@ class DrawAgentToolService:
         text: str,
         image_path: str = "",
         image_url: str = "",
+        delivery_media: WxbotDeliveryMedia | None = None,
         trace_id: str,
     ) -> None:
         session_id = str(getattr(session, "session_id", "") or "")
@@ -425,23 +439,18 @@ class DrawAgentToolService:
         if image_path.strip() or image_url.strip():
             await self._require_scope(session)
             command_id = f"channel-reply:{target.tenant_id}:{trace_id}:draw-agent-image"
-            clean_image_url = image_url.strip()
-            await outbound.send_image(
+            file_command_id = f"channel-reply:{target.tenant_id}:{trace_id}:draw-agent-file"
+            await send_channel_draw_picture(
+                outbound,
                 target,
-                ChannelMedia(
-                    image_path="" if clean_image_url else image_path.strip(),
-                    image_url=clean_image_url,
-                ),
-                ChannelSendOptions(
-                    trace_id=trace_id,
-                    source_message=source_message,
-                    idempotency_key=command_id,
-                    delivery_metadata={
-                        "command_id": command_id,
-                        "idempotency_key": command_id,
-                        **delivery_contract,
-                    },
-                ),
+                image_path=image_path,
+                image_url=image_url,
+                delivery_media=delivery_media,
+                trace_id=trace_id,
+                source_message=source_message,
+                command_id=command_id,
+                file_command_id=file_command_id,
+                delivery_contract=delivery_contract,
             )
 
     async def _scope_allowed(self, session: Session) -> bool:

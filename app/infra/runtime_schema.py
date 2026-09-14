@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0050_speaker_portrait_cursor"
+RUNTIME_SCHEMA_REVISION = "0052_wxbot_group_webhooks"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
 # 0046 adds durable memory-event provenance, evidence, and physical expiry.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
@@ -29,6 +29,7 @@ RUNTIME_SCHEMA_TABLES = frozenset(
         "plugin_credits_ledger",
         "plugin_credits_reservation",
         "plugin_draw_task",
+        "plugin_draw_runtime_config",
         "plugin_local_agent_job",
         "plugin_events",
         "plugin_group_activity_config",
@@ -59,6 +60,7 @@ RUNTIME_SCHEMA_TABLES = frozenset(
         "plugin_tibo_reset_delivery",
         "plugin_tibo_reset_feed",
         "plugin_tibo_reset_sync_state",
+        "plugin_wxbot_group_webhook",
         "plugin_wxbot_group_observations",
         "plugin_wxbot_group_membership",
         "plugin_wxbot_admin_mutation_state",
@@ -101,6 +103,7 @@ RUNTIME_SCHEMA_TABLES = frozenset(
 
 RUNTIME_SCHEMA_INDEXES = frozenset(
     {
+        "ux_plugin_wxbot_group_webhook_active_group",
         "idx_draw_task_status_heartbeat",
         "ix_channel_connection_tenant_adapter",
         "ix_channel_connection_tenant_state",
@@ -265,6 +268,12 @@ RUNTIME_SCHEMA_COLUMN_CONTRACTS = (
 # index with the wrong keys or without its partial predicate and still pass a
 # name-only readiness probe.
 RUNTIME_SCHEMA_INDEX_CONTRACTS = (
+    (
+        "ux_plugin_wxbot_group_webhook_active_group",
+        "plugin_wxbot_group_webhook",
+        ("tenant_id", "connection_id", "external_session_id"),
+        "revoked_at IS NULL",
+    ),
     (
         "ux_memory_event_key",
         "plugin_memory_event",

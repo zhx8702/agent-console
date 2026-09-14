@@ -1,5 +1,7 @@
-import { useId, useState } from "react";
+import { useEffect, useRef } from "react";
+import { Link } from "react-router-dom";
 
+import { messageStoryPath } from "../message-story/path";
 import type {
   EffectAuditFilters,
   FlowEffectLogResponse,
@@ -12,13 +14,7 @@ import type {
   TraceAggregate,
   TraceEventCard,
 } from "./models";
-import {
-  compactList,
-  formatTraceTime,
-  payloadKeys,
-  replyQueueSummary,
-  traceMessageSummary,
-} from "./models";
+import { compactList } from "./models";
 
 type FlowRuntimeSectionProps = {
   flowStatus: MessageFlowRuntimeStatus | null;
@@ -73,8 +69,8 @@ export function FlowRuntimeSection({
   onClearAuditFilters,
   onClearAllFilters,
 }: FlowRuntimeSectionProps) {
-  const traceFlowTitleId = useId();
-  const [traceFlowModalOpen, setTraceFlowModalOpen] = useState(false);
+  const flowDetailsRef = useRef<HTMLDetailsElement>(null);
+  const tracePanelRef = useRef<HTMLElement>(null);
   const loadFlowRuntimeStatus = onRefresh;
   const selectEffectTrace = onSelectTrace;
   const clearEffectTraceFilter = onClearTraceFilter;
@@ -293,6 +289,15 @@ export function FlowRuntimeSection({
   const lastRuntimeSummary = flowResultSummary(runtimeResult);
   const lastShadowSummary = flowResultSummary(shadowResult);
   const selectedTraceId = effectTraceFilter.trim();
+  useEffect(() => {
+    if (!selectedTraceId) {
+      return;
+    }
+    if (flowDetailsRef.current) {
+      flowDetailsRef.current.open = true;
+    }
+    tracePanelRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [selectedTraceId]);
   const activeTraceAggregate = traceAggregate?.traceId === selectedTraceId ? traceAggregate : null;
   const selectedTraceRuntime = activeTraceAggregate?.runtimeResult
     || (selectedTraceId && runtimeResult?.trace_id === selectedTraceId ? runtimeResult : null);
@@ -316,78 +321,6 @@ export function FlowRuntimeSection({
     ...(selectedTraceRuntime?.effect_dispatches || []).map((item) => ({ ...item, source: "runtime" })),
     ...(selectedTraceShadow?.effect_dispatches || []).map((item) => ({ ...item, source: "shadow" })),
   ];
-  const traceUsesWxbotReplyQueue = Boolean(activeTraceAggregate?.replyQueue.length)
-    || activeTraceAggregate?.inbound.some((item) => item.channel === "wechat")
-    || activeTraceAggregate?.outbound.some((item) => item.channel === "wechat");
-  const traceAggregateStats = activeTraceAggregate
-    ? [
-        { label: "入站", value: activeTraceAggregate.inbound.length, detail: "inbound stream" },
-        { label: "Flow Step", value: selectedTraceSteps.length, detail: selectedTraceSteps.length ? "snapshot/最近 trace" : "暂无 snapshot" },
-        { label: "Effect", value: activeTraceAggregate.effects.length, detail: "audit log" },
-        { label: "Handler", value: selectedTraceDispatches.length, detail: "dispatch trace" },
-        { label: "回复队列", value: activeTraceAggregate.replyQueue.length, detail: "wxbot queue" },
-        { label: "通用出站流", value: activeTraceAggregate.outbound.length, detail: "非 wxbot 回复队列" },
-      ]
-    : [];
-  const traceFlowNodes = activeTraceAggregate
-    ? [
-        {
-          label: "入站消息",
-          status: activeTraceAggregate.inbound.length ? "hit" : "miss",
-          count: activeTraceAggregate.inbound.length,
-          detail: activeTraceAggregate.inbound[0]
-            ? `${activeTraceAggregate.inbound[0].channel || "unknown"} · ${activeTraceAggregate.inbound[0].session_id || "no session"}`
-            : "没有查到 inbound stream",
-          meta: activeTraceAggregate.inbound[0] ? traceMessageSummary(activeTraceAggregate.inbound[0].payload) : "-",
-        },
-        {
-          label: "Flow / Step",
-          status: selectedTraceSteps.some((step) => step.status === "error" || step.error) ? "error" : selectedTraceSteps.length ? "hit" : "miss",
-          count: selectedTraceSteps.length,
-          detail: `${selectedTraceRuntimeSource} / ${selectedTraceShadowSource}`,
-          meta: selectedTraceSteps.length
-            ? compactList(selectedTraceSteps.map((step) => `${step.source}:${step.id || step.kind || step.status || "step"}`), 4)
-            : "当前后端只保留最近 runtime/shadow trace",
-        },
-        {
-          label: "Effect Commit",
-          status: activeTraceAggregate.effects.some((item) => item.status === "error" || item.status === "handler_error") ? "error" : activeTraceAggregate.effects.length ? "hit" : "miss",
-          count: activeTraceAggregate.effects.length,
-          detail: activeTraceAggregate.effects.length ? compactList(activeTraceAggregate.effects.map((item) => `${item.owner || "-"}.${item.type || "-"}`), 3) : "没有 effect audit",
-          meta: activeTraceAggregate.effects.length ? compactList(activeTraceAggregate.effects.map((item) => item.status || "unknown"), 4) : "-",
-        },
-        {
-          label: "Handler Dispatch",
-          status: selectedTraceDispatches.some((item) => item.status === "handler_error" || item.error) ? "error" : selectedTraceDispatches.length ? "hit" : "miss",
-          count: selectedTraceDispatches.length,
-          detail: selectedTraceDispatches.length ? compactList(selectedTraceDispatches.map((item) => `${item.source}:${item.owner || "-"}.${item.type || "-"}`), 3) : "没有 handler dispatch",
-          meta: selectedTraceDispatches.length ? compactList(selectedTraceDispatches.map((item) => item.error || item.status || item.commit_status || "unknown"), 4) : "-",
-        },
-        {
-          label: "回复队列",
-          status: activeTraceAggregate.replyQueue.some((item) => item.status === "failed" || item.error) ? "error" : activeTraceAggregate.replyQueue.length ? "hit" : "miss",
-          count: activeTraceAggregate.replyQueue.length,
-          detail: activeTraceAggregate.replyQueue[0]?.status || "没有 wxbot reply queue",
-          meta: activeTraceAggregate.replyQueue[0] ? replyQueueSummary(activeTraceAggregate.replyQueue[0]) : "-",
-        },
-        {
-          label: "通用出站流",
-          status: activeTraceAggregate.outbound.length ? "hit" : "miss",
-          count: activeTraceAggregate.outbound.length,
-          detail: activeTraceAggregate.outbound[0]
-            ? `${activeTraceAggregate.outbound[0].reason || "outbound"} · attempts=${activeTraceAggregate.outbound[0].attempts ?? "-"}`
-            : traceUsesWxbotReplyQueue
-              ? "wxbot 回复走回复队列，不写通用出站流"
-              : "没有查到通用出站流",
-          meta: activeTraceAggregate.outbound[0]
-            ? traceMessageSummary(activeTraceAggregate.outbound[0].payload)
-            : traceUsesWxbotReplyQueue
-              ? "已由 wxbot reply queue/SDK bridge 处理"
-              : "-",
-        },
-      ]
-    : [];
-  const traceFlowHasError = traceFlowNodes.some((node) => node.status === "error");
   const traceEventState = (status?: string | null, hasError = false, dryRun = false): TraceEventCard["state"] => {
     const normalized = String(status || "").toLowerCase();
     if (hasError || normalized.includes("error") || normalized.includes("fail")) {
@@ -398,14 +331,6 @@ export function FlowRuntimeSection({
     }
     return "hit";
   };
-  const traceIdentityRows = activeTraceAggregate
-    ? [
-        { label: "tenant", value: activeTraceAggregate.inbound[0]?.tenant_id || activeTraceAggregate.outbound[0]?.tenant_id || "-" },
-        { label: "session", value: activeTraceAggregate.inbound[0]?.session_id || activeTraceAggregate.replyQueue[0]?.session_id || activeTraceAggregate.outbound[0]?.session_id || "-" },
-        { label: "user", value: activeTraceAggregate.inbound[0]?.user_id || "-" },
-        { label: "channel", value: activeTraceAggregate.inbound[0]?.channel || activeTraceAggregate.outbound[0]?.channel || "-" },
-      ]
-    : [];
   const traceRuntimeCards = activeTraceAggregate
     ? [
         {
@@ -421,22 +346,6 @@ export function FlowRuntimeSection({
           state: selectedTraceShadow?.error ? "error" : selectedTraceShadow ? "hit" : "miss",
         },
       ]
-    : [];
-  const traceInboundEvents: TraceEventCard[] = activeTraceAggregate
-    ? activeTraceAggregate.inbound.map((item, index) => ({
-        key: `in:${item.stream_key || item.stream || "stream"}:${item.id}:${index}`,
-        eyebrow: formatTraceTime(item.created_ts_ms),
-        title: `${item.channel || "unknown"} 入站`,
-        status: item.stream_key || item.stream || "stream",
-        state: "hit",
-        detail: traceMessageSummary(item.payload),
-        meta: [
-          `session ${item.session_id || "-"}`,
-          `user ${item.user_id || "-"}`,
-          `keys ${compactList(payloadKeys(item.payload), 6)}`,
-        ],
-        chips: [item.source || "inbound", item.tenant_id || "tenant -"],
-      }))
     : [];
   const traceStepEvents: TraceEventCard[] = selectedTraceSteps.map((step, index) => ({
     key: `step:${step.source}:${step.id || step.kind || "step"}:${index}`,
@@ -482,42 +391,13 @@ export function FlowRuntimeSection({
         })),
       ]
     : [];
-  const traceDeliveryEvents: TraceEventCard[] = activeTraceAggregate
-    ? [
-        ...activeTraceAggregate.replyQueue.map((item, index) => ({
-          key: `reply:${item.id || index}`,
-          eyebrow: item.sent_at || item.queued_at || item.created_at || "reply queue",
-          title: "wxbot 回复队列",
-          status: item.status || "-",
-          state: traceEventState(item.status, Boolean(item.error)),
-          detail: item.error || replyQueueSummary(item),
-          meta: [
-            `session ${item.session_id || "-"}`,
-            `attempt ${item.attempt_count ?? "-"}`,
-            item.sdk_outbound_id ? `sdk ${item.sdk_outbound_id}` : "sdk -",
-          ],
-          chips: ["reply_queue", item.command_id || "command -"],
-        })),
-        ...activeTraceAggregate.outbound.map((item, index) => ({
-          key: `out:${item.stream_key || item.stream || "stream"}:${item.id}:${index}`,
-          eyebrow: formatTraceTime(item.created_ts_ms),
-          title: "通用出站流",
-          status: item.reason || "outbound",
-          state: "hit" as const,
-          detail: traceMessageSummary(item.payload),
-          meta: [
-            `session ${item.session_id || "-"}`,
-            `attempt ${item.attempts ?? "-"}`,
-            `keys ${compactList(payloadKeys(item.payload), 6)}`,
-          ],
-          chips: [item.channel || "channel -", item.stream_key || item.stream || "stream"],
-        })),
-      ]
-    : [];
-  const traceEmptyDeliveryText = traceUsesWxbotReplyQueue
-    ? "wxbot 回复已经进入回复队列；没有额外写通用出站流。"
-    : "没有查到回复队列或通用出站流记录。";
   const traceAggregateErrors = activeTraceAggregate?.errors || [];
+  const traceHasError = Boolean(
+    selectedTraceSteps.some((step) => step.status === "error" || step.error)
+    || selectedTraceDispatches.some((item) => item.status === "handler_error" || item.error)
+    || activeTraceAggregate?.effects.some((item) => item.status === "error" || item.status === "handler_error")
+    || traceAggregateErrors.length,
+  );
   const renderTraceEventCards = (events: TraceEventCard[]) => events.map((event) => (
     <article className={`flow-trace-event-card is-${event.state}`} key={event.key}>
       <div className="flow-trace-event-main">
@@ -657,22 +537,25 @@ export function FlowRuntimeSection({
   return (
     <>
       <section className="panel panel-scroll plugins-flow-panel span-3">
-        <details className="plugins-flow-details">
+        <details className="plugins-flow-details" ref={flowDetailsRef} open={selectedTraceId ? true : undefined}>
         <summary className="panel-header">
           <div>
             <p className="section-kicker">消息流运行状态</p>
             <h3>Flow / Effect 运行视图</h3>
           </div>
+          <div className="action-row">
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={(event) => {
+                event.preventDefault();
+                void loadFlowRuntimeStatus();
+              }}
+            >
+              {flowLoading ? "刷新中..." : "刷新 Runtime"}
+            </button>
+          </div>
         </summary>
-        <div className="action-row">
-          <button
-            className="button button-secondary"
-            type="button"
-            onClick={() => void loadFlowRuntimeStatus()}
-          >
-            {flowLoading ? "刷新中..." : "刷新 Runtime"}
-          </button>
-        </div>
         {flowError && <p className="muted-copy">{flowError}</p>}
         <div className="flow-runtime-board">
           <div className="flow-runtime-command-center">
@@ -795,18 +678,18 @@ export function FlowRuntimeSection({
           </div>
 
           {selectedTraceId && (
-            <article className="flow-trace-aggregate">
+            <article className="flow-trace-aggregate" ref={tracePanelRef} id="flow-trace-steps">
               <div className="flow-runtime-detail-header">
                 <div>
-                  <h4>单条 Trace 聚合</h4>
+                  <h4>这条消息的步骤与 Effect</h4>
                   <p className="muted-copy">
-                    按 trace 汇总入站、Flow step、Effect、Handler、回复队列和通用出站流记录；payload 只显示 keys 和脱敏摘要。
+                    这里只看 Flow step、Effect audit 和 Handler。消息正文、是否回复、有没有发出去，请回「这条消息」。
                   </p>
                 </div>
                 <div className="flow-trace-header-actions">
-                  <button className="button button-secondary" onClick={() => setTraceFlowModalOpen(true)} disabled={!activeTraceAggregate}>
-                    查看流转图
-                  </button>
+                  <Link className="button button-secondary" to={messageStoryPath(selectedTraceId)}>
+                    回到这条消息
+                  </Link>
                   <span className={`plugin-badge ${traceAggregateLoading ? "is-muted" : ""}`}>
                     {traceAggregateLoading ? "loading" : selectedTraceId}
                   </span>
@@ -815,48 +698,7 @@ export function FlowRuntimeSection({
               {traceAggregateError && <p className="muted-copy">{traceAggregateError}</p>}
               {activeTraceAggregate ? (
                 <>
-                  <div className="flow-trace-stat-grid">
-                    {traceAggregateStats.map((item) => (
-                      <div className="flow-trace-stat" key={item.label}>
-                        <span>{item.label}</span>
-                        <strong>{item.value}</strong>
-                        <small>{item.detail}</small>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="flow-trace-path" aria-label="追踪聚合流转阶段">
-                    {traceFlowNodes.map((node, index) => (
-                      <div className="flow-trace-path-item" key={node.label}>
-                        <div className={`flow-trace-path-card is-${node.status}`}>
-                          <div>
-                            <span>{node.label}</span>
-                            <strong>{node.count}</strong>
-                          </div>
-                          <small>{node.detail}</small>
-                          <em>{node.meta}</em>
-                        </div>
-                        {index < traceFlowNodes.length - 1 && <span className="flow-trace-path-arrow">→</span>}
-                      </div>
-                    ))}
-                  </div>
-
                   <div className="flow-trace-dossier">
-                    <section className="flow-trace-identity-card">
-                      <div>
-                        <span>消息身份</span>
-                        <h5>Trace Context</h5>
-                      </div>
-                      <dl>
-                        {traceIdentityRows.map((item) => (
-                          <div key={item.label}>
-                            <dt>{item.label}</dt>
-                            <dd className="mono">{item.value}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                    </section>
-
                     <section className="flow-trace-runtime-card">
                       <div>
                         <span>运行快照</span>
@@ -873,10 +715,14 @@ export function FlowRuntimeSection({
                       </div>
                     </section>
 
-                    <section className={`flow-trace-health-card is-${traceFlowHasError || traceAggregateErrors.length ? "error" : "ok"}`}>
+                    <section className={`flow-trace-health-card is-${traceHasError ? "error" : "ok"}`}>
                       <span>排查焦点</span>
-                      <h5>{traceFlowHasError || traceAggregateErrors.length ? "这条链路需要处理" : "链路状态稳定"}</h5>
-                      <p>{traceFlowHasError ? "优先看红色事件卡片里的 error/status 字段。" : "默认视图只展示关键摘要；字段级核对放在下方原始明细。"}</p>
+                      <h5>{traceHasError ? "步骤或 Effect 需要处理" : "步骤快照可用"}</h5>
+                      <p>
+                        {selectedTraceSteps.length
+                          ? (traceHasError ? "优先看红色事件卡片里的 error/status。" : "Runtime/Shadow 只保留最近一条；过期不等于没处理。")
+                          : "步骤快照已过期，不等于没处理。继续看 Effect Audit 和 Handler。"}
+                      </p>
                       {traceAggregateErrors.length ? (
                         <div className="flow-trace-error-list">
                           {traceAggregateErrors.map((item) => <span key={item}>{item}</span>)}
@@ -886,70 +732,12 @@ export function FlowRuntimeSection({
                   </div>
 
                   <div className="flow-trace-lane-grid">
-                    {renderTraceEventSection("入站消息", "Inbound", traceInboundEvents, "没有查到该 trace 的入站 stream 记录。")}
-                    {renderTraceEventSection("Flow / Step", "Runtime + Shadow", traceStepEvents, "当前后端只保留最近 runtime/shadow trace；这条 trace 可以继续看 Effect Audit 和回复队列。", 6)}
+                    {renderTraceEventSection("Flow / Step", "Runtime + Shadow", traceStepEvents, "步骤快照已过期，不等于没处理。继续看 Effect Audit 和 Handler。", 6)}
                     {renderTraceEventSection("Effect / Handler", "Audit + Dispatch", traceEffectEvents, "没有查到 effect audit 或 handler dispatch。")}
-                    {renderTraceEventSection("Reply / Outbound", "Delivery", traceDeliveryEvents, traceEmptyDeliveryText)}
                   </div>
-
-                  <details className="flow-runtime-advanced flow-trace-raw-drawer">
-                    <summary>
-                      <span>
-                        <strong>原始聚合明细</strong>
-                        <small>用于字段级核对；默认先看上方事件卡片定位问题。</small>
-                      </span>
-                      <em>{traceInboundEvents.length + traceStepEvents.length + traceEffectEvents.length + traceDeliveryEvents.length} rows</em>
-                    </summary>
-                    <div className="flow-trace-raw-grid">
-                      <section className="flow-trace-detail-card">
-                        <h5>入站消息</h5>
-                        <dl className="plugin-meta-list">
-                          {activeTraceAggregate.inbound.length ? activeTraceAggregate.inbound.map((item) => (
-                            <div key={`in:${item.stream_key || item.stream}:${item.id}`}>
-                              <dt>{formatTraceTime(item.created_ts_ms)}</dt>
-                              <dd>{item.channel || "-"} · {item.session_id || "-"} · keys {compactList(payloadKeys(item.payload), 6)}</dd>
-                            </div>
-                          )) : <div><dt>-</dt><dd>没有查到该 trace 的入站 stream 记录</dd></div>}
-                        </dl>
-                      </section>
-                      <section className="flow-trace-detail-card is-tall">
-                        <h5>Flow / Step</h5>
-                        <dl className="plugin-meta-list">
-                          {selectedTraceSteps.length ? selectedTraceSteps.map((step, index) => (
-                            <div key={`step:${step.source}:${step.id || step.kind}:${index}`}>
-                              <dt>{step.source}</dt>
-                              <dd>{step.id || step.kind || "-"} · {step.status || "-"} · {step.error || step.reason || step.action || "-"}</dd>
-                            </div>
-                          )) : <div><dt>-</dt><dd>当前后端只保留最近 runtime/shadow trace</dd></div>}
-                        </dl>
-                      </section>
-                      <section className="flow-trace-detail-card is-tall">
-                        <h5>Effect / Handler</h5>
-                        <dl className="plugin-meta-list">
-                          {traceEffectEvents.length ? traceEffectEvents.map((item) => (
-                            <div key={item.key}>
-                              <dt>{item.status}</dt>
-                              <dd>{item.title} · {item.detail}</dd>
-                            </div>
-                          )) : <div><dt>-</dt><dd>没有查到 effect audit 或 handler dispatch</dd></div>}
-                        </dl>
-                      </section>
-                      <section className="flow-trace-detail-card">
-                        <h5>Reply Queue / 通用出站流</h5>
-                        <dl className="plugin-meta-list">
-                          {traceDeliveryEvents.length ? traceDeliveryEvents.map((item) => (
-                            <div key={item.key}>
-                              <dt>{item.status}</dt>
-                              <dd>{item.title} · {item.detail}</dd>
-                            </div>
-                          )) : <div><dt>-</dt><dd>{traceEmptyDeliveryText}</dd></div>}
-                        </dl>
-                      </section>
-                    </div>
-                  </details>
                 </>
               ) : (
-                <p className="muted-copy">{traceAggregateLoading ? "正在加载该 trace..." : "暂无该 trace 的聚合数据。"}</p>
+                <p className="muted-copy">{traceAggregateLoading ? "正在加载该 trace..." : "暂无该 trace 的步骤或 Effect 快照。"}</p>
               )}
             </article>
           )}
@@ -1212,73 +1000,6 @@ export function FlowRuntimeSection({
         </div>
         </details>
       </section>
-
-      {traceFlowModalOpen && activeTraceAggregate && (
-        <div className="trace-flow-modal-backdrop" role="presentation" onClick={() => setTraceFlowModalOpen(false)}>
-          <div className="trace-flow-modal" role="dialog" aria-modal="true" aria-labelledby={traceFlowTitleId} onClick={(event) => event.stopPropagation()}>
-            <div className="trace-flow-modal-header">
-              <div>
-                <p className="section-kicker">单次消息流转</p>
-                <h3 id={traceFlowTitleId}>消息路径流转</h3>
-                <p className="muted-copy mono">{activeTraceAggregate.traceId}</p>
-              </div>
-              <button className="button button-secondary" onClick={() => setTraceFlowModalOpen(false)}>
-                关闭
-              </button>
-            </div>
-            <div className={`trace-flow-status is-${traceFlowHasError ? "error" : "ok"}`}>
-              <strong>{traceFlowHasError ? "链路存在异常节点" : "链路节点未发现错误状态"}</strong>
-              <span>从入站流到 wxbot 回复队列 / 通用出站流的聚合视图，节点为 0 表示该阶段未命中或后端未保留对应快照。</span>
-            </div>
-            <div className="trace-flow-diagram" aria-label="单次消息追踪路径">
-              {traceFlowNodes.map((node, index) => (
-                <div className="trace-flow-node-wrap" key={node.label}>
-                  <article className={`trace-flow-node is-${node.status}`}>
-                    <span className="trace-flow-node-dot" aria-hidden="true" />
-                    <span className="trace-flow-node-label">{node.label}</span>
-                    <strong>{node.count}</strong>
-                    <small>{node.status === "error" ? "异常" : node.status === "miss" ? "未命中" : "已命中"}</small>
-                  </article>
-                  {index < traceFlowNodes.length - 1 && <span className="trace-flow-arrow">→</span>}
-                </div>
-              ))}
-            </div>
-            <div className="trace-flow-detail-list">
-              {traceFlowNodes.map((node) => (
-                <article className={`trace-flow-detail-item is-${node.status}`} key={`${node.label}:detail`}>
-                  <div>
-                    <strong>{node.label}</strong>
-                    <span>{node.count} 条</span>
-                  </div>
-                  <p>{node.detail}</p>
-                  <small>{node.meta}</small>
-                </article>
-              ))}
-            </div>
-            <div className="trace-flow-modal-grid">
-              <section>
-                <h4>消息身份</h4>
-                <dl className="plugin-meta-list">
-                  <div><dt>tenant</dt><dd>{activeTraceAggregate.inbound[0]?.tenant_id || activeTraceAggregate.outbound[0]?.tenant_id || "-"}</dd></div>
-                  <div><dt>session</dt><dd>{activeTraceAggregate.inbound[0]?.session_id || activeTraceAggregate.replyQueue[0]?.session_id || activeTraceAggregate.outbound[0]?.session_id || "-"}</dd></div>
-                  <div><dt>user</dt><dd>{activeTraceAggregate.inbound[0]?.user_id || "-"}</dd></div>
-                  <div><dt>channel</dt><dd>{activeTraceAggregate.inbound[0]?.channel || activeTraceAggregate.outbound[0]?.channel || "-"}</dd></div>
-                </dl>
-              </section>
-              <section>
-                <h4>关键时间</h4>
-                <dl className="plugin-meta-list">
-                  <div><dt>inbound</dt><dd>{formatTraceTime(activeTraceAggregate.inbound[0]?.created_ts_ms)}</dd></div>
-                  <div><dt>effect</dt><dd>{activeTraceAggregate.effects[0]?.created_at || "-"}</dd></div>
-                  <div><dt>reply_queue</dt><dd>{activeTraceAggregate.replyQueue[0]?.sent_at || activeTraceAggregate.replyQueue[0]?.queued_at || activeTraceAggregate.replyQueue[0]?.created_at || "-"}</dd></div>
-                  <div><dt>通用出站流</dt><dd>{formatTraceTime(activeTraceAggregate.outbound[0]?.created_ts_ms)}</dd></div>
-                </dl>
-              </section>
-            </div>
-          </div>
-        </div>
-      )}
-
     </>
   );
 }

@@ -1,3 +1,4 @@
+import { DrawConfigSection } from "./plugins/DrawConfigSection";
 import { FlowRuntimeSection } from "./plugins/FlowRuntimeSection";
 import { GroupPluginScopeSection } from "./plugins/GroupPluginScopeSection";
 import { InstalledPluginsSection } from "./plugins/InstalledPluginsSection";
@@ -37,6 +38,25 @@ export function PluginsPage() {
         onSelectAuditFilters={page.selectEffectAuditFilters}
         onClearAuditFilters={page.clearEffectAuditFilters}
         onClearAllFilters={page.clearAllEffectFilters}
+      />
+
+      <DrawConfigSection
+        config={page.drawConfig}
+        apiUrl={page.drawApiUrl}
+        apiKey={page.drawApiKey}
+        apiModel={page.drawApiModel}
+        apiEditUrl={page.drawApiEditUrl}
+        loading={page.drawLoading}
+        saving={page.drawSaving}
+        error={page.drawError}
+        notice={page.drawNotice}
+        canManage={page.canManage}
+        onApiUrlChange={page.setDrawApiUrl}
+        onApiKeyChange={page.setDrawApiKey}
+        onApiModelChange={page.setDrawApiModel}
+        onApiEditUrlChange={page.setDrawApiEditUrl}
+        onSave={page.saveDrawConfig}
+        onDisable={page.disableDrawConfig}
       />
 
       <InstalledPluginsSection

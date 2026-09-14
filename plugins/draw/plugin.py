@@ -303,9 +303,19 @@ class DrawPlugin(Plugin):
             return {"configured": False, "storage": {}, "commands": []}
         settings = self._store.settings
         storage_dir = Path(str(getattr(settings, "draw_storage_dir", "") or ""))
+        snapshot = await self._store.get_runtime_config()
+        document = self._store.runtime_config_document(snapshot)
+        overlay_controls_primary = "draw_api_url" in snapshot.overrides
         return {
-            "configured": bool(str(getattr(settings, "draw_api_url", "") or "").strip()),
-            "fallback_configured": bool(str(getattr(settings, "draw_fallback_api_url", "") or "").strip()),
+            "configured": bool(document.get("enabled")),
+            "fallback_configured": (
+                False
+                if overlay_controls_primary
+                else bool(str(getattr(settings, "draw_fallback_api_url", "") or "").strip())
+            ),
+            "api_host": str(document.get("api_host") or ""),
+            "api_key_configured": bool(document.get("api_key_configured")),
+            "api_model": str(document.get("api_model") or ""),
             "storage": {
                 "dir": str(storage_dir),
                 "exists": storage_dir.exists(),

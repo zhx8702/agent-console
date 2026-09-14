@@ -4,11 +4,13 @@ import base64
 import binascii
 import json
 import shutil
+import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from os import replace
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 from uuid import uuid4
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
@@ -83,6 +86,148 @@ _ACTIVE_ADMIN_MUTATION_CONNECTION: ContextVar[AsyncConnection | None] = ContextV
     "draw_admin_mutation_connection",
     default=None,
 )
+_WXBOT_UI_JPEG_QUALITIES = (82, 72, 62, 52)
+_WXBOT_UI_JPEG_SUFFIXES = {".jpg", ".jpeg"}
+
+
+def _wxbot_ui_image_limits(settings: Any) -> tuple[int, int]:
+    max_bytes = int(
+        getattr(settings, "wxbot_outbound_image_max_bytes", 700 * 1024) or 700 * 1024
+    )
+    max_edge = int(getattr(settings, "wxbot_outbound_image_max_edge", 1600) or 1600)
+    return max(64 * 1024, max_bytes), max(256, max_edge)
+
+
+def _wxbot_original_basename(suffix: str, safe_id: str) -> str:
+    """Keep the pasted filename short enough for WeChat OCR confirmation."""
+
+    token = "".join(ch for ch in str(safe_id or "") if ch.isalnum())[-4:] or "img"
+    ext = suffix if suffix.startswith(".") else f".{suffix or 'png'}"
+    return f"pic{token}{ext}"
+
+
+def _rgb_for_wxbot_jpeg(image: Image.Image) -> Image.Image:
+    if image.mode in {"RGBA", "LA"}:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    if image.mode != "RGB":
+        return image.convert("RGB")
+    return image
+
+
+def _encode_wxbot_jpeg(
+    image: Image.Image,
+    *,
+    max_bytes: int,
+    max_edge: int,
+) -> bytes:
+    rgb = _rgb_for_wxbot_jpeg(image)
+    if max(rgb.size) > max_edge:
+        rgb = rgb.copy()
+        rgb.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    for quality in _WXBOT_UI_JPEG_QUALITIES:
+        buffer = BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+        payload = buffer.getvalue()
+        if len(payload) <= max_bytes:
+            return payload
+    width, height = rgb.size
+    while width > 256 and height > 256:
+        width = max(256, width // 2)
+        height = max(256, height // 2)
+        rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
+        buffer = BytesIO()
+        rgb.save(buffer, format="JPEG", quality=52, optimize=True)
+        payload = buffer.getvalue()
+        if len(payload) <= max_bytes:
+            return payload
+    raise DrawConfigError("图片无法压缩到微信可发送大小")
+
+
+def _transcode_wxbot_ui_image(source: Path, *, max_bytes: int, max_edge: int) -> bytes:
+    try:
+        with Image.open(source) as image:
+            image.load()
+            return _encode_wxbot_jpeg(image, max_bytes=max_bytes, max_edge=max_edge)
+    except DrawConfigError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise DrawConfigError("生成图片无法转成微信可发送的 JPEG") from exc
+
+
+DRAW_RUNTIME_CONFIG_KEY = "default"
+DRAW_RUNTIME_OVERRIDE_FIELDS = (
+    "draw_api_url",
+    "draw_api_key",
+    "draw_api_edit_url",
+    "draw_api_model",
+    "draw_api_provider",
+)
+_DRAW_RUNTIME_URL_FIELDS = frozenset({"draw_api_url", "draw_api_edit_url"})
+_DRAW_RUNTIME_FIELD_LIMITS = {
+    "draw_api_url": 512,
+    "draw_api_key": 512,
+    "draw_api_edit_url": 512,
+    "draw_api_model": 128,
+    "draw_api_provider": 64,
+}
+
+
+class DrawRuntimeConfigVersionConflict(RuntimeError):
+    def __init__(self, *, expected: int, current: int) -> None:
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"draw runtime config version conflict: expected {expected}, current {current}"
+        )
+
+
+@dataclass
+class DrawRuntimeConfigSnapshot:
+    version: int = 0
+    overrides: dict[str, str] = field(default_factory=dict)
+    updated_by: str = ""
+    updated_at: Any = None
+
+
+def _normalize_runtime_overrides(value: object) -> dict[str, str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for field in DRAW_RUNTIME_OVERRIDE_FIELDS:
+        if field not in value:
+            continue
+        text_value = str(value.get(field) or "").strip()
+        limit = _DRAW_RUNTIME_FIELD_LIMITS[field]
+        if len(text_value) > limit:
+            raise ValueError(f"{field}_too_long")
+        if field in _DRAW_RUNTIME_URL_FIELDS:
+            text_value = _validate_runtime_url(text_value, field=field)
+        normalized[field] = text_value
+    return normalized
+
+
+def _validate_runtime_url(value: str, *, field: str) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field}_invalid")
+    return value
+
+
+def _api_key_hint(value: str) -> str:
+    secret = str(value or "").strip()
+    if len(secret) < 4:
+        return ""
+    return secret[-4:]
 
 
 def normalize_draw_quality(value: object = DRAW_DEFAULT_QUALITY) -> str:
@@ -98,6 +243,17 @@ class DrawError(Exception):
 
 class DrawConfigError(DrawError):
     """Raised when required draw configuration is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class WxbotDeliveryMedia:
+    image_path: str
+    original_path: str = ""
+    original_name: str = ""
+    file_path: str = ""
+    file_name: str = ""
+    transcoded: bool = False
+    original_bytes: int = 0
 
 
 class DrawApiError(DrawError):
@@ -339,6 +495,7 @@ class DrawStore:
             )
         )
         self._index_path = self._storage_dir / "images.json"
+        self._runtime_overrides: dict[str, str] | None = None
 
     async def initialize(self) -> None:
         await self.ensure_task_table()
@@ -1401,7 +1558,7 @@ class DrawStore:
         quality = normalize_draw_quality(quality)
 
         self._ensure_storage_dir()
-        endpoints = self._resolve_endpoints()
+        endpoints = await self._resolved_endpoints()
         if not endpoints:
             raise DrawConfigError("未配置 DRAW_API_URL")
 
@@ -1443,7 +1600,7 @@ class DrawStore:
         if source is None:
             raise DrawApiError("找不到这个图片 ID")
 
-        endpoints = self._resolve_endpoints()
+        endpoints = await self._resolved_endpoints()
         if not endpoints:
             raise DrawConfigError("未配置 DRAW_API_URL")
 
@@ -1486,7 +1643,7 @@ class DrawStore:
         quality = normalize_draw_quality(quality)
 
         self._ensure_storage_dir()
-        endpoints = self._resolve_endpoints()
+        endpoints = await self._resolved_endpoints()
         if not endpoints:
             raise DrawConfigError("未配置 DRAW_API_URL")
 
@@ -1531,32 +1688,217 @@ class DrawStore:
 
         raise DrawApiError("; ".join(errors))
 
-    def _resolve_endpoints(self) -> list[DrawEndpoint]:
+    async def _resolved_endpoints(self) -> list[DrawEndpoint]:
+        overrides = await self.load_runtime_overrides()
+        if "draw_api_url" in overrides and not str(overrides.get("draw_api_url") or "").strip():
+            return []
+        return self._resolve_endpoints(overrides)
+
+    async def load_runtime_overrides(self) -> dict[str, str]:
+        if self._runtime_overrides is not None:
+            return dict(self._runtime_overrides)
+        snapshot = await self.get_runtime_config()
+        return dict(snapshot.overrides)
+
+    async def get_runtime_config(self) -> DrawRuntimeConfigSnapshot:
+        try:
+            async with self._db() as db:
+                row = (
+                    await db.execute(
+                        text(
+                            "SELECT version, overrides_json, updated_by, updated_at "
+                            "FROM plugin_draw_runtime_config WHERE config_key = :key"
+                        ),
+                        {"key": DRAW_RUNTIME_CONFIG_KEY},
+                    )
+                ).mappings().first()
+        except Exception:
+            logger.warning("draw.runtime_config_unavailable", exc_info=True)
+            return DrawRuntimeConfigSnapshot()
+        if row is None:
+            return DrawRuntimeConfigSnapshot()
+        return DrawRuntimeConfigSnapshot(
+            version=int(row.get("version") or 0),
+            overrides=_normalize_runtime_overrides(row.get("overrides_json")),
+            updated_by=str(row.get("updated_by") or ""),
+            updated_at=row.get("updated_at"),
+        )
+
+    async def set_runtime_config(
+        self,
+        *,
+        expected_version: int,
+        updates: dict[str, str | None],
+        updated_by: str = "",
+    ) -> DrawRuntimeConfigSnapshot:
+        current = await self.get_runtime_config()
+        if int(current.version) != int(expected_version):
+            raise DrawRuntimeConfigVersionConflict(
+                expected=int(expected_version),
+                current=int(current.version),
+            )
+        next_overrides = dict(current.overrides)
+        for field, value in updates.items():
+            if field not in DRAW_RUNTIME_OVERRIDE_FIELDS:
+                continue
+            if value is None:
+                continue
+            next_overrides[field] = str(value)
+        next_overrides = _normalize_runtime_overrides(next_overrides)
+        actor = str(updated_by or "").strip()[:128]
+        async with self._db() as db:
+            dialect = _dialect_name(db)
+            payload = json.dumps(next_overrides, ensure_ascii=False, sort_keys=True)
+            if dialect == "postgresql":
+                write_sql = (
+                    "INSERT INTO plugin_draw_runtime_config "
+                    "(config_key, version, overrides_json, updated_by, updated_at) "
+                    "VALUES (:key, 1, CAST(:overrides AS JSONB), :updated_by, NOW()) "
+                    "ON CONFLICT (config_key) DO UPDATE SET "
+                    "version = plugin_draw_runtime_config.version + 1, "
+                    "overrides_json = EXCLUDED.overrides_json, "
+                    "updated_by = EXCLUDED.updated_by, "
+                    "updated_at = NOW() "
+                    "WHERE plugin_draw_runtime_config.version = :expected "
+                    "RETURNING version, overrides_json, updated_by, updated_at"
+                )
+            else:
+                if current.version == 0:
+                    write_sql = (
+                        "INSERT INTO plugin_draw_runtime_config "
+                        "(config_key, version, overrides_json, updated_by, updated_at) "
+                        "VALUES (:key, 1, :overrides, :updated_by, CURRENT_TIMESTAMP)"
+                    )
+                else:
+                    write_sql = (
+                        "UPDATE plugin_draw_runtime_config SET "
+                        "version = version + 1, overrides_json = :overrides, "
+                        "updated_by = :updated_by, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE config_key = :key AND version = :expected"
+                    )
+            result = await db.execute(
+                text(write_sql),
+                {
+                    "key": DRAW_RUNTIME_CONFIG_KEY,
+                    "overrides": payload,
+                    "updated_by": actor,
+                    "expected": int(expected_version),
+                },
+            )
+            row = None
+            if getattr(result, "returns_rows", False):
+                row = result.mappings().first()
+        after = await self.get_runtime_config()
+        if after.version <= current.version:
+            raise DrawRuntimeConfigVersionConflict(
+                expected=int(expected_version),
+                current=int(after.version),
+            )
+        self._runtime_overrides = None
+        if row is not None:
+            return DrawRuntimeConfigSnapshot(
+                version=int(row.get("version") or after.version),
+                overrides=_normalize_runtime_overrides(row.get("overrides_json") or next_overrides),
+                updated_by=str(row.get("updated_by") or actor),
+                updated_at=row.get("updated_at"),
+            )
+        return after
+
+    def runtime_config_document(
+        self,
+        snapshot: DrawRuntimeConfigSnapshot | None = None,
+        *,
+        overrides: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        overlay = dict(overrides if overrides is not None else (snapshot.overrides if snapshot else {}))
+        sources: dict[str, str] = {}
+        values: dict[str, str] = {}
+        for field in DRAW_RUNTIME_OVERRIDE_FIELDS:
+            if field in overlay:
+                values[field] = overlay[field]
+                sources[field] = "persisted_override"
+            else:
+                values[field] = str(getattr(self.settings, field, "") or "").strip()
+                sources[field] = "environment"
+        api_url = values["draw_api_url"]
+        api_key = values["draw_api_key"]
+        host = str(urlparse(self._normalize_generation_api_url(api_url) or api_url).hostname or "")
+        return {
+            "version": int(snapshot.version if snapshot is not None else 0),
+            "enabled": bool(self._normalize_generation_api_url(api_url)),
+            "api_url": api_url,
+            "api_edit_url": values["draw_api_edit_url"],
+            "api_model": values["draw_api_model"],
+            "api_provider": values["draw_api_provider"],
+            "api_key_configured": bool(api_key),
+            "api_key_hint": _api_key_hint(api_key),
+            "api_host": host,
+            "field_sources": {
+                "api_url": sources["draw_api_url"],
+                "api_edit_url": sources["draw_api_edit_url"],
+                "api_model": sources["draw_api_model"],
+                "api_provider": sources["draw_api_provider"],
+                "api_key": sources["draw_api_key"],
+            },
+            "updated_by": snapshot.updated_by if snapshot is not None else "",
+            "updated_at": (
+                snapshot.updated_at.isoformat()
+                if snapshot is not None and hasattr(snapshot.updated_at, "isoformat") and snapshot.updated_at
+                else snapshot.updated_at if snapshot is not None else None
+            ),
+        }
+
+    def runtime_config_audit_state(self, document: dict[str, object]) -> dict[str, object]:
+        return {
+            "enabled": bool(document.get("enabled")),
+            "api_host": str(document.get("api_host") or ""),
+            "api_model": str(document.get("api_model") or ""),
+            "api_key_configured": bool(document.get("api_key_configured")),
+            "version": int(document.get("version") or 0),
+        }
+
+    def _resolve_endpoints(self, overrides: dict[str, str] | None = None) -> list[DrawEndpoint]:
         endpoints: list[DrawEndpoint] = []
         for prefix, name, client_name in (
             ("draw_api", "primary", "primary"),
             ("draw_fallback_api", "fallback", "fallback"),
         ):
-            endpoint = self._build_endpoint(prefix, name=name, client_name=client_name)
+            endpoint = self._build_endpoint(
+                prefix,
+                name=name,
+                client_name=client_name,
+                overrides=overrides or {},
+            )
             if endpoint is not None:
                 endpoints.append(endpoint)
         return endpoints
 
-    def _build_endpoint(self, prefix: str, *, name: str, client_name: str) -> DrawEndpoint | None:
-        api_url = self._normalize_generation_api_url(
-            str(getattr(self.settings, f"{prefix}_url", "") or "").strip()
-        )
+    def _overlay_setting(self, field: str, overrides: dict[str, str]) -> str:
+        if field in overrides:
+            return str(overrides.get(field) or "").strip()
+        return str(getattr(self.settings, field, "") or "").strip()
+
+    def _build_endpoint(
+        self,
+        prefix: str,
+        *,
+        name: str,
+        client_name: str,
+        overrides: dict[str, str] | None = None,
+    ) -> DrawEndpoint | None:
+        overlay = overrides or {}
+        api_url = self._normalize_generation_api_url(self._overlay_setting(f"{prefix}_url", overlay))
         if not api_url:
             return None
-        provider = str(getattr(self.settings, f"{prefix}_provider", "") or "").strip().lower()
+        provider = self._overlay_setting(f"{prefix}_provider", overlay).lower()
         if not provider and "airgate" in str(urlparse(api_url).hostname or "").lower():
             provider = "airgate"
         return DrawEndpoint(
             name=name,
             client_name=client_name,
             api_url=api_url,
-            api_key=str(getattr(self.settings, f"{prefix}_key", "") or "").strip(),
-            model=str(getattr(self.settings, f"{prefix}_model", "") or "").strip(),
+            api_key=self._overlay_setting(f"{prefix}_key", overlay),
+            model=self._overlay_setting(f"{prefix}_model", overlay),
             provider=provider or "generic",
             timeout=float(getattr(self.settings, f"{prefix}_timeout_seconds", 60.0) or 60.0),
             key_header=str(getattr(self.settings, f"{prefix}_key_header", "Authorization") or "Authorization").strip(),
@@ -1959,6 +2301,13 @@ class DrawStore:
     def stage_for_wxbot_delivery(self, image_path: str | Path, image_id: str = "") -> str:
         """Copy a generated image into the path shared with the SDK container."""
 
+        return self.stage_wxbot_delivery_media(image_path, image_id=image_id).image_path
+
+    def stage_wxbot_delivery_media(
+        self, image_path: str | Path, image_id: str = ""
+    ) -> WxbotDeliveryMedia:
+        """Stage a WeChat-UI JPEG plus the uncompressed original when needed."""
+
         source = Path(str(image_path or "")).expanduser().resolve(strict=False)
         if not source.is_file():
             raise DrawApiError("生成图片文件不存在")
@@ -1966,32 +2315,110 @@ class DrawStore:
             self._outbound_dir.mkdir(parents=True, exist_ok=True)
             if self._outbound_dir.is_symlink() or not self._outbound_dir.is_dir():
                 raise OSError("outbound directory is not a regular directory")
+            source_bytes = source.stat().st_size
             max_bytes = int(
                 getattr(self.settings, "wxbot_outbound_file_max_bytes", 10 * 1024 * 1024)
                 or 10 * 1024 * 1024
             )
-            if source.stat().st_size > max_bytes:
+            if source_bytes > max_bytes:
                 raise DrawConfigError(f"图片超过文件发送大小限制（{max_bytes} 字节）")
+            ui_max_bytes, ui_max_edge = _wxbot_ui_image_limits(self.settings)
+            suffix = source.suffix.lower() or ".jpg"
+            keep_original = (
+                suffix in _WXBOT_UI_JPEG_SUFFIXES and source_bytes <= ui_max_bytes
+            )
             safe_id = "".join(
                 ch for ch in str(image_id or "") if ch.isalnum() or ch in "-_"
             )[-32:] or uuid4().hex[:8]
-            suffix = source.suffix.lower() or ".jpg"
-            destination = self._outbound_dir / (
-                f"draw_{datetime.now(UTC):%Y%m%dT%H%M%S}_{safe_id}{suffix}"
+            stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%S}"
+            original_name = _wxbot_original_basename(suffix, safe_id)
+            if keep_original:
+                destination = self._write_outbound_copy(
+                    source,
+                    name=f"draw_{stamp}_{safe_id}{suffix}",
+                )
+                return WxbotDeliveryMedia(
+                    image_path=str(destination),
+                    original_path=str(destination),
+                    original_name=original_name,
+                    transcoded=False,
+                    original_bytes=source_bytes,
+                )
+            jpeg_destination = self._write_outbound_bytes(
+                _transcode_wxbot_ui_image(
+                    source,
+                    max_bytes=ui_max_bytes,
+                    max_edge=ui_max_edge,
+                ),
+                name=f"draw_{stamp}_{safe_id}.jpg",
             )
-            temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
-            try:
-                shutil.copy2(source, temporary)
-                replace(temporary, destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-            return str(destination)
+            original_destination = self._write_outbound_copy(
+                source,
+                name=original_name,
+            )
+            zip_name = f"{Path(original_name).stem}.zip"
+            zip_destination = self._write_outbound_zip(
+                source,
+                name=zip_name,
+                inner_name=original_name,
+            )
+            logger.info(
+                "draw.wxbot_image_transcoded",
+                source_suffix=suffix,
+                source_bytes=source_bytes,
+                staged_bytes=jpeg_destination.stat().st_size,
+                original_path=str(original_destination),
+                file_path=str(zip_destination),
+                max_edge=ui_max_edge,
+            )
+            return WxbotDeliveryMedia(
+                image_path=str(jpeg_destination),
+                original_path=str(original_destination),
+                original_name=original_name,
+                file_path=str(zip_destination),
+                file_name=zip_name,
+                transcoded=True,
+                original_bytes=source_bytes,
+            )
         except DrawConfigError:
             raise
         except OSError as exc:
             raise DrawConfigError(
                 "图片已生成，但无法复制到 SDK 文件发送目录"
             ) from exc
+
+    def _write_outbound_copy(self, source: Path, *, name: str) -> Path:
+        destination = self._outbound_dir / name
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+        try:
+            shutil.copy2(source, temporary)
+            replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    def _write_outbound_zip(
+        self, source: Path, *, name: str, inner_name: str
+    ) -> Path:
+        destination = self._outbound_dir / name
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.write(source, arcname=inner_name)
+            replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    def _write_outbound_bytes(self, payload: bytes, *, name: str) -> Path:
+        destination = self._outbound_dir / name
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(payload)
+            replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
 
     def _build_payload(
         self,

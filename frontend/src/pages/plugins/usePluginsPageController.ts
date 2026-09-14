@@ -10,6 +10,7 @@ import {
 } from "../../lib/api";
 import { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { useConsoleConfig } from "../../state/console-config";
+import type { DrawRuntimeConfig } from "./DrawConfigSection";
 import type {
   EffectAuditFilters,
   FlowEffectLogResponse,
@@ -69,6 +70,16 @@ export function usePluginsPageController() {
   const [flowLoading, setFlowLoading] = useState(false);
   const [flowError, setFlowError] = useState("");
   const [restartRequired, setRestartRequired] = useState(false);
+  const [drawConfig, setDrawConfig] = useState<DrawRuntimeConfig | null>(null);
+  const [drawEtag, setDrawEtag] = useState("");
+  const [drawApiUrl, setDrawApiUrl] = useState("");
+  const [drawApiKey, setDrawApiKey] = useState("");
+  const [drawApiModel, setDrawApiModel] = useState("");
+  const [drawApiEditUrl, setDrawApiEditUrl] = useState("");
+  const [drawLoading, setDrawLoading] = useState(false);
+  const [drawSaving, setDrawSaving] = useState(false);
+  const [drawError, setDrawError] = useState("");
+  const [drawNotice, setDrawNotice] = useState("");
   const selectedPluginName = searchParams.get("plugin")?.trim() || "";
 
   const pluginCards: InstalledPlugin[] = installed.length ? installed : (data?.plugins || []).map((plugin) => ({
@@ -612,6 +623,134 @@ export function usePluginsPageController() {
     }
   };
 
+  const applyDrawConfig = (document: DrawRuntimeConfig, etag?: string | null) => {
+    setDrawConfig(document);
+    setDrawEtag(etag || `"${document.version}"`);
+    setDrawApiUrl(document.api_url || "");
+    setDrawApiModel(document.api_model || "");
+    setDrawApiEditUrl(document.api_edit_url || "");
+    setDrawApiKey("");
+  };
+
+  const parseDrawConfig = (value: unknown): DrawRuntimeConfig | null => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const row = value as Record<string, unknown>;
+    if (!("version" in row) && !("api_url" in row) && !("enabled" in row)) {
+      return null;
+    }
+    return {
+      version: Number(row.version ?? 0) || 0,
+      enabled: Boolean(row.enabled),
+      api_url: String(row.api_url || ""),
+      api_edit_url: String(row.api_edit_url || ""),
+      api_model: String(row.api_model || ""),
+      api_provider: String(row.api_provider || ""),
+      api_key_configured: Boolean(row.api_key_configured),
+      api_key_hint: String(row.api_key_hint || ""),
+      api_host: String(row.api_host || ""),
+    };
+  };
+
+  const loadDrawConfig = async () => {
+    if (!config.adminToken) {
+      return;
+    }
+    setDrawLoading(true);
+    setDrawError("");
+    try {
+      const result = await apiVersionedResource<unknown>(config, "/plugins/draw/admin/config", {
+        auth: true,
+      });
+      const parsed = parseDrawConfig(result.value);
+      if (!parsed) {
+        setDrawConfig(null);
+        return;
+      }
+      applyDrawConfig(parsed, result.etag);
+    } catch (err) {
+      setDrawError(err instanceof Error ? err.message : "画图接口配置读取失败");
+      setDrawConfig(null);
+    } finally {
+      setDrawLoading(false);
+    }
+  };
+
+  const saveDrawConfig = async () => {
+    setDrawSaving(true);
+    setDrawError("");
+    setDrawNotice("");
+    try {
+      const body: Record<string, string> = {
+        api_url: drawApiUrl.trim(),
+        api_model: drawApiModel.trim(),
+        api_edit_url: drawApiEditUrl.trim(),
+      };
+      if (drawApiKey.trim()) {
+        body.api_key = drawApiKey.trim();
+      }
+      const result = await apiVersionedResource<unknown, Record<string, string>>(
+        config,
+        "/plugins/draw/admin/config",
+        {
+          method: "POST",
+          auth: true,
+          ifMatch: drawEtag || `"${drawConfig?.version ?? 0}"`,
+          body,
+        },
+      );
+      const parsed = parseDrawConfig(result.value);
+      if (parsed) {
+        applyDrawConfig(parsed, result.etag);
+      }
+      setDrawNotice(body.api_url ? "已保存，当前请求立即使用新地址。" : "已停用画图接口。");
+    } catch (err) {
+      if (err instanceof VersionConflictError) {
+        await loadDrawConfig();
+        setDrawError("配置已被其他管理员修改，已重新读取，请核对后重试。");
+      } else {
+        setDrawError(err instanceof Error ? err.message : "画图接口配置保存失败");
+      }
+    } finally {
+      setDrawSaving(false);
+    }
+  };
+
+  const disableDrawConfig = async () => {
+    setDrawSaving(true);
+    setDrawError("");
+    setDrawNotice("");
+    try {
+      const result = await apiVersionedResource<unknown, { api_url: string }>(
+        config,
+        "/plugins/draw/admin/config",
+        {
+          method: "POST",
+          auth: true,
+          ifMatch: drawEtag || `"${drawConfig?.version ?? 0}"`,
+          body: { api_url: "" },
+        },
+      );
+      const parsed = parseDrawConfig(result.value);
+      if (parsed) {
+        applyDrawConfig(parsed, result.etag);
+      } else {
+        setDrawApiUrl("");
+      }
+      setDrawNotice("已停用画图接口。");
+    } catch (err) {
+      if (err instanceof VersionConflictError) {
+        await loadDrawConfig();
+        setDrawError("配置已被其他管理员修改，已重新读取，请核对后重试。");
+      } else {
+        setDrawError(err instanceof Error ? err.message : "画图接口停用失败");
+      }
+    } finally {
+      setDrawSaving(false);
+    }
+  };
+
   useEffect(() => {
     if (config.adminToken) {
       void (async () => {
@@ -631,6 +770,7 @@ export function usePluginsPageController() {
         await loadPluginEvents();
         await loadRestartInstructions(installedResult.plugins || []);
         await loadFlowRuntimeStatus();
+        await loadDrawConfig();
       })().catch((err: unknown) => {
         setError(err instanceof Error ? err.message : "加载失败");
       });
@@ -773,6 +913,21 @@ export function usePluginsPageController() {
     flowError,
     selectedPluginName,
     restartRequired,
+    drawConfig,
+    drawApiUrl,
+    drawApiKey,
+    drawApiModel,
+    drawApiEditUrl,
+    drawLoading,
+    drawSaving,
+    drawError,
+    drawNotice,
+    setDrawApiUrl,
+    setDrawApiKey,
+    setDrawApiModel,
+    setDrawApiEditUrl,
+    saveDrawConfig,
+    disableDrawConfig,
     refreshSummary: loadSummary,
     refreshFlowRuntime: loadFlowRuntimeStatus,
     selectEffectTrace,

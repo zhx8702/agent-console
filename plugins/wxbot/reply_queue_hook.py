@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from app.channel import get_reply_policy_override
 from app.channel.reply_policy import match_reply_policy as _match_reply_policy
 from app.common.logging import get_logger
+from app.common.prompting import persona_cos_active
 from app.common.types import Channel, RouteType
 from app.orchestrator.pipeline import PipelineContext
 from app.plugin.hooks import HookPoint
@@ -507,6 +508,7 @@ class WxbotReplyQueueHook:
                             and ctx.result is not None
                             and ctx.result.route == RouteType.LLM
                         ),
+                        "preserve_persona_style": persona_cos_active(ctx.session),
                         "voice_profile": (
                             dict(ctx.extras["wxbot_voice_profile"])
                             if isinstance(ctx.extras.get("wxbot_voice_profile"), dict)

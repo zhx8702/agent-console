@@ -130,6 +130,13 @@ def bootstrap_draw_task_schema(connection: sqlite3.Connection) -> None:
             ON plugin_draw_task (tenant_id, created_at DESC);
         CREATE INDEX idx_draw_task_queue_due
             ON plugin_draw_task (status, next_run_at, locked_until);
+        CREATE TABLE plugin_draw_runtime_config (
+            config_key VARCHAR(32) PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            overrides_json TEXT NOT NULL DEFAULT '{}',
+            updated_by VARCHAR(128) NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     connection.commit()

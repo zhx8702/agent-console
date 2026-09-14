@@ -3,10 +3,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from typing import Annotated
+
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
+from pydantic import Field
 
+from app.admin.audit import set_admin_audit_context
 from app.admin.auth_router import authenticate_admin_request
+from app.common.request_models import StrictRequestModel
 from app.admin.mutation_ledger import (
     MutationAudit,
     MutationChange,
@@ -22,7 +27,16 @@ from plugins.draw.hooks import (
     resend_draw_task_callback,
     retry_draw_task_once,
 )
-from plugins.draw.store import DrawStore
+from plugins.draw.store import DrawRuntimeConfigVersionConflict, DrawStore
+
+
+class DrawRuntimeConfigUpdate(StrictRequestModel):
+    api_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=512)
+    api_edit_url: str | None = Field(default=None, max_length=512)
+    api_model: str | None = Field(default=None, max_length=128)
+    api_provider: str | None = Field(default=None, max_length=64)
+    clear_api_key: bool = False
 
 
 def build_draw_router(
@@ -37,6 +51,72 @@ def build_draw_router(
     scope_execution_allowed: Callable[[str, str], Awaitable[bool]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
+
+    @router.get("/admin/config")
+    async def get_runtime_config(request: Request, response: Response):
+        _require_admin(request, store)
+        snapshot = await store.get_runtime_config()
+        document = store.runtime_config_document(snapshot)
+        _set_config_headers(response, int(snapshot.version))
+        return document
+
+    @router.post("/admin/config")
+    async def set_runtime_config(
+        body: DrawRuntimeConfigUpdate,
+        request: Request,
+        response: Response,
+        if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    ):
+        _require_admin(request, store)
+        expected_version = _required_if_match(if_match)
+        updates: dict[str, str | None] = {}
+        if body.api_url is not None:
+            updates["draw_api_url"] = body.api_url
+        if body.api_edit_url is not None:
+            updates["draw_api_edit_url"] = body.api_edit_url
+        if body.api_model is not None:
+            updates["draw_api_model"] = body.api_model
+        if body.api_provider is not None:
+            updates["draw_api_provider"] = body.api_provider
+        if body.clear_api_key:
+            updates["draw_api_key"] = ""
+        elif body.api_key is not None:
+            updates["draw_api_key"] = body.api_key
+        if not updates:
+            raise HTTPException(status_code=400, detail="no_mutable_fields")
+        before = store.runtime_config_document(await store.get_runtime_config())
+        try:
+            snapshot = await store.set_runtime_config(
+                expected_version=expected_version,
+                updates=updates,
+                updated_by=str(
+                    getattr(getattr(request, "state", None), "principal", None)
+                    or getattr(request.state, "admin_id", "")
+                    or ""
+                ),
+            )
+        except DrawRuntimeConfigVersionConflict as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "version_conflict",
+                    "expected_version": exc.expected,
+                    "current_version": exc.current,
+                },
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        document = store.runtime_config_document(snapshot)
+        _set_config_headers(response, int(snapshot.version))
+        set_admin_audit_context(
+            request,
+            target_type="plugin_draw_runtime_config",
+            before_state=store.runtime_config_audit_state(before),
+            after_state=store.runtime_config_audit_state(document),
+            policy_version=int(snapshot.version),
+            reason="conditional_draw_runtime_config_update",
+        )
+        return document
 
     @router.get("/images")
     async def list_generated_images(limit: int = 50):
@@ -301,6 +381,27 @@ def build_draw_router(
 
 def _require_admin(request: Request, store: DrawStore) -> None:
     authenticate_admin_request(request, store.settings)
+
+
+def _set_config_headers(response: Response, version: int) -> None:
+    response.headers["ETag"] = f'"{int(version)}"'
+    response.headers["Cache-Control"] = "no-store"
+
+
+def _required_if_match(value: str | None) -> int:
+    if value is None or not value.strip():
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="if_match_required",
+        )
+    normalized = value.strip()
+    if normalized.startswith("W/"):
+        normalized = normalized[2:].strip()
+    if len(normalized) >= 2 and normalized[0] == '"' and normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    if not normalized.isdigit():
+        raise HTTPException(status_code=400, detail="invalid_if_match")
+    return int(normalized)
 
 
 async def _require_task_scope_execution(
