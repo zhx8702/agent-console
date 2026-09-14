@@ -11,11 +11,11 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from fastapi import FastAPI
 
-from app.infra.runtime_schema import RUNTIME_SCHEMA_REVISION, RUNTIME_SCHEMA_TABLES
+from app.infra.runtime_schema import RUNTIME_SCHEMA_TABLES
 from plugins.draw.router import build_draw_router
 from plugins.draw.store import DrawStore
 from tests.unit._schema_fixtures import bootstrap_draw_task_schema
-from tests.unit.test_draw_store import _SqliteSessionFactory, _draw_settings
+from tests.unit.test_draw_store import _draw_settings, _SqliteSessionFactory
 
 _MODULE = "migrations.versions.20260909_0051_draw_runtime_config"
 

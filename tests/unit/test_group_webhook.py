@@ -120,23 +120,6 @@ def test_request_public_origin_prefers_configured_domain(monkeypatch: pytest.Mon
     assert _request_public_origin(request) == "https://hooks.example"
 
 
-def test_request_public_origin_prefers_configured_domain(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.common.config import get_settings
-    from plugins.wxbot.admin_group_webhook_routes import _request_public_origin
-
-    monkeypatch.setattr(
-        get_settings(),
-        "wxbot_group_webhook_public_origin",
-        "https://hooks.example/",
-    )
-    request = SimpleNamespace(
-        headers={},
-        url=SimpleNamespace(scheme="http"),
-        base_url="http://127.0.0.1:4173/",
-    )
-    assert _request_public_origin(request) == "https://hooks.example"
-
-
 def test_webhook_token_helpers_are_unguessable_and_hashed() -> None:
     token = new_webhook_token()
     assert token.startswith("whg_")

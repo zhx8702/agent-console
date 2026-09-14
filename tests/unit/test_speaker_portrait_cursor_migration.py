@@ -11,7 +11,6 @@ from alembic.script import ScriptDirectory
 from app.infra.runtime_schema import (
     RUNTIME_SCHEMA_COLUMN_CONTRACTS,
     RUNTIME_SCHEMA_INDEXES,
-    RUNTIME_SCHEMA_REVISION,
 )
 
 _MODULE = "migrations.versions.20260902_0050_speaker_portrait_incremental_cursor"

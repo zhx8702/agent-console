@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
@@ -11,7 +10,6 @@ from pydantic import Field
 
 from app.admin.audit import set_admin_audit_context
 from app.admin.auth_router import authenticate_admin_request
-from app.common.request_models import StrictRequestModel
 from app.admin.mutation_ledger import (
     MutationAudit,
     MutationChange,
@@ -22,6 +20,7 @@ from app.admin.mutation_ledger import (
 )
 from app.billing import BillingCoordinator
 from app.channel import ChannelRegistry
+from app.common.request_models import StrictRequestModel
 from plugins.draw.hooks import (
     recover_stale_draw_tasks,
     resend_draw_task_callback,
