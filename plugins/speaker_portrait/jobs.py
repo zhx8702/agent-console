@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,56 @@ from plugins.speaker_portrait.workspace import (
 logger = get_logger(__name__)
 
 
+# Upper bound on how many messages one incremental job may pull from the SDK.
+# Wide enough to cover a week-long outage for an active speaker; the LLM batch
+# is still capped separately by the job's ``max_messages``.
+_INCREMENTAL_FETCH_CEILING = 5000
+_INCREMENTAL_FETCH_MARGIN = 200
+_INCREMENTAL_DAYS_CEILING = 365
+
+
+def _parse_cursor(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def incremental_fetch_window(job: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(days_limit, max_messages)`` to request from the SDK.
+
+    The SDK returns the *newest* N messages within the window. A backlog larger
+    than the batch cap must still be fetched in full, otherwise the oldest part
+    is dropped and the cursor jumps past it forever. Widen the request to the
+    claimed backlog (plus margin) and to however many days the cursor is behind.
+    """
+
+    days_limit = int(job.get("days_limit") or 0)
+    max_messages = int(job.get("max_messages") or 0)
+    if days_limit <= 0 or max_messages <= 0:
+        return days_limit, max_messages
+    claimed = max(0, int(job.get("claimed_pending_messages") or 0))
+    fetch_limit = min(_INCREMENTAL_FETCH_CEILING, max(max_messages, claimed + _INCREMENTAL_FETCH_MARGIN))
+    since = _parse_cursor(str(job.get("since_timestamp") or ""))
+    if since is not None:
+        behind_days = (datetime.now(UTC) - since).days + 1
+        days_limit = min(_INCREMENTAL_DAYS_CEILING, max(days_limit, behind_days))
+    return days_limit, fetch_limit
+
+
+def clip_oldest(messages: list[dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], bool]:
+    """Keep the oldest ``limit`` messages so the cursor advances contiguously."""
+
+    ordered = sorted(messages, key=lambda item: str(item.get("timestamp") or ""))
+    if limit <= 0 or len(ordered) <= limit:
+        return ordered, False
+    return ordered[:limit], True
+
+
 async def collect_speaker_messages(store: SpeakerPortraitStore, job: dict[str, Any]) -> list[dict[str, Any]]:
     settings = store.settings
     sdk_url = str(getattr(settings, "wxbot_sdk_url", "") or "").rstrip("/")
@@ -40,8 +91,7 @@ async def collect_speaker_messages(store: SpeakerPortraitStore, job: dict[str, A
     external_session_id = str(job.get("external_session_id") or job.get("session_id") or "").strip()
     if not external_session_id:
         raise RuntimeError("portrait_history_session_missing")
-    days_limit = int(job.get("days_limit") or 0)
-    max_messages = int(job.get("max_messages") or 0)
+    days_limit, max_messages = incremental_fetch_window(job)
     payload = {
         "session_id": external_session_id,
         "target_wxid": str(job.get("speaker_id") or ""),
@@ -160,6 +210,17 @@ async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> 
         raise RuntimeError("speaker_portrait_requires_local_cli")
     mode = str(job.get("mode") or "full").strip().lower()
     messages = await collect_speaker_messages(store, job)
+    truncated = False
+    if mode == "incremental":
+        # Process the oldest slice first; whatever is left stays pending and
+        # is picked up by the next sweep instead of being skipped for good.
+        messages, truncated = clip_oldest(messages, int(job.get("max_messages") or 0))
+        if truncated:
+            logger.info(
+                "speaker_portrait.incremental_backlog_split",
+                job_id=job.get("id"),
+                processed=len(messages),
+            )
     record = await store.get_portrait(
         tenant_id=str(job.get("tenant_id") or ""),
         speaker_id=str(job.get("speaker_id") or ""),
@@ -266,6 +327,8 @@ async def run_portrait_job(store: SpeakerPortraitStore, job: dict[str, Any]) -> 
         message_count=int(stats.get("used_messages") or 0),
         last_message_at=str((stats.get("time_span") or "").split(" ~ ")[-1] if stats.get("time_span") else ""),
         mode=mode,
+        # When the backlog was split, only debit what this batch covered.
+        pending_covered=len(messages) if truncated else None,
     )
     if bool(getattr(settings, "speaker_portrait_style_sync_enabled", True)):
         try:
