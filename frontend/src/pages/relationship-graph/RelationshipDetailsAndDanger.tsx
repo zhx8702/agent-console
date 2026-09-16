@@ -7,6 +7,8 @@ import {
   displayEdgeSource,
   displayEdgeTarget,
   evidenceCountsLabel,
+  evidenceObservedRange,
+  evidenceSourceLabel,
   formatConfidence,
   formatTimestamp,
   graphNodeLabel,
@@ -359,9 +361,18 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
                   <>
                     <dl className="relationship-detail-list">
                       <div><dt>证据来源</dt><dd>{evidenceCountsLabel(evidence)}</dd></div>
+                      {evidenceSourceLabel(evidence.evidence_source) && (
+                        <div><dt>证据类型</dt><dd>{evidenceSourceLabel(evidence.evidence_source)}</dd></div>
+                      )}
                       <div><dt>审核状态</dt><dd><span className={acceptanceClass(evidence.edge?.acceptance_status)}>{acceptanceStatusLabel(evidence.edge?.acceptance_status)}</span></dd></div>
                       <div><dt>首次出现</dt><dd>{formatTimestamp(evidence.edge?.first_seen)}</dd></div>
                       <div><dt>最近出现</dt><dd>{formatTimestamp(evidence.edge?.last_seen)}</dd></div>
+                      {evidenceObservedRange(evidence) && (
+                        <div><dt>群消息时间</dt><dd>{evidenceObservedRange(evidence)}</dd></div>
+                      )}
+                      {(evidence.evidence_counts?.evidence_days ?? 0) > 0 && (
+                        <div><dt>覆盖天数</dt><dd>{evidence.evidence_counts?.evidence_days}</dd></div>
+                      )}
                     </dl>
                     <TechnicalDetails summary="查看证据技术详情" value={evidence} />
                   </>

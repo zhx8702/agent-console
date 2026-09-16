@@ -4,6 +4,7 @@ import { DangerAction } from "../../components/DangerAction";
 import {
   GRAPH_CANVAS_HEIGHT,
   GRAPH_CANVAS_WIDTH,
+  GRAPH_LANES,
   GRAPH_RANGE_PRESETS,
   GRAPH_VIEW_MODES,
   NODE_TYPE_LEGEND,
@@ -18,14 +19,17 @@ import {
   edgeSeenOnDate,
   edgeStrokeWidth,
   extractionMethodLabel,
+  formatStrength,
   quadraticEdgePath,
   formatConfidence,
   isPendingReviewStatus,
+  isPersonNode,
   nodeIsFocused,
   nodeSecondaryLabel,
   nodeTypeLabel,
   nodeVisualType,
   graphNodeLabel,
+  populatedGraphLanes,
   readableRelationType,
   relationLabel,
   selectedEdgeTouchesNode,
@@ -192,6 +196,9 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
   } = controller;
   const canvas = useCanvasViewport();
   const bundleOffsets = edgeBundleOffsets(visibleGraphEdges);
+  const populatedLanes = populatedGraphLanes(graphNodes);
+  const pageInfo = graph?.page;
+  const serverTruncated = Boolean(pageInfo?.truncated) && Number(pageInfo?.total || 0) > (graph?.edges?.length || 0);
 
   return (
     <>
@@ -280,7 +287,9 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
           )}
           {!!graphNodes.length && (
             <p className="relationship-graph-summary">
-              {graphSummaryText} 可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据数，透明度表示新旧。
+              {graphSummaryText}
+              {serverTruncated && ` 服务端共 ${pageInfo?.total} 条匹配关系，按互动强度只返回了前 ${graph?.edges?.length}，收窄时间范围或关系类型可以看到其余部分。`}
+              {" "}可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据消息数（对数），透明度表示最近一次证据的新旧。
             </p>
           )}
           {loading ? (
@@ -302,10 +311,16 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
             >
               <g transform={`translate(${canvas.view.x} ${canvas.view.y}) scale(${canvas.view.scale})`}>
                 <g className="relationship-lane-labels" aria-hidden="true">
-                  <text x="94" y="38">人物 / 核心成员</text>
-                  <text x="520" y="38">主题 / 项目</text>
-                  <text x="710" y="38">产品 / 工具</text>
-                  {graphViewMode === "all" && <text x="760" y="410">值 / 其他</text>}
+                  {graphNodes.some((node) => isPersonNode(node)) && (
+                    <text x={populatedLanes.size ? 300 : GRAPH_CANVAS_WIDTH / 2} y="38" textAnchor="middle">
+                      人物 · 位置由互动强度决定，越常互动越靠近
+                    </text>
+                  )}
+                  {Array.from(populatedLanes).map((lane) => (
+                    <text key={lane} x={GRAPH_LANES[lane].x} y={lane === "value" ? GRAPH_LANES.value.top - 22 : 38} textAnchor="middle">
+                      {GRAPH_LANES[lane].label}
+                    </text>
+                  ))}
                 </g>
                 {visibleGraphEdges.map((edge) => {
                   const from = layout.get(displayEdgeSource(edge));
@@ -497,6 +512,8 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                   <span className={acceptanceClass(edge.acceptance_status)}>{acceptanceStatusLabel(edge.acceptance_status)}</span>
                   <small>
                     {readableRelationType(edge.label || edge.type)} · {extractionMethodLabel(edge.extraction_method)} · 置信度 {formatConfidence(edge.confidence)} · {edge.evidence_count ?? 0} 条证据
+                    {edge.strength !== undefined && edge.strength !== null ? ` · 强度 ${formatStrength(edge.strength)}` : ""}
+                    {(edge.evidence_day_count ?? 0) > 1 ? ` · ${edge.evidence_day_count} 天` : ""}
                   </small>
                 </button>
               ))}

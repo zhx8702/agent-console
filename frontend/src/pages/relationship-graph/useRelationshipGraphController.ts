@@ -89,6 +89,11 @@ export function useRelationshipGraphController() {
   const [windowCatchupMaxWindows, setWindowCatchupMaxWindows] = useState("20");
   const [actionPanelOpen, setActionPanelOpen] = useState(false);
   const extractionTimeBudgetSeconds = 60;
+  // The console talks to the API through a proxy with a ~60s read timeout, so a
+  // single-window run gives the model 45s; multi-window catch-up only runs the
+  // rule layer inline and leaves one LLM job per window for the scheduler.
+  const windowLlmTimeoutSeconds = 45;
+  const catchupLlmMode = "enqueue" as const;
   const currentGraphScopeKey = selectedGroupIsVerified
     ? [config.tenantId.trim(), channel.trim(), sourceKey.trim(), selectedGroupId].join("\u001f")
     : "";
@@ -892,6 +897,7 @@ export function useRelationshipGraphController() {
         cursor_event_id: windowExtractionCursor,
         dry_run: windowExtractionDryRun,
         include_llm: true,
+        llm_timeout_seconds: windowLlmTimeoutSeconds,
       };
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowExtraction>>>(
         config,
@@ -998,6 +1004,7 @@ export function useRelationshipGraphController() {
         dry_run: windowExtractionDryRun,
         time_budget_seconds: extractionTimeBudgetSeconds,
         include_llm: true,
+        llm_mode: catchupLlmMode,
       };
       const result = await apiRequest<Awaited<ReturnType<typeof runGroupGraphWindowCatchup>>>(
         config,
@@ -1146,6 +1153,7 @@ export function useRelationshipGraphController() {
                   dry_run: false,
                   time_budget_seconds: extractionTimeBudgetSeconds,
                   include_llm: true,
+                  llm_mode: catchupLlmMode,
                 }),
               },
             },
@@ -1157,6 +1165,7 @@ export function useRelationshipGraphController() {
             windows_processed: result.windows_processed ?? 0,
             more_remain: result.more_remain,
             stop_reason: result.stop_reason,
+            llm_jobs_enqueued: result.llm_jobs_enqueued ?? 0,
           });
         } catch (err) {
           catchups.push({

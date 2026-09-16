@@ -116,6 +116,7 @@ export function RelationshipActionPanel(controller: RelationshipGraphController)
             <small>仅演练</small>
           </label>
           <em>当前游标 {windowExtractionCursor}</em>
+          <em>单窗口抽取会等模型最多 45 秒；追平只跑规则，语义部分排成任务由调度进程每小时处理。</em>
         </div>
         <RelationshipUnavailableReset />
       </div>

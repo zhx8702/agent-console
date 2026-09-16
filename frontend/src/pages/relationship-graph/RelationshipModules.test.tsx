@@ -14,6 +14,122 @@ import {
   RelationshipGraphPresentation,
   type RelationshipGraphPresentationProps,
 } from "./RelationshipGraphPresentation";
+import {
+  GRAPH_CANVAS_WIDTH,
+  GRAPH_LANES,
+  buildGraphLayout,
+  edgeRecencyOpacity,
+  edgeStrokeWidth,
+  evidenceCountsLabel,
+  evidenceObservedRange,
+  evidenceSourceLabel,
+  populatedGraphLanes,
+  sanitizeEdgeEvidence,
+  shouldKeepEdgeForMode,
+} from "./graphModel";
+
+function personNode(id: string, label: string): GroupGraphNode {
+  return { id, type: "person", label, display_label: label, acceptance_status: "accepted", confidence: 1 };
+}
+
+function edgeBetween(id: string, source: string, target: string, type: string, evidence = 1): GroupGraphEdge {
+  return { id, source, target, type, label: type, confidence: 0.9, acceptance_status: "accepted", evidence_count: evidence };
+}
+
+describe("relationship graph layout and encodings", () => {
+  it("spreads people across the canvas instead of one vertical lane", () => {
+    const people = Array.from({ length: 12 }, (_, index) => personNode(`p${index}`, `成员${index}`));
+    const edges = [
+      edgeBetween("e1", "p0", "p1", "replied_to", 40),
+      edgeBetween("e2", "p0", "p2", "replied_to", 12),
+      edgeBetween("e3", "p1", "p2", "addressed", 3),
+      edgeBetween("e4", "p3", "p4", "replied_to", 2),
+      edgeBetween("e5", "p5", "p6", "replied_to", 1),
+    ];
+
+    const layout = buildGraphLayout(people, edges);
+    const points = people.map((node) => layout.get(node.id)!);
+
+    expect(points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))).toBe(true);
+    const xs = points.map((point) => point.x);
+    expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThan(GRAPH_CANVAS_WIDTH * 0.35);
+    // Strongly connected pair ends up closer than an unconnected pair.
+    const distance = (a: string, b: string) => Math.hypot(layout.get(a)!.x - layout.get(b)!.x, layout.get(a)!.y - layout.get(b)!.y);
+    expect(distance("p0", "p1")).toBeLessThan(distance("p0", "p9"));
+    // Deterministic: the same input always yields the same picture.
+    expect(buildGraphLayout(people, edges).get("p7")).toEqual(layout.get("p7"));
+  });
+
+  it("keeps topics in their own lane only when topic nodes exist", () => {
+    const people = [personNode("p0", "洋白"), personNode("p1", "小海")];
+    const topic: GroupGraphNode = { id: "t1", type: "topic", label: "并发", display_label: "并发", acceptance_status: "accepted", confidence: 0.8 };
+    const edges = [edgeBetween("e1", "p0", "p1", "replied_to", 5), edgeBetween("e2", "p0", "t1", "mentioned", 2)];
+
+    expect(populatedGraphLanes(people)).toEqual(new Set());
+    expect(populatedGraphLanes([...people, topic])).toEqual(new Set(["topic"]));
+    const layout = buildGraphLayout([...people, topic], edges);
+    expect(layout.get("t1")!.x).toBeGreaterThan(GRAPH_LANES.topic.x - 60);
+    expect(layout.get("p0")!.x).toBeLessThan(560);
+  });
+
+  it("folds same-window co-participation out of the default view only", () => {
+    const nodes = new Map([["p0", personNode("p0", "洋白")], ["p1", personNode("p1", "小海")]]);
+    const coParticipated = edgeBetween("e1", "p0", "p1", "co_participated");
+    const reply = edgeBetween("e2", "p0", "p1", "replied_to");
+
+    expect(shouldKeepEdgeForMode(coParticipated, nodes, "readable", new Set())).toBe(false);
+    expect(shouldKeepEdgeForMode(reply, nodes, "readable", new Set())).toBe(true);
+    expect(shouldKeepEdgeForMode(coParticipated, nodes, "people", new Set())).toBe(true);
+    expect(shouldKeepEdgeForMode(coParticipated, nodes, "all", new Set())).toBe(true);
+    // Selecting a node brings its co-participation edges back.
+    expect(shouldKeepEdgeForMode(coParticipated, nodes, "readable", new Set(["p0"]))).toBe(true);
+  });
+
+  it("scales stroke width by evidence on a log scale and opacity by the last evidence date", () => {
+    const widths = [1, 4, 20, 100].map((evidence) => edgeStrokeWidth(edgeBetween("e", "a", "b", "replied_to", evidence)));
+    expect(widths[0]).toBeLessThan(widths[1]);
+    expect(widths[1]).toBeLessThan(widths[2]);
+    expect(widths[2]).toBeLessThan(widths[3]);
+    expect(widths[3]).toBeLessThanOrEqual(5.5);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const fresh = { ...edgeBetween("e", "a", "b", "replied_to"), last_seen: "2026-01-01T00:00:00", last_seen_date: today };
+    const stale = { ...edgeBetween("e", "a", "b", "replied_to"), last_seen: "2026-01-01T00:00:00" };
+    expect(edgeRecencyOpacity(fresh)).toBeGreaterThan(edgeRecencyOpacity(stale));
+  });
+});
+
+describe("relationship graph evidence labels", () => {
+  it("adds live group-message evidence to the counts label without exposing text", () => {
+    const evidence = sanitizeEdgeEvidence({
+      edge: {
+        id: "fact:1",
+        type: "replied_to",
+        first_observed_at: "2026-08-09T01:02:03",
+        last_observed_at: "2026-09-04T04:05:06",
+      },
+      evidence_counts: { memory_items: 1, events: 0, episodes: 0, observations: 12, evidence_days: 2 },
+      evidence_source: "observation",
+      observations: [
+        { id: 154604, sender_label: "小海", occurred_at: "2026-08-09T01:02:03", content: "private text" },
+      ],
+    });
+
+    expect(evidenceCountsLabel(evidence)).toBe("记忆项 1 / 事件 0 / 片段 0 / 群消息 12");
+    expect(evidenceSourceLabel(evidence.evidence_source)).toBe("实时群消息");
+    expect(evidenceObservedRange(evidence)).toContain("→");
+    expect(JSON.stringify(evidence)).not.toContain("private text");
+  });
+
+  it("keeps the legacy label when no observation evidence exists", () => {
+    expect(evidenceCountsLabel({ evidence_counts: { memory_items: 2, events: 1, episodes: 1 } })).toBe(
+      "记忆项 2 / 事件 1 / 片段 1",
+    );
+    expect(evidenceSourceLabel("memory_event")).toBe("导入事件");
+    expect(evidenceSourceLabel(undefined)).toBe("");
+    expect(evidenceObservedRange(null)).toBe("");
+  });
+});
 
 describe("relationship graph modules", () => {
   it("keeps the unsupported destructive reset visibly unavailable", () => {
