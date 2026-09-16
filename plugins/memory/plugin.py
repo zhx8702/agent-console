@@ -231,11 +231,17 @@ class MemoryPlugin(Plugin):
                         getattr(settings, "memory_group_graph_auto_extract_llm_enabled", True)
                     ),
                     sync_missing_history=bool(
-                        getattr(settings, "memory_group_graph_auto_extract_sync_enabled", True)
+                        getattr(settings, "memory_group_graph_auto_extract_sync_enabled", False)
                     ),
                     sync_max_messages=int(
                         getattr(settings, "memory_group_graph_auto_extract_sync_max_messages", 200)
                         or 200
+                    ),
+                    llm_jobs_per_tick=int(
+                        getattr(settings, "memory_group_graph_llm_jobs_per_tick", 6) or 0
+                    ),
+                    llm_timeout_seconds=int(
+                        getattr(settings, "memory_group_graph_llm_timeout_seconds", 60) or 60
                     ),
                 )
             except asyncio.CancelledError:

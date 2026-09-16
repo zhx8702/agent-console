@@ -14,6 +14,7 @@ from plugins.memory.store import (
     _LLM_JOB_SCOPE_GROUP_KEYS,
     GRAPH_LLM_BACKING_SOURCE_TYPE,
     GROUP_HISTORY_USER_ID_SCOPE,
+    GROUP_WINDOW_LLM_JOB_TRACE_PREFIX,
     MEMORY_EXTRACTION_JOB_STATUSES,
     _clamp_int,
     _job_idempotency_key,
@@ -878,6 +879,7 @@ class MemoryExtractionJobStoreMixin:
             "         OR (status = 'running' AND locked_until < NOW())) "
             "    AND next_run_at <= NOW() "
             "    AND (locked_until IS NULL OR locked_until < NOW()) "
+            "    AND source_trace_id NOT LIKE :group_window_prefix "
             f"{allowlist_sql}"
             "  ORDER BY next_run_at ASC, created_at ASC "
             "  LIMIT :limit "
@@ -896,6 +898,7 @@ class MemoryExtractionJobStoreMixin:
                 "limit": batch_size,
                 "lock_ttl": lock_ttl,
                 "locked_by": claim_token,
+                "group_window_prefix": f"{GROUP_WINDOW_LLM_JOB_TRACE_PREFIX}%",
                 **allowlist_params,
             },
         )
@@ -1002,6 +1005,7 @@ class MemoryExtractionJobStoreMixin:
             "         OR (job.status = 'running' AND job.locked_until < NOW())) "
             "    AND job.next_run_at <= NOW() "
             "    AND (job.locked_until IS NULL OR job.locked_until < NOW()) "
+            "    AND job.source_trace_id NOT LIKE :group_window_prefix "
             "    AND ("
             "      job.source_event_id IN ("
             "        SELECT id FROM plugin_memory_event "
@@ -1037,6 +1041,7 @@ class MemoryExtractionJobStoreMixin:
                 "limit": batch_size,
                 "lock_ttl": lock_ttl,
                 "locked_by": claim_token,
+                "group_window_prefix": f"{GROUP_WINDOW_LLM_JOB_TRACE_PREFIX}%",
             },
         )
         for job in rows:

@@ -1446,8 +1446,17 @@ async def test_group_relationship_edge_evidence_safe_payload_uses_ids_not_raw_te
         "memory_item_ids": [100, 101],
         "event_ids": [500, 501],
         "episode_ids": [20],
+        "observation_ids": [],
     }
-    assert payload["evidence_counts"] == {"memory_items": 2, "events": 1, "episodes": 1}
+    assert payload["evidence_counts"] == {
+        "memory_items": 2,
+        "events": 1,
+        "episodes": 1,
+        "observations": 0,
+        "evidence_days": 0,
+    }
+    assert payload["observations"] == []
+    assert payload["evidence_source"] == "memory_event"
     serialized = str(payload)
     assert "private raw content" not in serialized
     assert "private original text" not in serialized
@@ -1881,6 +1890,14 @@ async def test_group_relationship_window_extraction_dry_run_builds_safe_windows_
             "candidate_count": 0,
             "applied_count": 0,
             "skipped_count": 0,
+            "signal_counts": {
+                "quote": 0,
+                "mention": 0,
+                "prefix_reply": 0,
+                "co_participation": 0,
+                "llm": 0,
+            },
+            "unresolved_targets": 0,
         }
     ]
     assert result["totals"] == {
@@ -2132,36 +2149,25 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
             ]
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             cursor = int(params["cursor_event_id"])
-            if cursor < 501:
-                return [
-                    {
-                        "id": 501,
-                        "tenant_id": "demo",
-                        "channel": "wechat",
-                        "source_key": "wxbot",
-                        "user_id": "__group__",
-                        "session_id": "room-a@chatroom",
-                        "user_text": "wxid_a: raw one",
-                        "assistant_text": "",
-                        "trace_id": "trace-501",
-                        "event_key": "event-501",
-                        "created_at": "2026-05-15T08:00:00",
-                    }
-                ]
+            # Two messages per window: a model claim needs two supporting
+            # messages before it is stored at all. Both endpoints must be real
+            # speakers, otherwise the object is reclassified or dropped.
+            window_ids = [501, 502] if cursor < 501 else [503, 504]
             return [
                 {
-                    "id": 502,
+                    "id": event_id,
                     "tenant_id": "demo",
                     "channel": "wechat",
                     "source_key": "wxbot",
                     "user_id": "__group__",
                     "session_id": "room-a@chatroom",
-                    "user_text": "wxid_a: raw two",
+                    "user_text": f"{'wxid_a' if event_id % 2 else 'wxid_b'}: raw {event_id}",
                     "assistant_text": "",
-                    "trace_id": "trace-502",
-                    "event_key": "event-502",
-                    "created_at": "2026-05-15T08:01:00",
+                    "trace_id": f"trace-{event_id}",
+                    "event_key": f"event-{event_id}",
+                    "created_at": f"2026-05-15T08:0{event_id - 500}:00",
                 }
+                for event_id in window_ids
             ]
         if "deleted_at IS NOT NULL" in sql:
             return []
@@ -2211,6 +2217,10 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
             item["occurrence_count"] = int(item["occurrence_count"]) + 1
             item["value_json"] = params["value_json"]
             item["confidence"] = max(float(item["confidence"]), float(params["confidence"]))
+            # Mirror the real statement: a promotion rewrites status/sensitivity.
+            item["status"] = params["status"]
+            item["sensitivity"] = params["sensitivity"]
+            item["sensitivity_category"] = params["sensitivity_category"]
             return []
         if "FROM plugin_memory_item WHERE id = :id" in sql:
             item = next(
@@ -2259,19 +2269,48 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
         session_id="room-a@chatroom",
         date="2026-05-15",
         window_size=10,
-        cursor_event_id=501,
+        cursor_event_id=502,
     )
 
     assert first["totals"]["applied"] == 1
     assert second["totals"]["applied"] == 1
+    assert first["signal_counts"]["llm"] == 2
     assert len(items_by_key) == 1
     item = next(iter(items_by_key.values()))
     assert item["occurrence_count"] == 2
     assert item["original_text"] == ""
     assert item["normalized_key"].startswith("group-window-rel:asked:")
     value = json.loads(item["value_json"])
-    assert value["relation"]["evidence_event_ids"] == [501, 502]
-    assert value["source_event_ids"] == [501, 502]
+    assert value["relation"]["evidence_event_ids"] == [501, 502, 503, 504]
+    assert value["source_event_ids"] == [501, 502, 503, 504]
+    # Four supporting messages on one day: accepted without waiting for a second day.
+    assert value["acceptance"]["status"] == "accepted"
+    assert value["acceptance"]["reason"] == "group_window_llm_repeated_evidence"
+    # The synthetic "wxid_a asked wxid_b" line must not be read as PII: an
+    # accepted relation is stored active, otherwise its fact never reaches the graph.
+    assert item["status"] == "active"
+    assert item["sensitivity"] == "normal"
+    assert item["sensitivity_category"] == "normal"
+
+
+def test_group_window_relation_sensitivity_probe_only_checks_free_text_objects() -> None:
+    from plugins.memory.store import _detect_sensitivity, _group_window_relation_sensitivity_probe
+
+    person_relation = {"relation": {"subject": "wxid_a", "predicate": "asked", "object": "wxid_b"}}
+    assert _group_window_relation_sensitivity_probe(person_relation) == ""
+    assert _detect_sensitivity(_group_window_relation_sensitivity_probe(person_relation)) == "normal"
+
+    term_relation = {
+        "relation": {"subject": "wxid_a", "predicate": "interested_in", "object": "Claude", "object_type": "tool"}
+    }
+    assert _group_window_relation_sensitivity_probe(term_relation) == "Claude"
+
+    phone_relation = {
+        "relation": {"subject": "wxid_a", "predicate": "mentioned", "object": "13812345678", "object_type": "topic"}
+    }
+    assert _detect_sensitivity(_group_window_relation_sensitivity_probe(phone_relation)) == "pii"
+    # value_json may arrive serialized.
+    assert _group_window_relation_sensitivity_probe(json.dumps(term_relation)) == "Claude"
 
 
 @pytest.mark.asyncio
@@ -2643,12 +2682,36 @@ async def test_group_relationship_window_extraction_no_llm_builds_person_person_
         "object_type": "person",
         "confidence": 0.62,
         "evidence_event_ids": [501, 502],
+        "evidence_observation_ids": [],
         "reason": "deterministic_adjacent_reply_window",
         "extraction_method": "deterministic_group_window",
+        "signals": {
+            "quote": 0,
+            "mention": 0,
+            "prefix_reply": 1,
+            "co_participation": 0,
+            "llm": 0,
+        },
+        # The replying message anchors the signal; counts derive from these ids.
+        "signal_evidence": {
+            "quote": [],
+            "mention": [],
+            "prefix_reply": [502],
+            "co_participation": [],
+            "llm": [],
+        },
+        "strength": value["relation"]["strength"],
     }
+    assert 0.2 < value["relation"]["strength"] < 0.4
     assert value["source_event_ids"] == [501, 502]
-    assert value["acceptance"]["status"] == "needs_review"
-    assert replied_to_item["status"] == "pending"
+    # An explicit reply prefix is an observable platform fact: accepted on sight.
+    assert value["acceptance"]["status"] == "accepted"
+    assert value["acceptance"]["reason"] == "group_window_direct_signal"
+    assert value["acceptance"]["reviewed_by"] == "system/auto"
+    assert value["acceptance"]["day_count"] == 1
+    assert replied_to_item["status"] == "active"
+    assert result["signal_counts"]["prefix_reply"] == 1
+    assert result["signal_counts"]["co_participation"] == 0
     assert [item["id"] for item in graph_sync_items] == [replied_to_item["id"]]
     serialized = str(result) + str(value)
     assert "RAW_FIELD_SENTINEL" not in serialized
@@ -2784,8 +2847,10 @@ async def test_group_relationship_window_extraction_no_llm_creates_person_person
         for relation in relations
     )
     assert all(item["source_type"] == "deterministic_group_window" for item in graph_items)
-    assert all(item["status"] == "pending" for item in graph_items)
-    assert all(item["value"]["acceptance"]["status"] == "needs_review" for item in graph_items)
+    # A text @-mention of another participant is a direct signal.
+    assert all(item["status"] == "active" for item in graph_items)
+    assert all(item["value"]["acceptance"]["status"] == "accepted" for item in graph_items)
+    assert all(item["value"]["relation"]["signals"]["mention"] >= 1 for item in graph_items)
     assert all(item["original_text"] == "" for item in graph_items)
     serialized = str(result) + str(graph_items)
     assert "RAW_FIELD_SENTINEL" not in serialized
@@ -3017,6 +3082,118 @@ async def test_group_relationship_graph_filters_value_nodes_and_hashes_fallback_
     assert value_graph["nodes"][1]["display_label"] == "note"
     assert value_graph["nodes"][1]["technical_label"].startswith("value:")
     assert value_graph["edges"][0]["id"].startswith("fact:1:note:value:")
+
+
+@pytest.mark.asyncio
+async def test_group_relationship_graph_node_type_keeps_edges_touching_that_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filtering a person -> tool graph by "tool" must show the tools and who uses them."""
+
+    store = MemoryStore(SimpleNamespace())
+
+    def entity(entity_id: int, entity_type: str, name: str) -> dict:
+        return {
+            "id": entity_id,
+            "tenant_id": "demo",
+            "channel": "wechat",
+            "source_key": "wxbot",
+            "user_id": "__group__",
+            "entity_type": entity_type,
+            "name": name,
+            "normalized_name": name.lower(),
+            "aliases_json": "[]",
+            "confidence": 0.9,
+            "status": "active",
+            "created_at": "2026-05-01T00:00:00",
+            "updated_at": "2026-05-10T00:00:00",
+        }
+
+    def fact(fact_id: int, subject_id: int, predicate: str, object_id: int, item_id: int) -> dict:
+        return {
+            "id": fact_id,
+            "tenant_id": "demo",
+            "channel": "wechat",
+            "source_key": "wxbot",
+            "user_id": "__group__",
+            "subject_entity_id": subject_id,
+            "predicate": predicate,
+            "object_entity_id": object_id,
+            "object_value": "",
+            "memory_item_id": item_id,
+            "source_event_id": None,
+            "confidence": 0.9,
+            "status": "active",
+            "valid_at": "2026-05-05T00:00:00",
+            "invalid_at": None,
+            "created_at": "2026-05-05T00:00:00",
+            "updated_at": "2026-05-12T00:00:00",
+        }
+
+    def item(item_id: int) -> dict:
+        return {
+            "id": item_id,
+            "tenant_id": "demo",
+            "channel": "wechat",
+            "source_key": "wxbot",
+            "user_id": "__group__",
+            "session_id": "group-1@chatroom",
+            "scope_type": "session",
+            "source_type": "llm_group_window",
+            "memory_type": "note",
+            "value_json": '{"kind":"group_window_relation","acceptance":{"status":"accepted"}}',
+            "normalized_key": f"group-window-rel:{item_id}",
+            "confidence": 0.9,
+            "status": "active",
+            "pinned": False,
+            "priority": 0,
+            "sensitivity": "normal",
+            "source_event_id": None,
+            "source_trace_id": "",
+            "occurrence_count": 1,
+            "first_seen_at": "2026-05-05T00:00:00",
+            "last_seen_at": "2026-05-12T00:00:00",
+            "created_at": "2026-05-05T00:00:00",
+            "updated_at": "2026-05-12T00:00:00",
+            "deleted_at": None,
+        }
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_entity" in sql:
+            return [entity(1, "person", "wxid_a"), entity(2, "person", "wxid_b"), entity(3, "tool", "Claude")]
+        if "COUNT(*)" in sql and "plugin_memory_fact" in sql:
+            return [{"count": 2}]
+        if "FROM plugin_memory_fact fact" in sql:
+            return [fact(10, 1, "interested_in", 3, 100), fact(11, 1, "replied_to", 2, 101)]
+        if "FROM plugin_memory_episode" in sql:
+            return []
+        if "FROM plugin_memory_item WHERE id = ANY" in sql:
+            return [item(100), item(101)]
+        return []
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+
+    tool_graph = await store.get_group_relationship_graph(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="group-1@chatroom",
+        node_type="tool",
+        limit=10,
+    )
+    full_graph = await store.get_group_relationship_graph(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="group-1@chatroom",
+        limit=10,
+    )
+
+    assert full_graph["counts"] == {"nodes": 3, "edges": 2}
+    # Only the edge that touches a tool survives, together with both of its endpoints.
+    assert tool_graph["counts"] == {"nodes": 2, "edges": 1}
+    assert tool_graph["edges"][0]["type"] == "interested_in"
+    assert {node["type"] for node in tool_graph["nodes"]} == {"person", "tool"}
 
 
 @pytest.mark.asyncio

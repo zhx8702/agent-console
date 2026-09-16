@@ -424,6 +424,13 @@ class Settings(BaseSettings):
     memory_governance_auto_cleanup_enabled: bool = True
     memory_governance_interval_seconds: float = Field(default=86_400.0, gt=0)
     memory_group_graph_auto_accept: bool = True
+    # Same-window co-participation pairs mostly mean "both were online"; the
+    # rule layer relies on quoted replies, @-mentions and explicit reply
+    # prefixes instead. Opt in to keep writing co_participated edges.
+    memory_group_graph_co_participation_edges: bool = False
+    # Group relations waiting for a second day of evidence must not be swept
+    # by the generic 30-day needs_review retention.
+    memory_group_relation_review_retention_days: int = Field(default=180, ge=1)
     memory_group_graph_auto_extract_enabled: bool = True
     memory_group_graph_auto_extract_llm_enabled: bool = True
     memory_group_graph_auto_extract_interval_seconds: float = Field(default=3_600.0, gt=0)
@@ -433,7 +440,24 @@ class Settings(BaseSettings):
     memory_group_graph_auto_extract_window_size: int = Field(default=50, ge=10, le=100)
     memory_group_graph_auto_extract_time_budget_seconds: int = Field(default=180, ge=5, le=180)
     memory_group_graph_auto_extract_roles: str = "scheduler"
-    memory_group_graph_auto_extract_sync_enabled: bool = True
+    # Per-window LLM timeout. The time budget decides how many windows fit in a
+    # run; it is never divided across windows any more.
+    memory_group_graph_llm_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    # Model tier for the window extraction prompt. Structured JSON over a short
+    # transcript is a fast-model task; reasoning tiers were measured at >60s per
+    # window on the production gateway versus 10-16s for the non-reasoning tier.
+    memory_group_graph_llm_model_tier: str = "tier-1"
+    # The scheduler tick queues one durable LLM job per window and processes at
+    # most this many per tick with the full timeout each. 0 disables the pass.
+    memory_group_graph_llm_jobs_per_tick: int = Field(default=6, ge=0, le=50)
+    memory_group_graph_llm_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    # Governance marks extraction jobs that stayed pending/failed this long as
+    # dead so a disabled drain cannot leave them queued forever.
+    memory_llm_extraction_job_stale_days: int = Field(default=30, ge=1)
+    # The pre-tick SDK history sync only works for the legacy account-wide
+    # wxbot connection; live groups already stream into
+    # plugin_wxbot_group_observations, which the tick now reads directly.
+    memory_group_graph_auto_extract_sync_enabled: bool = False
     memory_group_graph_auto_extract_sync_max_messages: int = Field(default=200, ge=20, le=500)
     memory_needs_review_retention_days: int = Field(default=30, ge=1)
     memory_rejected_retention_days: int = Field(default=7, ge=1)

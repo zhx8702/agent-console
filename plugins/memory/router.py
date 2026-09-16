@@ -495,9 +495,13 @@ class MemoryWindowRelationshipCatchupRequest(StrictRequestModel):
     dry_run: bool = False
     time_budget_seconds: int | None = None
     include_llm: bool = True
+    llm_timeout_seconds: int | None = None
+    # "inline" calls the model during the request; "enqueue" records one LLM job
+    # per window for the scheduler, so the request only pays for the rule layer.
+    llm_mode: str | None = None
 
-    def extraction_controls(self) -> dict[str, int | bool]:
-        return {
+    def extraction_controls(self) -> dict[str, int | bool | str]:
+        controls: dict[str, int | bool | str] = {
             "window_size": max(10, min(int(self.window_size or 50), 100)),
             "max_windows_per_run": max(1, min(int(self.max_windows_per_run or 20), 100)),
             "cursor_event_id": max(0, int(self.cursor_event_id or 0)),
@@ -505,6 +509,13 @@ class MemoryWindowRelationshipCatchupRequest(StrictRequestModel):
             "time_budget_seconds": max(1, min(int(self.time_budget_seconds or 60), 180)),
             "include_llm": bool(self.include_llm),
         }
+        if self.llm_timeout_seconds is not None:
+            # Per-window model timeout; the budget only bounds how many windows run.
+            controls["llm_timeout_seconds"] = max(5, min(int(self.llm_timeout_seconds), 180))
+        llm_mode = str(self.llm_mode or "").strip().lower()
+        if llm_mode in {"inline", "enqueue"}:
+            controls["llm_mode"] = llm_mode
+        return controls
 
 
 class MemoryEdgeAcceptanceReviewRequest(StrictRequestModel):

@@ -133,6 +133,9 @@ MEMORY_ACCEPTANCE_ID_PREVIEW_LIMIT = 25
 AUTO_SOURCE_TYPES = {"auto", "explicit_user", "backfill"}
 LLM_GROUP_WINDOW_SOURCE_TYPE = "llm_group_window"
 DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE = "deterministic_group_window"
+GROUP_WINDOW_RELATION_SOURCE_TYPES = frozenset(
+    {LLM_GROUP_WINDOW_SOURCE_TYPE, DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE}
+)
 PROFILE_ENRICHMENT_SOURCE_TYPE = "profile_enrichment"
 PROFILE_ENRICHMENT_MEMORY_TYPE = "profile_enrichment_candidate"
 PROFILE_ENRICHMENT_ACCEPTANCE_STATUSES = {
@@ -175,6 +178,9 @@ GROUP_GRAPH_EDGE_TYPES = (
     "tested",
 )
 GRAPH_LLM_BACKING_SOURCE_TYPE = "auto"
+# LLM window jobs share plugin_memory_extraction_job with per-event jobs; this
+# trace prefix is how the generic per-event drain leaves them alone.
+GROUP_WINDOW_LLM_JOB_TRACE_PREFIX = "group-window-llm:"
 GROUP_WINDOW_DETERMINISTIC_MAX_SENDERS = 8
 GROUP_WINDOW_DETERMINISTIC_MAX_PAIRS = 20
 HYBRID_ITEM_SQL_CANDIDATE_MULTIPLIER = 4
@@ -1019,6 +1025,24 @@ def _detect_sensitivity(content: str) -> str:
     if _PHONE_RE.search(text_value) or any(keyword in text_value for keyword in pii_keywords):
         return "pii"
     return "normal"
+
+
+def _group_window_relation_sensitivity_probe(value_json: Any) -> str:
+    """Return the only part of a group window relation worth sensitivity-checking.
+
+    Participant ids are the graph's node identities and are already stored by
+    the rule layer; a free-text object term (topic/tool/project) is the one
+    place a model could smuggle in a phone number or similar.
+    """
+
+    value = value_json if isinstance(value_json, dict) else _safe_json_loads(value_json, {})
+    relation = value.get("relation") if isinstance(value, dict) else None
+    if not isinstance(relation, dict):
+        return ""
+    object_type = str(relation.get("object_type") or "person").strip().lower()
+    if object_type == "person":
+        return ""
+    return str(relation.get("object") or "")
 
 
 def _memory_type_for_content(content: str) -> str:
@@ -3735,10 +3759,30 @@ class MemoryStore(
             )
             return [int(row["id"]) for row in rows]
 
+        group_relation_review_days = max(
+            review_days,
+            int(
+                getattr(self.settings, "memory_group_relation_review_retention_days", 180)
+                or 180
+            ),
+        )
+        group_relation_source_types = (
+            f"('{DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE}', '{LLM_GROUP_WINDOW_SOURCE_TYPE}')"
+        )
         review_ids = await candidate_ids(
             "COALESCE(NULLIF(value_json, '')::jsonb #>> '{acceptance,status}', '') "
-            "IN ('candidate', 'needs_review')",
+            "IN ('candidate', 'needs_review') "
+            f"AND source_type NOT IN {group_relation_source_types}",
             review_days,
+        )
+        # Group relations are promoted automatically once they repeat on a
+        # second day, so they wait longer than ordinary needs_review items
+        # before the sweep gives up on them.
+        review_ids += await candidate_ids(
+            "COALESCE(NULLIF(value_json, '')::jsonb #>> '{acceptance,status}', '') "
+            "IN ('candidate', 'needs_review') "
+            f"AND source_type IN {group_relation_source_types}",
+            group_relation_review_days,
         )
         rejected_ids = await candidate_ids(
             "COALESCE(NULLIF(value_json, '')::jsonb #>> '{acceptance,status}', '') = 'rejected'",
@@ -3750,17 +3794,34 @@ class MemoryStore(
             "IN ('accepted', '')",
             expire_days,
         )
+        # Extraction jobs that nobody drained (drain disabled, worker gone) must
+        # not stay queued forever; they are marked dead after a long grace period.
+        stale_job_days = max(
+            1,
+            int(getattr(self.settings, "memory_llm_extraction_job_stale_days", 30) or 30),
+        )
+        stale_job_rows = await _exec(
+            "SELECT id FROM plugin_memory_extraction_job "
+            "WHERE status IN ('pending', 'failed') "
+            "AND updated_at < NOW() - (:days * INTERVAL '1 day') "
+            "AND (locked_until IS NULL OR locked_until < NOW()) "
+            "ORDER BY updated_at ASC, id ASC LIMIT :limit",
+            {"days": stale_job_days, "limit": batch},
+        )
+        stale_job_ids = [int(row["id"]) for row in stale_job_rows or []]
         result = {
             "dry_run": dry_run,
             "skipped_locked": False,
             "needs_review_expired": len(review_ids),
             "rejected_purged": len(rejected_ids),
             "stale_auto_expired": len(stale_ids),
+            "stale_jobs_dead": len(stale_job_ids),
             "selected": len(set(review_ids + rejected_ids + stale_ids)),
             "ids": {
                 "needs_review": review_ids,
                 "rejected": rejected_ids,
                 "stale_auto": stale_ids,
+                "stale_jobs": stale_job_ids,
             },
         }
         physical_expiry = await self._run_physical_expiry_sweep(
@@ -3768,12 +3829,29 @@ class MemoryStore(
             batch=batch,
         )
         result["physical_expiry"] = physical_expiry
-        total_selected = int(result["selected"]) + int(
-            physical_expiry.get("selected") or 0
+        total_selected = (
+            int(result["selected"])
+            + int(physical_expiry.get("selected") or 0)
+            + len(stale_job_ids)
         )
         if dry_run or total_selected <= 0:
             MEMORY_GOVERNANCE_EVENTS.labels(action="cleanup", result="dry_run").inc()
             return result
+
+        if stale_job_ids:
+            await _exec(
+                "UPDATE plugin_memory_extraction_job SET status = 'dead', "
+                "last_error = CASE WHEN COALESCE(last_error, '') = '' "
+                "THEN 'stale: not processed within retention' ELSE last_error END, "
+                "locked_until = NULL, locked_by = '', updated_at = NOW() "
+                "WHERE id = ANY(:ids) AND status IN ('pending', 'failed')",
+                {"ids": stale_job_ids},
+            )
+            logger.info(
+                "memory.governance_stale_jobs_dead",
+                count=len(stale_job_ids),
+                stale_days=stale_job_days,
+            )
 
         expire_ids = sorted(set(review_ids + stale_ids))
         if expire_ids:
@@ -4293,11 +4371,18 @@ class MemoryStore(
     ) -> dict[str, Any] | None:
         raw_original_text = _sanitize_db_text(original_text)
         raw_content = _sanitize_db_text(content)
-        detected_sensitivity = (
-            "normal"
-            if source_type == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE
-            else _detect_sensitivity(raw_content)
-        )
+        is_group_window_relation = source_type in GROUP_WINDOW_RELATION_SOURCE_TYPES
+        if is_group_window_relation:
+            # The content is the synthetic "<participant id> <predicate> <object>"
+            # line, never chat text. Participant ids contain "wxid", which the
+            # generic detector reads as PII and would park every accepted
+            # model relation in pending. Only a non-person object term can
+            # carry something sensitive, so probe just that.
+            detected_sensitivity = _detect_sensitivity(
+                _group_window_relation_sensitivity_probe(value_json)
+            )
+        else:
+            detected_sensitivity = _detect_sensitivity(raw_content)
         original_text = _redact_memory_storage_text(raw_original_text)
         content = _normalize_line(_redact_memory_storage_text(raw_content))[:500]
         if not content:
@@ -4354,9 +4439,11 @@ class MemoryStore(
             confidence = max(float(confidence or 0.0), 0.9)
             if status in {"deleted", "invalidated"}:
                 status = "active"
-        elif source_type != DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE and (
+        elif not is_group_window_relation and (
             sensitivity != "normal" or float(confidence or 0.0) < PROMPT_AUTO_CONFIDENCE_MIN
         ):
+            # Group window relations are gated by their own acceptance policy
+            # (signals, evidence count, day count), not by raw model confidence.
             status = "pending"
         if sensitivity != "normal":
             status = "pending"

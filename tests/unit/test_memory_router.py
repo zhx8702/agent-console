@@ -2974,6 +2974,32 @@ async def test_memory_router_window_catchup_requires_admin_scrubs_and_passes_con
 
 
 @pytest.mark.asyncio
+async def test_memory_router_window_catchup_passes_explicit_llm_timeout() -> None:
+    app = FastAPI()
+    store = _FakeStore()
+    app.include_router(build_memory_router(store), prefix="/plugins/memory")
+
+    transport = httpx.ASGITransport(app=app)
+    body = {
+        "tenant_id": "demo",
+        "session_id": "room-a@chatroom",
+        "date": "2026-05-15",
+        "llm_timeout_seconds": 999,
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/plugins/memory/group-graph/extract-window-catchup",
+            headers={"Authorization": "Bearer admin_token"},
+            json=body,
+        )
+
+    assert resp.status_code == 200
+    # Clamped to the request-side ceiling and forwarded as a per-window timeout.
+    assert store.window_catchup_calls[0]["llm_timeout_seconds"] == 180
+    assert store.window_catchup_calls[0]["time_budget_seconds"] == 60
+
+
+@pytest.mark.asyncio
 async def test_memory_router_window_stats_requires_admin_and_scrubs() -> None:
     app = FastAPI()
     store = _FakeStore()
