@@ -23,6 +23,54 @@ async def _no_auto_review(**kwargs: Any) -> dict[str, Any]:
     return {"scanned": 0, "accepted": 0, "remaining": 0, "stop_reason": "completed"}
 
 
+def test_group_relation_judgement_explains_model_edges_without_chat_text() -> None:
+    from plugins.memory.store_group_graph import _group_relation_judgement
+
+    judgement = _group_relation_judgement(
+        {
+            "source_type": "llm_group_window",
+            "value": {
+                "relation": {
+                    "signals": {"quote": 0, "llm": 10},
+                    "reason": "多次比较三位成员并评价其外貌",
+                    "strength": 0.63,
+                },
+                "acceptance": {
+                    "status": "accepted",
+                    "reason": "group_window_weak_signal",
+                    "policy": "group_window_weak_signal",
+                    "reviewed_by": "system/auto-review",
+                    "review_reason": "group_window_term_corroborated",
+                    "day_count": 1,
+                },
+            },
+        }
+    )
+
+    assert judgement == {
+        "extraction_method": "llm",
+        "signals": {"llm": 10},
+        "policy": "group_window_weak_signal",
+        "acceptance_status": "accepted",
+        "reviewed_by": "system/auto-review",
+        "review_reason": "group_window_term_corroborated",
+        "model_reason": "多次比较三位成员并评价其外貌",
+        "day_count": 1,
+        "strength": 0.63,
+    }
+    # Rule-layer edges never carry a model rationale, even if one is present.
+    deterministic = _group_relation_judgement(
+        {
+            "source_type": "deterministic_group_window",
+            "value": {"relation": {"signals": {"quote": 3}, "reason": "quoted reply"}, "acceptance": {}},
+        }
+    )
+    assert deterministic["extraction_method"] == "deterministic"
+    assert deterministic["signals"] == {"quote": 3}
+    assert deterministic["model_reason"] == ""
+    assert _group_relation_judgement(None)["extraction_method"] == "unknown"
+
+
 def test_group_graph_edge_quality_reads_safe_value_payload() -> None:
     quality = _group_graph_edge_quality(
         {

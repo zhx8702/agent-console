@@ -136,6 +136,46 @@ def _group_graph_edge_quality(item: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _group_relation_judgement(item: dict[str, Any] | None) -> dict[str, Any]:
+    """Why the pipeline believes this edge, without any chat text.
+
+    Operators asking "how was this decided?" get the extraction method, the
+    per-signal counts, the acceptance policy that fired and who/what reviewed
+    it, plus the model's one-line rationale for model relations. That rationale
+    is the model's own paraphrase (capped when stored), not a message.
+    """
+
+    value = _group_graph_item_value(item)
+    acceptance = value.get("acceptance") if isinstance(value.get("acceptance"), dict) else {}
+    relation = value.get("relation") if isinstance(value.get("relation"), dict) else {}
+    source_type = str((item or {}).get("source_type") or "").strip()
+    method = (
+        "llm"
+        if source_type == LLM_GROUP_WINDOW_SOURCE_TYPE
+        else "deterministic"
+        if source_type == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE
+        else str(relation.get("extraction_method") or "").strip() or "unknown"
+    )
+    raw_signals = relation.get("signals") if isinstance(relation.get("signals"), dict) else {}
+    signals = {
+        key: max(0, _safe_int(raw_signals.get(key), 0))
+        for key in GROUP_SIGNAL_KEYS
+        if _safe_int(raw_signals.get(key), 0) > 0
+    }
+    model_reason = _normalize_line(str(relation.get("reason") or ""))[:240]
+    return {
+        "extraction_method": method,
+        "signals": signals,
+        "policy": str(acceptance.get("policy") or acceptance.get("reason") or "").strip()[:80],
+        "acceptance_status": str(acceptance.get("status") or "").strip(),
+        "reviewed_by": str(acceptance.get("reviewed_by") or "").strip()[:120],
+        "review_reason": _normalize_line(str(acceptance.get("review_reason") or ""))[:240],
+        "model_reason": model_reason if method == "llm" else "",
+        "day_count": max(0, _safe_int(acceptance.get("day_count"), 0)),
+        "strength": _clamp_score(relation.get("strength")) if relation.get("strength") is not None else None,
+    }
+
+
 SYMMETRIC_GROUP_PREDICATES = frozenset({"co_participated", "collaborated_with"})
 
 
@@ -1695,6 +1735,7 @@ class MemoryGroupGraphStoreMixin:
         payload["observations"] = observations
         payload["evidence_source"] = quality["evidence_source"]
         payload["evidence_dates"] = quality["evidence_dates"]
+        payload["judgement"] = _group_relation_judgement(backing_item)
         edge_payload = payload.get("edge")
         if isinstance(edge_payload, dict):
             edge_payload["extracted_at"] = edge_payload.get("first_seen")
@@ -2186,7 +2227,13 @@ class MemoryGroupGraphStoreMixin:
             "who merely talked in the same time span; direct replies and @-mentions are already "
             "tracked, so prefer asked/answered/requested/provided_resource/collaborated_with between "
             "people and interested_in/reported_issue/works_on/maintains/tested/fixed_issue/asked "
-            "between a person and a term. Return an empty list rather than guessing."
+            "between a person and a term. "
+            "(5) interested_in means the person wants, likes, uses or asks how to get the thing. "
+            "Mocking it, criticizing it, gossiping about it, or discussing whether this system "
+            "labelled it correctly is mentioned, never interested_in. "
+            "(6) reason is one short sentence in the group's language that names the concrete "
+            "behaviour (what was asked, compared, complained about), so a reviewer can find the "
+            "messages; never quote a message verbatim. Return an empty list rather than guessing."
         )
         payload = {
             "date": target_date,

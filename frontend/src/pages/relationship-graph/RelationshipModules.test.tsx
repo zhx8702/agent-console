@@ -23,6 +23,7 @@ import {
   evidenceCountsLabel,
   evidenceObservedRange,
   evidenceSourceLabel,
+  judgementSummary,
   populatedGraphLanes,
   sanitizeEdgeEvidence,
   shouldKeepEdgeForMode,
@@ -128,6 +129,28 @@ describe("relationship graph evidence labels", () => {
     expect(evidenceSourceLabel("memory_event")).toBe("导入事件");
     expect(evidenceSourceLabel(undefined)).toBe("");
     expect(evidenceObservedRange(null)).toBe("");
+  });
+
+  it("explains how an edge was decided from the judgement block", () => {
+    const summary = judgementSummary({
+      extraction_method: "llm",
+      signals: { llm: 10, quote: 0 },
+      policy: "group_window_weak_signal",
+      acceptance_status: "accepted",
+      reviewed_by: "system/auto-review",
+      review_reason: "group_window_term_corroborated",
+      model_reason: "多次比较三位成员并评价其外貌",
+      day_count: 1,
+    });
+
+    expect(summary).not.toBeNull();
+    expect(summary?.method).toBe("语义抽取");
+    expect(summary?.signals).toEqual(["模型判定的支撑消息 10 条"]);
+    // The review reason (why it was finally accepted) wins over the initial policy.
+    expect(summary?.policyText).toBe("同一主题已有其他已通过的关系，系统印证通过");
+    expect(summary?.reviewerText).toBe("系统印证扫描");
+    expect(summary?.modelReason).toBe("多次比较三位成员并评价其外貌");
+    expect(judgementSummary(undefined)).toBeNull();
   });
 });
 

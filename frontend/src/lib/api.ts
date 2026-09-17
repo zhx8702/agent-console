@@ -622,7 +622,22 @@ export type GroupGraphEdgeEvidenceResponse = {
   events?: GroupGraphEdgeEvidenceEntity[];
   episodes?: GroupGraphEdgeEvidenceEntity[];
   observations?: GroupGraphObservationEvidence[];
+  /** Why the pipeline believes this edge: method, signals, policy, model rationale. No chat text. */
+  judgement?: GroupGraphEdgeJudgement;
   [key: string]: unknown;
+};
+
+export type GroupGraphEdgeJudgement = {
+  extraction_method?: string;
+  signals?: Record<string, number>;
+  policy?: string;
+  acceptance_status?: string;
+  reviewed_by?: string;
+  review_reason?: string;
+  /** The model's own one-line rationale (a paraphrase, never a message). */
+  model_reason?: string;
+  day_count?: number;
+  strength?: number | null;
 };
 
 export type GroupGraphQuery = {

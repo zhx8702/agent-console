@@ -21,6 +21,7 @@ import {
   edgeCanReturnToReview,
   evidenceQuality,
   extractionMethodLabel,
+  judgementSummary,
   counterpartEdges,
   firstMemoryItemId,
   formatAcceptanceScore,
@@ -187,6 +188,7 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
   const replaceableEdges = selectedEdge
     ? counterpartEdges(selectedEdge, [...(graphEdges || []), ...(pendingEdges || [])])
     : [];
+  const judgement = judgementSummary(evidence?.judgement);
 
   return (
         <section className="panel relationship-detail-panel">
@@ -374,6 +376,26 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
                         <div><dt>覆盖天数</dt><dd>{evidence.evidence_counts?.evidence_days}</dd></div>
                       )}
                     </dl>
+                    {judgement && (
+                      <div className="relationship-judgement" data-testid="relationship-judgement">
+                        <h4>怎么判定的</h4>
+                        <dl className="relationship-detail-list">
+                          <div><dt>抽取方式</dt><dd>{judgement.method}</dd></div>
+                          {judgement.signals.length > 0 && (
+                            <div><dt>信号</dt><dd>{judgement.signals.join("，")}</dd></div>
+                          )}
+                          {judgement.policyText && (
+                            <div><dt>通过依据</dt><dd>{judgement.policyText}</dd></div>
+                          )}
+                          {judgement.reviewerText && (
+                            <div><dt>判定者</dt><dd>{judgement.reviewerText}</dd></div>
+                          )}
+                          {judgement.modelReason && (
+                            <div><dt>模型理由</dt><dd>{judgement.modelReason}<small className="muted-copy"> 模型自己的转述，不是聊天原文；主题词可能是模型归纳的（如把成员名归为组合名），按"群消息时间"去原聊天里核对。</small></dd></div>
+                          )}
+                        </dl>
+                      </div>
+                    )}
                     <TechnicalDetails summary="查看证据技术详情" value={evidence} />
                   </>
                 )}

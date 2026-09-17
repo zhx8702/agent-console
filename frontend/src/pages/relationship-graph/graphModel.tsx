@@ -2,6 +2,7 @@ import type {
   GroupGraphEdge,
   GroupGraphEdgeEvidenceEntity,
   GroupGraphEdgeEvidenceResponse,
+  GroupGraphEdgeJudgement,
   GroupGraphNode,
   GroupGraphResponse,
   MemoryBackfillResponse,
@@ -1168,6 +1169,53 @@ export function evidenceObservedRange(evidence?: GroupGraphEdgeEvidenceResponse 
   if (!first && !last) return "";
   if (first && last && first !== last) return `${formatTimestamp(first)} → ${formatTimestamp(last)}`;
   return formatTimestamp(first || last);
+}
+
+const SIGNAL_LABELS: Record<string, string> = {
+  quote: "引用回复",
+  mention: "@ 提及",
+  prefix_reply: "前缀回复",
+  co_participation: "同窗共现",
+  llm: "模型判定的支撑消息",
+};
+
+const POLICY_LABELS: Record<string, string> = {
+  group_window_direct_signal: "有引用 / @ 这类直接互动，立即通过",
+  group_window_llm_multi_day: "模型关系在不止一天里出现，自动通过",
+  group_window_llm_repeated_evidence: "同一窗口内有 3 条以上消息支撑，自动通过",
+  group_window_repeated_weak_signal: "弱信号跨天重复出现，自动通过",
+  group_window_weak_signal: "只有单日弱信号，等待印证",
+  group_window_term_corroborated: "同一主题已有其他已通过的关系，系统印证通过",
+  group_window_pair_corroborated: "两人之间已有其他已通过的互动，系统印证通过",
+  group_window_auto_accept: "旧版策略：全部自动通过",
+  group_window_relation: "自动通过已关闭，等待人工",
+};
+
+/** Human-readable breakdown of why an edge exists; empty when the payload has nothing to say. */
+export function judgementSummary(judgement?: GroupGraphEdgeJudgement | null) {
+  if (!judgement) return null;
+  const signals = Object.entries(judgement.signals || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([key, count]) => `${SIGNAL_LABELS[key] || key} ${count} 条`);
+  const policyKey = String(judgement.policy || "").trim();
+  const reviewKey = String(judgement.review_reason || "").trim();
+  const policyText = POLICY_LABELS[reviewKey] || POLICY_LABELS[policyKey] || policyKey || "";
+  const reviewer = String(judgement.reviewed_by || "").trim();
+  const reviewerText = !reviewer
+    ? ""
+    : reviewer === "system/auto-review"
+      ? "系统印证扫描"
+      : reviewer === "system/auto"
+        ? "策略自动通过"
+        : reviewer;
+  return {
+    method: extractionMethodLabel(judgement.extraction_method),
+    signals,
+    policyText,
+    reviewerText,
+    modelReason: String(judgement.model_reason || "").trim(),
+    dayCount: Number(judgement.day_count || 0),
+  };
 }
 
 export function evidenceRecordMeta(record: GroupGraphEdgeEvidenceEntity) {
