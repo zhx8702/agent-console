@@ -67,6 +67,7 @@ export type RelationshipGraphPresentationProps = Pick<
   | "applyPlaybackDate"
   | "playbackDates"
   | "pendingEdges"
+  | "pendingTotal"
   | "pendingReviewError"
   | "pendingReviewLoading"
   | "reviewing"
@@ -189,11 +190,16 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
     applyPlaybackDate,
     playbackDates,
     pendingEdges,
+    pendingTotal,
     pendingReviewError,
     pendingReviewLoading,
     reviewing,
     reviewEdge,
   } = controller;
+  const pendingShown = pendingEdges.length;
+  const pendingCountLabel = pendingTotal !== null && pendingTotal > pendingShown
+    ? `${pendingShown} / ${pendingTotal}`
+    : String(pendingShown);
   const canvas = useCanvasViewport();
   const bundleOffsets = edgeBundleOffsets(visibleGraphEdges);
   const populatedLanes = populatedGraphLanes(graphNodes);
@@ -425,9 +431,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               <div>
                 <p className="section-kicker">审核</p>
                 <h3 id="relationship-review-queue-title">待审核队列</h3>
-                <p className="muted-copy">新抽的关系会自动通过。这里只剩还没转完或被退回的，最多 100 条。</p>
+                <p className="muted-copy">
+                  引用、@ 这类直接互动即时通过；模型推断的关系在跨天复现、同窗有 3 条以上消息支撑，或与已通过的关系相互印证（同一主题已有人在聊、两人已有直接互动）后由系统自动通过，14 天内都没印证的自动过期。这里是还在等印证的候选，人工点不点都不影响自动流程；最多显示 100 条。
+                </p>
               </div>
-              <span className="relationship-queue-count">{pendingEdges.length}</span>
+              <span className="relationship-queue-count" title={pendingTotal !== null ? `共 ${pendingTotal} 条待印证，显示前 ${pendingShown} 条` : undefined}>
+                {pendingCountLabel}
+              </span>
             </div>
             <div className="relationship-list">
               {pendingReviewError && (

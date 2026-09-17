@@ -243,6 +243,9 @@ class MemoryPlugin(Plugin):
                     llm_timeout_seconds=int(
                         getattr(settings, "memory_group_graph_llm_timeout_seconds", 60) or 60
                     ),
+                    auto_review_batch=int(
+                        getattr(settings, "memory_group_graph_auto_review_batch", 200) or 0
+                    ),
                 )
             except asyncio.CancelledError:
                 raise

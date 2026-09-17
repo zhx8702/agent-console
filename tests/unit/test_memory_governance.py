@@ -27,8 +27,9 @@ async def test_memory_governance_dry_run_and_bounded_cleanup(monkeypatch) -> Non
         calls.append((sql, params or {}))
         if sql.startswith("SELECT id"):
             if "candidate" in sql and "source_type IN ('deterministic_group_window'" in sql:
-                # Group window relations use their own, longer retention.
-                assert (params or {}).get("days") == 180
+                # Group window relations use their own retention (default 14 days),
+                # independent of the generic 30-day needs_review window.
+                assert (params or {}).get("days") == 14
                 return []
             if "candidate" in sql:
                 assert "source_type NOT IN ('deterministic_group_window'" in sql

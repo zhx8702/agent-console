@@ -261,6 +261,7 @@ describe("relationship graph modules", () => {
       applyPlaybackDate: vi.fn(),
       playbackDates: ["2026-08-25", "2026-08-26", "2026-08-27"],
       pendingEdges: [pendingEdge],
+      pendingTotal: 637,
       pendingReviewError: "",
       pendingReviewLoading: false,
       reviewing: false,
@@ -271,7 +272,9 @@ describe("relationship graph modules", () => {
     const nodeList = screen.getByRole("region", { name: "这些人" });
     const edgeList = screen.getByRole("region", { name: "这些互动" });
     const queue = screen.getByRole("region", { name: "待审核队列" });
-    expect(within(queue).getByText(/新抽的关系会自动通过/)).toBeInTheDocument();
+    expect(within(queue).getByText(/相互印证.*自动通过/)).toBeInTheDocument();
+    // The list is capped; the badge tells how many are really waiting.
+    expect(within(queue).getByText("1 / 637")).toBeInTheDocument();
     const nodeRow = within(nodeList).getByRole("button", { name: /成员甲/ });
     await user.click(nodeRow);
 

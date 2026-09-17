@@ -428,9 +428,14 @@ class Settings(BaseSettings):
     # rule layer relies on quoted replies, @-mentions and explicit reply
     # prefixes instead. Opt in to keep writing co_participated edges.
     memory_group_graph_co_participation_edges: bool = False
-    # Group relations waiting for a second day of evidence must not be swept
-    # by the generic 30-day needs_review retention.
-    memory_group_relation_review_retention_days: int = Field(default=180, ge=1)
+    # Pending model relations are promoted automatically once the accepted
+    # graph corroborates them (same term used by another accepted relation, or
+    # an accepted direct edge between the two people) or once they repeat on a
+    # second day; this is how many candidates one tick re-checks.
+    memory_group_graph_auto_review_batch: int = Field(default=200, ge=0, le=1000)
+    # A model relation that is neither corroborated nor repeated within this
+    # window is expired by governance instead of waiting for a reviewer.
+    memory_group_relation_review_retention_days: int = Field(default=14, ge=1)
     memory_group_graph_auto_extract_enabled: bool = True
     memory_group_graph_auto_extract_llm_enabled: bool = True
     memory_group_graph_auto_extract_interval_seconds: float = Field(default=3_600.0, gt=0)

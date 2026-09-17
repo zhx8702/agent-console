@@ -127,6 +127,8 @@ export function useRelationshipGraphController() {
   const [windowStatsStatus, setWindowStatsStatus] = useState("选择已验证群聊后可查看窗口关系统计。");
   const [pendingEdges, setPendingEdges] = useState<GroupGraphEdge[]>([]);
   const [pendingNodes, setPendingNodes] = useState<GroupGraphNode[]>([]);
+  // Server-side total of pending relations; the list itself is capped at 100.
+  const [pendingTotal, setPendingTotal] = useState<number | null>(null);
   const [pendingReviewLoading, setPendingReviewLoading] = useState(false);
   const selectedNode = selection?.kind === "node" ? selection.item : null;
   const selectedEdge = selection?.kind === "edge" ? selection.item : null;
@@ -205,9 +207,10 @@ export function useRelationshipGraphController() {
     [nodes, pendingNodes],
   );
   const graphStateMessage = graphError || projectedGraphStateMessage;
-  const pendingReviewCount = pendingEdges.length
-    || Number(windowStatsAcceptance.needs_review || 0)
-    + Number(windowStatsAcceptance.candidate || 0);
+  const pendingReviewCount = pendingTotal
+    ?? (pendingEdges.length
+      || Number(windowStatsAcceptance.needs_review || 0)
+      + Number(windowStatsAcceptance.candidate || 0));
 
   const scopeQuery = useMemo(() => {
     const tenantId = config.tenantId.trim();
@@ -443,6 +446,7 @@ export function useRelationshipGraphController() {
     if (!tenantId || !selectedGroupIsVerified) {
       setPendingEdges([]);
       setPendingNodes([]);
+      setPendingTotal(null);
       setPendingReviewError("");
       setPendingReviewLoading(false);
       return;
@@ -464,11 +468,14 @@ export function useRelationshipGraphController() {
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setPendingEdges(result.edges || []);
       setPendingNodes(result.nodes || []);
+      const serverTotal = Number(result.page?.total);
+      setPendingTotal(Number.isFinite(serverTotal) && serverTotal >= (result.edges || []).length ? serverTotal : null);
       setPendingReviewError("");
     } catch (err) {
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setPendingEdges([]);
       setPendingNodes([]);
+      setPendingTotal(null);
       setPendingReviewError(
         `待审核关系加载失败：${
           err instanceof ApiError || err instanceof Error ? err.message : "pending review request failed"
@@ -1229,6 +1236,7 @@ export function useRelationshipGraphController() {
     setEvidence(null);
     setPendingEdges([]);
     setPendingNodes([]);
+    setPendingTotal(null);
     setGraphError("");
     setPendingReviewError("");
     setReviewError("");
@@ -1363,6 +1371,7 @@ export function useRelationshipGraphController() {
     windowStatsAcceptance,
     pendingReviewCount,
     pendingEdges,
+    pendingTotal,
     pendingReviewLoading,
     governanceStatus,
     governanceStatusText,

@@ -576,6 +576,10 @@
   font-size: var(--font-size-xs);
   font-weight: 800;
   text-align: center;
+  /* "shown / total" must stay on one line next to the panel copy. */
+  flex-shrink: 0;
+  align-self: flex-start;
+  white-space: nowrap;
 }
 
 .relationship-queue-item {

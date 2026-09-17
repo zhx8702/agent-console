@@ -3759,11 +3759,14 @@ class MemoryStore(
             )
             return [int(row["id"]) for row in rows]
 
+        # Independent of the generic retention: group relations have their own
+        # promotion paths (second day, corroboration sweep), so what is left
+        # after this window is noise and can go sooner than 30 days.
         group_relation_review_days = max(
-            review_days,
+            1,
             int(
-                getattr(self.settings, "memory_group_relation_review_retention_days", 180)
-                or 180
+                getattr(self.settings, "memory_group_relation_review_retention_days", 14)
+                or 14
             ),
         )
         group_relation_source_types = (
@@ -3775,9 +3778,9 @@ class MemoryStore(
             f"AND source_type NOT IN {group_relation_source_types}",
             review_days,
         )
-        # Group relations are promoted automatically once they repeat on a
-        # second day, so they wait longer than ordinary needs_review items
-        # before the sweep gives up on them.
+        # Group relations are promoted automatically (second day, corroboration
+        # sweep); whatever is still waiting after their own retention window
+        # is expired here.
         review_ids += await candidate_ids(
             "COALESCE(NULLIF(value_json, '')::jsonb #>> '{acceptance,status}', '') "
             "IN ('candidate', 'needs_review') "
@@ -6849,7 +6852,9 @@ class MemoryStore(
                 "reason": str(reason or "")[:1000],
                 "superseded_by_item_id": superseded_by_item_id,
                 "supersedes_item_id": supersedes_item_id,
-                "reviewed_at": reviewed_at,
+                # asyncpg binds the CAST(... AS TIMESTAMP) parameter as a
+                # timestamp and rejects the ISO string the reviewer built.
+                "reviewed_at": _coerce_datetime(reviewed_at),
             },
         )
 

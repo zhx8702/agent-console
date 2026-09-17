@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -1295,9 +1296,13 @@ async def test_memory_acceptance_review_appends_durable_audit_record(
             "reason": f"sha256:{hashlib.sha256(b'manual approve').hexdigest()}",
             "superseded_by_item_id": None,
             "supersedes_item_id": None,
-            "reviewed_at": result["value"]["acceptance"]["reviewed_at"],
+            # Bound as a datetime: asyncpg rejects a string for the TIMESTAMP cast.
+            "reviewed_at": datetime.fromisoformat(
+                result["value"]["acceptance"]["reviewed_at"].replace("Z", "+00:00")
+            ).replace(tzinfo=None),
         }
     ]
+    assert isinstance(audit_rows[0]["reviewed_at"], datetime)
 
 
 @pytest.mark.asyncio

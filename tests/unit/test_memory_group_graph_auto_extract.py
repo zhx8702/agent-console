@@ -17,6 +17,12 @@ from plugins.memory.store_group_graph import (
 )
 
 
+async def _no_auto_review(**kwargs: Any) -> dict[str, Any]:
+    """Tick tests that do not exercise the corroboration sweep skip its query."""
+
+    return {"scanned": 0, "accepted": 0, "remaining": 0, "stop_reason": "completed"}
+
+
 def test_group_graph_edge_quality_reads_safe_value_payload() -> None:
     quality = _group_graph_edge_quality(
         {
@@ -139,6 +145,7 @@ async def test_auto_extract_tick_skips_disabled_scope_and_runs_deterministic_cat
         saved_cursors.append(kwargs)
 
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)
     monkeypatch.setattr(store, "_load_group_graph_auto_extract_cursor", fake_load_cursor)
     monkeypatch.setattr(store, "_save_group_graph_auto_extract_cursor", fake_save_cursor)
@@ -212,6 +219,7 @@ async def test_auto_extract_tick_defaults_to_llm_catchup(
         return {"status": "completed", "totals": {}, "more_remain": False}
 
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)
     monkeypatch.setattr(
         store, "_load_group_graph_auto_extract_cursor", lambda **kwargs: asyncio.sleep(0, result=0)
@@ -405,6 +413,7 @@ async def test_auto_extract_tick_can_sync_known_sessions_before_catchup(
     store.combined_history_scope_execution_allowed = allowed
     monkeypatch.setattr(store, "list_known_group_graph_sessions", fake_sessions)
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "backfill_from_sdk", fake_backfill)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)
     monkeypatch.setattr(
@@ -1535,9 +1544,16 @@ async def test_auto_extract_tick_runs_queued_llm_jobs_after_catchup(
         assert kwargs == {"limit": 4, "llm_timeout_seconds": 90}
         return {"claimed": 2, "succeeded": 2, "failed": 0, "dead": 0, "deferred": 0, "applied": 5, "stop_reason": "completed"}
 
+    async def fake_auto_review(**kwargs: Any) -> dict[str, Any]:
+        order.append("auto_review")
+        assert kwargs == {"limit": 50}
+        return {"scanned": 3, "accepted": 2, "accepted_term": 1, "accepted_pair": 1, "remaining": 1, "stop_reason": "completed"}
+
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)
     monkeypatch.setattr(store, "run_group_window_llm_jobs", fake_jobs)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", fake_auto_review)
     monkeypatch.setattr(
         store, "_load_group_graph_auto_extract_cursor", lambda **kwargs: asyncio.sleep(0, result=0)
     )
@@ -1548,15 +1564,107 @@ async def test_auto_extract_tick_runs_queued_llm_jobs_after_catchup(
     result = await store.run_group_graph_auto_extract_tick(
         llm_jobs_per_tick=4,
         llm_timeout_seconds=90,
+        auto_review_batch=50,
     )
 
-    assert order == ["catchup", "llm_jobs"]
+    # The corroboration sweep runs last so this tick's model output can already
+    # be checked against the accepted graph.
+    assert order == ["catchup", "llm_jobs", "auto_review"]
     assert result["llm_jobs"]["succeeded"] == 2
     assert result["applied"] == 7
+    assert result["auto_review"]["accepted"] == 2
 
     order.clear()
-    await store.run_group_graph_auto_extract_tick(include_llm=False, llm_timeout_seconds=90)
-    assert order == ["catchup"]
+    await store.run_group_graph_auto_extract_tick(
+        include_llm=False, llm_timeout_seconds=90, auto_review_batch=50
+    )
+    assert order == ["catchup", "auto_review"]
+
+
+@pytest.mark.asyncio
+async def test_group_relation_auto_review_accepts_only_corroborated_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace(memory_group_graph_auto_review_batch=200))
+    reviews: list[tuple[int, str, str, str]] = []
+
+    async def fake_candidates(**kwargs: Any) -> list[dict[str, Any]]:
+        assert kwargs == {"limit": 200, "tenant_id": None}
+        return [
+            # Term already used by another accepted relation in this group.
+            {"id": 1, "object_type": "tool", "term_corroborated": True, "pair_corroborated": False},
+            # Term nobody else has an accepted relation with: stays pending.
+            {"id": 2, "object_type": "topic", "term_corroborated": False, "pair_corroborated": False},
+            # Two people who already share an accepted direct edge.
+            {"id": 3, "object_type": "person", "term_corroborated": True, "pair_corroborated": True},
+            # Person pair without any accepted edge: stays pending, even though the
+            # other person is the object of accepted relations elsewhere.
+            {"id": 4, "object_type": "person", "term_corroborated": True, "pair_corroborated": False},
+        ]
+
+    async def fake_review(item_id: int, **kwargs: Any) -> dict[str, Any] | None:
+        reviews.append((item_id, kwargs["action"], kwargs["review_reason"], kwargs["reviewed_by"]))
+        return {"id": item_id, "acceptance_status": "accepted"}
+
+    monkeypatch.setattr(store, "_list_group_relation_auto_review_candidates", fake_candidates)
+    monkeypatch.setattr(store, "review_memory_item_acceptance", fake_review)
+
+    summary = await store.run_group_relation_auto_review()
+
+    assert reviews == [
+        (1, "accept", "group_window_term_corroborated", "system/auto-review"),
+        (3, "accept", "group_window_pair_corroborated", "system/auto-review"),
+    ]
+    assert summary["scanned"] == 4
+    assert summary["accepted"] == 2
+    assert summary["accepted_term"] == 1
+    assert summary["accepted_pair"] == 1
+    assert summary["remaining"] == 2
+    assert summary["stop_reason"] == "completed"
+
+    assert (await store.run_group_relation_auto_review(limit=0))["stop_reason"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_group_relation_auto_review_candidates_are_scoped_to_the_same_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace())
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
+        calls.append((sql, dict(params or {})))
+        return [
+            {
+                "id": 7,
+                "tenant_id": "demo",
+                "session_id": "room-a@chatroom",
+                "predicate": "interested_in",
+                "object_type": "tool",
+                "term_corroborated": True,
+                "pair_corroborated": False,
+            }
+        ]
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+
+    rows = await store._list_group_relation_auto_review_candidates(limit=25, tenant_id="demo")
+
+    assert rows[0]["id"] == 7
+    sql, params = calls[0]
+    assert params["limit"] == 25
+    assert params["tid"] == "demo"
+    assert params["llm_source"] == "llm_group_window"
+    # Only pending model relations with a real object entity are candidates.
+    assert "item.status = 'pending'" in sql
+    assert "item.source_type = :llm_source" in sql
+    assert "fact.object_entity_id IS NOT NULL" in sql
+    # Corroboration never crosses groups or counts the candidate itself, and
+    # co-participation is too weak to corroborate a person pair.
+    assert sql.count("other_item.session_id = pending.session_id") == 2
+    assert sql.count("other.memory_item_id <> pending.id") == 2
+    assert "other.predicate <> :weak_predicate" in sql
+    assert params["weak_predicate"] == "co_participated"
 
 
 @pytest.mark.asyncio
@@ -1672,6 +1780,7 @@ async def test_auto_extract_skips_completed_front_target_without_starving_next(
         return None
 
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "_load_group_graph_auto_extract_cursor", fake_load_cursor)
     monkeypatch.setattr(store, "_save_group_graph_auto_extract_cursor", fake_save_cursor)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)
@@ -2130,6 +2239,7 @@ async def test_auto_extract_tick_runs_observation_targets_with_their_own_cursor(
         }
 
     monkeypatch.setattr(store, "list_imported_group_graph_targets", fake_targets)
+    monkeypatch.setattr(store, "run_group_relation_auto_review", _no_auto_review)
     monkeypatch.setattr(store, "_load_group_graph_auto_extract_cursor", fake_load_cursor)
     monkeypatch.setattr(store, "_save_group_graph_auto_extract_cursor", fake_save_cursor)
     monkeypatch.setattr(store, "run_group_relationship_window_catchup", fake_catchup)

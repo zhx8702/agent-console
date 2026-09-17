@@ -280,6 +280,8 @@ GROUP_RELATION_MIN_LLM_EVIDENCE = 3
 GROUP_RELATION_MIN_LLM_WINDOW_EVIDENCE = 2
 GROUP_RELATION_MIN_WEAK_DAYS = 2
 GROUP_RELATION_MIN_WEAK_COUNT = 3
+# Actor recorded on acceptance audits written by the corroboration sweep.
+GROUP_RELATION_AUTO_REVIEWER = "system/auto-review"
 # The rule layer owns these; a model re-stating them adds nothing but noise.
 LLM_EXCLUDED_PREDICATES = frozenset({"co_participated"})
 # Objects for the pseudo-entity "the group" ("asked the group") are dropped.
@@ -3298,6 +3300,169 @@ class MemoryGroupGraphStoreMixin:
         )
         return summary
 
+    async def _list_group_relation_auto_review_candidates(
+        self,
+        *,
+        limit: int,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pending model relations with the two corroboration flags computed in SQL.
+
+        A relation is corroborated when the rest of the accepted graph of the
+        same group already agrees with it: the object term has another accepted
+        relation (any member, so the term is real in this group), or the two
+        people already share an accepted non-co-participation edge.
+        """
+
+        params: dict[str, Any] = {
+            "llm_source": LLM_GROUP_WINDOW_SOURCE_TYPE,
+            "weak_predicate": "co_participated",
+            "limit": max(1, int(limit)),
+        }
+        tenant_clause = ""
+        if tenant_id:
+            tenant_clause = "AND item.tenant_id = :tid "
+            params["tid"] = str(tenant_id)
+        rows = await _exec(
+            "WITH pending AS ("
+            "  SELECT item.id, item.tenant_id, item.session_id, item.created_at, "
+            "         fact.subject_entity_id AS subject_id, fact.object_entity_id AS object_id, "
+            "         fact.predicate, "
+            "         COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{relation,object_type}', 'person') "
+            "           AS object_type "
+            "  FROM plugin_memory_item item "
+            "  JOIN plugin_memory_fact fact ON fact.memory_item_id = item.id "
+            "  WHERE item.deleted_at IS NULL AND item.status = 'pending' "
+            "    AND item.source_type = :llm_source "
+            "    AND fact.object_entity_id IS NOT NULL "
+            "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{kind}', '') = 'group_window_relation' "
+            "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{acceptance,status}', '') "
+            "        IN ('needs_review', 'candidate') "
+            f"    {tenant_clause}"
+            "  ORDER BY item.updated_at ASC, item.id ASC "
+            "  LIMIT :limit"
+            ") "
+            "SELECT pending.id, pending.tenant_id, pending.session_id, pending.predicate, "
+            "       pending.object_type, "
+            "  EXISTS ("
+            "    SELECT 1 FROM plugin_memory_fact other "
+            "    JOIN plugin_memory_item other_item ON other_item.id = other.memory_item_id "
+            "    WHERE other.status = 'active' AND other_item.deleted_at IS NULL "
+            "      AND other_item.tenant_id = pending.tenant_id "
+            "      AND other_item.session_id = pending.session_id "
+            "      AND other.memory_item_id <> pending.id "
+            "      AND other.object_entity_id = pending.object_id"
+            "  ) AS term_corroborated, "
+            "  EXISTS ("
+            "    SELECT 1 FROM plugin_memory_fact other "
+            "    JOIN plugin_memory_item other_item ON other_item.id = other.memory_item_id "
+            "    WHERE other.status = 'active' AND other_item.deleted_at IS NULL "
+            "      AND other_item.tenant_id = pending.tenant_id "
+            "      AND other_item.session_id = pending.session_id "
+            "      AND other.memory_item_id <> pending.id "
+            "      AND other.predicate <> :weak_predicate "
+            "      AND ((other.subject_entity_id = pending.subject_id "
+            "            AND other.object_entity_id = pending.object_id) "
+            "        OR (other.subject_entity_id = pending.object_id "
+            "            AND other.object_entity_id = pending.subject_id))"
+            "  ) AS pair_corroborated "
+            "FROM pending ORDER BY pending.id ASC",
+            params,
+        )
+        return [dict(row) for row in rows or []]
+
+    async def run_group_relation_auto_review(
+        self,
+        *,
+        limit: int | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Accept pending model relations that the accepted graph already corroborates.
+
+        Single-window model claims wait in needs_review. Instead of a human
+        clicking through them, this pass promotes the ones the rest of the
+        group's graph supports: a term that some member already has an accepted
+        relation with, or two people who already have an accepted direct edge.
+        Uncorroborated claims stay pending until they repeat on another day or
+        governance expires them after the review retention window.
+        """
+
+        settings = getattr(self, "settings", None)
+        effective_limit = _clamp_int(
+            limit,
+            _clamp_int(
+                getattr(settings, "memory_group_graph_auto_review_batch", 200),
+                200,
+                minimum=0,
+                maximum=1000,
+            ),
+            minimum=0,
+            maximum=1000,
+        )
+        summary: dict[str, Any] = {
+            "ok": True,
+            "scanned": 0,
+            "accepted": 0,
+            "accepted_term": 0,
+            "accepted_pair": 0,
+            "failed": 0,
+            "remaining": 0,
+            "stop_reason": "disabled" if effective_limit <= 0 else "completed",
+        }
+        if effective_limit <= 0:
+            return summary
+        candidates = await self._list_group_relation_auto_review_candidates(
+            limit=effective_limit,
+            tenant_id=tenant_id,
+        )
+        summary["scanned"] = len(candidates)
+        for candidate in candidates:
+            object_type = str(candidate.get("object_type") or "person").strip().lower()
+            if object_type != "person" and candidate.get("term_corroborated"):
+                reason = "group_window_term_corroborated"
+                bucket = "accepted_term"
+            elif object_type == "person" and candidate.get("pair_corroborated"):
+                reason = "group_window_pair_corroborated"
+                bucket = "accepted_pair"
+            else:
+                summary["remaining"] += 1
+                continue
+            item_id = _safe_int(candidate.get("id"), 0)
+            try:
+                reviewed = await self.review_memory_item_acceptance(
+                    item_id,
+                    action="accept",
+                    review_reason=reason,
+                    reviewed_by=GROUP_RELATION_AUTO_REVIEWER,
+                )
+            except Exception as exc:
+                summary["failed"] += 1
+                logger.warning(
+                    "memory.group_relation_auto_review_failed",
+                    item_id=item_id,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+                continue
+            if not reviewed:
+                summary["failed"] += 1
+                continue
+            summary["accepted"] += 1
+            summary[bucket] += 1
+        if len(candidates) >= effective_limit:
+            summary["stop_reason"] = "batch_limit_reached"
+        logger.info(
+            "memory.group_relation_auto_review",
+            scanned=summary["scanned"],
+            accepted=summary["accepted"],
+            accepted_term=summary["accepted_term"],
+            accepted_pair=summary["accepted_pair"],
+            failed=summary["failed"],
+            remaining=summary["remaining"],
+            stop_reason=summary["stop_reason"],
+        )
+        return summary
+
     async def run_group_relationship_window_catchup(
         self,
         *,
@@ -4769,9 +4934,11 @@ class MemoryGroupGraphStoreMixin:
         sync_max_messages: int = 200,
         llm_jobs_per_tick: int | None = None,
         llm_timeout_seconds: int | None = None,
+        auto_review_batch: int | None = None,
     ) -> dict[str, Any]:
-        """One scheduler tick: deterministic catch-up for every target, then a
-        bounded number of queued LLM window jobs with a full per-job timeout."""
+        """One scheduler tick: deterministic catch-up for every target, a bounded
+        number of queued LLM window jobs with a full per-job timeout, then the
+        corroboration sweep that promotes pending model relations."""
 
         effective_time_budget = _clamp_int(
             time_budget_seconds, 180, minimum=1, maximum=900
@@ -4960,6 +5127,18 @@ class MemoryGroupGraphStoreMixin:
                     error=_truncate_error(exc),
                 )
                 llm_jobs = {"claimed": 0, "succeeded": 0, "failed": 0, "dead": 0, "error": exc.__class__.__name__}
+        auto_review: dict[str, Any] = {"scanned": 0, "accepted": 0, "remaining": 0}
+        try:
+            # Runs after the model pass so relations produced this tick can
+            # already be corroborated by the rest of the accepted graph.
+            auto_review = await self.run_group_relation_auto_review(limit=auto_review_batch)
+        except Exception as exc:
+            logger.warning(
+                "memory.group_relation_auto_review_sweep_failed",
+                error_type=exc.__class__.__name__,
+                error=_truncate_error(exc),
+            )
+            auto_review = {"scanned": 0, "accepted": 0, "remaining": 0, "error": exc.__class__.__name__}
         skipped_reasons: dict[str, int] = {}
         for item in skipped:
             reason = str(item.get("reason") or "unknown")
@@ -4991,6 +5170,11 @@ class MemoryGroupGraphStoreMixin:
                 for key in ("claimed", "succeeded", "failed", "dead", "deferred", "stop_reason")
                 if key in llm_jobs
             },
+            auto_review={
+                key: auto_review.get(key)
+                for key in ("scanned", "accepted", "accepted_term", "accepted_pair", "remaining", "stop_reason")
+                if key in auto_review
+            },
         )
         return {
             "ok": True,
@@ -5002,6 +5186,7 @@ class MemoryGroupGraphStoreMixin:
             "applied": applied_total,
             "skipped_reasons": skipped_reasons,
             "llm_jobs": llm_jobs,
+            "auto_review": auto_review,
             "synced": synced,
             "skipped": skipped,
             "results": results,
