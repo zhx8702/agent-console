@@ -315,6 +315,21 @@ describe("relationship graph modules", () => {
     fireEvent.click(canvas.querySelector("[data-graph-item='edge']") as SVGElement);
     expect(setSelection).toHaveBeenCalledWith({ kind: "edge", item: edge });
 
+    // With something selected, the empty canvas, Esc and a second click on the
+    // selected item all release the focus; without a selection they are no-ops.
+    setSelection.mockClear();
+    fireEvent.click(canvas);
+    expect(setSelection).not.toHaveBeenCalled();
+    rerender(<RelationshipGraphPresentation {...controller} selection={{ kind: "node", item: node }} selectedNode={node} />);
+    fireEvent.click(canvas);
+    expect(setSelection).toHaveBeenLastCalledWith(null);
+    fireEvent.keyDown(canvas, { key: "Escape" });
+    expect(setSelection).toHaveBeenLastCalledWith(null);
+    setSelection.mockClear();
+    fireEvent.click(canvas.querySelector("[data-graph-item='node']") as SVGElement);
+    expect(setSelection).toHaveBeenLastCalledWith(null);
+    rerender(<RelationshipGraphPresentation {...controller} />);
+
     await user.click(screen.getByRole("button", { name: "近14天" }));
     expect(applyGraphRangeDays).toHaveBeenCalledWith(14);
     expect(screen.getByRole("slider")).toBeInTheDocument();
@@ -362,8 +377,10 @@ describe("relationship graph modules", () => {
       acceptance_score: 0.62,
       acceptance_reason: "window_relation",
     };
+    const setSelection = vi.fn();
     const controller = {
       selection: { kind: "edge", item: edge },
+      setSelection,
       selectedNode: null,
       selectedEdge: edge,
       nodesById: new Map([[node.id, node], [otherNode.id, otherNode]]),
@@ -382,6 +399,9 @@ describe("relationship graph modules", () => {
     expect(screen.getByText("语义抽取")).toBeInTheDocument();
     expect(screen.getByText("验收分")).toBeInTheDocument();
     expect(screen.getByText("window_relation")).toBeInTheDocument();
+    // The panel offers a way back to the whole graph without reloading.
+    await user.click(screen.getByRole("button", { name: "取消选中" }));
+    expect(setSelection).toHaveBeenCalledWith(null);
     await user.click(screen.getByRole("button", { name: "接受关系" }));
 
     const dialog = screen.getByRole("dialog", { name: "确认接受该关系" });

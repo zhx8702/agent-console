@@ -310,10 +310,24 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               viewBox={`0 0 ${GRAPH_CANVAS_WIDTH} ${GRAPH_CANVAS_HEIGHT}`}
               role="img"
               aria-label="群聊关系图"
+              tabIndex={-1}
               onPointerDown={canvas.onPointerDown}
               onPointerMove={canvas.onPointerMove}
               onPointerUp={canvas.onPointerUp}
               onPointerCancel={canvas.onPointerUp}
+              onClick={(event) => {
+                // Empty canvas: drop the focus. Node/edge clicks stop propagation,
+                // and a drag that ended here is a pan, not a deselect.
+                if (canvas.didPan()) return;
+                if ((event.target as Element).closest("[data-graph-item]")) return;
+                if (selection) setSelection(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && selection) {
+                  event.preventDefault();
+                  setSelection(null);
+                }
+              }}
             >
               <g transform={`translate(${canvas.view.x} ${canvas.view.y}) scale(${canvas.view.scale})`}>
                 <g className="relationship-lane-labels" aria-hidden="true">
@@ -350,12 +364,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                       onClick={(event) => {
                         event.stopPropagation();
                         if (canvas.didPan()) return;
-                        setSelection({ kind: "edge", item: edge });
+                        // Clicking the focused edge again releases the focus.
+                        setSelection(selected ? null : { kind: "edge", item: edge });
                       }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          setSelection({ kind: "edge", item: edge });
+                          setSelection(selected ? null : { kind: "edge", item: edge });
                         }
                       }}
                     >
@@ -397,12 +412,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                       onClick={(event) => {
                         event.stopPropagation();
                         if (canvas.didPan()) return;
-                        setSelection({ kind: "node", item: node });
+                        // Clicking the focused node again releases the focus.
+                        setSelection(selected ? null : { kind: "node", item: node });
                       }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          setSelection({ kind: "node", item: node });
+                          setSelection(selected ? null : { kind: "node", item: node });
                         }
                       }}
                     >

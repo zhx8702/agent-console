@@ -172,6 +172,7 @@ export function RelationshipUnavailableReset() {
 export function RelationshipDetailPanel(controller: RelationshipGraphController) {
   const {
     selection,
+    setSelection,
     selectedNode,
     selectedEdge,
     nodesById,
@@ -197,6 +198,16 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
               <p className="section-kicker">详情</p>
               <h3>{selection ? (selection.kind === "node" ? "这个人" : "这条互动") : "点一个人或一条线"}</h3>
             </div>
+            {selection && (
+              <button
+                type="button"
+                className="button button-secondary button-compact"
+                onClick={() => setSelection(null)}
+                title="回到整张图（也可以点空白处或按 Esc）"
+              >
+                取消选中
+              </button>
+            )}
           </div>
           {!selection && (
             <div className="relationship-empty is-compact">
