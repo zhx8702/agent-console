@@ -2139,6 +2139,9 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
     store.graph_extractor.llm_service = object()
     items_by_key: dict[str, dict[str, Any]] = {}
     next_item_id = 910
+    # Flipped on after the first window: the stored row then looks like one
+    # written before the sensitivity fix (flagged pii for a plain person pair).
+    legacy_pii_rows = False
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         nonlocal next_item_id
@@ -2152,6 +2155,14 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
                 }
                 for event_id in params.get("event_ids", [])
             ]
+        if (
+            legacy_pii_rows
+            and "normalized_key = :normalized_key" in sql
+            and "FROM plugin_memory_item" in sql
+            and "deleted_at IS NOT NULL" not in sql
+        ):
+            item = items_by_key.get(str(params["normalized_key"]))
+            return [{**item, "sensitivity": "pii", "sensitivity_category": "pii"}] if item else []
         if "FROM plugin_memory_event" in sql and "id > :cursor_event_id" in sql:
             cursor = int(params["cursor_event_id"])
             # Two messages per window: a model claim needs two supporting
@@ -2267,6 +2278,7 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
         window_size=10,
         cursor_event_id=0,
     )
+    legacy_pii_rows = True
     second = await store.run_group_relationship_window_extraction(
         tenant_id="demo",
         channel="wechat",
