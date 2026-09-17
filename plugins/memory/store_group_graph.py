@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from plugins.memory.store import (
     GROUP_HISTORY_USER_ID_SCOPE,
     GROUP_WINDOW_DETERMINISTIC_MAX_PAIRS,
     GROUP_WINDOW_DETERMINISTIC_MAX_SENDERS,
+    GROUP_WINDOW_LLM_JOB_TRACE_PREFIX,
     LLM_GROUP_WINDOW_SOURCE_TYPE,
     MEMORY_ACCEPTANCE_REVIEW_ACTIONS,
     _append_unique_int,
@@ -77,24 +79,204 @@ def _group_graph_item_value(item: dict[str, Any] | None) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+EVIDENCE_SOURCE_MEMORY_EVENT = "memory_event"
+EVIDENCE_SOURCE_OBSERVATION = "observation"
+EVIDENCE_SOURCE_MIXED = "mixed"
+GROUP_GRAPH_EVIDENCE_SOURCES = (EVIDENCE_SOURCE_MEMORY_EVENT, EVIDENCE_SOURCE_OBSERVATION)
+
+
+def _group_graph_evidence_source(event_ids: Iterable[Any], observation_ids: Iterable[Any]) -> str:
+    has_events = bool(_coerce_int_set(event_ids))
+    has_observations = bool(_coerce_int_set(observation_ids))
+    if has_events and has_observations:
+        return EVIDENCE_SOURCE_MIXED
+    if has_observations:
+        return EVIDENCE_SOURCE_OBSERVATION
+    return EVIDENCE_SOURCE_MEMORY_EVENT
+
+
 def _group_graph_edge_quality(item: dict[str, Any] | None) -> dict[str, Any]:
     value = _group_graph_item_value(item)
     acceptance = value.get("acceptance") if isinstance(value.get("acceptance"), dict) else {}
+    relation = value.get("relation") if isinstance(value.get("relation"), dict) else {}
     dates = value.get("evidence_dates")
     evidence_dates = (
         [str(entry).strip()[:10] for entry in dates if str(entry).strip()]
         if isinstance(dates, list)
         else []
     )
+    evidence_dates = list(dict.fromkeys(evidence_dates))[:90]
     score = acceptance.get("score")
     if score is None:
         score = item.get("acceptance_score") if item else None
     reason = str(acceptance.get("reason") or (item or {}).get("acceptance_reason") or "").strip()
+    event_ids = _coerce_int_set(
+        relation.get("evidence_event_ids") or value.get("source_event_ids") or []
+    )
+    observation_ids = _coerce_int_set(
+        relation.get("evidence_observation_ids") or value.get("source_observation_ids") or []
+    )
+    first_seen_date = str(value.get("first_seen_date") or "").strip()[:10] or (
+        min(evidence_dates) if evidence_dates else None
+    )
+    last_seen_date = str(value.get("last_seen_date") or "").strip()[:10] or (
+        max(evidence_dates) if evidence_dates else None
+    )
     return {
-        "evidence_dates": list(dict.fromkeys(evidence_dates))[:90],
+        "evidence_dates": evidence_dates,
         "acceptance_score": _clamp_score(score) if score is not None else None,
         "acceptance_reason": reason[:80] or None,
+        "evidence_event_count": len(event_ids),
+        "evidence_observation_count": len(observation_ids),
+        "evidence_day_count": len(evidence_dates),
+        "evidence_source": str(value.get("evidence_source") or "").strip()
+        or _group_graph_evidence_source(event_ids, observation_ids),
+        "first_seen_date": first_seen_date or None,
+        "last_seen_date": last_seen_date or None,
     }
+
+
+def _group_relation_judgement(item: dict[str, Any] | None) -> dict[str, Any]:
+    """Why the pipeline believes this edge, without any chat text.
+
+    Operators asking "how was this decided?" get the extraction method, the
+    per-signal counts, the acceptance policy that fired and who/what reviewed
+    it, plus the model's one-line rationale for model relations. That rationale
+    is the model's own paraphrase (capped when stored), not a message.
+    """
+
+    value = _group_graph_item_value(item)
+    acceptance = value.get("acceptance") if isinstance(value.get("acceptance"), dict) else {}
+    relation = value.get("relation") if isinstance(value.get("relation"), dict) else {}
+    source_type = str((item or {}).get("source_type") or "").strip()
+    method = (
+        "llm"
+        if source_type == LLM_GROUP_WINDOW_SOURCE_TYPE
+        else "deterministic"
+        if source_type == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE
+        else str(relation.get("extraction_method") or "").strip() or "unknown"
+    )
+    raw_signals = relation.get("signals") if isinstance(relation.get("signals"), dict) else {}
+    signals = {
+        key: max(0, _safe_int(raw_signals.get(key), 0))
+        for key in GROUP_SIGNAL_KEYS
+        if _safe_int(raw_signals.get(key), 0) > 0
+    }
+    model_reason = _normalize_line(str(relation.get("reason") or ""))[:240]
+    return {
+        "extraction_method": method,
+        "signals": signals,
+        "policy": str(acceptance.get("policy") or acceptance.get("reason") or "").strip()[:80],
+        "acceptance_status": str(acceptance.get("status") or "").strip(),
+        "reviewed_by": str(acceptance.get("reviewed_by") or "").strip()[:120],
+        "review_reason": _normalize_line(str(acceptance.get("review_reason") or ""))[:240],
+        "model_reason": model_reason if method == "llm" else "",
+        "day_count": max(0, _safe_int(acceptance.get("day_count"), 0)),
+        "strength": _clamp_score(relation.get("strength")) if relation.get("strength") is not None else None,
+    }
+
+
+SYMMETRIC_GROUP_PREDICATES = frozenset({"co_participated", "collaborated_with"})
+
+
+def _end_of_day(value: datetime, date_text: Any) -> datetime:
+    """Treat a date-only evidence boundary as the end of that day."""
+
+    if date_text and len(str(date_text).strip()) <= 10:
+        return value.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return value
+
+
+def _merge_symmetric_group_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse A→B and B→A rows of symmetric predicates into one edge.
+
+    Co-participation is stored directionally because the pair order depends on
+    who spoke first in a window; on the wire it is one undirected relation.
+    """
+
+    merged: list[dict[str, Any]] = []
+    by_pair: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for edge in edges:
+        predicate = str(edge.get("type") or "")
+        if predicate not in SYMMETRIC_GROUP_PREDICATES:
+            merged.append(edge)
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        key = (predicate, *sorted((source, target)))
+        existing = by_pair.get(key)
+        if existing is None:
+            edge = {**edge, "mirror_ids": []}
+            by_pair[key] = edge
+            merged.append(edge)
+            continue
+        existing["mirror_ids"] = [*existing.get("mirror_ids", []), edge.get("id")]
+        existing["confidence"] = max(
+            _clamp_score(existing.get("confidence"), 0.0), _clamp_score(edge.get("confidence"), 0.0)
+        )
+        existing["evidence_count"] = int(existing.get("evidence_count") or 0) + int(
+            edge.get("evidence_count") or 0
+        )
+        existing["observation_count"] = int(existing.get("observation_count") or 0) + int(
+            edge.get("observation_count") or 0
+        )
+        dates = list(dict.fromkeys([*(existing.get("evidence_dates") or []), *(edge.get("evidence_dates") or [])]))
+        existing["evidence_dates"] = sorted(dates)[:90]
+        existing["evidence_day_count"] = max(
+            len(existing["evidence_dates"]), int(existing.get("evidence_day_count") or 0)
+        )
+        for key_name, pick in (("first_seen", min), ("last_seen", max)):
+            values = [str(v) for v in (existing.get(key_name), edge.get(key_name)) if v]
+            if values:
+                existing[key_name] = pick(values)
+        for key_name, pick in (("first_seen_date", min), ("last_seen_date", max)):
+            values = [str(v) for v in (existing.get(key_name), edge.get(key_name)) if v]
+            existing[key_name] = pick(values) if values else None
+        strengths = [
+            float(v) for v in (existing.get("strength"), edge.get("strength")) if v is not None
+        ]
+        if strengths:
+            existing["strength"] = round(max(strengths), 4)
+        existing["source_event_ids"] = _merge_int_lists(
+            existing.get("source_event_ids"), edge.get("source_event_ids"), max_items=200
+        )
+        existing["memory_item_ids"] = _merge_int_lists(
+            existing.get("memory_item_ids"), edge.get("memory_item_ids"), max_items=200
+        )
+        if existing.get("acceptance_status") != "accepted" and edge.get("acceptance_status") == "accepted":
+            existing["acceptance_status"] = "accepted"
+    return merged
+
+
+def _group_graph_item_observation_ids(item: dict[str, Any] | None) -> list[int]:
+    value = _group_graph_item_value(item)
+    relation = value.get("relation") if isinstance(value.get("relation"), dict) else {}
+    return sorted(
+        _coerce_int_set(relation.get("evidence_observation_ids") or [])
+        | _coerce_int_set(value.get("source_observation_ids") or [])
+    )
+
+
+def _split_window_evidence_ids(
+    candidate_ids: Iterable[Any],
+    observation_ids: set[int],
+) -> tuple[list[int], list[int]]:
+    """Split window evidence into memory-event ids and group-observation ids.
+
+    Observation rows come from ``plugin_wxbot_group_observations`` whose id
+    space is unrelated to ``plugin_memory_event``. Keeping them under their own
+    key preserves the evidence trail without tricking the memory-event
+    provenance check that runs when the item is written.
+    """
+
+    event_ids: list[int] = []
+    observation_evidence: list[int] = []
+    for event_id in sorted(_coerce_int_set(candidate_ids)):
+        if event_id in observation_ids:
+            observation_evidence.append(event_id)
+        else:
+            event_ids.append(event_id)
+    return event_ids, observation_evidence
 
 
 def _group_graph_auto_cursor_key(
@@ -107,6 +289,327 @@ def _group_graph_auto_cursor_key(
 ) -> str:
     scope = "\x1f".join((tenant_id, channel, source_key, session_id, target_date))
     return f"group-graph-auto-cursor:v1:{_normalize_key(scope)}"
+
+
+def _normalize_evidence_source(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in GROUP_GRAPH_EVIDENCE_SOURCES else None
+
+
+# Deterministic interaction signals. ``direct`` signals are observable platform
+# facts (a quoted reply, an @-mention, an explicit "回复" prefix); they may be
+# accepted on first sight. Anything else needs repetition before acceptance.
+SIGNAL_QUOTE = "quote"
+SIGNAL_MENTION = "mention"
+SIGNAL_PREFIX_REPLY = "prefix_reply"
+SIGNAL_CO_PARTICIPATION = "co_participation"
+SIGNAL_LLM = "llm"
+DIRECT_GROUP_SIGNALS = (SIGNAL_QUOTE, SIGNAL_MENTION, SIGNAL_PREFIX_REPLY)
+GROUP_SIGNAL_KEYS = (*DIRECT_GROUP_SIGNALS, SIGNAL_CO_PARTICIPATION, SIGNAL_LLM)
+QUOTE_REPLY_CONFIDENCE = 0.9
+MENTION_METADATA_CONFIDENCE = 0.85
+MENTION_TEXT_CONFIDENCE = 0.72
+PREFIX_REPLY_CONFIDENCE = 0.62
+CO_PARTICIPATION_CONFIDENCE = 0.45
+GROUP_RELATION_MIN_LLM_DAYS = 2
+# A model-only relation is also accepted without a second day once this many
+# distinct messages in the window support it; one-off claims stay in review.
+GROUP_RELATION_MIN_LLM_EVIDENCE = 3
+# Below this many supporting messages an LLM candidate is not stored at all:
+# on the production data single-message claims were the bulk of the noise.
+GROUP_RELATION_MIN_LLM_WINDOW_EVIDENCE = 2
+GROUP_RELATION_MIN_WEAK_DAYS = 2
+GROUP_RELATION_MIN_WEAK_COUNT = 3
+# Actor recorded on acceptance audits written by the corroboration sweep.
+GROUP_RELATION_AUTO_REVIEWER = "system/auto-review"
+# The rule layer owns these; a model re-stating them adds nothing but noise.
+LLM_EXCLUDED_PREDICATES = frozenset({"co_participated"})
+# Objects for the pseudo-entity "the group" ("asked the group") are dropped.
+LLM_GROUP_PSEUDO_OBJECTS = frozenset({"group", "the group", "群", "群聊", "大家", "everyone", "all"})
+LLM_TERM_MIN_LENGTH = 2
+LLM_TERM_MAX_LENGTH = 40
+
+_MENTION_TOKEN_RE = re.compile(r"@([^\s\u2005\u00a0@:：,，;；]+)")
+
+# LLM window jobs live in plugin_memory_extraction_job next to per-event jobs
+# (see GROUP_WINDOW_LLM_JOB_TRACE_PREFIX in store.py).
+GROUP_WINDOW_LLM_JOB_KIND = "group_window_llm"
+LLM_MODE_INLINE = "inline"
+LLM_MODE_ENQUEUE = "enqueue"
+GROUP_WINDOW_LLM_TIMEOUT_DEFAULT = 60
+GROUP_WINDOW_LLM_TIMEOUT_MIN = 5
+GROUP_WINDOW_LLM_TIMEOUT_MAX = 600
+GROUP_WINDOW_LLM_MODEL_TIER_DEFAULT = "tier-1"
+# LLM-proposed objects typed "person" that are not real participants are almost
+# always terms ("缩水", "gpt", "4.8"); these predicates keep them as topics.
+LLM_PERSON_TO_TOPIC_PREDICATES = frozenset(
+    {"mentioned", "interested_in", "asked", "requested", "reported_issue", "works_on", "provided_resource"}
+)
+
+
+def _group_window_llm_job_key(
+    *,
+    tenant_id: str,
+    channel: str,
+    source_key: str,
+    session_id: str,
+    target_date: str,
+    source: str,
+    first_event_id: Any,
+    last_event_id: Any,
+) -> str:
+    scope = "\x1f".join(
+        (
+            tenant_id,
+            channel,
+            source_key,
+            session_id,
+            target_date,
+            source or EVIDENCE_SOURCE_MEMORY_EVENT,
+            str(first_event_id or 0),
+            str(last_event_id or 0),
+        )
+    )
+    return f"{GROUP_WINDOW_LLM_JOB_TRACE_PREFIX}v1:{_normalize_key(scope)}"
+
+
+def _normalize_llm_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return LLM_MODE_ENQUEUE if text == LLM_MODE_ENQUEUE else LLM_MODE_INLINE
+
+
+def _normalize_group_name(value: Any) -> str:
+    text = _normalize_line(_sanitize_db_text(value))
+    return re.sub(r"[\s\u2005\u00a0]+", "", text).lower()
+
+
+_LLM_TERM_WORD_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+# wxid_xxx, bare QQ-style numbers and letter+digits account ids: member
+# identifiers, never topics.
+_PARTICIPANT_ID_RE = re.compile(r"^(?:wxid_[\w-]+|\d{5,}|[a-z]\d{6,})$", re.IGNORECASE)
+
+
+def _looks_like_participant_id(value: str) -> bool:
+    return bool(_PARTICIPANT_ID_RE.match(_normalize_line(str(value or ""))))
+
+
+def _is_usable_llm_term(value: str) -> bool:
+    """Reject model-proposed terms that cannot be a graph node.
+
+    Sentences (too long), single characters, bare numbers/times ("9点", "4.8")
+    and punctuation-only strings are dropped; a term must contain at least one
+    letter or CJK character and stay within ``LLM_TERM_MAX_LENGTH``.
+    """
+
+    text = _normalize_line(str(value or ""))
+    if len(text) < LLM_TERM_MIN_LENGTH or len(text) > LLM_TERM_MAX_LENGTH:
+        return False
+    letters = _LLM_TERM_WORD_RE.findall(text)
+    if not letters:
+        return False
+    # "9点" / "5x" style: one letter riding on digits is still a number.
+    if len(letters) < 2 and re.search(r"\d", text):
+        return False
+    return True
+
+
+def _observation_interaction_metadata(
+    raw_metadata: Any,
+    *,
+    sender_name: Any = None,
+) -> dict[str, Any]:
+    """Pull the interaction facts out of ``metadata_json`` without keeping text.
+
+    Only identifiers, display names and message ids are retained: who was
+    quoted (``quote.fromusr`` / ``quote.sender_name``), who was @-mentioned
+    (``at_wxids``) and the bot's own id so it can be excluded as a target.
+    """
+
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else _safe_json_loads(raw_metadata, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    quote = metadata.get("quote") if isinstance(metadata.get("quote"), dict) else {}
+    at_wxids_raw = metadata.get("at_wxids")
+    at_wxids = (
+        [str(item).strip() for item in at_wxids_raw if str(item or "").strip()]
+        if isinstance(at_wxids_raw, list)
+        else []
+    )
+    return {
+        "sender_name": _normalize_line(_sanitize_db_text(sender_name))[:80],
+        "quote_from": str(quote.get("fromusr") or "").strip()[:200],
+        "quote_sender_name": _normalize_line(_sanitize_db_text(quote.get("sender_name")))[:80],
+        "quote_message_id": str(quote.get("refer_msg_svr_id") or "").strip()[:64],
+        "at_wxids": at_wxids[:20],
+        "bot_wxid": str(metadata.get("bot_wxid") or "").strip()[:200],
+    }
+
+
+class GroupMemberDirectory:
+    """Resolve the different id/name forms a member shows up under in one group.
+
+    ``sender_wxid`` is the canonical node id. Quote and @ metadata sometimes
+    carry a member's alias id instead, so resolution goes: known sender id →
+    nickname match → alias id known to the membership table → unresolved.
+    Unresolved targets are dropped rather than turned into phantom nodes.
+    """
+
+    def __init__(self) -> None:
+        self.names_by_id: dict[str, str] = {}
+        self.ids_by_name: dict[str, str] = {}
+        self.sender_ids: set[str] = set()
+        self._sorted_names: list[str] | None = None
+
+    def add_sender(self, member_id: Any, name: Any = None) -> None:
+        canonical = _normalize_line(_sanitize_db_text(member_id))[:200]
+        if not canonical:
+            return
+        self.sender_ids.add(canonical)
+        self.add_member(canonical, name, prefer=True)
+
+    def add_member(self, member_id: Any, name: Any = None, *, prefer: bool = False) -> None:
+        canonical = _normalize_line(_sanitize_db_text(member_id))[:200]
+        if not canonical:
+            return
+        display = _normalize_line(_sanitize_db_text(name))[:80]
+        if display and display != canonical:
+            self.names_by_id.setdefault(canonical, display)
+            key = _normalize_group_name(display)
+            if key and (
+                key not in self.ids_by_name
+                or (prefer and self.ids_by_name[key] not in self.sender_ids)
+            ):
+                self.ids_by_name[key] = canonical
+                self._sorted_names = None
+
+    def resolve_name(self, name: Any) -> str | None:
+        key = _normalize_group_name(name)
+        if not key:
+            return None
+        exact = self.ids_by_name.get(key)
+        if exact:
+            return exact
+        if self._sorted_names is None:
+            self._sorted_names = sorted(self.ids_by_name, key=len, reverse=True)
+        for known in self._sorted_names:
+            if len(known) >= 2 and key.startswith(known):
+                return self.ids_by_name[known]
+        return None
+
+    def resolve_id(self, raw_id: Any, *, fallback_name: Any = None) -> str | None:
+        candidate = _normalize_line(_sanitize_db_text(raw_id))[:200]
+        if candidate.startswith("user:"):
+            candidate = candidate[5:]
+        if candidate and candidate in self.sender_ids:
+            return candidate
+        via_name = self.resolve_name(fallback_name) if fallback_name else None
+        if via_name:
+            return via_name
+        if candidate and candidate in self.names_by_id:
+            via_alias = self.resolve_name(self.names_by_id[candidate])
+            return via_alias or candidate
+        return None
+
+
+def _empty_group_signals() -> dict[str, int]:
+    return dict.fromkeys(GROUP_SIGNAL_KEYS, 0)
+
+
+def _merge_group_signals(*values: Any) -> dict[str, int]:
+    merged = _empty_group_signals()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in GROUP_SIGNAL_KEYS:
+            merged[key] += max(0, _safe_int(value.get(key), 0))
+    return merged
+
+
+def _merge_signal_evidence(*values: Any, max_items: int = 200) -> dict[str, list[int]]:
+    """Union per-signal evidence ids. Counting ids instead of occurrences keeps
+    ``signals`` idempotent when a window is processed twice (retries, manual
+    re-runs, the LLM pass following the deterministic pass)."""
+
+    merged: dict[str, list[int]] = {key: [] for key in GROUP_SIGNAL_KEYS}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in GROUP_SIGNAL_KEYS:
+            merged[key] = _merge_int_lists(merged[key], value.get(key), max_items=max_items)
+    return merged
+
+
+def _signals_from_evidence(signal_evidence: dict[str, list[int]]) -> dict[str, int]:
+    signals = _empty_group_signals()
+    for key in GROUP_SIGNAL_KEYS:
+        signals[key] = len(_coerce_int_set(signal_evidence.get(key) or []))
+    return signals
+
+
+_LEGACY_REASON_SIGNALS = {
+    "deterministic_quote_reply": SIGNAL_QUOTE,
+    "deterministic_at_mention_metadata": SIGNAL_MENTION,
+    "deterministic_addressed_participant": SIGNAL_MENTION,
+    "deterministic_adjacent_reply_window": SIGNAL_PREFIX_REPLY,
+    "deterministic_same_window_participation": SIGNAL_CO_PARTICIPATION,
+}
+
+
+def _infer_legacy_group_signals(relation: dict[str, Any], source_type: str) -> dict[str, int]:
+    """Signal counts for relations written before ``signals`` existed."""
+
+    signals = _empty_group_signals()
+    reason = str(relation.get("reason") or "").strip()
+    mapped = _LEGACY_REASON_SIGNALS.get(reason)
+    if mapped is None:
+        method = str(relation.get("extraction_method") or source_type or "")
+        if method == DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE:
+            mapped = (
+                SIGNAL_CO_PARTICIPATION
+                if str(relation.get("predicate") or "") == "co_participated"
+                else SIGNAL_PREFIX_REPLY
+            )
+        else:
+            mapped = SIGNAL_LLM
+    # One legacy item = one known occurrence; evidence ids per occurrence vary
+    # by rule, so they are not a reliable count.
+    signals[mapped] = 1
+    return signals
+
+
+def _group_relation_strength(signals: dict[str, int], day_count: int) -> float:
+    """Accumulated interaction strength in [0, 1]: more direct hits and more
+    distinct days saturate towards 1 with diminishing returns."""
+
+    direct = sum(signals.get(key, 0) for key in DIRECT_GROUP_SIGNALS)
+    weak = signals.get(SIGNAL_CO_PARTICIPATION, 0) + signals.get(SIGNAL_LLM, 0)
+    exponent = direct / 3.0 + weak / 10.0 + max(0, int(day_count) - 1) / 4.0
+    return round(_clamp_score(1.0 - math.exp(-exponent), 0.0), 4)
+
+
+def _group_relation_acceptance_decision(
+    signals: dict[str, int],
+    *,
+    day_count: int,
+    auto_accept: bool,
+) -> tuple[str, str]:
+    """Deterministic acceptance policy for group window relations."""
+
+    if not auto_accept:
+        return "needs_review", "group_window_relation"
+    if any(signals.get(key, 0) > 0 for key in DIRECT_GROUP_SIGNALS):
+        return "accepted", "group_window_direct_signal"
+    llm_count = int(signals.get(SIGNAL_LLM, 0) or 0)
+    if llm_count > 0 and int(day_count) >= GROUP_RELATION_MIN_LLM_DAYS:
+        return "accepted", "group_window_llm_multi_day"
+    if llm_count >= GROUP_RELATION_MIN_LLM_EVIDENCE:
+        return "accepted", "group_window_llm_repeated_evidence"
+    if (
+        signals.get(SIGNAL_CO_PARTICIPATION, 0) >= GROUP_RELATION_MIN_WEAK_COUNT
+        and int(day_count) >= GROUP_RELATION_MIN_WEAK_DAYS
+    ):
+        return "accepted", "group_window_repeated_weak_signal"
+    return "needs_review", "group_window_weak_signal"
 
 
 def _clean_session_ids(*values: Any) -> list[str]:
@@ -222,6 +725,112 @@ class MemoryGroupGraphStoreMixin:
             row["confidence"] = float(row.get("confidence") or 0.0)
         return rows
 
+    def _group_graph_fact_filter_sql(
+        self,
+        params: dict[str, Any],
+        *,
+        predicates: list[str] | None,
+        min_confidence: float | None,
+        acceptance_statuses: list[str] | None,
+        default_accepted_only: bool,
+        from_date: str | None,
+        to_date: str | None,
+    ) -> list[str]:
+        """SQL conditions for the graph read path, evaluated before LIMIT.
+
+        Acceptance and evidence dates live on the backing memory item
+        (``backing``), so the caller must LEFT JOIN it. Doing this in SQL keeps a
+        500-row cap from silently hiding older or non-dominant edges.
+        """
+
+        conditions: list[str] = []
+        acceptance_expr = (
+            "COALESCE(NULLIF(NULLIF(backing.value_json, '')::jsonb #>> '{acceptance,status}', ''), "
+            "CASE WHEN backing.status = 'active' THEN 'accepted' ELSE 'needs_review' END)"
+        )
+        if predicates:
+            conditions.append("fact.predicate = ANY(:predicates)")
+            params["predicates"] = list(predicates)
+        if min_confidence is not None:
+            conditions.append("fact.confidence >= :min_confidence")
+            params["min_confidence"] = float(min_confidence)
+        if acceptance_statuses:
+            conditions.append(f"{acceptance_expr} = ANY(:acceptance_statuses)")
+            params["acceptance_statuses"] = list(acceptance_statuses)
+        elif default_accepted_only:
+            conditions.append(
+                f"{acceptance_expr} = 'accepted' "
+                "AND backing.status = 'active' AND backing.deleted_at IS NULL"
+            )
+        first_seen_expr = (
+            "COALESCE(NULLIF(NULLIF(backing.value_json, '')::jsonb ->> 'first_seen_date', ''), "
+            "to_char(COALESCE(fact.valid_at, fact.created_at, fact.updated_at), 'YYYY-MM-DD'))"
+        )
+        last_seen_expr = (
+            "COALESCE(NULLIF(NULLIF(backing.value_json, '')::jsonb ->> 'last_seen_date', ''), "
+            "to_char(COALESCE(fact.valid_at, fact.created_at, fact.updated_at), 'YYYY-MM-DD'))"
+        )
+        if from_date:
+            # An edge is in range when its evidence interval overlaps the window.
+            conditions.append(f"{last_seen_expr} >= :from_date")
+            params["from_date"] = from_date
+        if to_date:
+            conditions.append(f"{first_seen_expr} <= :to_date")
+            params["to_date"] = to_date
+        return conditions
+
+    async def count_memory_graph_facts(
+        self,
+        *,
+        tenant_id: str,
+        channel: str | None = None,
+        source_key: str | None = None,
+        session_ids: list[str] | None = None,
+        status: str | None = None,
+        predicates: list[str] | None = None,
+        min_confidence: float | None = None,
+        acceptance_statuses: list[str] | None = None,
+        default_accepted_only: bool = False,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> int:
+        conditions = ["fact.tenant_id = :tid"]
+        params: dict[str, Any] = {"tid": tenant_id}
+        if channel is not None:
+            conditions.append("fact.channel = :channel")
+            params["channel"] = channel
+        if source_key is not None:
+            conditions.append("fact.source_key = :source_key")
+            params["source_key"] = source_key
+        if session_ids:
+            conditions.append("backing.session_id = ANY(:sids)")
+            params["sids"] = list(session_ids)
+        if status is not None:
+            conditions.append("fact.status = :status")
+            params["status"] = status
+        conditions.extend(
+            self._group_graph_fact_filter_sql(
+                params,
+                predicates=predicates,
+                min_confidence=min_confidence,
+                acceptance_statuses=acceptance_statuses,
+                default_accepted_only=default_accepted_only,
+                from_date=from_date,
+                to_date=to_date,
+            )
+        )
+        try:
+            rows = await _exec(
+                "SELECT COUNT(*) AS count FROM plugin_memory_fact fact "
+                "LEFT JOIN plugin_memory_item backing ON backing.id = fact.memory_item_id "
+                f"WHERE {' AND '.join(conditions)}",
+                params,
+            )
+        except Exception:
+            logger.warning("memory.group_graph_fact_count_failed", exc_info=True)
+            return 0
+        return _safe_int((rows[0] if rows else {}).get("count"), 0)
+
     async def list_memory_graph_facts(
         self,
         *,
@@ -233,6 +842,13 @@ class MemoryGroupGraphStoreMixin:
         session_ids: list[str] | None = None,
         status: str | None = None,
         limit: int = 100,
+        predicates: list[str] | None = None,
+        min_confidence: float | None = None,
+        acceptance_statuses: list[str] | None = None,
+        default_accepted_only: bool = False,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        order_by_strength: bool = False,
     ) -> list[dict[str, Any]]:
         conditions = ["fact.tenant_id = :tid"]
         params: dict[str, Any] = {"tid": tenant_id, "lim": max(1, min(int(limit or 100), 500))}
@@ -269,6 +885,28 @@ class MemoryGroupGraphStoreMixin:
         if status is not None:
             conditions.append("fact.status = :status")
             params["status"] = status
+        graph_filters = self._group_graph_fact_filter_sql(
+            params,
+            predicates=predicates,
+            min_confidence=min_confidence,
+            acceptance_statuses=acceptance_statuses,
+            default_accepted_only=default_accepted_only,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        conditions.extend(graph_filters)
+        needs_backing = bool(graph_filters) or order_by_strength
+        backing_join = (
+            "LEFT JOIN plugin_memory_item backing ON backing.id = fact.memory_item_id "
+            if needs_backing
+            else ""
+        )
+        order_sql = (
+            "ORDER BY COALESCE((NULLIF(backing.value_json, '')::jsonb #>> '{relation,strength}')::float, 0) DESC, "
+            "fact.updated_at DESC, fact.id DESC"
+            if order_by_strength
+            else "ORDER BY fact.updated_at DESC, fact.id DESC"
+        )
         rows = await _exec(
             "SELECT fact.id, fact.tenant_id, fact.channel, fact.source_key, fact.user_id, "
             "fact.subject_entity_id, subject.name AS subject_name, fact.predicate, "
@@ -282,13 +920,44 @@ class MemoryGroupGraphStoreMixin:
             "LEFT JOIN plugin_memory_entity object_entity ON object_entity.id = fact.object_entity_id "
             "AND object_entity.tenant_id = fact.tenant_id AND object_entity.channel = fact.channel "
             "AND object_entity.source_key = fact.source_key AND object_entity.user_id = fact.user_id "
+            f"{backing_join}"
             f"WHERE {' AND '.join(conditions)} "
-            "ORDER BY fact.updated_at DESC, fact.id DESC LIMIT :lim",
+            f"{order_sql} LIMIT :lim",
             params,
         )
         for row in rows:
             row["confidence"] = float(row.get("confidence") or 0.0)
         return rows
+
+    async def _list_memory_graph_entities_by_ids(
+        self,
+        *,
+        tenant_id: str,
+        entity_ids: Iterable[Any],
+    ) -> list[dict[str, Any]]:
+        """Fetch the endpoints of already-selected facts so no edge is dropped
+        just because its entity fell outside the recency-ordered entity page."""
+
+        ids = sorted(_coerce_int_set(entity_ids))
+        if not ids:
+            return []
+        try:
+            rows = await _exec(
+                "SELECT entity.id, entity.tenant_id, entity.channel, entity.source_key, "
+                "entity.user_id, entity.entity_type, entity.name, entity.normalized_name, "
+                "entity.aliases_json, entity.confidence, entity.status, "
+                "entity.created_at, entity.updated_at "
+                "FROM plugin_memory_entity entity "
+                "WHERE entity.tenant_id = :tid AND entity.id = ANY(:ids)",
+                {"tid": tenant_id, "ids": ids[:1000]},
+            )
+        except Exception:
+            logger.warning("memory.group_graph_entity_fetch_failed", exc_info=True)
+            return []
+        for row in rows or []:
+            row["aliases"] = _safe_json_loads(row.get("aliases_json"), [])
+            row["confidence"] = float(row.get("confidence") or 0.0)
+        return list(rows or [])
 
     async def list_memory_graph_episodes(
         self,
@@ -360,11 +1029,18 @@ class MemoryGroupGraphStoreMixin:
             for value in str(acceptance_status or "").split(",")
             if value.strip()
         }
+        requested_predicates = [
+            value.strip()
+            for value in str(edge_type or "").split(",")
+            if value.strip()
+        ]
         confidence_floor = (
             _clamp_score(min_confidence, default=0.0) if min_confidence is not None else None
         )
         from_dt = _coerce_datetime(from_)
         to_dt = _coerce_datetime(to)
+        from_date = from_dt.date().isoformat() if from_dt is not None else None
+        to_date = to_dt.date().isoformat() if to_dt is not None else None
         status_filter = None if requested_acceptance - {"accepted"} else "active"
         generated_from = ["plugin_memory_entity", "plugin_memory_fact", "plugin_memory_episode"]
         scope = _group_graph_scope(
@@ -406,6 +1082,16 @@ class MemoryGroupGraphStoreMixin:
             status=status_filter,
             limit=fetch_limit,
         )
+        # Filters are applied in SQL before the row cap so the strongest matching
+        # edges come back first instead of the most recently touched rows.
+        fact_filter_kwargs: dict[str, Any] = {
+            "predicates": requested_predicates or None,
+            "min_confidence": confidence_floor,
+            "acceptance_statuses": sorted(requested_acceptance) or None,
+            "default_accepted_only": not requested_acceptance,
+            "from_date": from_date,
+            "to_date": to_date,
+        }
         facts = await self.list_memory_graph_facts(
             tenant_id=tenant_id,
             channel=channel,
@@ -415,7 +1101,34 @@ class MemoryGroupGraphStoreMixin:
             session_ids=scoped_session_ids or None,
             status=status_filter,
             limit=fetch_limit,
+            order_by_strength=True,
+            **fact_filter_kwargs,
         )
+        total_matching_facts = await self.count_memory_graph_facts(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_ids=scoped_session_ids or None,
+            status=status_filter,
+            **fact_filter_kwargs,
+        )
+        # Endpoints of the selected facts must be present even when they fall
+        # outside the recency-ordered entity page.
+        known_entity_ids = {row.get("id") for row in entities if row.get("id") is not None}
+        missing_entity_ids = {
+            entity_id
+            for fact in facts
+            for entity_id in (fact.get("subject_entity_id"), fact.get("object_entity_id"))
+            if entity_id is not None and entity_id not in known_entity_ids
+        }
+        if missing_entity_ids:
+            entities = [
+                *entities,
+                *await self._list_memory_graph_entities_by_ids(
+                    tenant_id=tenant_id,
+                    entity_ids=missing_entity_ids,
+                ),
+            ]
         episodes = await self.list_memory_graph_episodes(
             tenant_id=tenant_id,
             channel=channel,
@@ -476,15 +1189,19 @@ class MemoryGroupGraphStoreMixin:
         edges: list[dict[str, Any]] = []
         connected_node_ids: set[str] = set()
 
+        # node_type selects edges that touch a node of that type; the other
+        # endpoint stays so a person -> tool graph filtered to "tool" still
+        # shows who is attached to each tool. Unconnected nodes are pruned below.
+        typed_node_ids: set[str] = set()
         for entity in entities:
             node_id = _group_graph_node_id(entity)
             status = str(entity.get("status") or "active")
             confidence = _clamp_score(entity.get("confidence"))
             node_acceptance = _group_graph_acceptance_status(entity)
-            if node_type and str(entity.get("entity_type") or "") != node_type:
-                continue
             if confidence_floor is not None and confidence < confidence_floor:
                 continue
+            if node_type and str(entity.get("entity_type") or "") == node_type:
+                typed_node_ids.add(node_id)
             nodes[node_id] = {
                 "id": node_id,
                 "type": str(entity.get("entity_type") or "thing"),
@@ -505,7 +1222,7 @@ class MemoryGroupGraphStoreMixin:
 
         for fact in facts:
             predicate = str(fact.get("predicate") or "")
-            if edge_type and predicate != edge_type:
+            if requested_predicates and predicate not in requested_predicates:
                 continue
             confidence = _clamp_score(fact.get("confidence"))
             if confidence_floor is not None and confidence < confidence_floor:
@@ -531,9 +1248,15 @@ class MemoryGroupGraphStoreMixin:
                     continue
             timestamp = _group_graph_timestamp(fact, "valid_at", "created_at", "updated_at")
             timestamp_dt = _coerce_datetime(timestamp)
-            if from_dt is not None and timestamp_dt is not None and timestamp_dt < from_dt:
-                continue
-            if to_dt is not None and timestamp_dt is not None and timestamp_dt > to_dt:
+            quality = _group_graph_edge_quality(backing_item)
+            # Evidence dates (when the message was observed) win over fact
+            # timestamps (when the relation was extracted) for time filtering.
+            first_seen_dt = _coerce_datetime(quality["first_seen_date"]) or timestamp_dt
+            last_seen_dt = _coerce_datetime(quality["last_seen_date"]) or timestamp_dt
+            if from_dt is not None and last_seen_dt is not None:
+                if _end_of_day(last_seen_dt, quality["last_seen_date"]) < from_dt:
+                    continue
+            if to_dt is not None and first_seen_dt is not None and first_seen_dt > to_dt:
                 continue
 
             acceptance_row = backing_item or fact
@@ -557,6 +1280,10 @@ class MemoryGroupGraphStoreMixin:
                 }
                 target_node_id = _group_graph_node_id(object_entity)
                 if target_node_id not in nodes:
+                    continue
+                if node_type and not typed_node_ids.intersection(
+                    {source_node_id, target_node_id}
+                ):
                     continue
             else:
                 if node_type and node_type != "value":
@@ -596,10 +1323,15 @@ class MemoryGroupGraphStoreMixin:
                     _append_unique_int(memory_item_ids_for_edge, evidence_item_id)
 
             source_ref_count = len(set(source_event_ids)) + len(set(memory_item_ids_for_edge))
-            quality = _group_graph_edge_quality(backing_item)
             evidence_dates = quality["evidence_dates"]
             if not evidence_dates and timestamp:
                 evidence_dates = [str(timestamp)[:10]]
+            stored_evidence_count = int(quality["evidence_event_count"]) + int(
+                quality["evidence_observation_count"]
+            )
+            relation_payload = _group_graph_item_value(backing_item).get("relation")
+            relation_payload = relation_payload if isinstance(relation_payload, dict) else {}
+            extracted_at = _group_graph_timestamp(fact, "updated_at", "valid_at", "created_at")
             edge = {
                 "id": _group_graph_edge_id(fact),
                 "source": source_node_id,
@@ -610,10 +1342,26 @@ class MemoryGroupGraphStoreMixin:
                 "acceptance_status": edge_acceptance,
                 "acceptance_score": quality["acceptance_score"],
                 "acceptance_reason": quality["acceptance_reason"],
-                "evidence_count": max(1, source_ref_count),
+                "evidence_count": max(1, source_ref_count, stored_evidence_count),
                 "evidence_dates": evidence_dates,
-                "first_seen": timestamp,
-                "last_seen": _group_graph_timestamp(fact, "updated_at", "valid_at", "created_at"),
+                "evidence_day_count": max(len(evidence_dates), int(quality["evidence_day_count"])),
+                "evidence_source": quality["evidence_source"],
+                "observation_count": int(quality["evidence_observation_count"]),
+                # first/last_seen follow the evidence (message dates) when known;
+                # the extraction timestamp is kept separately.
+                "first_seen": quality["first_seen_date"] or timestamp,
+                "last_seen": quality["last_seen_date"] or extracted_at,
+                "first_seen_date": quality["first_seen_date"],
+                "last_seen_date": quality["last_seen_date"],
+                "extracted_at": extracted_at,
+                "strength": _clamp_score(relation_payload.get("strength"), 0.0)
+                if relation_payload.get("strength") is not None
+                else None,
+                "signals": (
+                    dict(relation_payload.get("signals"))
+                    if isinstance(relation_payload.get("signals"), dict)
+                    else None
+                ),
                 "source_event_ids": source_event_ids,
                 "memory_item_ids": memory_item_ids_for_edge,
                 "extraction_method": str((backing_item or {}).get("source_type") or "graph"),
@@ -630,7 +1378,12 @@ class MemoryGroupGraphStoreMixin:
             if len(edges) >= safe_limit:
                 break
 
-        if session_id is not None:
+        edges = _merge_symmetric_group_edges(edges)
+        connected_node_ids = {
+            node_id for edge in edges for node_id in (edge["source"], edge["target"])
+        }
+
+        if session_id is not None or node_type:
             nodes = {
                 node_id: node for node_id, node in nodes.items() if node_id in connected_node_ids
             }
@@ -648,6 +1401,11 @@ class MemoryGroupGraphStoreMixin:
             )
 
         node_items = list(nodes.values())[:safe_limit]
+        visible_edges = edges[:safe_limit]
+        # The COUNT runs with the same SQL filters, so anything above what is
+        # shown was cut by the row cap rather than by a filter.
+        total_edges = max(total_matching_facts, len(visible_edges))
+        truncated = len(facts) >= fetch_limit or total_matching_facts > len(visible_edges)
         return {
             "schema": {
                 "version": GROUP_GRAPH_SCHEMA_VERSION,
@@ -657,10 +1415,17 @@ class MemoryGroupGraphStoreMixin:
             "scope": scope,
             "filters": filters,
             "nodes": node_items,
-            "edges": edges[:safe_limit],
+            "edges": visible_edges,
             "counts": {
                 "nodes": len(node_items),
-                "edges": len(edges[:safe_limit]),
+                "edges": len(visible_edges),
+            },
+            "page": {
+                "limit": safe_limit,
+                "total": total_edges,
+                "truncated": bool(truncated),
+                "order": "strength_desc",
+                "next_cursor": None,
             },
             "generated_from": generated_from,
         }
@@ -957,6 +1722,35 @@ class MemoryGroupGraphStoreMixin:
             memory_item_ids=memory_item_ids,
             event_ids=event_ids,
         )
+        quality = _group_graph_edge_quality(backing_item)
+        observation_ids = _group_graph_item_observation_ids(backing_item)
+        observations = (
+            await self._get_group_observation_evidence_by_ids(observation_ids)
+            if observation_ids
+            else []
+        )
+        payload["evidence_ids"]["observation_ids"] = observation_ids[:200]
+        payload["evidence_counts"]["observations"] = len(observation_ids)
+        payload["evidence_counts"]["evidence_days"] = quality["evidence_day_count"]
+        payload["observations"] = observations
+        payload["evidence_source"] = quality["evidence_source"]
+        payload["evidence_dates"] = quality["evidence_dates"]
+        payload["judgement"] = _group_relation_judgement(backing_item)
+        edge_payload = payload.get("edge")
+        if isinstance(edge_payload, dict):
+            edge_payload["extracted_at"] = edge_payload.get("first_seen")
+            if quality["first_seen_date"]:
+                edge_payload["first_seen"] = quality["first_seen_date"]
+            if quality["last_seen_date"]:
+                edge_payload["last_seen"] = quality["last_seen_date"]
+            observed = [
+                str(entry.get("occurred_at") or "")
+                for entry in observations
+                if entry.get("occurred_at")
+            ]
+            if observed:
+                edge_payload["first_observed_at"] = min(observed)
+                edge_payload["last_observed_at"] = max(observed)
         if include_raw:
             raw_items = await self._get_memory_items_by_ids(memory_item_ids)
             payload["raw"] = {
@@ -966,6 +1760,57 @@ class MemoryGroupGraphStoreMixin:
                 "episodes": evidence_episodes,
             }
         return payload
+
+    async def _get_group_observation_evidence_by_ids(
+        self,
+        observation_ids: Iterable[Any],
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return display-safe metadata for group observations used as evidence.
+
+        Only ids, the session, the sender's group nickname and the timestamp are
+        exposed; message content never leaves this method.
+        """
+
+        ids = sorted(_coerce_int_set(observation_ids))[: max(1, min(int(limit or 200), 500))]
+        if not ids:
+            return []
+        try:
+            rows = await _exec(
+                "SELECT id, session_id, sender_name, occurred_ts "
+                "FROM plugin_wxbot_group_observations "
+                "WHERE id = ANY(:ids) "
+                "ORDER BY occurred_ts ASC, id ASC",
+                {"ids": ids},
+            )
+        except Exception:
+            logger.warning("memory.group_graph_observation_evidence_failed", exc_info=True)
+            return []
+        evidence: list[dict[str, Any]] = []
+        for row in rows or []:
+            occurred = _safe_int(row.get("occurred_ts"), 0)
+            sender_name = _normalize_line(_sanitize_db_text(row.get("sender_name")))[:80]
+            label = (
+                sender_name
+                if sender_name and not _group_graph_label_is_technical(sender_name)
+                else ""
+            )
+            evidence.append(
+                {
+                    "id": _safe_int(row.get("id"), 0),
+                    "session_id": str(row.get("session_id") or ""),
+                    "sender_label": label or None,
+                    "sender_is_technical": not label,
+                    "occurred_at": (
+                        datetime.fromtimestamp(occurred, UTC).replace(tzinfo=None).isoformat()
+                        if occurred > 0
+                        else None
+                    ),
+                    "source": EVIDENCE_SOURCE_OBSERVATION,
+                }
+            )
+        return evidence
 
     def _build_group_relationship_windows(
         self,
@@ -996,6 +1841,12 @@ class MemoryGroupGraphStoreMixin:
                     break
                 transcript_lines.append(line)
                 prompt_chars += len(line) + 1
+            observation_row_ids = {
+                int(row.get("id") or 0)
+                for row in rows
+                if str(row.get("_graph_source") or "") == EVIDENCE_SOURCE_OBSERVATION
+                and int(row.get("id") or 0)
+            }
             windows.append(
                 {
                     "index": index,
@@ -1005,6 +1856,14 @@ class MemoryGroupGraphStoreMixin:
                     "last_event_id": event_ids[-1] if event_ids else None,
                     "sender_ids": sender_ids,
                     "transcript": "\n".join(transcript_lines),
+                    "source": (
+                        EVIDENCE_SOURCE_OBSERVATION
+                        if observation_row_ids and len(observation_row_ids) == len(event_ids)
+                        else EVIDENCE_SOURCE_MIXED
+                        if observation_row_ids
+                        else EVIDENCE_SOURCE_MEMORY_EVENT
+                    ),
+                    "observation_ids": observation_row_ids,
                 }
             )
         return windows
@@ -1021,19 +1880,35 @@ class MemoryGroupGraphStoreMixin:
         body: str,
         *,
         participants: Iterable[str],
+        directory: GroupMemberDirectory | None = None,
     ) -> list[str]:
+        """Resolve text ``@`` mentions to participant ids.
+
+        WeChat renders mentions as ``@昵称`` (followed by U+2005), so the text
+        is matched against the member directory's nicknames as well as against
+        raw participant ids.
+        """
+
         if not body:
             return []
         participant_set = {self._normalize_group_participant_id(item) for item in participants}
         participant_set.discard("")
-        if not participant_set:
+        if not participant_set and directory is None:
             return []
         targets: list[str] = []
 
-        for mention in re.findall(r"@([^\s\u2005\u00a0:：,，;；]+)", body):
-            normalized = self._normalize_group_participant_id(mention)
-            if normalized in participant_set and normalized not in targets:
+        def add_target(value: str | None) -> None:
+            normalized = self._normalize_group_participant_id(value)
+            if normalized and normalized not in targets:
                 targets.append(normalized)
+
+        for mention in _MENTION_TOKEN_RE.findall(body):
+            normalized = self._normalize_group_participant_id(mention)
+            if normalized in participant_set:
+                add_target(normalized)
+                continue
+            if directory is not None:
+                add_target(directory.resolve_name(mention))
 
         stripped = body.strip()
         for participant in sorted(participant_set, key=len, reverse=True):
@@ -1041,18 +1916,44 @@ class MemoryGroupGraphStoreMixin:
                 continue
             escaped = re.escape(participant)
             if re.search(rf"(^|[\s@]){escaped}([:：,，\s]|$)", stripped):
-                targets.append(participant)
+                add_target(participant)
                 continue
             if re.search(rf"(回复|回|问|告诉|建议)\s*@?{escaped}", stripped):
-                targets.append(participant)
+                add_target(participant)
 
         return targets[:5]
 
     def _build_deterministic_group_window_candidates(
         self,
         window: dict[str, Any],
+        *,
+        directory: GroupMemberDirectory | None = None,
+        co_participation_edges: bool | None = None,
     ) -> list[dict[str, Any]]:
+        """Rule-based relation candidates for one window.
+
+        Signals, strongest first:
+
+        * quoted reply (``metadata_json.quote``) → ``replied_to``
+        * ``@`` mention (``metadata_json.at_wxids`` or ``@昵称`` text) → ``addressed``
+        * explicit "回复/回/接着/关于" prefix right after another member → ``replied_to``
+        * same-window co-participation → ``co_participated`` (opt-in only; in a
+          busy group it means little more than "both were online")
+
+        Every candidate carries ``signals`` counts so acceptance and strength can
+        be computed from what was actually observed rather than a flat confidence.
+        """
+
         rows = window.get("rows") if isinstance(window.get("rows"), list) else []
+        if co_participation_edges is None:
+            co_participation_edges = bool(
+                getattr(
+                    getattr(self, "settings", None),
+                    "memory_group_graph_co_participation_edges",
+                    False,
+                )
+            )
+        local_directory = directory or GroupMemberDirectory()
         events: list[dict[str, Any]] = []
         participants: list[str] = []
         for row in rows:
@@ -1063,11 +1964,23 @@ class MemoryGroupGraphStoreMixin:
             event_id = next(iter(_coerce_int_set([row.get("id")])), None)
             if event_id is None:
                 continue
+            observation = (
+                row.get("_observation") if isinstance(row.get("_observation"), dict) else {}
+            )
+            local_directory.add_sender(sender_id, observation.get("sender_name"))
             if sender_id not in participants:
                 participants.append(sender_id)
-            events.append({"id": event_id, "sender": sender_id, "body": str(body or "")})
+            events.append(
+                {
+                    "id": event_id,
+                    "sender": sender_id,
+                    "body": str(body or ""),
+                    "observation": observation,
+                }
+            )
 
         candidates_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        unresolved_targets = 0
 
         def add_candidate(
             *,
@@ -1077,6 +1990,8 @@ class MemoryGroupGraphStoreMixin:
             confidence: float,
             evidence_event_ids: Iterable[Any],
             reason: str,
+            signal: str,
+            signal_event_id: int,
         ) -> None:
             subject = self._normalize_group_participant_id(subject)
             object_value = self._normalize_group_participant_id(object_value)
@@ -1097,7 +2012,12 @@ class MemoryGroupGraphStoreMixin:
                     evidence_ids,
                     max_items=200,
                 )
+                existing["signal_evidence"] = _merge_signal_evidence(
+                    existing.get("signal_evidence"), {signal: [signal_event_id]}
+                )
+                existing["signals"] = _signals_from_evidence(existing["signal_evidence"])
                 return
+            signal_evidence = _merge_signal_evidence({signal: [signal_event_id]})
             candidates_by_key[key] = {
                 "subject": subject,
                 "subject_type": "person",
@@ -1108,26 +2028,79 @@ class MemoryGroupGraphStoreMixin:
                 "evidence_event_ids": evidence_ids,
                 "reason": reason,
                 "extraction_method": DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE,
+                "signals": _signals_from_evidence(signal_evidence),
+                "signal_evidence": signal_evidence,
             }
 
         for index, event in enumerate(events):
             sender = str(event["sender"])
             event_id = int(event["id"])
+            observation = event.get("observation") or {}
+            bot_wxid = self._normalize_group_participant_id(observation.get("bot_wxid"))
+            body = str(event.get("body") or "").strip()
+
+            # 1. Quoted reply: the platform tells us exactly whose message this answers.
+            quote_from = str(observation.get("quote_from") or "")
+            quote_name = str(observation.get("quote_sender_name") or "")
+            if (quote_from or quote_name) and self._normalize_group_participant_id(
+                quote_from
+            ) != bot_wxid:
+                target = local_directory.resolve_id(quote_from, fallback_name=quote_name)
+                if target and target != bot_wxid:
+                    add_candidate(
+                        subject=sender,
+                        predicate="replied_to",
+                        object_value=target,
+                        confidence=QUOTE_REPLY_CONFIDENCE,
+                        evidence_event_ids=[event_id],
+                        reason="deterministic_quote_reply",
+                        signal=SIGNAL_QUOTE,
+                        signal_event_id=event_id,
+                    )
+                elif not target:
+                    unresolved_targets += 1
+
+            # 2. @ mentions: structured ids first, then nicknames in the text.
+            mention_targets: list[str] = []
+            for raw_id in observation.get("at_wxids") or []:
+                if self._normalize_group_participant_id(raw_id) == bot_wxid:
+                    continue
+                target = local_directory.resolve_id(raw_id)
+                if target and target != bot_wxid:
+                    if target not in mention_targets:
+                        mention_targets.append(target)
+                elif not target:
+                    unresolved_targets += 1
+            metadata_mentions = set(mention_targets)
             for target in self._extract_addressed_participant_ids(
-                str(event.get("body") or ""),
+                body,
                 participants=participants,
+                directory=local_directory,
             ):
+                if target != bot_wxid and target not in mention_targets:
+                    mention_targets.append(target)
+            for target in mention_targets[:5]:
                 add_candidate(
                     subject=sender,
                     predicate="addressed",
                     object_value=target,
-                    confidence=0.72,
+                    confidence=(
+                        MENTION_METADATA_CONFIDENCE
+                        if target in metadata_mentions
+                        else MENTION_TEXT_CONFIDENCE
+                    ),
                     evidence_event_ids=[event_id],
-                    reason="deterministic_addressed_participant",
+                    reason=(
+                        "deterministic_at_mention_metadata"
+                        if target in metadata_mentions
+                        else "deterministic_addressed_participant"
+                    ),
+                    signal=SIGNAL_MENTION,
+                    signal_event_id=event_id,
                 )
 
+            # 3. Explicit reply prefix right after somebody else spoke.
             previous = events[index - 1] if index > 0 else None
-            body = str(event.get("body") or "").strip()
             if (
                 previous
                 and previous.get("sender") != sender
@@ -1137,11 +2110,18 @@ class MemoryGroupGraphStoreMixin:
                     subject=sender,
                     predicate="replied_to",
                     object_value=str(previous.get("sender") or ""),
-                    confidence=0.62,
+                    confidence=PREFIX_REPLY_CONFIDENCE,
                     evidence_event_ids=[previous.get("id"), event_id],
                     reason="deterministic_adjacent_reply_window",
+                    signal=SIGNAL_PREFIX_REPLY,
+                    signal_event_id=event_id,
                 )
 
+        window["unresolved_targets"] = unresolved_targets
+        if not co_participation_edges:
+            return list(candidates_by_key.values())
+
+        # 4. Legacy co-participation pairs, only when explicitly enabled.
         participant_counts = {
             participant: sum(1 for event in events if event.get("sender") == participant)
             for participant in participants
@@ -1157,14 +2137,56 @@ class MemoryGroupGraphStoreMixin:
                         subject=subject,
                         predicate="co_participated",
                         object_value=object_value,
-                        confidence=0.45,
+                        confidence=CO_PARTICIPATION_CONFIDENCE,
                         evidence_event_ids=evidence_ids,
                         reason="deterministic_same_window_participation",
+                        signal=SIGNAL_CO_PARTICIPATION,
+                        # One co-participation observation per window.
+                        signal_event_id=int(evidence_ids[0]),
                     )
                     if len(candidates_by_key) >= GROUP_WINDOW_DETERMINISTIC_MAX_PAIRS:
                         return list(candidates_by_key.values())
 
         return list(candidates_by_key.values())
+
+    async def _load_group_member_directory(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: Iterable[str],
+        event_rows: Iterable[dict[str, Any]],
+    ) -> GroupMemberDirectory:
+        """Build the id/nickname directory for one group from the day's rows plus
+        the membership table, so quote/@ targets resolve to sender ids."""
+
+        directory = GroupMemberDirectory()
+        for row in event_rows:
+            sender_id, _body = _split_group_event_text(row.get("user_text"))
+            observation = (
+                row.get("_observation") if isinstance(row.get("_observation"), dict) else {}
+            )
+            directory.add_sender(sender_id or row.get("user_id"), observation.get("sender_name"))
+        rooms = [
+            _normalize_line(_sanitize_db_text(session_id))
+            for session_id in session_ids
+            if _is_group_session_id(session_id)
+        ]
+        if not rooms:
+            return directory
+        try:
+            member_rows = await _exec(
+                "SELECT user_wxid, user_name "
+                "FROM plugin_wxbot_group_membership "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND user_wxid <> ''",
+                {"tid": str(tenant_id or "").strip(), "sids": rooms},
+            )
+        except Exception:
+            logger.warning("memory.group_graph_member_directory_failed", exc_info=True)
+            member_rows = []
+        for row in member_rows or []:
+            directory.add_member(row.get("user_wxid"), row.get("user_name"))
+        return directory
 
     async def _extract_group_relationship_window_candidates(
         self,
@@ -1179,13 +2201,39 @@ class MemoryGroupGraphStoreMixin:
         llm_service = getattr(self.graph_extractor, "llm_service", None)
         if llm_service is None:
             return {"relations": []}
+        allowed_predicates = [
+            predicate
+            for predicate in GROUP_GRAPH_EDGE_TYPES
+            if predicate not in LLM_EXCLUDED_PREDICATES
+        ]
         system = (
             "Extract conservative group-chat relationship candidates from a bounded transcript. "
             "Return JSON only with key relations. Each relation must include subject, subject_type, "
             "predicate, object, object_type, confidence, evidence_event_ids, and optional reason. "
             "Allowed predicates: "
-            + ", ".join(GROUP_GRAPH_EDGE_TYPES)
-            + ". Evidence ids must come from the provided event ids. Do not quote raw messages."
+            + ", ".join(allowed_predicates)
+            + ". Evidence ids must come from the provided event ids. Do not quote raw messages. "
+            "Rules: (1) subject is always a participant id exactly as written in the transcript; "
+            "a person object must also be a participant id. "
+            "(2) Only report a relation when at least two different messages support it and list "
+            "each supporting message id in evidence_event_ids; skip one-off remarks. "
+            "(3) Objects that are not people are short canonical terms, not sentences: "
+            "products, models, services and software are object_type tool "
+            "(e.g. Claude, DeepSeek, 阿里云); named efforts are project; everything else is topic. "
+            "Write terms in the language the group uses (Chinese chat -> Chinese term), keep the "
+            "common spelling of product names, at most 12 Chinese characters or 4 English words, "
+            "and reuse one spelling for the same term. "
+            "(4) Do not emit 'the group', '大家' or the chat itself as an object, and do not report "
+            "who merely talked in the same time span; direct replies and @-mentions are already "
+            "tracked, so prefer asked/answered/requested/provided_resource/collaborated_with between "
+            "people and interested_in/reported_issue/works_on/maintains/tested/fixed_issue/asked "
+            "between a person and a term. "
+            "(5) interested_in means the person wants, likes, uses or asks how to get the thing. "
+            "Mocking it, criticizing it, gossiping about it, or discussing whether this system "
+            "labelled it correctly is mentioned, never interested_in. "
+            "(6) reason is one short sentence in the group's language that names the concrete "
+            "behaviour (what was asked, compared, complained about), so a reviewer can find the "
+            "messages; never quote a message verbatim. Return an empty list rather than guessing."
         )
         payload = {
             "date": target_date,
@@ -1193,10 +2241,21 @@ class MemoryGroupGraphStoreMixin:
             "event_ids": event_ids,
             "transcript": transcript,
         }
+        # Structured extraction over a short transcript is a fast-model task: on
+        # the production gateway the reasoning tier needs >60s per window while
+        # the non-reasoning tier answers in 10-16s with valid JSON.
+        model_tier = str(
+            getattr(
+                getattr(self, "settings", None),
+                "memory_group_graph_llm_model_tier",
+                GROUP_WINDOW_LLM_MODEL_TIER_DEFAULT,
+            )
+            or GROUP_WINDOW_LLM_MODEL_TIER_DEFAULT
+        ).strip()
         request = ChatRequest(
             tenant_id=tenant_id,
             trace_id=trace_id,
-            model_tier="tier-3",
+            model_tier=model_tier,
             messages=[ChatMessage(role=Role.USER, content=json.dumps(payload, ensure_ascii=False))],
             system=system,
             temperature=0.0,
@@ -1216,11 +2275,22 @@ class MemoryGroupGraphStoreMixin:
         raw_candidate: Any,
         *,
         allowed_event_ids: set[int],
+        participants: Iterable[str] | None = None,
+        directory: GroupMemberDirectory | None = None,
     ) -> dict[str, Any] | None:
+        """Validate one LLM-proposed relation.
+
+        Besides predicate/evidence checks, ``person`` endpoints must resolve to a
+        real participant (window sender or directory member). A subject that does
+        not resolve is dropped; an unresolvable ``person`` object is kept as a
+        ``topic`` for mention-like predicates and dropped otherwise, so the model
+        cannot mint phantom members out of terms it misclassified.
+        """
+
         if not isinstance(raw_candidate, dict):
             return None
         predicate = str(raw_candidate.get("predicate") or "").strip().lower()
-        if predicate not in GROUP_GRAPH_EDGE_TYPES:
+        if predicate not in GROUP_GRAPH_EDGE_TYPES or predicate in LLM_EXCLUDED_PREDICATES:
             return None
         subject = _normalize_line(str(raw_candidate.get("subject") or ""))[:200]
         object_value = _normalize_line(str(raw_candidate.get("object") or ""))[:200]
@@ -1228,7 +2298,7 @@ class MemoryGroupGraphStoreMixin:
             return None
         evidence_ids = sorted(_coerce_int_set(raw_candidate.get("evidence_event_ids") or []))
         evidence_ids = [event_id for event_id in evidence_ids if event_id in allowed_event_ids]
-        if not evidence_ids:
+        if len(evidence_ids) < GROUP_RELATION_MIN_LLM_WINDOW_EVIDENCE:
             return None
         subject_type = str(raw_candidate.get("subject_type") or "person").strip().lower()
         object_type = str(raw_candidate.get("object_type") or "person").strip().lower()
@@ -1236,6 +2306,46 @@ class MemoryGroupGraphStoreMixin:
             subject_type = "person"
         if object_type not in GROUP_GRAPH_NODE_TYPES:
             object_type = "person"
+        if subject_type == "group" or object_type == "group":
+            return None
+        if object_value.strip().lower() in LLM_GROUP_PSEUDO_OBJECTS:
+            return None
+
+        participant_set = {
+            self._normalize_group_participant_id(item) for item in (participants or [])
+        }
+        participant_set.discard("")
+        can_resolve = bool(participant_set) or directory is not None
+
+        def resolve_person(value: str) -> str | None:
+            normalized = self._normalize_group_participant_id(value)
+            if normalized in participant_set:
+                return normalized
+            if directory is not None:
+                return directory.resolve_id(normalized) or directory.resolve_name(normalized)
+            return None
+
+        if can_resolve and subject_type == "person":
+            resolved_subject = resolve_person(subject)
+            if not resolved_subject:
+                return None
+            subject = resolved_subject
+        if can_resolve and object_type == "person":
+            resolved_object = resolve_person(object_value)
+            if resolved_object:
+                object_value = resolved_object
+            elif predicate in LLM_PERSON_TO_TOPIC_PREDICATES and not _looks_like_participant_id(
+                object_value
+            ):
+                object_type = "topic"
+            else:
+                # An unknown id-shaped "person" is a hallucinated member, not a term.
+                return None
+        if subject_type == object_type == "person" and subject == object_value:
+            return None
+        if object_type != "person" and not _is_usable_llm_term(object_value):
+            return None
+        signal_evidence = _merge_signal_evidence({SIGNAL_LLM: evidence_ids})
         return {
             "subject": subject,
             "subject_type": subject_type,
@@ -1245,6 +2355,8 @@ class MemoryGroupGraphStoreMixin:
             "confidence": _clamp_score(raw_candidate.get("confidence"), 0.5),
             "evidence_event_ids": evidence_ids,
             "reason": _normalize_line(str(raw_candidate.get("reason") or ""))[:240],
+            "signals": _signals_from_evidence(signal_evidence),
+            "signal_evidence": signal_evidence,
         }
 
     def _parse_group_window_candidates(
@@ -1252,6 +2364,8 @@ class MemoryGroupGraphStoreMixin:
         raw_payload: Any,
         *,
         allowed_event_ids: set[int],
+        participants: Iterable[str] | None = None,
+        directory: GroupMemberDirectory | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         try:
             payload = (
@@ -1270,7 +2384,10 @@ class MemoryGroupGraphStoreMixin:
         skipped = 0
         for raw_candidate in raw_candidates:
             candidate = self._validate_group_window_candidate(
-                raw_candidate, allowed_event_ids=allowed_event_ids
+                raw_candidate,
+                allowed_event_ids=allowed_event_ids,
+                participants=participants,
+                directory=directory,
             )
             if candidate is None:
                 skipped += 1
@@ -1304,6 +2421,10 @@ class MemoryGroupGraphStoreMixin:
                     candidate.get("evidence_event_ids"),
                     max_items=200,
                 )
+                existing["signal_evidence"] = _merge_signal_evidence(
+                    existing.get("signal_evidence"), candidate.get("signal_evidence")
+                )
+                existing["signals"] = _signals_from_evidence(existing["signal_evidence"])
                 if not existing.get("reason") and candidate.get("reason"):
                     existing["reason"] = candidate.get("reason")
         return list(merged.values())
@@ -1328,11 +2449,16 @@ class MemoryGroupGraphStoreMixin:
             object_value=candidate["object"],
         )
         evidence_event_ids = _merge_int_lists(candidate.get("evidence_event_ids"), max_items=200)
+        evidence_observation_ids = _merge_int_lists(
+            candidate.get("evidence_observation_ids"), max_items=200
+        )
         relation_payload = dict(candidate)
         relation_payload["evidence_event_ids"] = evidence_event_ids
+        relation_payload["evidence_observation_ids"] = evidence_observation_ids
         evidence_dates = [target_date]
         existing_item: dict[str, Any] | None = None
         existing_acceptance: dict[str, Any] = {}
+        existing_relation: dict[str, Any] = {}
 
         existing_items = await self._find_memory_item_by_normalized_key(
             tenant_id=tenant_id,
@@ -1367,12 +2493,19 @@ class MemoryGroupGraphStoreMixin:
                 candidate.get("evidence_event_ids"),
                 max_items=200,
             )
+            evidence_observation_ids = _merge_int_lists(
+                existing_relation.get("evidence_observation_ids"),
+                existing_value.get("source_observation_ids"),
+                candidate.get("evidence_observation_ids"),
+                max_items=200,
+            )
             relation_payload = {**existing_relation, **candidate}
             relation_payload["confidence"] = max(
                 _clamp_score(existing_relation.get("confidence"), 0.0),
                 _clamp_score(candidate.get("confidence"), 0.0),
             )
             relation_payload["evidence_event_ids"] = evidence_event_ids
+            relation_payload["evidence_observation_ids"] = evidence_observation_ids
             existing_dates = existing_value.get("evidence_dates")
             if not isinstance(existing_dates, list):
                 existing_dates = []
@@ -1395,23 +2528,73 @@ class MemoryGroupGraphStoreMixin:
             DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE,
         }:
             relation_source_type = LLM_GROUP_WINDOW_SOURCE_TYPE
-        # Keep a human reject/accept. Otherwise auto-accept so the graph
-        # and recall do not wait on a manual queue.
+
+        # Accumulate what was actually observed. Legacy items carry no signal
+        # counts, so infer one from their reason/source before merging.
+        candidate_signal_evidence = candidate.get("signal_evidence")
+        if not isinstance(candidate_signal_evidence, dict):
+            # Callers that only pass counts get one occurrence per flagged signal,
+            # anchored on the first evidence id so re-runs stay idempotent.
+            anchor_ids = sorted(
+                _coerce_int_set(candidate.get("evidence_event_ids") or [])
+                | _coerce_int_set(candidate.get("evidence_observation_ids") or [])
+            )
+            candidate_signal_evidence = {
+                key: anchor_ids[:1]
+                for key, count in (candidate.get("signals") or {}).items()
+                if _safe_int(count, 0) > 0 and anchor_ids
+            }
+        signal_evidence = _merge_signal_evidence(
+            existing_relation.get("signal_evidence"),
+            candidate_signal_evidence,
+        )
+        signals = _signals_from_evidence(signal_evidence)
+        # Items written before signal evidence existed contribute one known
+        # occurrence per inferred signal; never less than what the ids show.
+        if existing_item is not None and not isinstance(
+            existing_relation.get("signal_evidence"), dict
+        ):
+            legacy = (
+                existing_relation.get("signals")
+                if isinstance(existing_relation.get("signals"), dict)
+                else _infer_legacy_group_signals(existing_relation, relation_source_type)
+            )
+            for key in GROUP_SIGNAL_KEYS:
+                signals[key] = max(signals[key], max(0, _safe_int(legacy.get(key), 0)))
+        if not any(signals.values()):
+            signals = _merge_group_signals(
+                signals, _infer_legacy_group_signals(candidate, relation_source_type)
+            )
+        day_count = len(evidence_dates)
+        strength = _group_relation_strength(signals, day_count)
+        relation_payload["signals"] = signals
+        relation_payload["signal_evidence"] = signal_evidence
+        relation_payload["strength"] = strength
+
+        # Human accept/reject decisions stick. Everything else follows the
+        # deterministic policy, which may promote a needs_review relation to
+        # accepted once it has repeated across days.
         prior_acceptance_status = str(
             existing_acceptance.get("status")
             or (existing_item or {}).get("acceptance_status")
             or ""
         ).strip().lower()
-        auto_accept = bool(getattr(self.settings, "memory_group_graph_auto_accept", True))
+        auto_accept = bool(
+            getattr(getattr(self, "settings", None), "memory_group_graph_auto_accept", True)
+        )
+        policy_status, policy_reason = _group_relation_acceptance_decision(
+            signals,
+            day_count=day_count,
+            auto_accept=auto_accept,
+        )
         if prior_acceptance_status in {"accepted", "rejected"}:
             acceptance_status = prior_acceptance_status
+            acceptance_reason = str(
+                existing_acceptance.get("reason") or relation_payload.get("reason") or policy_reason
+            )[:80]
         else:
-            acceptance_status = "accepted" if auto_accept else "needs_review"
-        acceptance_reason = str(
-            existing_acceptance.get("reason")
-            or relation_payload.get("reason")
-            or ("group_window_auto_accept" if acceptance_status == "accepted" else "group_window_relation")
-        )[:80]
+            acceptance_status = policy_status
+            acceptance_reason = policy_reason
         acceptance_payload = {
             **existing_acceptance,
             "status": acceptance_status,
@@ -1424,10 +2607,17 @@ class MemoryGroupGraphStoreMixin:
                 _clamp_score(existing_acceptance.get("extraction_confidence"), 0.0),
                 _clamp_score(relation_payload.get("confidence"), 0.0),
             ),
+            "strength": strength,
+            "signals": signals,
+            "day_count": day_count,
+            "policy": policy_reason,
         }
         if acceptance_status == "accepted" and prior_acceptance_status != "accepted":
             acceptance_payload.setdefault("reviewed_by", "system/auto")
-            acceptance_payload.setdefault("review_reason", "group_window_auto_accept")
+            acceptance_payload.setdefault("review_reason", policy_reason)
+        evidence_source = _group_graph_evidence_source(
+            evidence_event_ids, evidence_observation_ids
+        )
         value_payload = {
             "kind": "group_window_relation",
             "date": target_date,
@@ -1438,9 +2628,12 @@ class MemoryGroupGraphStoreMixin:
                 "index": window["index"],
                 "first_event_id": window["first_event_id"],
                 "last_event_id": window["last_event_id"],
+                "source": str(window.get("source") or EVIDENCE_SOURCE_MEMORY_EVENT),
             },
             "relation": relation_payload,
             "source_event_ids": evidence_event_ids,
+            "source_observation_ids": evidence_observation_ids,
+            "evidence_source": evidence_source,
             "acceptance": acceptance_payload,
         }
         is_group_history_scope = user_id == GROUP_HISTORY_USER_ID_SCOPE
@@ -1463,6 +2656,7 @@ class MemoryGroupGraphStoreMixin:
             status=(
                 str(existing_item.get("status") or "pending")
                 if existing_item is not None
+                and acceptance_status == prior_acceptance_status
                 and acceptance_status in {"accepted", "rejected"}
                 else _memory_status_for_acceptance(acceptance_status, sensitivity="normal")
             ),
@@ -1494,7 +2688,19 @@ class MemoryGroupGraphStoreMixin:
         dry_run: bool = False,
         include_llm: bool = True,
         llm_timeout_seconds: int | None = None,
+        source: str | None = None,
+        llm_mode: str | None = None,
+        deterministic: bool = True,
     ) -> dict[str, Any]:
+        """Extract relations for up to ``max_windows`` windows of one day.
+
+        ``llm_mode``: ``inline`` calls the LLM per window with a full
+        ``llm_timeout_seconds``; ``enqueue`` writes one durable job per window
+        instead, so the cheap deterministic pass never waits on the model and
+        failed LLM windows are retried by ``run_group_window_llm_jobs``.
+        ``deterministic=False`` skips the rule layer (used by that retry path).
+        """
+
         session_id = str(session_id or "").strip()
         if not session_id:
             raise RuntimeError("session_id required")
@@ -1506,8 +2712,13 @@ class MemoryGroupGraphStoreMixin:
         effective_max_windows = _clamp_int(max_windows, 1, minimum=1, maximum=10)
         effective_cursor = max(0, int(cursor_event_id or 0))
         effective_llm_timeout = _clamp_int(
-            llm_timeout_seconds, 60, minimum=1, maximum=180
+            llm_timeout_seconds,
+            self._group_window_llm_timeout_default(),
+            minimum=1,
+            maximum=GROUP_WINDOW_LLM_TIMEOUT_MAX,
         )
+        effective_llm_mode = _normalize_llm_mode(llm_mode)
+        effective_source = _normalize_evidence_source(source)
         user_id_scope, user_id_auto = _group_history_user_scope(session_id, user_id)
         if not user_id_scope:
             raise RuntimeError("user_id required")
@@ -1527,14 +2738,23 @@ class MemoryGroupGraphStoreMixin:
             ),
             cursor_event_id=effective_cursor,
             limit=fetch_limit,
+            source=effective_source,
         )
         more_remain = len(event_rows) > effective_window_size * effective_max_windows
         event_rows = event_rows[: effective_window_size * effective_max_windows]
         observation_event_ids = {
             int(row.get("id") or 0)
             for row in event_rows
-            if str(row.get("_graph_source") or "") == "observation" and int(row.get("id") or 0)
+            if str(row.get("_graph_source") or "") == EVIDENCE_SOURCE_OBSERVATION
+            and int(row.get("id") or 0)
         }
+        resolved_source = (
+            EVIDENCE_SOURCE_OBSERVATION
+            if observation_event_ids and len(observation_event_ids) == len(event_rows)
+            else EVIDENCE_SOURCE_MIXED
+            if observation_event_ids
+            else EVIDENCE_SOURCE_MEMORY_EVENT
+        )
         windows = self._build_group_relationship_windows(
             event_rows, window_size=effective_window_size
         )
@@ -1548,9 +2768,13 @@ class MemoryGroupGraphStoreMixin:
                 "candidate_count": 0,
                 "applied_count": 0,
                 "skipped_count": 0,
+                "signal_counts": _empty_group_signals(),
+                "unresolved_targets": 0,
             }
             for window in windows
         ]
+        signal_totals = _empty_group_signals()
+        unresolved_total = 0
         next_cursor_event_id = max(
             [effective_cursor, *[int(window["last_event_id"] or 0) for window in windows]]
         )
@@ -1574,7 +2798,13 @@ class MemoryGroupGraphStoreMixin:
                 "dry_run": bool(dry_run),
                 "include_llm": bool(include_llm),
                 "llm_timeout_seconds": effective_llm_timeout,
+                "llm_mode": effective_llm_mode,
+                "deterministic": bool(deterministic),
+                "source": effective_source,
             },
+            "source": resolved_source,
+            "llm_jobs_enqueued": 0,
+            "llm_failures": 0,
             "windows": window_summaries,
             "totals": {
                 "events": sum(len(window["event_ids"]) for window in windows),
@@ -1601,17 +2831,71 @@ class MemoryGroupGraphStoreMixin:
             and self.graph_extractor.config.enabled
             and self.graph_extractor.llm_service is not None
         )
+        llm_inline = llm_available and effective_llm_mode == LLM_MODE_INLINE
+        llm_enqueue = llm_available and effective_llm_mode == LLM_MODE_ENQUEUE
 
         total_candidates = 0
         total_applied = 0
         total_skipped = 0
-        generated_from = ["plugin_memory_event", "deterministic_window_participants"]
-        if llm_available:
+        llm_jobs_enqueued = 0
+        llm_jobs_seen = 0
+        llm_failures = 0
+        generated_from = [
+            (
+                "plugin_wxbot_group_observations"
+                if resolved_source == EVIDENCE_SOURCE_OBSERVATION
+                else "plugin_memory_event"
+            ),
+        ]
+        if resolved_source == EVIDENCE_SOURCE_MIXED:
+            generated_from.append("plugin_wxbot_group_observations")
+        if deterministic:
+            generated_from.append("deterministic_window_participants")
+        if llm_inline:
             generated_from.append("llm_window_extractor")
+        if llm_enqueue:
+            generated_from.append("llm_window_jobs")
+        directory = (
+            await self._load_group_member_directory(
+                tenant_id=tenant_id,
+                session_ids=await self._resolve_group_graph_session_ids(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                )
+                or [session_id],
+                event_rows=event_rows,
+            )
+            if (deterministic or llm_inline)
+            else None
+        )
         for window, summary in zip(windows, window_summaries, strict=True):
-            deterministic_candidates = self._build_deterministic_group_window_candidates(window)
+            deterministic_candidates = (
+                self._build_deterministic_group_window_candidates(
+                    window,
+                    directory=directory,
+                )
+                if deterministic
+                else []
+            )
+            summary["unresolved_targets"] = int(window.get("unresolved_targets") or 0)
+            unresolved_total += summary["unresolved_targets"]
             llm_candidates: list[dict[str, Any]] = []
-            if llm_available:
+            if llm_enqueue:
+                enqueued = await self._enqueue_group_window_llm_job(
+                    tenant_id=tenant_id,
+                    channel=channel,
+                    source_key=source_key,
+                    session_id=session_id,
+                    target_date=target_date,
+                    source=str(window.get("source") or resolved_source),
+                    window=window,
+                    window_size=effective_window_size,
+                )
+                if enqueued:
+                    llm_jobs_enqueued += 1
+                llm_jobs_seen += 1
+                summary["llm_job"] = "enqueued" if enqueued else "exists"
+            if llm_inline:
                 try:
                     raw_payload = await asyncio.wait_for(
                         self._extract_group_relationship_window_candidates(
@@ -1636,33 +2920,53 @@ class MemoryGroupGraphStoreMixin:
                         error=_truncate_error(exc),
                     )
                     summary["skipped_count"] += 1
+                    summary["llm_failed"] = True
                     total_skipped += 1
+                    llm_failures += 1
                 else:
                     llm_candidates, skipped = self._parse_group_window_candidates(
                         raw_payload,
                         allowed_event_ids=set(window["event_ids"]),
+                        participants=window.get("sender_ids") or [],
+                        directory=directory,
                     )
                     summary["skipped_count"] += skipped
+                    summary["llm_candidates"] = len(llm_candidates)
                     total_skipped += skipped
             candidates = self._merge_group_window_candidates(
                 deterministic_candidates,
                 llm_candidates,
             )
             if not candidates:
-                summary["skipped_count"] += 1
-                total_skipped += 1
+                if not summary.get("llm_job"):
+                    # Nothing found and nothing deferred: the window is done.
+                    summary["skipped_count"] += 1
+                    total_skipped += 1
                 continue
             summary["candidate_count"] = len(candidates)
             total_candidates += len(candidates)
+            # Count what this run actually saw, rule signals and model claims alike.
+            for candidate in candidates:
+                for key, count in (candidate.get("signals") or {}).items():
+                    if key in signal_totals:
+                        summary["signal_counts"][key] += int(count or 0)
+                        signal_totals[key] += int(count or 0)
             for candidate in candidates:
                 if observation_event_ids:
+                    # Observation ids are not memory-event ids; keep them as their
+                    # own evidence list instead of throwing the trail away.
+                    event_evidence, observation_evidence = _split_window_evidence_ids(
+                        candidate.get("evidence_event_ids") or [],
+                        observation_event_ids,
+                    )
                     candidate = {
                         **candidate,
-                        "evidence_event_ids": [
-                            event_id
-                            for event_id in (candidate.get("evidence_event_ids") or [])
-                            if int(event_id or 0) not in observation_event_ids
-                        ],
+                        "evidence_event_ids": event_evidence,
+                        "evidence_observation_ids": _merge_int_lists(
+                            candidate.get("evidence_observation_ids"),
+                            observation_evidence,
+                            max_items=200,
+                        ),
                     }
                 item = await self._apply_group_relationship_window_candidate(
                     tenant_id=tenant_id,
@@ -1684,12 +2988,14 @@ class MemoryGroupGraphStoreMixin:
                 await self._sync_memory_graph_for_item_safe(item)
                 await self._sync_memory_vector_for_item_safe(item)
 
-        if total_applied == 0 and total_candidates == 0:
+        if total_applied == 0 and total_candidates == 0 and llm_jobs_seen == 0:
             base_payload["status"] = "skipped"
             if not llm_available:
                 base_payload["skipped_reason"] = "no_deterministic_candidates"
         else:
             base_payload["status"] = "completed" if total_skipped == 0 else "partial"
+        base_payload["llm_jobs_enqueued"] = llm_jobs_enqueued
+        base_payload["llm_failures"] = llm_failures
         base_payload["generated_from"] = generated_from
         base_payload["totals"] = {
             "events": sum(len(window["event_ids"]) for window in windows),
@@ -1698,7 +3004,511 @@ class MemoryGroupGraphStoreMixin:
             "applied": total_applied,
             "skipped": total_skipped,
         }
+        base_payload["signal_counts"] = signal_totals
+        base_payload["unresolved_targets"] = unresolved_total
         return base_payload
+
+    def _group_window_llm_timeout_default(self) -> int:
+        return _clamp_int(
+            getattr(
+                getattr(self, "settings", None),
+                "memory_group_graph_llm_timeout_seconds",
+                GROUP_WINDOW_LLM_TIMEOUT_DEFAULT,
+            ),
+            GROUP_WINDOW_LLM_TIMEOUT_DEFAULT,
+            minimum=GROUP_WINDOW_LLM_TIMEOUT_MIN,
+            maximum=GROUP_WINDOW_LLM_TIMEOUT_MAX,
+        )
+
+    async def _enqueue_group_window_llm_job(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        source_key: str,
+        session_id: str,
+        target_date: str,
+        source: str,
+        window: dict[str, Any],
+        window_size: int,
+    ) -> bool:
+        """Durably record that a window still needs its LLM pass.
+
+        Idempotent per (scope, date, source, window bounds): a window whose job
+        already exists (pending, running, succeeded or dead) is not re-queued.
+        Returns True when a new job row was created.
+        """
+
+        first_event_id = int(window.get("first_event_id") or 0)
+        last_event_id = int(window.get("last_event_id") or 0)
+        if not first_event_id or not last_event_id:
+            return False
+        job_key = _group_window_llm_job_key(
+            tenant_id=tenant_id,
+            channel=channel,
+            source_key=source_key,
+            session_id=session_id,
+            target_date=target_date,
+            source=source,
+            first_event_id=first_event_id,
+            last_event_id=last_event_id,
+        )
+        payload = json.dumps(
+            {
+                "kind": GROUP_WINDOW_LLM_JOB_KIND,
+                "version": 1,
+                "scope": {
+                    "tenant_id": tenant_id,
+                    "channel": channel,
+                    "source_key": source_key,
+                    "session_id": session_id,
+                    "date": target_date,
+                    "source": source,
+                },
+                "window": {
+                    "index": int(window.get("index") or 0),
+                    "first_event_id": first_event_id,
+                    "last_event_id": last_event_id,
+                    "event_count": len(window.get("event_ids") or []),
+                    "window_size": int(window_size),
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        max_attempts = _clamp_int(
+            getattr(
+                getattr(self, "settings", None),
+                "memory_group_graph_llm_job_max_attempts",
+                3,
+            ),
+            3,
+            minimum=1,
+            maximum=10,
+        )
+        rows = await _exec(
+            "INSERT INTO plugin_memory_extraction_job "
+            "(tenant_id, channel, source_key, user_id, session_id, source_event_id, "
+            "source_trace_id, status, attempts, max_attempts, next_run_at, result_json, "
+            "idempotency_key, created_at, updated_at) "
+            "VALUES (:tid, :channel, :source_key, :group_uid, :sid, NULL, :trace, "
+            "'pending', 0, :max_attempts, NOW(), :result_json, :job_key, NOW(), NOW()) "
+            "ON CONFLICT (idempotency_key) DO NOTHING "
+            "RETURNING id",
+            {
+                "tid": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "group_uid": GROUP_HISTORY_USER_ID_SCOPE,
+                "sid": session_id,
+                "trace": job_key[:128],
+                "max_attempts": max_attempts,
+                "result_json": payload,
+                "job_key": job_key,
+            },
+        )
+        return bool(rows)
+
+    async def _claim_group_window_llm_jobs(
+        self,
+        *,
+        limit: int,
+        lock_ttl_seconds: int,
+    ) -> list[dict[str, Any]]:
+        rows = await _exec(
+            "WITH candidate AS ("
+            "  SELECT id FROM plugin_memory_extraction_job "
+            "  WHERE source_trace_id LIKE :trace_prefix "
+            "    AND (status IN ('pending', 'failed') "
+            "         OR (status = 'running' AND locked_until < NOW())) "
+            "    AND next_run_at <= NOW() "
+            "    AND (locked_until IS NULL OR locked_until < NOW()) "
+            "  ORDER BY next_run_at ASC, created_at ASC "
+            "  LIMIT :limit "
+            "  FOR UPDATE SKIP LOCKED"
+            ") "
+            "UPDATE plugin_memory_extraction_job job SET "
+            "status = 'running', locked_until = NOW() + (:lock_ttl * INTERVAL '1 second'), "
+            "locked_by = :locked_by, updated_at = NOW() "
+            "FROM candidate WHERE job.id = candidate.id "
+            "RETURNING job.id, job.tenant_id, job.channel, job.source_key, job.session_id, "
+            "job.attempts, job.max_attempts, job.result_json, job.idempotency_key",
+            {
+                "trace_prefix": f"{GROUP_WINDOW_LLM_JOB_TRACE_PREFIX}%",
+                "limit": max(1, int(limit)),
+                "lock_ttl": max(1, int(lock_ttl_seconds)),
+                "locked_by": f"group-window-llm:{monotonic():.0f}",
+            },
+        )
+        return list(rows or [])
+
+    async def _finish_group_window_llm_job(
+        self,
+        job: dict[str, Any],
+        *,
+        status: str,
+        error: str = "",
+        result: dict[str, Any] | None = None,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        payload = _safe_json_loads(job.get("result_json"), {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if result is not None:
+            payload["last_result"] = result
+        await _exec(
+            "UPDATE plugin_memory_extraction_job SET "
+            "status = :status, attempts = attempts + 1, "
+            "next_run_at = NOW() + (:retry_after * INTERVAL '1 second'), "
+            "locked_until = NULL, locked_by = '', last_error = :error, "
+            "result_json = :result_json, updated_at = NOW() "
+            "WHERE id = :id",
+            {
+                "id": int(job["id"]),
+                "status": status,
+                "retry_after": max(0, int(retry_after_seconds)),
+                "error": _truncate_error(error) if error else "",
+                "result_json": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        )
+
+    async def run_group_window_llm_jobs(
+        self,
+        *,
+        limit: int | None = None,
+        llm_timeout_seconds: int | None = None,
+        time_budget_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Run the LLM pass for windows queued by the deterministic catch-up.
+
+        Each job gets the full ``llm_timeout_seconds``; the run stops when the
+        time budget cannot fit another attempt. Failures back off and retry
+        until ``max_attempts``, then the job is marked ``dead``.
+        """
+
+        settings = getattr(self, "settings", None)
+        effective_limit = _clamp_int(
+            limit,
+            _clamp_int(
+                getattr(settings, "memory_group_graph_llm_jobs_per_tick", 6),
+                6,
+                minimum=0,
+                maximum=50,
+            ),
+            minimum=0,
+            maximum=50,
+        )
+        effective_timeout = _clamp_int(
+            llm_timeout_seconds,
+            self._group_window_llm_timeout_default(),
+            minimum=GROUP_WINDOW_LLM_TIMEOUT_MIN,
+            maximum=GROUP_WINDOW_LLM_TIMEOUT_MAX,
+        )
+        effective_budget = _clamp_int(
+            time_budget_seconds,
+            effective_timeout * max(1, effective_limit),
+            minimum=effective_timeout,
+            maximum=3600,
+        )
+        summary: dict[str, Any] = {
+            "ok": True,
+            "claimed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "dead": 0,
+            "deferred": 0,
+            "applied": 0,
+            "stop_reason": "no_jobs",
+            "controls": {
+                "limit": effective_limit,
+                "llm_timeout_seconds": effective_timeout,
+                "time_budget_seconds": effective_budget,
+            },
+        }
+        if effective_limit <= 0:
+            summary["stop_reason"] = "disabled"
+            return summary
+        llm_available = bool(
+            self.graph_extractor.config.enabled and self.graph_extractor.llm_service is not None
+        )
+        if not llm_available:
+            summary["stop_reason"] = "llm_unavailable"
+            return summary
+        jobs = await self._claim_group_window_llm_jobs(
+            limit=effective_limit,
+            lock_ttl_seconds=effective_timeout * 2 + 30,
+        )
+        summary["claimed"] = len(jobs)
+        started_at = monotonic()
+        for index, job in enumerate(jobs):
+            remaining = effective_budget - (monotonic() - started_at)
+            if index > 0 and remaining < effective_timeout:
+                # Release the claim untouched; the next tick picks it up.
+                await self._finish_group_window_llm_job(job, status="pending")
+                summary["deferred"] += 1
+                summary["stop_reason"] = "time_budget_reached"
+                continue
+            payload = _safe_json_loads(job.get("result_json"), {})
+            scope = payload.get("scope") if isinstance(payload, dict) else None
+            window = payload.get("window") if isinstance(payload, dict) else None
+            if not isinstance(scope, dict) or not isinstance(window, dict):
+                await self._finish_group_window_llm_job(
+                    job, status="dead", error="malformed group window job payload"
+                )
+                summary["dead"] += 1
+                continue
+            tenant_id = str(scope.get("tenant_id") or job.get("tenant_id") or "")
+            session_id = str(scope.get("session_id") or job.get("session_id") or "")
+            if not await self._group_graph_auto_extract_scope_allowed(tenant_id, session_id):
+                await self._finish_group_window_llm_job(
+                    job, status="pending", retry_after_seconds=6 * 3600
+                )
+                summary["deferred"] += 1
+                continue
+            first_event_id = max(0, _safe_int(window.get("first_event_id"), 0))
+            event_count = _safe_int(window.get("event_count"), 0)
+            window_size = _clamp_int(
+                event_count or window.get("window_size"), 50, minimum=10, maximum=100
+            )
+            try:
+                result = await self.run_group_relationship_window_extraction(
+                    tenant_id=tenant_id,
+                    channel=str(scope.get("channel") or job.get("channel") or "wechat"),
+                    source_key=str(scope.get("source_key") or job.get("source_key") or "wxbot"),
+                    session_id=session_id,
+                    date=str(scope.get("date") or ""),
+                    window_size=window_size,
+                    max_windows=1,
+                    cursor_event_id=max(0, first_event_id - 1),
+                    include_llm=True,
+                    llm_timeout_seconds=effective_timeout,
+                    source=_normalize_evidence_source(scope.get("source")),
+                    llm_mode=LLM_MODE_INLINE,
+                    deterministic=False,
+                )
+            except Exception as exc:
+                attempts = _safe_int(job.get("attempts"), 0) + 1
+                max_attempts = max(1, _safe_int(job.get("max_attempts"), 3))
+                dead = attempts >= max_attempts
+                await self._finish_group_window_llm_job(
+                    job,
+                    status="dead" if dead else "failed",
+                    error=f"{exc.__class__.__name__}: {exc}",
+                    retry_after_seconds=0 if dead else min(6 * 3600, 600 * attempts),
+                )
+                summary["dead" if dead else "failed"] += 1
+                logger.warning(
+                    "memory.group_window_llm_job_failed",
+                    job_id=job.get("id"),
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    attempts=attempts,
+                    dead=dead,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+                continue
+            totals = result.get("totals") if isinstance(result.get("totals"), dict) else {}
+            if int(result.get("llm_failures") or 0) > 0:
+                attempts = _safe_int(job.get("attempts"), 0) + 1
+                max_attempts = max(1, _safe_int(job.get("max_attempts"), 3))
+                dead = attempts >= max_attempts
+                await self._finish_group_window_llm_job(
+                    job,
+                    status="dead" if dead else "failed",
+                    error="llm_window_extraction_failed",
+                    result={"totals": totals, "status": result.get("status")},
+                    retry_after_seconds=0 if dead else min(6 * 3600, 600 * attempts),
+                )
+                summary["dead" if dead else "failed"] += 1
+                continue
+            await self._finish_group_window_llm_job(
+                job,
+                status="succeeded",
+                result={
+                    "totals": totals,
+                    "status": result.get("status"),
+                    "signal_counts": result.get("signal_counts"),
+                },
+            )
+            summary["succeeded"] += 1
+            summary["applied"] += int(totals.get("applied") or 0)
+            summary["stop_reason"] = "completed"
+        logger.info(
+            "memory.group_window_llm_jobs",
+            claimed=summary["claimed"],
+            succeeded=summary["succeeded"],
+            failed=summary["failed"],
+            dead=summary["dead"],
+            deferred=summary["deferred"],
+            applied=summary["applied"],
+            stop_reason=summary["stop_reason"],
+            llm_timeout_seconds=effective_timeout,
+        )
+        return summary
+
+    async def _list_group_relation_auto_review_candidates(
+        self,
+        *,
+        limit: int,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pending model relations with the two corroboration flags computed in SQL.
+
+        A relation is corroborated when the rest of the accepted graph of the
+        same group already agrees with it: the object term has another accepted
+        relation (any member, so the term is real in this group), or the two
+        people already share an accepted non-co-participation edge.
+        """
+
+        params: dict[str, Any] = {
+            "llm_source": LLM_GROUP_WINDOW_SOURCE_TYPE,
+            "weak_predicate": "co_participated",
+            "limit": max(1, int(limit)),
+        }
+        tenant_clause = ""
+        if tenant_id:
+            tenant_clause = "AND item.tenant_id = :tid "
+            params["tid"] = str(tenant_id)
+        rows = await _exec(
+            "WITH pending AS ("
+            "  SELECT item.id, item.tenant_id, item.session_id, item.created_at, "
+            "         fact.subject_entity_id AS subject_id, fact.object_entity_id AS object_id, "
+            "         fact.predicate, "
+            "         COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{relation,object_type}', 'person') "
+            "           AS object_type "
+            "  FROM plugin_memory_item item "
+            "  JOIN plugin_memory_fact fact ON fact.memory_item_id = item.id "
+            "  WHERE item.deleted_at IS NULL AND item.status = 'pending' "
+            "    AND item.source_type = :llm_source "
+            "    AND fact.object_entity_id IS NOT NULL "
+            "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{kind}', '') = 'group_window_relation' "
+            "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{acceptance,status}', '') "
+            "        IN ('needs_review', 'candidate') "
+            f"    {tenant_clause}"
+            "  ORDER BY item.updated_at ASC, item.id ASC "
+            "  LIMIT :limit"
+            ") "
+            "SELECT pending.id, pending.tenant_id, pending.session_id, pending.predicate, "
+            "       pending.object_type, "
+            "  EXISTS ("
+            "    SELECT 1 FROM plugin_memory_fact other "
+            "    JOIN plugin_memory_item other_item ON other_item.id = other.memory_item_id "
+            "    WHERE other.status = 'active' AND other_item.deleted_at IS NULL "
+            "      AND other_item.tenant_id = pending.tenant_id "
+            "      AND other_item.session_id = pending.session_id "
+            "      AND other.memory_item_id <> pending.id "
+            "      AND other.object_entity_id = pending.object_id"
+            "  ) AS term_corroborated, "
+            "  EXISTS ("
+            "    SELECT 1 FROM plugin_memory_fact other "
+            "    JOIN plugin_memory_item other_item ON other_item.id = other.memory_item_id "
+            "    WHERE other.status = 'active' AND other_item.deleted_at IS NULL "
+            "      AND other_item.tenant_id = pending.tenant_id "
+            "      AND other_item.session_id = pending.session_id "
+            "      AND other.memory_item_id <> pending.id "
+            "      AND other.predicate <> :weak_predicate "
+            "      AND ((other.subject_entity_id = pending.subject_id "
+            "            AND other.object_entity_id = pending.object_id) "
+            "        OR (other.subject_entity_id = pending.object_id "
+            "            AND other.object_entity_id = pending.subject_id))"
+            "  ) AS pair_corroborated "
+            "FROM pending ORDER BY pending.id ASC",
+            params,
+        )
+        return [dict(row) for row in rows or []]
+
+    async def run_group_relation_auto_review(
+        self,
+        *,
+        limit: int | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Accept pending model relations that the accepted graph already corroborates.
+
+        Single-window model claims wait in needs_review. Instead of a human
+        clicking through them, this pass promotes the ones the rest of the
+        group's graph supports: a term that some member already has an accepted
+        relation with, or two people who already have an accepted direct edge.
+        Uncorroborated claims stay pending until they repeat on another day or
+        governance expires them after the review retention window.
+        """
+
+        settings = getattr(self, "settings", None)
+        effective_limit = _clamp_int(
+            limit,
+            _clamp_int(
+                getattr(settings, "memory_group_graph_auto_review_batch", 200),
+                200,
+                minimum=0,
+                maximum=1000,
+            ),
+            minimum=0,
+            maximum=1000,
+        )
+        summary: dict[str, Any] = {
+            "ok": True,
+            "scanned": 0,
+            "accepted": 0,
+            "accepted_term": 0,
+            "accepted_pair": 0,
+            "failed": 0,
+            "remaining": 0,
+            "stop_reason": "disabled" if effective_limit <= 0 else "completed",
+        }
+        if effective_limit <= 0:
+            return summary
+        candidates = await self._list_group_relation_auto_review_candidates(
+            limit=effective_limit,
+            tenant_id=tenant_id,
+        )
+        summary["scanned"] = len(candidates)
+        for candidate in candidates:
+            object_type = str(candidate.get("object_type") or "person").strip().lower()
+            if object_type != "person" and candidate.get("term_corroborated"):
+                reason = "group_window_term_corroborated"
+                bucket = "accepted_term"
+            elif object_type == "person" and candidate.get("pair_corroborated"):
+                reason = "group_window_pair_corroborated"
+                bucket = "accepted_pair"
+            else:
+                summary["remaining"] += 1
+                continue
+            item_id = _safe_int(candidate.get("id"), 0)
+            try:
+                reviewed = await self.review_memory_item_acceptance(
+                    item_id,
+                    action="accept",
+                    review_reason=reason,
+                    reviewed_by=GROUP_RELATION_AUTO_REVIEWER,
+                )
+            except Exception as exc:
+                summary["failed"] += 1
+                logger.warning(
+                    "memory.group_relation_auto_review_failed",
+                    item_id=item_id,
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+                continue
+            if not reviewed:
+                summary["failed"] += 1
+                continue
+            summary["accepted"] += 1
+            summary[bucket] += 1
+        if len(candidates) >= effective_limit:
+            summary["stop_reason"] = "batch_limit_reached"
+        logger.info(
+            "memory.group_relation_auto_review",
+            scanned=summary["scanned"],
+            accepted=summary["accepted"],
+            accepted_term=summary["accepted_term"],
+            accepted_pair=summary["accepted_pair"],
+            failed=summary["failed"],
+            remaining=summary["remaining"],
+            stop_reason=summary["stop_reason"],
+        )
+        return summary
 
     async def run_group_relationship_window_catchup(
         self,
@@ -1715,13 +3525,30 @@ class MemoryGroupGraphStoreMixin:
         dry_run: bool = False,
         time_budget_seconds: int | None = None,
         include_llm: bool = True,
+        source: str | None = None,
+        llm_timeout_seconds: int | None = None,
+        llm_mode: str | None = None,
     ) -> dict[str, Any]:
+        """Walk a day window by window until the budget or window cap is hit.
+
+        The LLM timeout is a fixed per-window value (``llm_timeout_seconds``,
+        default from settings). The time budget only decides how many windows
+        fit in this run; it is never divided across windows, which is what used
+        to leave the model 3 seconds per call.
+        """
+
         effective_window_size = _clamp_int(window_size, 50, minimum=10, maximum=100)
         effective_max_windows = _clamp_int(max_windows_per_run, 20, minimum=1, maximum=100)
         effective_cursor = max(0, int(cursor_event_id or 0))
-        effective_time_budget = _clamp_int(time_budget_seconds, 60, minimum=1, maximum=180)
-        per_window_llm_timeout = max(
-            1, effective_time_budget // effective_max_windows
+        effective_time_budget = _clamp_int(time_budget_seconds, 60, minimum=1, maximum=900)
+        effective_source = _normalize_evidence_source(source)
+        effective_llm_mode = _normalize_llm_mode(llm_mode)
+        llm_inline = bool(include_llm) and effective_llm_mode == LLM_MODE_INLINE
+        per_window_llm_timeout = _clamp_int(
+            llm_timeout_seconds,
+            self._group_window_llm_timeout_default(),
+            minimum=1,
+            maximum=GROUP_WINDOW_LLM_TIMEOUT_MAX,
         )
         started_at = monotonic()
         totals = {"events": 0, "windows": 0, "candidates": 0, "applied": 0, "skipped": 0}
@@ -1733,25 +3560,43 @@ class MemoryGroupGraphStoreMixin:
             "time_budget_seconds": effective_time_budget,
             "include_llm": bool(include_llm),
             "llm_timeout_seconds": per_window_llm_timeout,
+            "llm_mode": effective_llm_mode,
+            "source": effective_source,
         }
         windows_processed = 0
         more_remain = False
         stop_reason = "no_more_events"
         status = "completed"
         next_cursor_event_id = effective_cursor
+        resolved_source: str | None = effective_source
+        signal_totals = _empty_group_signals()
+        unresolved_total = 0
+        llm_jobs_enqueued = 0
+        llm_failures = 0
 
         while windows_processed < effective_max_windows:
             elapsed = monotonic() - started_at
-            if elapsed >= effective_time_budget:
+            remaining_budget = effective_time_budget - elapsed
+            if remaining_budget <= 0:
                 stop_reason = "time_budget_reached"
                 more_remain = True
                 break
-            remaining_budget = max(0.001, effective_time_budget - elapsed)
-            # Keep LLM-backed calls to one window so each successful return is
+            if (
+                llm_inline
+                and windows_processed > 0
+                and remaining_budget < min(per_window_llm_timeout, 10)
+            ):
+                # Not enough budget left for a real model call; stop cleanly
+                # instead of starting a window that can only time out.
+                stop_reason = "time_budget_reached"
+                more_remain = True
+                break
+            remaining_budget = max(0.001, remaining_budget)
+            # Keep inline LLM calls to one window so each successful return is
             # also a durable checkpoint for the automatic runner.
             batch_limit = (
                 1
-                if include_llm
+                if llm_inline
                 else min(effective_max_windows - windows_processed, 10)
             )
             try:
@@ -1772,6 +3617,8 @@ class MemoryGroupGraphStoreMixin:
                             1,
                             min(per_window_llm_timeout, int(remaining_budget)),
                         ),
+                        source=effective_source,
+                        llm_mode=effective_llm_mode,
                     ),
                     timeout=remaining_budget,
                 )
@@ -1784,6 +3631,12 @@ class MemoryGroupGraphStoreMixin:
             processed = int(result_totals.get("windows") or 0)
             for key in totals:
                 totals[key] += int(result_totals.get(key) or 0)
+            if result.get("source") and processed:
+                resolved_source = str(result.get("source"))
+            signal_totals = _merge_group_signals(signal_totals, result.get("signal_counts"))
+            unresolved_total += int(result.get("unresolved_targets") or 0)
+            llm_jobs_enqueued += int(result.get("llm_jobs_enqueued") or 0)
+            llm_failures += int(result.get("llm_failures") or 0)
             next_cursor_event_id = int(result.get("next_cursor_event_id") or next_cursor_event_id)
             more_remain = bool(result.get("more_remain"))
             result_status = str(result.get("status") or "")
@@ -1815,13 +3668,22 @@ class MemoryGroupGraphStoreMixin:
             },
             "date": _parse_daily_relationship_date(date).date().isoformat(),
             "controls": controls,
+            "source": resolved_source,
             "totals": totals,
+            "signal_counts": signal_totals,
+            "unresolved_targets": unresolved_total,
+            "llm_jobs_enqueued": llm_jobs_enqueued,
+            "llm_failures": llm_failures,
             "windows_processed": windows_processed,
             "next_cursor_event_id": next_cursor_event_id,
             "more_remain": more_remain,
             "stop_reason": stop_reason,
             "generated_from": [
-                "plugin_memory_event",
+                (
+                    "plugin_wxbot_group_observations"
+                    if resolved_source == EVIDENCE_SOURCE_OBSERVATION
+                    else "plugin_memory_event"
+                ),
                 "deterministic_window_participants",
                 "llm_window_extractor",
             ],
@@ -1838,21 +3700,44 @@ class MemoryGroupGraphStoreMixin:
         date: str | None = None,
         limit: int = 5000,
     ) -> dict[str, Any]:
-        items = await self._list_memory_acceptance_audit_items(
-            tenant_id=tenant_id,
-            channel=channel,
-            source_key=source_key,
-            user_id=user_id,
-            session_id=session_id,
-            scope_type="session",
-            source_type=None,
-            include_deleted=False,
-            limit=max(1, min(int(limit or 5000), 10000)),
-        )
+        # Relations are stored under the operator session id, so a runtime
+        # alias (cx1:...) must be expanded before counting, otherwise the panel
+        # shows zeros for a group that has thousands of relations.
+        scoped_session_ids = (
+            await self._resolve_group_graph_session_ids(
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            if session_id
+            else [None]
+        ) or [session_id]
+        safe_limit = max(1, min(int(limit or 5000), 10000))
+        items: list[dict[str, Any]] = []
+        seen_item_ids: set[int] = set()
+        for scoped_session_id in scoped_session_ids:
+            scoped_items = await self._list_memory_acceptance_audit_items(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                user_id=user_id,
+                session_id=scoped_session_id,
+                scope_type="session",
+                source_type=None,
+                include_deleted=False,
+                limit=safe_limit,
+            )
+            for item in scoped_items:
+                item_id = _safe_int(item.get("id"), 0)
+                if item_id and item_id in seen_item_ids:
+                    continue
+                if item_id:
+                    seen_item_ids.add(item_id)
+                items.append(item)
         target_date = _parse_daily_relationship_date(date).date().isoformat() if date else ""
         totals = {
             "items": 0,
             "events": 0,
+            "observations": 0,
             "windows": 0,
             "accepted": 0,
             "needs_review": 0,
@@ -1865,7 +3750,9 @@ class MemoryGroupGraphStoreMixin:
         status_counts: dict[str, int] = {}
         acceptance_counts: dict[str, int] = {}
         predicate_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
         event_ids: set[int] = set()
+        observation_ids: set[int] = set()
         window_keys: set[tuple[Any, Any, Any]] = set()
         for item in items:
             value = _safe_json_loads(item.get("value_json"), {})
@@ -1896,11 +3783,20 @@ class MemoryGroupGraphStoreMixin:
                 relation.get("evidence_event_ids") or value.get("source_event_ids") or []
             ):
                 event_ids.add(event_id)
+            for observation_id in _coerce_int_set(
+                relation.get("evidence_observation_ids")
+                or value.get("source_observation_ids")
+                or []
+            ):
+                observation_ids.add(observation_id)
+            evidence_source = str(value.get("evidence_source") or EVIDENCE_SOURCE_MEMORY_EVENT)
+            source_counts[evidence_source] = source_counts.get(evidence_source, 0) + 1
             window = value.get("window") if isinstance(value.get("window"), dict) else {}
             window_keys.add(
                 (value.get("date"), window.get("first_event_id"), window.get("last_event_id"))
             )
         totals["events"] = len(event_ids)
+        totals["observations"] = len(observation_ids)
         totals["windows"] = len(
             [key for key in window_keys if key[1] is not None or key[2] is not None]
         )
@@ -1911,6 +3807,7 @@ class MemoryGroupGraphStoreMixin:
                 "channel": channel or "",
                 "source_key": source_key or "",
                 "session_id": session_id or "",
+                "session_ids": [item for item in scoped_session_ids if item],
                 "user_id": user_id or "",
                 "date": target_date,
             },
@@ -1918,6 +3815,7 @@ class MemoryGroupGraphStoreMixin:
             "status_counts": status_counts,
             "acceptance_counts": acceptance_counts,
             "predicate_counts": predicate_counts,
+            "evidence_source_counts": source_counts,
             "generated_from": [
                 "plugin_memory_item",
                 DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE,
@@ -2482,11 +4380,30 @@ class MemoryGroupGraphStoreMixin:
         columns: str,
         cursor_event_id: int | None = None,
         limit: int | None = None,
+        source: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Load one day of group messages for window extraction.
+
+        ``source`` pins the evidence source: ``memory_event`` reads only imported
+        memory events, ``observation`` reads only live group observations. When
+        omitted the legacy order is kept (scoped events, live events, then
+        observations) so manual API callers keep working.
+        """
+
         session_ids = await self._resolve_group_graph_session_ids(
             tenant_id=tenant_id,
             session_id=session_id,
         ) or [session_id]
+        effective_source = _normalize_evidence_source(source)
+        if effective_source == EVIDENCE_SOURCE_OBSERVATION:
+            return await self._load_group_relationship_events_from_observations(
+                tenant_id=tenant_id,
+                session_ids=session_ids,
+                start_at=start_at,
+                end_at=end_at,
+                cursor_event_id=cursor_event_id,
+                limit=limit,
+            )
         params: dict[str, Any] = {
             "tid": tenant_id,
             "channel": channel,
@@ -2534,6 +4451,8 @@ class MemoryGroupGraphStoreMixin:
         )
         if live_rows:
             return live_rows
+        if effective_source == EVIDENCE_SOURCE_MEMORY_EVENT:
+            return []
         return await self._load_group_relationship_events_from_observations(
             tenant_id=tenant_id,
             session_ids=session_ids,
@@ -2574,10 +4493,12 @@ class MemoryGroupGraphStoreMixin:
             limit_sql = "LIMIT :lim"
             params["lim"] = int(limit)
         rows = await _exec(
-            "SELECT id, tenant_id, session_id, sender_wxid, content, occurred_ts "
+            "SELECT id, tenant_id, session_id, sender_wxid, sender_name, content, "
+            "occurred_ts, is_self_sent, metadata_json "
             "FROM plugin_wxbot_group_observations "
             "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
             "AND occurred_ts >= :start_ts AND occurred_ts < :end_ts "
+            "AND COALESCE(is_self_sent, FALSE) = FALSE "
             f"{cursor_sql}"
             "ORDER BY occurred_ts ASC, id ASC "
             f"{limit_sql}",
@@ -2588,6 +4509,9 @@ class MemoryGroupGraphStoreMixin:
             sender = str(row.get("sender_wxid") or "").strip()
             content = str(row.get("content") or "").strip()
             if not sender or not content:
+                continue
+            if str(row.get("is_self_sent") or "").strip().lower() in {"true", "t", "1"}:
+                # Defensive: the bot's own replies are not group-member interactions.
                 continue
             occurred = int(row.get("occurred_ts") or 0)
             created_at = (
@@ -2608,7 +4532,11 @@ class MemoryGroupGraphStoreMixin:
                     "trace_id": "",
                     "event_key": f"observation:{row.get('id')}",
                     "created_at": created_at,
-                    "_graph_source": "observation",
+                    "_graph_source": EVIDENCE_SOURCE_OBSERVATION,
+                    "_observation": _observation_interaction_metadata(
+                        row.get("metadata_json"),
+                        sender_name=row.get("sender_name"),
+                    ),
                 }
             )
         return events
@@ -2622,9 +4550,15 @@ class MemoryGroupGraphStoreMixin:
             return True
         gate = getattr(self, "combined_history_scope_execution_allowed", None)
         if not callable(gate):
+            logger.warning(
+                "memory.group_graph_auto_extract_scope_denied",
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason="scope_gate_unavailable",
+            )
             return False
         try:
-            return await gate(str(tenant_id or ""), str(session_id or "")) is True
+            allowed = await gate(str(tenant_id or ""), str(session_id or "")) is True
         except Exception:
             logger.warning(
                 "memory.group_graph_auto_extract_scope_failed",
@@ -2633,6 +4567,16 @@ class MemoryGroupGraphStoreMixin:
                 exc_info=True,
             )
             return False
+        if not allowed:
+            # Per-target detail stays at debug; the tick summary reports the
+            # aggregated skipped_reasons at info level.
+            logger.debug(
+                "memory.group_graph_auto_extract_scope_denied",
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason="plugin_scope_disabled",
+            )
+        return allowed
 
     async def list_known_group_graph_sessions(
         self,
@@ -2660,6 +4604,10 @@ class MemoryGroupGraphStoreMixin:
                 "lim": effective_max_sessions,
             },
         )
+        observation_rows = await self._list_group_observation_session_counts(
+            start_at=cutoff,
+            limit=effective_max_sessions,
+        )
         activity_rows = await _exec(
             "SELECT tenant_id, channel, session_id "
             "FROM sessions "
@@ -2674,7 +4622,7 @@ class MemoryGroupGraphStoreMixin:
         )
         sessions: list[dict[str, Any]] = []
         merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-        for row in list(rows or []) + [
+        for row in list(rows or []) + list(observation_rows) + [
             {
                 **item,
                 "source_key": "wxbot",
@@ -2741,9 +4689,13 @@ class MemoryGroupGraphStoreMixin:
                 "lim": fetch_limit,
             },
         )
+        observation_rows = await self._list_group_observation_day_counts(
+            start_at=cutoff,
+            limit=fetch_limit,
+        )
         targets: list[dict[str, Any]] = []
         merged: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
-        for row in rows:
+        for row in [*rows, *observation_rows]:
             session_id = str(row.get("session_id") or "").strip()
             if not _is_group_session_id(session_id):
                 continue
@@ -2757,33 +4709,143 @@ class MemoryGroupGraphStoreMixin:
             tenant_id = str(row.get("tenant_id") or "").strip()
             channel = str(row.get("channel") or "").strip() or "wechat"
             source_key = str(row.get("source_key") or "").strip() or "wxbot"
+            row_source = _normalize_evidence_source(row.get("source")) or EVIDENCE_SOURCE_MEMORY_EVENT
             operator_session = await self._operator_group_session_id(
                 tenant_id=tenant_id,
                 session_id=session_id,
             )
             key = (tenant_id, channel, source_key, operator_session, date_value)
             event_count = int(row.get("event_count") or 0)
-            last_event_id = int(row.get("last_event_id") or 0)
+            last_id = int(row.get("last_event_id") or 0)
             current = merged.get(key)
             if current is None:
-                merged[key] = {
+                current = {
                     "tenant_id": tenant_id,
                     "channel": channel,
                     "source_key": source_key,
                     "session_id": operator_session,
                     "date": date_value,
-                    "event_count": event_count,
-                    "last_event_id": last_event_id,
+                    "event_count": 0,
+                    "last_event_id": 0,
+                    "last_observation_id": 0,
+                    "memory_event_count": 0,
+                    "observation_count": 0,
                 }
-                continue
+                merged[key] = current
             current["event_count"] = int(current.get("event_count") or 0) + event_count
-            current["last_event_id"] = max(int(current.get("last_event_id") or 0), last_event_id)
-        targets = list(merged.values())
+            if row_source == EVIDENCE_SOURCE_OBSERVATION:
+                current["observation_count"] = int(current.get("observation_count") or 0) + event_count
+                current["last_observation_id"] = max(
+                    int(current.get("last_observation_id") or 0), last_id
+                )
+            else:
+                current["memory_event_count"] = (
+                    int(current.get("memory_event_count") or 0) + event_count
+                )
+                current["last_event_id"] = max(int(current.get("last_event_id") or 0), last_id)
+        targets = []
+        for item in merged.values():
+            # Imported memory events keep priority for a day; observations are the
+            # source for every day that only exists in the live group stream.
+            item["source"] = (
+                EVIDENCE_SOURCE_MEMORY_EVENT
+                if int(item.get("memory_event_count") or 0) > 0
+                else EVIDENCE_SOURCE_OBSERVATION
+            )
+            targets.append(item)
         targets.sort(
             key=lambda item: (str(item.get("date") or ""), int(item.get("event_count") or 0)),
             reverse=True,
         )
         return targets[:effective_max_targets]
+
+    async def _list_group_observation_day_counts(
+        self,
+        *,
+        start_at: datetime,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Group observation counts per (session, UTC day) shaped like memory-event rows."""
+
+        start_dt = (
+            start_at
+            if isinstance(start_at, datetime)
+            else datetime.combine(start_at, datetime.min.time())
+        )
+        try:
+            rows = await _exec(
+                "SELECT tenant_id, session_id, "
+                "CAST(to_timestamp(occurred_ts) AT TIME ZONE 'UTC' AS date) AS day, "
+                "COUNT(*) AS event_count, MAX(id) AS last_event_id "
+                "FROM plugin_wxbot_group_observations "
+                "WHERE occurred_ts >= :start_ts "
+                "AND session_id LIKE '%@chatroom' "
+                "AND sender_wxid <> '' AND content <> '' "
+                "GROUP BY tenant_id, session_id, "
+                "CAST(to_timestamp(occurred_ts) AT TIME ZONE 'UTC' AS date) "
+                "ORDER BY day DESC, event_count DESC "
+                "LIMIT :lim",
+                {
+                    "start_ts": int(start_dt.replace(tzinfo=UTC).timestamp()),
+                    "lim": int(limit),
+                },
+            )
+        except Exception:
+            logger.warning("memory.group_graph_observation_targets_failed", exc_info=True)
+            return []
+        return [
+            {
+                "tenant_id": row.get("tenant_id"),
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": row.get("session_id"),
+                "day": row.get("day"),
+                "event_count": row.get("event_count"),
+                "last_event_id": row.get("last_event_id"),
+                "source": EVIDENCE_SOURCE_OBSERVATION,
+            }
+            for row in rows or []
+        ]
+
+    async def _list_group_observation_session_counts(
+        self,
+        *,
+        start_at: datetime,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        start_dt = (
+            start_at
+            if isinstance(start_at, datetime)
+            else datetime.combine(start_at, datetime.min.time())
+        )
+        try:
+            rows = await _exec(
+                "SELECT tenant_id, session_id, COUNT(*) AS event_count, "
+                "MAX(occurred_ts) AS last_seen_ts "
+                "FROM plugin_wxbot_group_observations "
+                "WHERE occurred_ts >= :start_ts "
+                "AND session_id LIKE '%@chatroom' "
+                "GROUP BY tenant_id, session_id "
+                "ORDER BY last_seen_ts DESC, event_count DESC "
+                "LIMIT :lim",
+                {
+                    "start_ts": int(start_dt.replace(tzinfo=UTC).timestamp()),
+                    "lim": int(limit),
+                },
+            )
+        except Exception:
+            logger.warning("memory.group_graph_observation_sessions_failed", exc_info=True)
+            return []
+        return [
+            {
+                "tenant_id": row.get("tenant_id"),
+                "channel": "wechat",
+                "source_key": "wxbot",
+                "session_id": row.get("session_id"),
+                "event_count": row.get("event_count"),
+            }
+            for row in rows or []
+        ]
 
     async def _load_group_graph_auto_extract_cursor(
         self,
@@ -2793,6 +4855,7 @@ class MemoryGroupGraphStoreMixin:
         source_key: str,
         session_id: str,
         target_date: str,
+        source: str | None = None,
     ) -> int:
         cursor_key = _group_graph_auto_cursor_key(
             tenant_id=tenant_id,
@@ -2825,6 +4888,14 @@ class MemoryGroupGraphStoreMixin:
         }
         if payload.get("scope") != expected_scope:
             return 0
+        requested_source = _normalize_evidence_source(source)
+        stored_source = (
+            _normalize_evidence_source(payload.get("source")) or EVIDENCE_SOURCE_MEMORY_EVENT
+        )
+        if requested_source is not None and stored_source != requested_source:
+            # Memory-event ids and observation ids live in different id spaces; a
+            # cursor from one source must never be applied to the other.
+            return 0
         return max(0, _safe_int(payload.get("cursor_event_id"), 0))
 
     async def _save_group_graph_auto_extract_cursor(
@@ -2836,8 +4907,10 @@ class MemoryGroupGraphStoreMixin:
         session_id: str,
         target_date: str,
         cursor_event_id: int,
+        source: str | None = None,
     ) -> None:
         cursor = max(0, int(cursor_event_id or 0))
+        cursor_source = _normalize_evidence_source(source) or EVIDENCE_SOURCE_MEMORY_EVENT
         cursor_key = _group_graph_auto_cursor_key(
             tenant_id=tenant_id,
             channel=channel,
@@ -2848,7 +4921,7 @@ class MemoryGroupGraphStoreMixin:
         payload = json.dumps(
             {
                 "kind": "group_graph_auto_cursor",
-                "version": 1,
+                "version": 2,
                 "scope": {
                     "tenant_id": tenant_id,
                     "channel": channel,
@@ -2856,11 +4929,15 @@ class MemoryGroupGraphStoreMixin:
                     "session_id": session_id,
                     "date": target_date,
                 },
+                "source": cursor_source,
                 "cursor_event_id": cursor,
             },
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        # A cursor only advances within the same source; switching source (for
+        # example a day that used to read imported events and now reads live
+        # observations) restarts from the new source's beginning.
         await _exec(
             "INSERT INTO plugin_memory_extraction_job "
             "(tenant_id, channel, source_key, user_id, session_id, source_event_id, "
@@ -2869,7 +4946,10 @@ class MemoryGroupGraphStoreMixin:
             "VALUES (:tid, :channel, :source_key, :group_uid, :sid, NULL, :trace, "
             "'succeeded', 0, 1, NOW(), :result_json, :cursor_key, NOW(), NOW()) "
             "ON CONFLICT (idempotency_key) DO UPDATE SET "
-            "result_json = CASE WHEN COALESCE(NULLIF("
+            "result_json = CASE WHEN "
+            "COALESCE(NULLIF(plugin_memory_extraction_job.result_json, '')::jsonb ->> 'source', "
+            "'memory_event') <> :cursor_source "
+            "OR COALESCE(NULLIF("
             "plugin_memory_extraction_job.result_json, '')::jsonb ->> 'cursor_event_id', '0')::bigint "
             "< :cursor_event_id THEN EXCLUDED.result_json "
             "ELSE plugin_memory_extraction_job.result_json END, "
@@ -2884,6 +4964,7 @@ class MemoryGroupGraphStoreMixin:
                 "result_json": payload,
                 "cursor_key": cursor_key,
                 "cursor_event_id": cursor,
+                "cursor_source": cursor_source,
             },
         )
 
@@ -2898,9 +4979,16 @@ class MemoryGroupGraphStoreMixin:
         include_llm: bool = True,
         sync_missing_history: bool = False,
         sync_max_messages: int = 200,
+        llm_jobs_per_tick: int | None = None,
+        llm_timeout_seconds: int | None = None,
+        auto_review_batch: int | None = None,
     ) -> dict[str, Any]:
+        """One scheduler tick: deterministic catch-up for every target, a bounded
+        number of queued LLM window jobs with a full per-job timeout, then the
+        corroboration sweep that promotes pending model relations."""
+
         effective_time_budget = _clamp_int(
-            time_budget_seconds, 180, minimum=1, maximum=180
+            time_budget_seconds, 180, minimum=1, maximum=900
         )
         skipped: list[dict[str, Any]] = []
         synced: list[dict[str, Any]] = []
@@ -2959,6 +5047,14 @@ class MemoryGroupGraphStoreMixin:
                         "ok": backfill.get("ok"),
                     }
                 )
+                logger.info(
+                    "memory.group_graph_auto_extract_synced",
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    imported_count=backfill.get("imported_count"),
+                    events_inserted=backfill.get("events_inserted"),
+                    ok=backfill.get("ok"),
+                )
         targets = await self.list_imported_group_graph_targets(
             lookback_days=lookback_days,
             max_targets=min(
@@ -2980,14 +5076,28 @@ class MemoryGroupGraphStoreMixin:
             channel = str(target.get("channel") or "wechat")
             source_key = str(target.get("source_key") or "wxbot")
             target_date = str(target.get("date") or "")
-            cursor_event_id = await self._load_group_graph_auto_extract_cursor(
-                tenant_id=tenant_id,
-                channel=channel,
-                source_key=source_key,
-                session_id=session_id,
-                target_date=target_date,
+            target_source = _normalize_evidence_source(target.get("source"))
+            cursor_kwargs: dict[str, Any] = {
+                "tenant_id": tenant_id,
+                "channel": channel,
+                "source_key": source_key,
+                "session_id": session_id,
+                "target_date": target_date,
+            }
+            if target_source is not None:
+                cursor_kwargs["source"] = target_source
+            cursor_event_id = await self._load_group_graph_auto_extract_cursor(**cursor_kwargs)
+            last_event_id = max(
+                0,
+                int(
+                    (
+                        target.get("last_observation_id")
+                        if target_source == EVIDENCE_SOURCE_OBSERVATION
+                        else target.get("last_event_id")
+                    )
+                    or 0
+                ),
             )
-            last_event_id = max(0, int(target.get("last_event_id") or 0))
             if last_event_id > 0 and cursor_event_id >= last_event_id:
                 skipped.append({**target, "reason": "up_to_date"})
                 continue
@@ -3006,6 +5116,11 @@ class MemoryGroupGraphStoreMixin:
                     cursor_event_id=cursor_event_id,
                     time_budget_seconds=effective_time_budget,
                     include_llm=include_llm,
+                    source=target_source,
+                    # The tick never waits on the model inline: windows get a
+                    # durable LLM job and are processed below with a real timeout.
+                    llm_mode=LLM_MODE_ENQUEUE,
+                    llm_timeout_seconds=llm_timeout_seconds,
                 )
             except Exception as exc:
                 logger.warning(
@@ -3029,14 +5144,11 @@ class MemoryGroupGraphStoreMixin:
                 int(catchup.get("next_cursor_event_id") or cursor_event_id),
             )
             if next_cursor_event_id > cursor_event_id:
-                await self._save_group_graph_auto_extract_cursor(
-                    tenant_id=tenant_id,
-                    channel=channel,
-                    source_key=source_key,
-                    session_id=session_id,
-                    target_date=target_date,
-                    cursor_event_id=next_cursor_event_id,
-                )
+                save_kwargs: dict[str, Any] = {
+                    **cursor_kwargs,
+                    "cursor_event_id": next_cursor_event_id,
+                }
+                await self._save_group_graph_auto_extract_cursor(**save_kwargs)
             results.append(
                 {
                     **target,
@@ -3048,13 +5160,80 @@ class MemoryGroupGraphStoreMixin:
                     "next_cursor_event_id": next_cursor_event_id,
                 }
             )
+        llm_jobs: dict[str, Any] = {"claimed": 0, "succeeded": 0, "failed": 0, "dead": 0}
+        if include_llm:
+            try:
+                llm_jobs = await self.run_group_window_llm_jobs(
+                    limit=llm_jobs_per_tick,
+                    llm_timeout_seconds=llm_timeout_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "memory.group_window_llm_jobs_failed",
+                    error_type=exc.__class__.__name__,
+                    error=_truncate_error(exc),
+                )
+                llm_jobs = {"claimed": 0, "succeeded": 0, "failed": 0, "dead": 0, "error": exc.__class__.__name__}
+        auto_review: dict[str, Any] = {"scanned": 0, "accepted": 0, "remaining": 0}
+        try:
+            # Runs after the model pass so relations produced this tick can
+            # already be corroborated by the rest of the accepted graph.
+            auto_review = await self.run_group_relation_auto_review(limit=auto_review_batch)
+        except Exception as exc:
+            logger.warning(
+                "memory.group_relation_auto_review_sweep_failed",
+                error_type=exc.__class__.__name__,
+                error=_truncate_error(exc),
+            )
+            auto_review = {"scanned": 0, "accepted": 0, "remaining": 0, "error": exc.__class__.__name__}
+        skipped_reasons: dict[str, int] = {}
+        for item in skipped:
+            reason = str(item.get("reason") or "unknown")
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+        applied_total = sum(
+            int((item.get("totals") or {}).get("applied") or 0) for item in results
+        )
+        applied_total += int(llm_jobs.get("applied") or 0)
+        failed_total = len([item for item in results if item.get("status") == "failed"])
+        # Always leave a trace, even for a no-op tick: an idle scheduler must be
+        # distinguishable from a broken one in the logs.
+        logger.info(
+            "memory.group_graph_auto_extract_tick",
+            target_count=len(targets),
+            ran=len(results) - failed_total,
+            failed=failed_total,
+            applied=applied_total,
+            synced=len(synced),
+            skipped=len(skipped),
+            skipped_reasons=skipped_reasons,
+            sources={
+                source: len([item for item in targets if item.get("source") == source])
+                for source in GROUP_GRAPH_EVIDENCE_SOURCES
+            },
+            include_llm=bool(include_llm),
+            lookback_days=_clamp_int(lookback_days, 7, minimum=1, maximum=14),
+            llm_jobs={
+                key: llm_jobs.get(key)
+                for key in ("claimed", "succeeded", "failed", "dead", "deferred", "stop_reason")
+                if key in llm_jobs
+            },
+            auto_review={
+                key: auto_review.get(key)
+                for key in ("scanned", "accepted", "accepted_term", "accepted_pair", "remaining", "stop_reason")
+                if key in auto_review
+            },
+        )
         return {
             "ok": True,
             "lookback_days": _clamp_int(lookback_days, 7, minimum=1, maximum=14),
             "include_llm": bool(include_llm),
             "sync_missing_history": bool(sync_missing_history),
             "target_count": len(targets),
-            "ran": len([item for item in results if item.get("status") != "failed"]),
+            "ran": len(results) - failed_total,
+            "applied": applied_total,
+            "skipped_reasons": skipped_reasons,
+            "llm_jobs": llm_jobs,
+            "auto_review": auto_review,
             "synced": synced,
             "skipped": skipped,
             "results": results,

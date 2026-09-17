@@ -4,6 +4,7 @@ import { DangerAction } from "../../components/DangerAction";
 import {
   GRAPH_CANVAS_HEIGHT,
   GRAPH_CANVAS_WIDTH,
+  GRAPH_LANES,
   GRAPH_RANGE_PRESETS,
   GRAPH_VIEW_MODES,
   NODE_TYPE_LEGEND,
@@ -18,14 +19,17 @@ import {
   edgeSeenOnDate,
   edgeStrokeWidth,
   extractionMethodLabel,
+  formatStrength,
   quadraticEdgePath,
   formatConfidence,
   isPendingReviewStatus,
+  isPersonNode,
   nodeIsFocused,
   nodeSecondaryLabel,
   nodeTypeLabel,
   nodeVisualType,
   graphNodeLabel,
+  populatedGraphLanes,
   readableRelationType,
   relationLabel,
   selectedEdgeTouchesNode,
@@ -63,6 +67,7 @@ export type RelationshipGraphPresentationProps = Pick<
   | "applyPlaybackDate"
   | "playbackDates"
   | "pendingEdges"
+  | "pendingTotal"
   | "pendingReviewError"
   | "pendingReviewLoading"
   | "reviewing"
@@ -185,13 +190,21 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
     applyPlaybackDate,
     playbackDates,
     pendingEdges,
+    pendingTotal,
     pendingReviewError,
     pendingReviewLoading,
     reviewing,
     reviewEdge,
   } = controller;
+  const pendingShown = pendingEdges.length;
+  const pendingCountLabel = pendingTotal !== null && pendingTotal > pendingShown
+    ? `${pendingShown} / ${pendingTotal}`
+    : String(pendingShown);
   const canvas = useCanvasViewport();
   const bundleOffsets = edgeBundleOffsets(visibleGraphEdges);
+  const populatedLanes = populatedGraphLanes(graphNodes);
+  const pageInfo = graph?.page;
+  const serverTruncated = Boolean(pageInfo?.truncated) && Number(pageInfo?.total || 0) > (graph?.edges?.length || 0);
 
   return (
     <>
@@ -280,7 +293,9 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
           )}
           {!!graphNodes.length && (
             <p className="relationship-graph-summary">
-              {graphSummaryText} 可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据数，透明度表示新旧。
+              {graphSummaryText}
+              {serverTruncated && ` 服务端共 ${pageInfo?.total} 条匹配关系，按互动强度只返回了前 ${graph?.edges?.length}，收窄时间范围或关系类型可以看到其余部分。`}
+              {" "}可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据消息数（对数），透明度表示最近一次证据的新旧。
             </p>
           )}
           {loading ? (
@@ -295,17 +310,37 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               viewBox={`0 0 ${GRAPH_CANVAS_WIDTH} ${GRAPH_CANVAS_HEIGHT}`}
               role="img"
               aria-label="群聊关系图"
+              tabIndex={-1}
               onPointerDown={canvas.onPointerDown}
               onPointerMove={canvas.onPointerMove}
               onPointerUp={canvas.onPointerUp}
               onPointerCancel={canvas.onPointerUp}
+              onClick={(event) => {
+                // Empty canvas: drop the focus. Node/edge clicks stop propagation,
+                // and a drag that ended here is a pan, not a deselect.
+                if (canvas.didPan()) return;
+                if ((event.target as Element).closest("[data-graph-item]")) return;
+                if (selection) setSelection(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && selection) {
+                  event.preventDefault();
+                  setSelection(null);
+                }
+              }}
             >
               <g transform={`translate(${canvas.view.x} ${canvas.view.y}) scale(${canvas.view.scale})`}>
                 <g className="relationship-lane-labels" aria-hidden="true">
-                  <text x="94" y="38">人物 / 核心成员</text>
-                  <text x="520" y="38">主题 / 项目</text>
-                  <text x="710" y="38">产品 / 工具</text>
-                  {graphViewMode === "all" && <text x="760" y="410">值 / 其他</text>}
+                  {graphNodes.some((node) => isPersonNode(node)) && (
+                    <text x={populatedLanes.size ? 300 : GRAPH_CANVAS_WIDTH / 2} y="38" textAnchor="middle">
+                      人物 · 位置由互动强度决定，越常互动越靠近
+                    </text>
+                  )}
+                  {Array.from(populatedLanes).map((lane) => (
+                    <text key={lane} x={GRAPH_LANES[lane].x} y={lane === "value" ? GRAPH_LANES.value.top - 22 : 38} textAnchor="middle">
+                      {GRAPH_LANES[lane].label}
+                    </text>
+                  ))}
                 </g>
                 {visibleGraphEdges.map((edge) => {
                   const from = layout.get(displayEdgeSource(edge));
@@ -329,12 +364,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                       onClick={(event) => {
                         event.stopPropagation();
                         if (canvas.didPan()) return;
-                        setSelection({ kind: "edge", item: edge });
+                        // Clicking the focused edge again releases the focus.
+                        setSelection(selected ? null : { kind: "edge", item: edge });
                       }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          setSelection({ kind: "edge", item: edge });
+                          setSelection(selected ? null : { kind: "edge", item: edge });
                         }
                       }}
                     >
@@ -376,12 +412,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                       onClick={(event) => {
                         event.stopPropagation();
                         if (canvas.didPan()) return;
-                        setSelection({ kind: "node", item: node });
+                        // Clicking the focused node again releases the focus.
+                        setSelection(selected ? null : { kind: "node", item: node });
                       }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          setSelection({ kind: "node", item: node });
+                          setSelection(selected ? null : { kind: "node", item: node });
                         }
                       }}
                     >
@@ -410,9 +447,13 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               <div>
                 <p className="section-kicker">审核</p>
                 <h3 id="relationship-review-queue-title">待审核队列</h3>
-                <p className="muted-copy">新抽的关系会自动通过。这里只剩还没转完或被退回的，最多 100 条。</p>
+                <p className="muted-copy">
+                  引用、@ 这类直接互动即时通过；模型推断的关系在跨天复现、同窗有 3 条以上消息支撑，或与已通过的关系相互印证（同一主题已有人在聊、两人已有直接互动）后由系统自动通过，14 天内都没印证的自动过期。这里是还在等印证的候选，人工点不点都不影响自动流程；最多显示 100 条。
+                </p>
               </div>
-              <span className="relationship-queue-count">{pendingEdges.length}</span>
+              <span className="relationship-queue-count" title={pendingTotal !== null ? `共 ${pendingTotal} 条待印证，显示前 ${pendingShown} 条` : undefined}>
+                {pendingCountLabel}
+              </span>
             </div>
             <div className="relationship-list">
               {pendingReviewError && (
@@ -497,6 +538,8 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                   <span className={acceptanceClass(edge.acceptance_status)}>{acceptanceStatusLabel(edge.acceptance_status)}</span>
                   <small>
                     {readableRelationType(edge.label || edge.type)} · {extractionMethodLabel(edge.extraction_method)} · 置信度 {formatConfidence(edge.confidence)} · {edge.evidence_count ?? 0} 条证据
+                    {edge.strength !== undefined && edge.strength !== null ? ` · 强度 ${formatStrength(edge.strength)}` : ""}
+                    {(edge.evidence_day_count ?? 0) > 1 ? ` · ${edge.evidence_day_count} 天` : ""}
                   </small>
                 </button>
               ))}

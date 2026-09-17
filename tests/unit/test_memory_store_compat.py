@@ -2079,12 +2079,18 @@ async def test_group_graph_history_dates_returns_counts_only(
         return []
 
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM sessions" in sql:
+            return []
+        if "FROM plugin_wxbot_group_observations" in sql:
+            return [{"count": 0}]
         if "FROM plugin_memory_extraction_job" in sql:
             if len(collect_calls) == 1:
                 return [{"status": "pending", "count": 1}, {"status": "succeeded", "count": 2}]
             if len(collect_calls) == 2:
                 return [{"status": "failed", "count": 1}]
             return []
+        assert "session_id = ANY(:sids)" in sql
+        assert params is not None and params["sids"] == ["room-a@chatroom"]
         if len(collect_calls) == 1:
             return [{"count": 1}]
         if len(collect_calls) == 2:
@@ -2106,8 +2112,11 @@ async def test_group_graph_history_dates_returns_counts_only(
     assert result["user_id"] == "__group__"
     assert result["user_id_scope"] == "__group__"
     assert result["user_id_auto"] is True
+    assert result["session_ids"] == ["room-a@chatroom"]
     assert result["items"][0]["raw_message_count"] == 2
     assert result["items"][0]["imported_count"] == 1
+    assert result["items"][0]["memory_event_count"] == 1
+    assert result["items"][0]["observation_count"] == 0
     assert result["items"][0]["job_counts"] == {
         "pending": 1,
         "running": 0,
@@ -2126,6 +2135,57 @@ async def test_group_graph_history_dates_returns_counts_only(
     assert "sanitized-message" not in str(result)
     assert all(call["user_id"] == "__group__" for call in collect_calls)
     assert all(call["end_ts"] - call["cutoff_ts"] == 86400 for call in collect_calls)
+
+
+@pytest.mark.asyncio
+async def test_group_graph_history_dates_count_live_observations_across_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group addressed by its runtime alias still sees its observation-backed days."""
+
+    store = MemoryStore(SimpleNamespace())
+    observation_params: list[dict] = []
+
+    async def fake_collect_session_history(**kwargs):
+        return []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM sessions" in sql:
+            return [
+                {
+                    "session_id": "cx1:c:abc@chatroom",
+                    "external_id": "53876528317@chatroom",
+                    "external_session_id": "",
+                    "canonical_id": "cx1:c:abc@chatroom",
+                }
+            ]
+        if "FROM plugin_wxbot_group_observations" in sql:
+            observation_params.append(dict(params or {}))
+            return [{"count": 1433}]
+        if "FROM plugin_memory_extraction_job" in sql:
+            return []
+        return [{"count": 0}]
+
+    monkeypatch.setattr(store, "_collect_session_history", fake_collect_session_history)
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+
+    result = await store.get_group_graph_history_dates(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="cx1:c:abc@chatroom",
+        user_id="",
+        recent_days=1,
+    )
+
+    assert result["session_ids"] == ["cx1:c:abc@chatroom", "53876528317@chatroom"]
+    assert set(observation_params[0]["sids"]) == {"cx1:c:abc@chatroom", "53876528317@chatroom"}
+    day = result["items"][0]
+    assert day["raw_message_count"] == 1433
+    assert day["observation_count"] == 1433
+    assert day["memory_event_count"] == 0
+    assert day["imported_count"] == 1433
+    assert day["status"] == "extracted"
 
 
 @pytest.mark.asyncio
@@ -2200,6 +2260,34 @@ async def test_selected_day_extraction_claim_scopes_jobs_by_event_date_and_sessi
     assert "job.user_id = :uid AND job.session_id = :sid" in sql
     assert "created_at >= :start_at AND created_at < :end_at" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
+    # Group-window LLM jobs share the table but belong to their own runner.
+    assert "job.source_trace_id NOT LIKE :group_window_prefix" in sql
+    assert seen["params"]["group_window_prefix"] == "group-window-llm:%"
+
+
+@pytest.mark.asyncio
+async def test_generic_job_drain_leaves_group_window_jobs_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(
+        SimpleNamespace(
+            memory_llm_extraction_job_enabled=True,
+            memory_graph_llm_extraction_enabled=True,
+        ),
+        llm_service=object(),
+    )
+    seen: dict[str, Any] = {}
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        seen["sql"] = sql
+        seen["params"] = params or {}
+        return []
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+
+    assert await store.claim_llm_extraction_jobs(limit=3, worker_id="drain-worker") == []
+    assert "source_trace_id NOT LIKE :group_window_prefix" in seen["sql"]
+    assert seen["params"]["group_window_prefix"] == "group-window-llm:%"
 
 
 def test_memory_schema_consistency_guard_covers_alembic_migrations() -> None:

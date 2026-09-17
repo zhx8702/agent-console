@@ -576,6 +576,10 @@
   font-size: var(--font-size-xs);
   font-weight: 800;
   text-align: center;
+  /* "shown / total" must stay on one line next to the panel copy. */
+  flex-shrink: 0;
+  align-self: flex-start;
+  white-space: nowrap;
 }
 
 .relationship-queue-item {
@@ -978,6 +982,26 @@
   color: var(--color-emerald-700);
   border-color: var(--color-green-200);
   font-weight: 700;
+}
+
+.relationship-judgement {
+  margin-top: var(--space-3);
+  padding: var(--space-2-5) var(--space-3);
+  border-radius: var(--radius);
+  border: 1px dashed var(--line-light);
+  background: var(--color-paper-bright);
+}
+
+.relationship-judgement h4 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-sm);
+  font-weight: 800;
+}
+
+.relationship-judgement small {
+  display: block;
+  margin-top: var(--space-1);
+  font-weight: 400;
 }
 
 .relationship-evidence-records {

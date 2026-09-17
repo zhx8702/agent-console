@@ -26,7 +26,14 @@ async def test_memory_governance_dry_run_and_bounded_cleanup(monkeypatch) -> Non
     async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
         calls.append((sql, params or {}))
         if sql.startswith("SELECT id"):
+            if "candidate" in sql and "source_type IN ('deterministic_group_window'" in sql:
+                # Group window relations use their own retention (default 14 days),
+                # independent of the generic 30-day needs_review window.
+                assert (params or {}).get("days") == 14
+                return []
             if "candidate" in sql:
+                assert "source_type NOT IN ('deterministic_group_window'" in sql
+                assert (params or {}).get("days") == 30
                 return [{"id": 1}]
             if "= 'rejected'" in sql:
                 return [{"id": 2}]
@@ -74,3 +81,43 @@ async def test_memory_governance_dry_run_and_bounded_cleanup(monkeypatch) -> Non
     assert "status = 'expired'" not in item_expiry_sql
     select_sql = next(sql for sql, _params in calls if sql.startswith("SELECT id"))
     assert "explicit_user" in select_sql
+
+
+@pytest.mark.asyncio
+async def test_memory_governance_marks_stale_extraction_jobs_dead(monkeypatch) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        calls.append((sql, params or {}))
+        if sql.startswith("SELECT id FROM plugin_memory_extraction_job"):
+            assert "status IN ('pending', 'failed')" in sql
+            assert (params or {}).get("days") == 14
+            return [{"id": 41}, {"id": 42}]
+        return []
+
+    monkeypatch.setattr("plugins.memory.store._exec", fake_exec)
+    store = MemoryStore(
+        SimpleNamespace(
+            memory_needs_review_retention_days=30,
+            memory_rejected_retention_days=7,
+            memory_auto_expire_days=180,
+            memory_governance_batch_size=100,
+            memory_llm_extraction_job_stale_days=14,
+        )
+    )
+
+    preview = await store.run_governance_cleanup(dry_run=True)
+    assert preview["stale_jobs_dead"] == 2
+    assert preview["ids"]["stale_jobs"] == [41, 42]
+    assert not any(sql.startswith("UPDATE") for sql, _params in calls)
+
+    calls.clear()
+    applied = await store.run_governance_cleanup(dry_run=False)
+    assert applied["stale_jobs_dead"] == 2
+    update_sql, update_params = next(
+        (sql, params)
+        for sql, params in calls
+        if sql.startswith("UPDATE plugin_memory_extraction_job SET status = 'dead'")
+    )
+    assert update_params["ids"] == [41, 42]
+    assert "status IN ('pending', 'failed')" in update_sql

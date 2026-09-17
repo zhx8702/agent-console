@@ -510,7 +510,30 @@ export type GroupGraphEdge = {
   acceptance_score?: number | null;
   acceptance_reason?: string | null;
   evidence_dates?: string[];
+  evidence_day_count?: number;
+  /** `memory_event`, `observation` or `mixed`: which table backs this edge's evidence. */
+  evidence_source?: string;
+  observation_count?: number;
+  first_seen_date?: string | null;
+  last_seen_date?: string | null;
+  /** When the relation row was written, as opposed to when the messages happened. */
+  extracted_at?: string | null;
+  /** Accumulated interaction strength in [0, 1] (direct signals + distinct days). */
+  strength?: number | null;
+  signals?: Record<string, number> | null;
+  /** Fact ids folded into this edge when a symmetric relation was stored in both directions. */
+  mirror_ids?: string[];
   history?: unknown[];
+};
+
+export type GroupGraphObservationEvidence = {
+  id: number;
+  session_id?: string;
+  sender_label?: string | null;
+  sender_is_technical?: boolean;
+  occurred_at?: string | null;
+  source?: string;
+  [key: string]: unknown;
 };
 
 export type GroupGraphResponse = {
@@ -526,6 +549,14 @@ export type GroupGraphResponse = {
   counts?: {
     nodes?: number;
     edges?: number;
+  };
+  /** Server-side paging info: `total` matched the filters, `truncated` means the row cap cut some. */
+  page?: {
+    limit?: number;
+    total?: number;
+    truncated?: boolean;
+    order?: string;
+    next_cursor?: string | null;
   };
   generated_from?: string[];
 };
@@ -566,22 +597,47 @@ export type GroupGraphEdgeEvidenceResponse = {
     updated_at?: string | null;
     valid_at?: string | null;
     invalid_at?: string | null;
+    /** Fact row timestamp, i.e. when the relation was extracted. */
+    extracted_at?: string | null;
+    first_observed_at?: string | null;
+    last_observed_at?: string | null;
   };
   evidence_ids?: {
     memory_item_ids?: Array<string | number>;
     event_ids?: Array<string | number>;
     episode_ids?: Array<string | number>;
+    observation_ids?: Array<string | number>;
   };
   evidence_counts?: {
     memory_items?: number;
     events?: number;
     episodes?: number;
+    observations?: number;
+    evidence_days?: number;
     [key: string]: number | undefined;
   };
+  evidence_source?: string;
+  evidence_dates?: string[];
   memory_items?: GroupGraphEdgeEvidenceEntity[];
   events?: GroupGraphEdgeEvidenceEntity[];
   episodes?: GroupGraphEdgeEvidenceEntity[];
+  observations?: GroupGraphObservationEvidence[];
+  /** Why the pipeline believes this edge: method, signals, policy, model rationale. No chat text. */
+  judgement?: GroupGraphEdgeJudgement;
   [key: string]: unknown;
+};
+
+export type GroupGraphEdgeJudgement = {
+  extraction_method?: string;
+  signals?: Record<string, number>;
+  policy?: string;
+  acceptance_status?: string;
+  reviewed_by?: string;
+  review_reason?: string;
+  /** The model's own one-line rationale (a paraphrase, never a message). */
+  model_reason?: string;
+  day_count?: number;
+  strength?: number | null;
 };
 
 export type GroupGraphQuery = {
@@ -767,7 +823,15 @@ export type GroupGraphWindowExtractionRequest = {
   cursor_event_id?: number;
   dry_run?: boolean;
   include_llm?: boolean;
+  /** Per-window model timeout in seconds (server clamps to 5–180). */
+  llm_timeout_seconds?: number;
 };
+
+/**
+ * `inline` waits for the model inside the request; `enqueue` only runs the rule
+ * layer and leaves one LLM job per window for the scheduler.
+ */
+export type GroupGraphLlmMode = "inline" | "enqueue";
 
 export type GroupGraphWindowCatchupRequest = {
   tenant_id: string;
@@ -782,6 +846,8 @@ export type GroupGraphWindowCatchupRequest = {
   dry_run?: boolean;
   time_budget_seconds?: number;
   include_llm?: boolean;
+  llm_timeout_seconds?: number;
+  llm_mode?: GroupGraphLlmMode;
 };
 
 export type GroupGraphWindowExtractionResponse = {
@@ -848,6 +914,11 @@ export type GroupGraphWindowCatchupResponse = {
   more_remain?: boolean;
   stop_reason?: string;
   generated_from?: string[];
+  /** Windows whose LLM pass was handed to the scheduler (enqueue mode). */
+  llm_jobs_enqueued?: number;
+  llm_failures?: number;
+  signal_counts?: Record<string, number>;
+  unresolved_targets?: number;
   [key: string]: unknown;
 };
 
