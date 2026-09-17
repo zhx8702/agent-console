@@ -4603,9 +4603,13 @@ class MemoryStore(
             if current_sensitivity not in MEMORY_SENSITIVITY_CATEGORIES:
                 current_sensitivity = "sensitive"
             sensitivity_order = {"normal": 0, "pii": 1, "sensitive": 2}
-            if sensitivity_order.get(current_sensitivity, 3) > sensitivity_order.get(
-                sensitivity_category, 3
-            ):
+            # Group window relations are re-probed on every touch (only the
+            # object term can be sensitive); inheriting the stored value would
+            # keep rows flagged by the old participant-id false positive
+            # parked in pending forever.
+            if not is_group_window_relation and sensitivity_order.get(
+                current_sensitivity, 3
+            ) > sensitivity_order.get(sensitivity_category, 3):
                 sensitivity_category = current_sensitivity
                 sensitivity = current_sensitivity
             current_expiry = _coerce_datetime(current.get("expires_at"))
