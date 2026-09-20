@@ -47,6 +47,7 @@ export type RelationshipGraphPresentationProps = Pick<
   | "graphNodes"
   | "graphSummaryText"
   | "loading"
+  | "loadNextGraphPage"
   | "visibleGraphEdges"
   | "layout"
   | "selectedEdge"
@@ -170,6 +171,7 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
     graphNodes,
     graphSummaryText,
     loading,
+    loadNextGraphPage,
     visibleGraphEdges,
     layout,
     selectedEdge,
@@ -294,6 +296,16 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
           {serverTruncated && (
             <p className="relationship-sync-hint is-warning" role="status">
               服务端匹配到 {pageInfo?.total} 条关系，但本次只返回 {graph?.edges?.length || 0} 条{pageInfo?.limit ? `（上限 ${pageInfo.limit}）` : ""}。画布还会按当前视图预算继续筛选；如需查看其余关系，请缩小时间范围或关系类型。
+              {pageInfo?.next_cursor && (
+                <button
+                  className="button button-secondary button-compact"
+                  type="button"
+                  onClick={() => void loadNextGraphPage()}
+                  disabled={loading}
+                >
+                  {loading ? "正在加载下一页" : "加载下一页关系"}
+                </button>
+              )}
             </p>
           )}
           {!!graphNodes.length && (

@@ -298,6 +298,8 @@ export function useRelationshipGraphController() {
     limit: string;
     fromDate: string;
     toDate: string;
+    cursor: string;
+    append: boolean;
   }> = {}) => {
     if (!config.tenantId.trim() || !selectedGroupIsVerified) {
       graphRequestIdRef.current += 1;
@@ -326,29 +328,39 @@ export function useRelationshipGraphController() {
         relation_type: queryEdgeType,
         min_confidence: overrides.minConfidence ?? minConfidence,
         limit: overrides.limit ?? limit,
+        ...(overrides.cursor ? { cursor: overrides.cursor } : {}),
         from: (overrides.fromDate ?? fromDate) || undefined,
         to: (overrides.toDate ?? toDate) || undefined,
       });
       if (graphRequestIdRef.current !== requestId || activeGraphScopeKeyRef.current !== requestScopeKey) return;
-      setLoadedGraph(result);
+      const append = Boolean(overrides.append && overrides.cursor);
+      const mergedResult = append && loadedGraphScopeKey === requestScopeKey && loadedGraph
+        ? {
+            ...result,
+            nodes: [...new Map([...loadedGraph.nodes, ...result.nodes].map((node) => [node.id, node])).values()],
+            edges: [...new Map([...loadedGraph.edges, ...result.edges].map((edge) => [edge.id, edge])).values()],
+          }
+        : result;
+      setLoadedGraph(mergedResult);
       setLoadedGraphScopeKey(requestScopeKey);
       setGraphError("");
-      const nextSelection = restoreGraphSelection(selectionRef.current, result);
+      const nextSelection = restoreGraphSelection(selectionRef.current, mergedResult);
       setSelection(nextSelection);
       if (!nextSelection) {
         setEvidence(null);
         setEvidenceStatus("选择一条关系后会自动加载证据来源。");
       }
       setOutput(formatJson({
-        schema: result.schema,
-        scope: result.scope,
-        filters: result.filters,
-        counts: result.counts,
+        schema: mergedResult.schema,
+        scope: mergedResult.scope,
+        filters: mergedResult.filters,
+        counts: mergedResult.counts,
         visible_counts: {
-          nodes: result.nodes?.length ?? 0,
-          edges: result.edges?.length ?? 0,
+          nodes: mergedResult.nodes?.length ?? 0,
+          edges: mergedResult.edges?.length ?? 0,
         },
-        generated_from: result.generated_from,
+        page: mergedResult.page,
+        generated_from: mergedResult.generated_from,
       }));
       void loadJobStats();
     } catch (err) {
@@ -369,9 +381,15 @@ export function useRelationshipGraphController() {
         setLoading(false);
       }
     }
-  }, [acceptanceStatus, channel, config, currentGraphScopeKey, edgeType, fromDate, limit, loadJobStats, minConfidence, nodeType, selectedGroupId, selectedGroupIsVerified, sourceKey, toDate]);
+  }, [acceptanceStatus, channel, config, currentGraphScopeKey, edgeType, fromDate, limit, loadedGraph, loadedGraphScopeKey, loadJobStats, minConfidence, nodeType, selectedGroupId, selectedGroupIsVerified, sourceKey, toDate]);
   const loadGraphRef = useRef(loadGraph);
   loadGraphRef.current = loadGraph;
+
+  const loadNextGraphPage = useCallback(async () => {
+    const cursor = graph?.page?.next_cursor;
+    if (!cursor || loading) return;
+    await loadGraph({ cursor, append: true });
+  }, [graph?.page?.next_cursor, loadGraph, loading]);
 
   const loadEdgeEvidence = useCallback(async (edge: GroupGraphEdge) => {
     const tenantId = config.tenantId.trim();
@@ -1387,6 +1405,7 @@ export function useRelationshipGraphController() {
     neighborNodeIds,
     graphStateMessage,
     loadGraph,
+    loadNextGraphPage,
     loadEdgeEvidence,
     loadGraphAndStatus,
     showAllGraph,

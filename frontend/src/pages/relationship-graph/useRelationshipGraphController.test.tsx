@@ -366,4 +366,35 @@ describe("useRelationshipGraphController verified group loading", () => {
       expect.objectContaining({ connection_id: "legacy-wechat-default" }),
     );
   });
+
+  it("loads and merges a server graph page when a cursor is available", async () => {
+    const firstPage = {
+      ...graphFor("group-a@chatroom"),
+      nodes: [{ id: "person:a", type: "person", label: "甲" }],
+      edges: [{ id: "edge-1", from: "person:a", to: "person:a", type: "mentioned" }],
+      page: { limit: 1, total: 2, truncated: true, next_cursor: "cursor-2" },
+    };
+    const secondPage = {
+      ...graphFor("group-a@chatroom"),
+      nodes: [{ id: "person:b", type: "person", label: "乙" }],
+      edges: [{ id: "edge-2", from: "person:b", to: "person:b", type: "mentioned" }],
+      page: { limit: 1, total: 2, truncated: false, next_cursor: null },
+    };
+    apiMocks.getGroupGraph.mockImplementation((_config, query) => (
+      query.cursor === "cursor-2" ? Promise.resolve(secondPage) : Promise.resolve(firstPage)
+    ));
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph?.page?.next_cursor).toBe("cursor-2"));
+    await act(async () => {
+      await result.current.loadNextGraphPage();
+    });
+
+    expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ cursor: "cursor-2" }),
+    );
+    expect(result.current.graph?.edges.map((edge) => edge.id)).toEqual(["edge-1", "edge-2"]);
+    expect(result.current.graph?.page?.next_cursor).toBeNull();
+  });
 });
