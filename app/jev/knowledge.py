@@ -51,6 +51,12 @@ class JevKnowledgeService:
         self._task = None
         self._schedule_at = 0.0
 
+    @property
+    def generation_timeout(self) -> float:
+        # The provider owns stream-first-event, idle, total and internal retry limits.
+        # An outer offline deadline must allow that configured window to complete.
+        return max(300.0, float(self.jev.settings.openai_responses_stream_max_duration_seconds) + 30.0)
+
     def start(self):
         if self.jev.enabled and self.kb is not None and self._task is None:
             self._task = asyncio.create_task(self._loop(), name="jev-daily-knowledge")
@@ -130,7 +136,7 @@ class JevKnowledgeService:
                 await handler(row)
             except asyncio.CancelledError:
                 # Graceful deployment does not need to wait for crash-lease expiry.
-                await self.store.finish(kind, row, status="pending", error="WorkerShutdown", retry=True)
+                await self.store.finish(kind, row, status="pending", error="WorkerShutdown", retry=True, release_attempt=True)
                 raise
             except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
                 await self.store.finish(kind, row, status="skipped", error=type(exc).__name__)
@@ -164,7 +170,7 @@ class JevKnowledgeService:
             model_tier="tier-2", system=EXTRACTION_PROMPT + QUALITY_PROMPT,
             messages=[ChatMessage(role=Role.USER, content=json.dumps({"messages": payload, "runtime": safe_runtime, "open_questions": [{"id": c["id"], "question": c["draft"]["question"], "evidence_ids": c["draft"]["evidence_ids"]} for c in opened]}, ensure_ascii=False))],
             max_tokens=6000, temperature=0.1,
-            metadata={"purpose": "jev_knowledge_extraction"})), timeout=120)
+            metadata={"purpose": "jev_knowledge_extraction"})), timeout=self.generation_timeout)
         extraction = parse_extraction(response.content)
         # Reject the whole malformed batch so the checkpoint never skips unprocessed messages.
         drafts = []
@@ -280,7 +286,7 @@ class JevKnowledgeService:
                 messages=[ChatMessage(role=Role.USER, content=json.dumps({
                     "baseline": {"title": redact(doc.title), "content": redact(doc.content, limit=24000)},
                     "candidate": row["draft"], "evidence": self.message_payload(evidence)}, ensure_ascii=False))],
-                max_tokens=6500, temperature=.1, metadata={"purpose": "jev_knowledge_revision"})), timeout=120)
+                max_tokens=6500, temperature=.1, metadata={"purpose": "jev_knowledge_revision"})), timeout=self.generation_timeout)
             content = response.content.strip()
             if content.startswith("```json") and content.endswith("```"):
                 content = content[7:-3].strip()

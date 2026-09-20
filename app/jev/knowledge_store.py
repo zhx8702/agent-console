@@ -31,6 +31,9 @@ class KnowledgeStore:
 
     async def claim(self, kind: str) -> dict | None:
         table = _TABLES[kind]
+        # Older workers counted graceful shutdown toward the failure limit.
+        await execute(f"UPDATE {table} SET attempts=2 WHERE status='pending' "
+                      "AND error_type='WorkerShutdown' AND attempts>=3")
         await execute(f"UPDATE {table} SET status='failed',error_type='LeaseExpired',lease_token=NULL,locked_until=NULL "
                       "WHERE status='running' AND locked_until<NOW() AND attempts>=3")
         rows = await execute(
@@ -42,13 +45,14 @@ class KnowledgeStore:
             {"token": str(uuid4())})
         return rows[0] if rows else None
 
-    async def finish(self, kind: str, row: dict, *, status: str, error: str = "", retry: bool = False) -> bool:
+    async def finish(self, kind: str, row: dict, *, status: str, error: str = "", retry: bool = False, release_attempt: bool = False) -> bool:
         rows = await execute(
             f"UPDATE {_TABLES[kind]} SET status=:status,error_type=:error,lease_token=NULL,locked_until=NULL,"
+            "attempts=GREATEST(0,attempts-:release_attempt),"
             "next_run_at=NOW()+(:delay * INTERVAL '1 second'),updated_at=NOW() "
             "WHERE id=:id AND status='running' AND lease_token=:token AND locked_until>NOW() RETURNING id",
             {"id": row["id"], "token": row["lease_token"], "status": status, "error": error[:96],
-             "delay": min(300, 10 * 2 ** row["attempts"]) if retry else 0})
+             "release_attempt": int(release_attempt), "delay": min(300, 10 * 2 ** row["attempts"]) if retry else 0})
         return bool(rows)
 
     async def page(self, job: dict, limit: int = 50) -> list[dict]:

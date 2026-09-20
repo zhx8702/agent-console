@@ -453,3 +453,19 @@ async def test_quality_confirmation_rejects_changed_evidence_and_dismissal_retai
     response=await client.post(path,params={'tenant_id':tid},json={**payload,'action':'dismiss','reason':'群友已经提供了正确答案'},headers={'Idempotency-Key':'dismiss'})
     assert response.status_code==200,response.text
     assert (await store.dashboard(tid,finding_status='dismissed'))['findings'][0]['review']['_operator']['reason']=='群友已经提供了正确答案'
+
+
+
+async def test_deployment_exit_does_not_exhaust_last_retry(env):
+    tid,store,_,_=env
+    await store.schedule(tid,'g@chatroom',date(2026,9,20),0,1000)
+    await execute("UPDATE jev_knowledge_job SET attempts=2 WHERE tenant_id=:tid",{'tid':tid})
+    claimed=await store.claim('job')
+    assert claimed['attempts']==3
+    assert await store.finish('job',claimed,status='pending',error='WorkerShutdown',release_attempt=True)
+    resumed=await store.claim('job')
+    assert resumed is not None and resumed['attempts']==3 and resumed['cursor_id']==0
+    # A claim returned by the older worker also remains recoverable after upgrade.
+    await store.finish('job',resumed,status='pending',error='WorkerShutdown')
+    legacy=await store.claim('job')
+    assert legacy is not None and legacy['attempts']==3

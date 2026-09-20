@@ -236,4 +236,17 @@ async def test_graceful_shutdown_returns_claim_for_resumption():
     svc.extract_page=AsyncMock(side_effect=asyncio.CancelledError())
     with pytest.raises(asyncio.CancelledError):
         await svc.tick()
-    svc.store.finish.assert_awaited_once_with('job',job,status='pending',error='WorkerShutdown',retry=True)
+    svc.store.finish.assert_awaited_once_with('job',job,status='pending',error='WorkerShutdown',retry=True,release_attempt=True)
+
+
+async def test_offline_extraction_allows_configured_stream_retry_window(monkeypatch):
+    svc=service()
+    svc.jev.settings=svc.jev.settings.model_copy(update={'openai_responses_stream_max_duration_seconds':600})
+    import app.jev.knowledge as module
+    observed=[]
+    async def wait(awaitable, *, timeout):
+        observed.append(timeout)
+        return await awaitable
+    monkeypatch.setattr(module,'wait_for_llm_activity',wait)
+    await svc.extract_page(row())
+    assert len(observed)==1 and observed[0]>600
