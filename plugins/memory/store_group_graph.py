@@ -760,8 +760,7 @@ class MemoryGroupGraphStoreMixin:
             },
             "evidence_count": len(
                 _coerce_int_set(candidate.get("evidence_event_ids") or [])
-                | _coerce_int_set(candidate.get("evidence_observation_ids") or [])
-            ),
+            ) + len(_coerce_int_set(candidate.get("evidence_observation_ids") or [])),
             "window_event_count": len(window.get("event_ids") or []),
             "window_sender_count": len(window.get("sender_ids") or []),
         }
@@ -825,25 +824,43 @@ class MemoryGroupGraphStoreMixin:
     def _normalize_typesafe_shadow_result(result: Any) -> dict[str, Any]:
         """Keep only compact, JSON-safe TypeSafe audit fields."""
 
+        if result is None:
+            return {"status": "unavailable", "error_type": "empty_result"}
         if isinstance(result, dict):
             raw = result
+        elif callable(getattr(result, "as_dict", None)):
+            raw = result.as_dict()
         else:
             raw = getattr(result, "model_dump", lambda: None)() or getattr(
                 result, "__dict__", {}
             )
         if not isinstance(raw, dict):
             return {"status": "completed", "result": str(result)[:160]}
+        def bounded_value(value: Any, depth: int = 0) -> Any:
+            if isinstance(value, str):
+                return value[:160]
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if isinstance(value, (int, bool)) or value is None:
+                return value
+            if isinstance(value, dict) and depth < 2:
+                return {
+                    str(k)[:48]: bounded_value(v, depth + 1)
+                    for k, v in list(value.items())[:16]
+                }
+            return None
+
         output: dict[str, Any] = {"status": "completed"}
-        for key in ("decision", "supported", "quality", "confidence", "request_id", "trace_id"):
+        for key in (
+            "model", "usage", "decision", "supported", "quality", "confidence",
+            "request_id", "trace_id",
+        ):
             value = raw.get(key)
             if value is None and isinstance(raw.get("answers"), dict):
                 value = raw["answers"].get(key)
             if value is None:
                 continue
-            if isinstance(value, (str, int, float, bool)):
-                output[key] = str(value)[:160] if isinstance(value, str) else value
-            elif isinstance(value, dict):
-                output[key] = {str(k)[:48]: str(v)[:120] for k, v in list(value.items())[:8]}
+            output[key] = bounded_value(value)
         return output
 
     async def list_memory_graph_entities(
