@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import math
 import re
@@ -682,6 +684,168 @@ def _prefer_operator_group_session_id(
 
 
 class MemoryGroupGraphStoreMixin:
+    """Persistence and extraction helpers for the group relationship graph.
+
+    The TypeSafe integration below is deliberately a shadow verifier.  It is
+    optional and duck typed so deployments can provide a small adapter without
+    coupling the memory store to a particular SDK version.  A verifier error
+    must never change the existing extraction or acceptance path.
+    """
+
+    def _typesafe_group_shadow_config(self) -> tuple[Any | None, bool, float]:
+        settings = getattr(self, "settings", None)
+        client = (
+            getattr(self, "typesafe_client", None)
+            or getattr(self, "typesafe_decision_client", None)
+            or getattr(settings, "typesafe_client", None)
+        )
+        enabled = bool(
+            getattr(settings, "typesafe_group_graph_shadow_enabled", False)
+            or getattr(settings, "typesafe_shadow_enabled", False)
+            or getattr(settings, "typesafe_enabled", False)
+        )
+        timeout_raw = (
+            getattr(settings, "typesafe_group_graph_shadow_timeout_seconds", None)
+            or getattr(settings, "typesafe_shadow_timeout_seconds", None)
+            or 8.0
+        )
+        try:
+            timeout = max(0.1, min(float(timeout_raw), 30.0))
+        except (TypeError, ValueError):
+            timeout = 8.0
+        return client, enabled, timeout
+
+    @staticmethod
+    def _typesafe_shadow_subject(value: Any) -> str:
+        """Return a stable opaque participant token for external evaluation."""
+
+        normalized = _normalize_line(str(value or ""))[:200]
+        if not normalized:
+            return ""
+        return "p_" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    async def _run_typesafe_group_shadow(
+        self,
+        *,
+        candidate: dict[str, Any],
+        window: dict[str, Any],
+        target_date: str,
+    ) -> dict[str, Any] | None:
+        """Evaluate one candidate without affecting graph persistence.
+
+        Adapters may expose ``evaluate_group_relationship`` (preferred),
+        ``system_one`` or be directly callable.  The method receives only
+        pseudonymous participants, predicate/signal counts and evidence
+        cardinalities; transcript text and raw identifiers never leave this
+        process.  The returned payload is intentionally bounded and safe to
+        persist as audit metadata.
+        """
+
+        client, enabled, timeout = self._typesafe_group_shadow_config()
+        if not enabled or client is None:
+            return None
+        state = {
+            "kind": "group_relationship_candidate",
+            "date": str(target_date)[:10],
+            "subject": self._typesafe_shadow_subject(candidate.get("subject")),
+            "object": self._typesafe_shadow_subject(candidate.get("object")),
+            "predicate": str(candidate.get("predicate") or "").strip()[:64],
+            "subject_type": str(candidate.get("subject_type") or "person")[:32],
+            "object_type": str(candidate.get("object_type") or "person")[:32],
+            "confidence": round(_clamp_score(candidate.get("confidence"), 0.0), 4),
+            "signals": {
+                str(key)[:64]: max(0, _safe_int(value, 0))
+                for key, value in (candidate.get("signals") or {}).items()
+                if str(key).strip()
+            },
+            "evidence_count": len(
+                _coerce_int_set(candidate.get("evidence_event_ids") or [])
+                | _coerce_int_set(candidate.get("evidence_observation_ids") or [])
+            ),
+            "window_event_count": len(window.get("event_ids") or []),
+            "window_sender_count": len(window.get("sender_ids") or []),
+        }
+        questions = {
+            "supported": {
+                "type": "noul",
+                "instructions": "Does the available structured evidence support this relationship?",
+            },
+            "quality": {
+                "type": "score",
+                "instructions": "Rate the evidence quality for this relationship.",
+                "criteria": ["none", "weak", "moderate", "strong"],
+            },
+            "decision": {
+                "type": "choice",
+                "instructions": "Classify this candidate for audit only.",
+                "criteria": {
+                    "accepted": "Evidence appears sufficient",
+                    "needs_review": "Evidence is ambiguous",
+                    "rejected": "Evidence appears insufficient",
+                },
+            },
+        }
+        try:
+            method = getattr(client, "evaluate_group_relationship", None)
+            if method is None:
+                method = getattr(client, "system_one", None)
+            if method is None and callable(client):
+                method = client
+            if method is None:
+                return {"status": "unavailable", "error_type": "missing_method"}
+            if inspect.iscoroutinefunction(method):
+                try:
+                    result = await asyncio.wait_for(
+                        method(state=state, questions=questions), timeout=timeout
+                    )
+                except TypeError:
+                    result = await asyncio.wait_for(method(state, questions), timeout=timeout)
+            else:
+                async def _invoke_sync() -> Any:
+                    def _call() -> Any:
+                        try:
+                            return method(state=state, questions=questions)
+                        except TypeError:
+                            return method(state, questions)
+
+                    return await asyncio.to_thread(_call)
+
+                result = await asyncio.wait_for(_invoke_sync(), timeout=timeout)
+                if hasattr(result, "__await__"):
+                    result = await asyncio.wait_for(result, timeout=timeout)
+            return self._normalize_typesafe_shadow_result(result)
+        except Exception as exc:
+            logger.warning(
+                "memory.group_graph_typesafe_shadow_failed",
+                error_type=exc.__class__.__name__,
+            )
+            return {"status": "error", "error_type": exc.__class__.__name__}
+
+    @staticmethod
+    def _normalize_typesafe_shadow_result(result: Any) -> dict[str, Any]:
+        """Keep only compact, JSON-safe TypeSafe audit fields."""
+
+        if isinstance(result, dict):
+            raw = result
+        else:
+            raw = getattr(result, "model_dump", lambda: None)() or getattr(
+                result, "__dict__", {}
+            )
+        if not isinstance(raw, dict):
+            return {"status": "completed", "result": str(result)[:160]}
+        output: dict[str, Any] = {"status": "completed"}
+        for key in ("decision", "supported", "quality", "confidence", "request_id", "trace_id"):
+            value = raw.get(key)
+            if value is None and isinstance(raw.get("answers"), dict):
+                value = raw["answers"].get(key)
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                output[key] = str(value)[:160] if isinstance(value, str) else value
+            elif isinstance(value, dict):
+                output[key] = {str(k)[:48]: str(v)[:120] for k, v in list(value.items())[:8]}
+        return output
+
     async def list_memory_graph_entities(
         self,
         *,
@@ -2882,6 +3046,11 @@ class MemoryGroupGraphStoreMixin:
             "source": resolved_source,
             "llm_jobs_enqueued": 0,
             "llm_failures": 0,
+            "typesafe_shadow": {
+                "attempted": 0,
+                "completed": 0,
+                "failed": 0,
+            },
             "windows": window_summaries,
             "totals": {
                 "events": sum(len(window["event_ids"]) for window in windows),
@@ -2917,6 +3086,9 @@ class MemoryGroupGraphStoreMixin:
         llm_jobs_enqueued = 0
         llm_jobs_seen = 0
         llm_failures = 0
+        typesafe_shadow_attempted = 0
+        typesafe_shadow_completed = 0
+        typesafe_shadow_failed = 0
         generated_from = [
             (
                 "plugin_wxbot_group_observations"
@@ -3014,6 +3186,35 @@ class MemoryGroupGraphStoreMixin:
                 deterministic_candidates,
                 llm_candidates,
             )
+            # TypeSafe is a shadow verifier: its result is carried as bounded
+            # audit metadata only.  The deterministic acceptance policy below
+            # remains the sole source of persistence/acceptance decisions.
+            for candidate_index, candidate in enumerate(candidates):
+                shadow_result = await self._run_typesafe_group_shadow(
+                    candidate=candidate,
+                    window=window,
+                    target_date=target_date,
+                )
+                if shadow_result is None:
+                    continue
+                summary.setdefault(
+                    "typesafe_shadow", {"attempted": 0, "completed": 0, "failed": 0}
+                )
+                typesafe_shadow_attempted += 1
+                status = str(shadow_result.get("status") or "completed")
+                if status == "completed":
+                    typesafe_shadow_completed += 1
+                    summary["typesafe_shadow"]["completed"] += 1
+                else:
+                    typesafe_shadow_failed += 1
+                    summary["typesafe_shadow"]["failed"] += 1
+                summary["typesafe_shadow"]["attempted"] += 1
+                # Do not mutate the merged candidate in place: a caller may
+                # reuse it for retries and shadow metadata is observational.
+                candidates[candidate_index] = {
+                    **candidate,
+                    "typesafe_shadow": shadow_result,
+                }
             if not candidates:
                 if not summary.get("llm_job"):
                     # Nothing found and nothing deferred: the window is done.
@@ -3074,6 +3275,11 @@ class MemoryGroupGraphStoreMixin:
             base_payload["status"] = "completed" if total_skipped == 0 else "partial"
         base_payload["llm_jobs_enqueued"] = llm_jobs_enqueued
         base_payload["llm_failures"] = llm_failures
+        base_payload["typesafe_shadow"] = {
+            "attempted": typesafe_shadow_attempted,
+            "completed": typesafe_shadow_completed,
+            "failed": typesafe_shadow_failed,
+        }
         base_payload["generated_from"] = generated_from
         base_payload["totals"] = {
             "events": sum(len(window["event_ids"]) for window in windows),

@@ -4244,3 +4244,42 @@ async def test_memory_graph_retrieve_candidate_params_are_normalized(
         candidate_fact_ids=["2", 1, "bad", 2],
         candidate_episode_ids=["4", 3, None, 4],
     )
+
+
+@pytest.mark.asyncio
+async def test_typesafe_group_shadow_is_bounded_and_fail_open() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.state: dict[str, Any] | None = None
+
+        async def evaluate_group_relationship(self, *, state: dict, questions: dict) -> dict:
+            self.state = state
+            return {"answers": {"decision": "needs_review", "confidence": 0.73}}
+
+    client = _Client()
+    store = MemoryStore(
+        SimpleNamespace(typesafe_group_graph_shadow_enabled=True, typesafe_shadow_timeout_seconds=1)
+    )
+    store.typesafe_client = client
+    result = await store._run_typesafe_group_shadow(
+        candidate={
+            "subject": "wxid-张三",
+            "object": "wxid-李四",
+            "predicate": "replied_to",
+            "subject_type": "person",
+            "object_type": "person",
+            "confidence": 0.9,
+            "signals": {"direct_reply": 1},
+            "evidence_event_ids": [1, 2],
+        },
+        window={"event_ids": [1, 2, 3], "sender_ids": ["wxid-张三", "wxid-李四"]},
+        target_date="2026-09-20",
+    )
+    assert result == {
+        "status": "completed",
+        "decision": "needs_review",
+        "confidence": 0.73,
+    }
+    assert client.state is not None
+    assert "张三" not in repr(client.state)
+    assert client.state["subject"].startswith("p_")
