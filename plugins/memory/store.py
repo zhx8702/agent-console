@@ -6120,7 +6120,11 @@ class MemoryStore(
             status=status,
             include_deleted=include_deleted,
         )
-        params["lim"] = max(1, min(int(limit or 5000), 10000))
+        # Audit/statistics callers may need to scan more than the historical
+        # 10k preview cap.  Individual API endpoints still clamp their public
+        # limits; this internal reader accepts a larger bounded page so group
+        # window totals are not silently truncated.
+        params["lim"] = max(1, min(int(limit or 5000), 100000))
         rows = await _exec(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, value_json, confidence, status, pinned, priority, sensitivity, "

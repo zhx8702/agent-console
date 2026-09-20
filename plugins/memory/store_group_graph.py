@@ -259,7 +259,9 @@ def _group_graph_item_observation_ids(item: dict[str, Any] | None) -> list[int]:
 
 def _split_window_evidence_ids(
     candidate_ids: Iterable[Any],
-    observation_ids: set[int],
+    observation_ids: set[int] | None = None,
+    *,
+    rows: Iterable[dict[str, Any]] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Split window evidence into memory-event ids and group-observation ids.
 
@@ -271,8 +273,28 @@ def _split_window_evidence_ids(
 
     event_ids: list[int] = []
     observation_evidence: list[int] = []
+    # Build provenance from the row carrying the id.  The two backing tables
+    # have independent integer id spaces; looking at the numeric id alone can
+    # therefore misclassify an event when an observation happens to reuse it.
+    row_sources: dict[int, set[str]] = {}
+    for row in rows or []:
+        row_id = _safe_int(row.get("id"), 0)
+        if row_id:
+            row_sources.setdefault(row_id, set()).add(
+                str(row.get("_graph_source") or EVIDENCE_SOURCE_MEMORY_EVENT)
+            )
+    fallback_observation_ids = observation_ids or set()
     for event_id in sorted(_coerce_int_set(candidate_ids)):
-        if event_id in observation_ids:
+        sources = row_sources.get(event_id)
+        if sources is None:
+            # Keep compatibility with callers that only have the old set, but
+            # never let that set override an explicit row source.
+            sources = {
+                EVIDENCE_SOURCE_OBSERVATION
+                if event_id in fallback_observation_ids
+                else EVIDENCE_SOURCE_MEMORY_EVENT
+            }
+        if sources == {EVIDENCE_SOURCE_OBSERVATION}:
             observation_evidence.append(event_id)
         else:
             event_ids.append(event_id)
@@ -286,8 +308,12 @@ def _group_graph_auto_cursor_key(
     source_key: str,
     session_id: str,
     target_date: str,
+    source: str | None = None,
 ) -> str:
-    scope = "\x1f".join((tenant_id, channel, source_key, session_id, target_date))
+    parts = (tenant_id, channel, source_key, session_id, target_date)
+    if source is not None:
+        parts = (*parts, str(source))
+    scope = "\x1f".join(parts)
     return f"group-graph-auto-cursor:v1:{_normalize_key(scope)}"
 
 
@@ -851,7 +877,9 @@ class MemoryGroupGraphStoreMixin:
         order_by_strength: bool = False,
     ) -> list[dict[str, Any]]:
         conditions = ["fact.tenant_id = :tid"]
-        params: dict[str, Any] = {"tid": tenant_id, "lim": max(1, min(int(limit or 100), 500))}
+        # Cursor pages need the rows preceding the requested offset; keep this
+        # internal reader larger than the public page size but bounded.
+        params: dict[str, Any] = {"tid": tenant_id, "lim": max(1, min(int(limit or 100), 10000))}
         if channel is not None:
             conditions.append("fact.channel = :channel")
             params["channel"] = channel
@@ -1021,9 +1049,16 @@ class MemoryGroupGraphStoreMixin:
         acceptance_status: str | None = None,
         min_confidence: float | None = None,
         limit: int = 500,
+        cursor: str | int | None = None,
     ) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit or 500), 500))
-        fetch_limit = min(max(safe_limit * 3, safe_limit), 500)
+        try:
+            page_offset = max(0, int(str(cursor or "0").strip() or 0))
+        except (TypeError, ValueError):
+            page_offset = 0
+        # Fetch enough rows to serve the requested page after symmetric edges
+        # are collapsed.  The SQL helpers cap this at 10k.
+        fetch_limit = min(max(safe_limit * 3 + page_offset, safe_limit), 10000)
         requested_acceptance = {
             value.strip().lower()
             for value in str(acceptance_status or "").split(",")
@@ -1061,6 +1096,7 @@ class MemoryGroupGraphStoreMixin:
             "acceptance_status": sorted(requested_acceptance) if requested_acceptance else None,
             "min_confidence": min_confidence,
             "limit": safe_limit,
+            "cursor": str(page_offset) if page_offset else None,
         }
 
         scoped_session_ids = (
@@ -1112,6 +1148,28 @@ class MemoryGroupGraphStoreMixin:
             status=status_filter,
             **fact_filter_kwargs,
         )
+        # Symmetric predicates collapse two directional facts into one wire
+        # edge.  When the filtered set fits in the bounded read page, reload
+        # the complete set so `page.total` reflects the merged edge count
+        # rather than the raw directional fact count.
+        if (
+            len(facts) >= fetch_limit
+            and total_matching_facts > len(facts)
+            and total_matching_facts <= 10000
+        ):
+            facts = await self.list_memory_graph_facts(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                user_id=None,
+                session_id=session_id,
+                session_ids=scoped_session_ids or None,
+                status=status_filter,
+                limit=total_matching_facts,
+                order_by_strength=True,
+                **fact_filter_kwargs,
+            )
+        facts_complete = total_matching_facts <= len(facts)
         # Endpoints of the selected facts must be present even when they fall
         # outside the recency-ordered entity page.
         known_entity_ids = {row.get("id") for row in entities if row.get("id") is not None}
@@ -1375,9 +1433,6 @@ class MemoryGroupGraphStoreMixin:
                     nodes[node_id]["evidence_count"] = evidence_count + edge["evidence_count"]
                     nodes[node_id]["source_ref_count"] = source_refs + source_ref_count
 
-            if len(edges) >= safe_limit:
-                break
-
         edges = _merge_symmetric_group_edges(edges)
         connected_node_ids = {
             node_id for edge in edges for node_id in (edge["source"], edge["target"])
@@ -1401,11 +1456,11 @@ class MemoryGroupGraphStoreMixin:
             )
 
         node_items = list(nodes.values())[:safe_limit]
-        visible_edges = edges[:safe_limit]
+        total_edges = len(edges) if facts_complete else max(total_matching_facts, len(edges))
+        visible_edges = edges[page_offset : page_offset + safe_limit]
         # The COUNT runs with the same SQL filters, so anything above what is
         # shown was cut by the row cap rather than by a filter.
-        total_edges = max(total_matching_facts, len(visible_edges))
-        truncated = len(facts) >= fetch_limit or total_matching_facts > len(visible_edges)
+        truncated = page_offset + len(visible_edges) < total_edges
         return {
             "schema": {
                 "version": GROUP_GRAPH_SCHEMA_VERSION,
@@ -1425,7 +1480,11 @@ class MemoryGroupGraphStoreMixin:
                 "total": total_edges,
                 "truncated": bool(truncated),
                 "order": "strength_desc",
-                "next_cursor": None,
+                "next_cursor": (
+                    str(page_offset + safe_limit)
+                    if page_offset + len(visible_edges) < total_edges
+                    else None
+                ),
             },
             "generated_from": generated_from,
         }
@@ -1819,53 +1878,71 @@ class MemoryGroupGraphStoreMixin:
         window_size: int,
     ) -> list[dict[str, Any]]:
         windows: list[dict[str, Any]] = []
-        for index, start in enumerate(range(0, len(event_rows), window_size), start=1):
-            rows = event_rows[start : start + window_size]
-            if not rows:
-                continue
-            event_ids = sorted(_coerce_int_set(row.get("id") for row in rows))
-            sender_ids: list[str] = []
-            transcript_lines: list[str] = []
-            prompt_chars = 0
-            for row in rows:
-                event_id = row.get("id")
-                sender_id, body = _split_group_event_text(row.get("user_text"))
-                sender_id = sender_id or str(row.get("user_id") or "unknown")
-                if sender_id not in sender_ids:
-                    sender_ids.append(sender_id)
-                body = _normalize_line(_sanitize_db_text(body))[:500]
-                if not body:
+        # Keep evidence-source boundaries intact.  A memory event id and an
+        # observation id are independent namespaces, so a mixed window cannot
+        # safely infer provenance from the integer id emitted by an extractor.
+        grouped_rows: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_source = ""
+        for row in event_rows:
+            row_source = str(row.get("_graph_source") or EVIDENCE_SOURCE_MEMORY_EVENT)
+            if current and row_source != current_source:
+                grouped_rows.append(current)
+                current = []
+            current_source = row_source
+            current.append(row)
+        if current:
+            grouped_rows.append(current)
+        index = 0
+        for group in grouped_rows:
+            for start in range(0, len(group), window_size):
+                rows = group[start : start + window_size]
+                index += 1
+                if not rows:
                     continue
-                line = f"[event_id={event_id}] {sender_id}: {body}"
-                if prompt_chars + len(line) + 1 > 12000:
-                    break
-                transcript_lines.append(line)
-                prompt_chars += len(line) + 1
-            observation_row_ids = {
-                int(row.get("id") or 0)
-                for row in rows
-                if str(row.get("_graph_source") or "") == EVIDENCE_SOURCE_OBSERVATION
-                and int(row.get("id") or 0)
-            }
-            windows.append(
-                {
-                    "index": index,
-                    "rows": rows,
-                    "event_ids": event_ids,
-                    "first_event_id": event_ids[0] if event_ids else None,
-                    "last_event_id": event_ids[-1] if event_ids else None,
-                    "sender_ids": sender_ids,
-                    "transcript": "\n".join(transcript_lines),
-                    "source": (
-                        EVIDENCE_SOURCE_OBSERVATION
-                        if observation_row_ids and len(observation_row_ids) == len(event_ids)
-                        else EVIDENCE_SOURCE_MIXED
-                        if observation_row_ids
-                        else EVIDENCE_SOURCE_MEMORY_EVENT
-                    ),
-                    "observation_ids": observation_row_ids,
+                event_ids = sorted(_coerce_int_set(row.get("id") for row in rows))
+                sender_ids: list[str] = []
+                transcript_lines: list[str] = []
+                prompt_chars = 0
+                for row in rows:
+                    event_id = row.get("id")
+                    sender_id, body = _split_group_event_text(row.get("user_text"))
+                    sender_id = sender_id or str(row.get("user_id") or "unknown")
+                    if sender_id not in sender_ids:
+                        sender_ids.append(sender_id)
+                    body = _normalize_line(_sanitize_db_text(body))[:500]
+                    if not body:
+                        continue
+                    line = f"[event_id={event_id}] {sender_id}: {body}"
+                    if prompt_chars + len(line) + 1 > 12000:
+                        break
+                    transcript_lines.append(line)
+                    prompt_chars += len(line) + 1
+                observation_row_ids = {
+                    int(row.get("id") or 0)
+                    for row in rows
+                    if str(row.get("_graph_source") or "") == EVIDENCE_SOURCE_OBSERVATION
+                    and int(row.get("id") or 0)
                 }
-            )
+                windows.append(
+                    {
+                        "index": index,
+                        "rows": rows,
+                        "event_ids": event_ids,
+                        "first_event_id": event_ids[0] if event_ids else None,
+                        "last_event_id": event_ids[-1] if event_ids else None,
+                        "sender_ids": sender_ids,
+                        "transcript": "\n".join(transcript_lines),
+                        "source": (
+                            EVIDENCE_SOURCE_OBSERVATION
+                            if observation_row_ids and len(observation_row_ids) == len(event_ids)
+                            else EVIDENCE_SOURCE_MIXED
+                            if observation_row_ids
+                            else EVIDENCE_SOURCE_MEMORY_EVENT
+                        ),
+                        "observation_ids": observation_row_ids,
+                    }
+                )
         return windows
 
     @staticmethod
@@ -2958,6 +3035,7 @@ class MemoryGroupGraphStoreMixin:
                     event_evidence, observation_evidence = _split_window_evidence_ids(
                         candidate.get("evidence_event_ids") or [],
                         observation_event_ids,
+                        rows=window.get("rows") or [],
                     )
                     candidate = {
                         **candidate,
@@ -3711,7 +3789,7 @@ class MemoryGroupGraphStoreMixin:
             if session_id
             else [None]
         ) or [session_id]
-        safe_limit = max(1, min(int(limit or 5000), 10000))
+        safe_limit = max(1, min(int(limit or 50000), 100000))
         items: list[dict[str, Any]] = []
         seen_item_ids: set[int] = set()
         for scoped_session_id in scoped_session_ids:
@@ -3753,7 +3831,7 @@ class MemoryGroupGraphStoreMixin:
         source_counts: dict[str, int] = {}
         event_ids: set[int] = set()
         observation_ids: set[int] = set()
-        window_keys: set[tuple[Any, Any, Any]] = set()
+        window_keys: set[tuple[Any, Any, Any, Any]] = set()
         for item in items:
             value = _safe_json_loads(item.get("value_json"), {})
             if not isinstance(value, dict):
@@ -3793,12 +3871,17 @@ class MemoryGroupGraphStoreMixin:
             source_counts[evidence_source] = source_counts.get(evidence_source, 0) + 1
             window = value.get("window") if isinstance(value.get("window"), dict) else {}
             window_keys.add(
-                (value.get("date"), window.get("first_event_id"), window.get("last_event_id"))
+                (
+                    value.get("date"),
+                    window.get("source") or value.get("evidence_source"),
+                    window.get("first_event_id"),
+                    window.get("last_event_id"),
+                )
             )
         totals["events"] = len(event_ids)
         totals["observations"] = len(observation_ids)
         totals["windows"] = len(
-            [key for key in window_keys if key[1] is not None or key[2] is not None]
+            [key for key in window_keys if key[2] is not None or key[3] is not None]
         )
         return {
             "ok": True,
@@ -4434,7 +4517,8 @@ class MemoryGroupGraphStoreMixin:
             params,
         )
         if scoped_rows:
-            return scoped_rows
+            for row in scoped_rows:
+                row.setdefault("_graph_source", EVIDENCE_SOURCE_MEMORY_EVENT)
         live_params = dict(params)
         live_params.pop("uid", None)
         live_rows = await _exec(
@@ -4449,11 +4533,17 @@ class MemoryGroupGraphStoreMixin:
             f"{limit_sql}",
             live_params,
         )
+        memory_rows = scoped_rows or live_rows or []
         if live_rows:
-            return live_rows
+            for row in live_rows:
+                row.setdefault("_graph_source", EVIDENCE_SOURCE_MEMORY_EVENT)
+            # A user-scoped query is preferred when available; otherwise the
+            # broader live query is the complete imported stream.
+            if not scoped_rows:
+                memory_rows = live_rows
         if effective_source == EVIDENCE_SOURCE_MEMORY_EVENT:
-            return []
-        return await self._load_group_relationship_events_from_observations(
+            return memory_rows
+        observation_rows = await self._load_group_relationship_events_from_observations(
             tenant_id=tenant_id,
             session_ids=session_ids,
             start_at=start_at,
@@ -4461,6 +4551,19 @@ class MemoryGroupGraphStoreMixin:
             cursor_event_id=cursor_event_id,
             limit=limit,
         )
+        if effective_source == EVIDENCE_SOURCE_OBSERVATION:
+            return observation_rows
+        # With no source pin, process both streams.  Keep their row source
+        # marker and sort by timestamp; window construction will split source
+        # boundaries before extracting evidence.
+        combined = [*memory_rows, *observation_rows]
+        combined.sort(
+            key=lambda row: (
+                _coerce_datetime(row.get("created_at")) or start_at,
+                _safe_int(row.get("id"), 0),
+            )
+        )
+        return combined[:limit] if limit is not None else combined
 
     async def _load_group_relationship_events_from_observations(
         self,
@@ -4745,14 +4848,29 @@ class MemoryGroupGraphStoreMixin:
                 current["last_event_id"] = max(int(current.get("last_event_id") or 0), last_id)
         targets = []
         for item in merged.values():
-            # Imported memory events keep priority for a day; observations are the
-            # source for every day that only exists in the live group stream.
-            item["source"] = (
-                EVIDENCE_SOURCE_MEMORY_EVENT
-                if int(item.get("memory_event_count") or 0) > 0
-                else EVIDENCE_SOURCE_OBSERVATION
-            )
-            targets.append(item)
+            # Keep one target/cursor per evidence source.  A day can contain
+            # imported events and newer live observations; preferring one source
+            # silently leaves the other stream unprocessed.
+            memory_count = int(item.get("memory_event_count") or 0)
+            observation_count = int(item.get("observation_count") or 0)
+            if memory_count:
+                targets.append(
+                    {
+                        **item,
+                        "source": EVIDENCE_SOURCE_MEMORY_EVENT,
+                        "event_count": memory_count,
+                        "last_observation_id": 0,
+                    }
+                )
+            if observation_count:
+                targets.append(
+                    {
+                        **item,
+                        "source": EVIDENCE_SOURCE_OBSERVATION,
+                        "event_count": observation_count,
+                        "last_event_id": 0,
+                    }
+                )
         targets.sort(
             key=lambda item: (str(item.get("date") or ""), int(item.get("event_count") or 0)),
             reverse=True,
@@ -4780,6 +4898,7 @@ class MemoryGroupGraphStoreMixin:
                 "FROM plugin_wxbot_group_observations "
                 "WHERE occurred_ts >= :start_ts "
                 "AND session_id LIKE '%@chatroom' "
+                "AND COALESCE(is_self_sent, FALSE) = FALSE "
                 "AND sender_wxid <> '' AND content <> '' "
                 "GROUP BY tenant_id, session_id, "
                 "CAST(to_timestamp(occurred_ts) AT TIME ZONE 'UTC' AS date) "
@@ -4857,18 +4976,51 @@ class MemoryGroupGraphStoreMixin:
         target_date: str,
         source: str | None = None,
     ) -> int:
+        requested_source = _normalize_evidence_source(source)
         cursor_key = _group_graph_auto_cursor_key(
             tenant_id=tenant_id,
             channel=channel,
             source_key=source_key,
             session_id=session_id,
             target_date=target_date,
+            source=requested_source,
         )
         rows = await _exec(
             "SELECT result_json FROM plugin_memory_extraction_job "
             "WHERE idempotency_key = :cursor_key LIMIT 1",
             {"cursor_key": cursor_key},
         )
+        # A source-less lookup is retained for legacy callers.  Prefer the
+        # explicit memory-event key, then fall back to the old unsuffixed key;
+        # never apply either cursor to observations.
+        if not rows and requested_source is None:
+            memory_key = _group_graph_auto_cursor_key(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                target_date=target_date,
+                source=EVIDENCE_SOURCE_MEMORY_EVENT,
+            )
+            rows = await _exec(
+                "SELECT result_json FROM plugin_memory_extraction_job "
+                "WHERE idempotency_key = :cursor_key LIMIT 1",
+                {"cursor_key": memory_key},
+            )
+        if not rows and requested_source in {None, EVIDENCE_SOURCE_MEMORY_EVENT}:
+            legacy_key = _group_graph_auto_cursor_key(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                target_date=target_date,
+            )
+            if legacy_key != cursor_key:
+                rows = await _exec(
+                    "SELECT result_json FROM plugin_memory_extraction_job "
+                    "WHERE idempotency_key = :cursor_key LIMIT 1",
+                    {"cursor_key": legacy_key},
+                )
         if not rows:
             return 0
         raw_payload = rows[0].get("result_json")
@@ -4917,6 +5069,7 @@ class MemoryGroupGraphStoreMixin:
             source_key=source_key,
             session_id=session_id,
             target_date=target_date,
+            source=cursor_source,
         )
         payload = json.dumps(
             {
