@@ -3626,6 +3626,8 @@ async def test_jev_help_nomination_only_in_enabled_group(reply):
         await hook.run(ctx)
         assert ctx.extras['wxbot_participation']['status'] == 'may_reply'
         assert 'jev_help_seeking:plus60' in ctx.extras['wxbot_participation']['reason_codes']
+        expiry = datetime.fromisoformat(ctx.extras['wxbot_participation']['expires_at'])
+        assert expiry == ctx.event.received_at + timedelta(seconds=120)
     else:
         with pytest.raises(HookAbort):
             await hook.run(ctx)
