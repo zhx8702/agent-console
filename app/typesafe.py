@@ -171,6 +171,17 @@ class TypeSafeClient:
 
         return await self.evaluate(state=state, questions=questions, model=model)
 
+    async def evaluate_group_relationship(
+        self,
+        *,
+        state: Any,
+        questions: Mapping[str, Question],
+        model: str | None = None,
+    ) -> TypeSafeEvaluation | None:
+        """Named adapter entry point for the group-graph shadow verifier."""
+
+        return await self.evaluate(state=state, questions=questions, model=model)
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
