@@ -210,3 +210,30 @@ async def test_erasure_requires_vector_cleanup_success():
     with pytest.raises(RuntimeError,match='vector unavailable'):
         await svc.erase_member(tenant_id='t',user_id='member',run=run)
     assert run.await_count==1  # Candidate provenance is retained for the durable retry.
+
+
+async def test_rechecking_own_resolved_followup_is_allowed_but_not_another_candidates():
+    svc=service()
+    prior={'id':'prior','status':'resolved','tenant_id':'t','session_id':'g@chatroom',
+        'draft':draft(solution='',outcome='',resolution_ids=[]).model_dump(),
+        'review':{'resolution_candidate_id':'j'}}
+    svc.store.candidate.return_value=prior
+    svc.jev.client.evaluate.return_value=result(resolves_prior={'noul':.98})
+    current={**row(),'draft':draft(resolves_candidate_id='prior').model_dump()}
+    await svc.review_candidate(current)
+    assert svc.store.save_review.call_args.kwargs['status']=='ready'
+    prior['review']['resolution_candidate_id']='different'
+    with pytest.raises(KnowledgeEvidenceChanged,match='prior_question_changed'):
+        await svc.review_candidate(current)
+
+
+async def test_graceful_shutdown_returns_claim_for_resumption():
+    svc=service()
+    svc._schedule_at=float('inf')
+    job=row()
+    svc.store.claim=AsyncMock(return_value=job)
+    svc.store.finish=AsyncMock(return_value=True)
+    svc.extract_page=AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await svc.tick()
+    svc.store.finish.assert_awaited_once_with('job',job,status='pending',error='WorkerShutdown',retry=True)

@@ -76,8 +76,10 @@ async def test_revision_keeps_baseline_and_reviews_operator_edits_independently(
         "status"
     ] == "needs_review"
     edited["revision"]["base_hash"] = "b" * 64
-    with pytest.raises(KnowledgeEvidenceChanged, match="revision_base_changed"):
-        await svc.build_revision(edited, baseline(), messages(), threshold=0.9)
+    rebased = await svc.build_revision(edited, baseline(), messages(), threshold=.9)
+    assert rebased["base_hash"] == "a"*64 and rebased["previous_revision_id"] == "rev"
+    assert rebased["id"] != "rev" and rebased["status"] == "needs_review"
+    assert rebased["before"]["content"] == baseline().content
 
 
 async def publication_fixture():

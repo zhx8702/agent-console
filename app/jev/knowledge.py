@@ -129,6 +129,8 @@ class JevKnowledgeService:
             try:
                 await handler(row)
             except asyncio.CancelledError:
+                # Graceful deployment does not need to wait for crash-lease expiry.
+                await self.store.finish(kind, row, status="pending", error="WorkerShutdown", retry=True)
                 raise
             except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
                 await self.store.finish(kind, row, status="skipped", error=type(exc).__name__)
@@ -260,8 +262,15 @@ class JevKnowledgeService:
                 raise KnowledgeEvidenceChanged("revision_baseline_too_large")
             return {}
         if proposal:
-            if proposal["target_doc_id"] != doc.id or proposal["base_hash"] != doc.content_hash:
-                raise KnowledgeEvidenceChanged("revision_base_changed")
+            if proposal["target_doc_id"] != doc.id:
+                raise KnowledgeEvidenceChanged("revision_target_changed")
+            if proposal["base_hash"] != doc.content_hash:
+                # Retry after an intervening KB edit: retain proposed text but review it
+                # against the new complete baseline under a fresh revision identity.
+                proposal = {**proposal, "previous_revision_id": proposal["id"], "id": str(uuid4()),
+                    "base_hash": doc.content_hash,
+                    "before": {"title": doc.title, "content": doc.content, "source": doc.source,
+                               "url": doc.url, "metadata": doc.meta}}
             edited = RevisionEdit(title=proposal["title"], content=proposal["content"])
         else:
             await self.require_scope(row["tenant_id"], row["session_id"])
@@ -296,7 +305,9 @@ class JevKnowledgeService:
         prior = None
         if draft.resolves_candidate_id:
             prior = await self.store.candidate(row["tenant_id"], row["session_id"], draft.resolves_candidate_id)
-            if prior is None or prior["status"] != "unresolved":
+            own_resolution = (prior is not None and prior["status"] == "resolved"
+                and (prior.get("review") or {}).get("resolution_candidate_id") == row["id"])
+            if prior is None or (prior["status"] != "unresolved" and not own_resolution):
                 raise KnowledgeEvidenceChanged("prior_question_changed")
             await self.candidate_evidence(prior)
         result = await self.evaluate(row, questions=knowledge_questions(),
