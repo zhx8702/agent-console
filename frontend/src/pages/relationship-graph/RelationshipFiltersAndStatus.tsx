@@ -49,6 +49,7 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
     optionalUserScopeLabel,
     loadGraphAndStatus,
     dateLoading,
+    dateStatusError,
     jobStatsLoading,
     dateRows,
     graph,
@@ -192,6 +193,11 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
           <span>最近 {HISTORY_RECENT_DAYS} 天，仅显示数量、导入状态和 AI 任务计数，不显示聊天内容。</span>
         </div>
         <div className="relationship-date-list" aria-label="近期历史日期状态">
+          {dateStatusError && (
+            <p className="relationship-sync-hint is-warning" role="alert">
+              日期状态加载失败：{dateStatusError}。你仍可继续使用关系图，或直接同步所选日期。
+            </p>
+          )}
           {dateRows.map((row) => (
             <button
               key={row.date}
@@ -210,7 +216,7 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
               </small>
             </button>
           ))}
-          {!dateRows.length && (
+          {!dateRows.length && !dateStatusError && (
             <p className="muted-copy">
               选择授权群聊后，可以查看最近日期状态。
             </p>
@@ -221,7 +227,10 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
       <section className="status-grid relationship-status-grid">
         <StatusTile label="数据版本" value={graph?.schema?.version || "-"} />
         <StatusTile label="节点" value={`${modeFilteredNodes.length} / ${graph?.counts?.nodes ?? nodes.length}`} />
-        <StatusTile label="关系" value={`${graphEdges.length} / ${graph?.counts?.edges ?? edges.length}`} />
+        <StatusTile
+          label="关系（当前视图 / 服务端返回）"
+          value={`${graphEdges.length} / ${graph?.edges?.length ?? edges.length}${graph?.page?.total && graph.page.total > (graph.edges?.length ?? 0) ? `（匹配 ${graph.page.total}）` : ""}`}
+        />
         <StatusTile label="待审保留" value={`${governanceStatus?.needs_review_retention_days ?? "-"} 天`} />
         <StatusTile label="已到期记忆" value={`${governanceStatus?.expired_items ?? 0}`} />
         <StatusTile label="7天内到期" value={`${governanceStatus?.expiring_within_7_days ?? 0}`} />

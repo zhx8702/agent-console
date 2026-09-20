@@ -291,10 +291,14 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               </button>
             </div>
           )}
+          {serverTruncated && (
+            <p className="relationship-sync-hint is-warning" role="status">
+              服务端匹配到 {pageInfo?.total} 条关系，但本次只返回 {graph?.edges?.length || 0} 条{pageInfo?.limit ? `（上限 ${pageInfo.limit}）` : ""}。画布还会按当前视图预算继续筛选；如需查看其余关系，请缩小时间范围或关系类型。
+            </p>
+          )}
           {!!graphNodes.length && (
             <p className="relationship-graph-summary">
               {graphSummaryText}
-              {serverTruncated && ` 服务端共 ${pageInfo?.total} 条匹配关系，按互动强度只返回了前 ${graph?.edges?.length}，收窄时间范围或关系类型可以看到其余部分。`}
               {" "}可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据消息数（对数），透明度表示最近一次证据的新旧。
             </p>
           )}

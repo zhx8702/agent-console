@@ -653,6 +653,8 @@ export type GroupGraphQuery = {
   relation_type?: string;
   min_confidence?: string | number;
   limit?: string | number;
+  /** Opaque server-side cursor for fetching the next page of matched edges. */
+  cursor?: string;
 };
 
 export type GroupGraphEdgeEvidenceQuery = {
@@ -731,6 +733,8 @@ export type GroupGraphHistoryDatesQuery = {
   channel?: string;
   source_key?: string;
   session_id: string;
+  /** Legacy wxbot connection scope used by history adapters. */
+  connection_id?: string;
   user_id?: string;
   recent_days?: string | number;
 };

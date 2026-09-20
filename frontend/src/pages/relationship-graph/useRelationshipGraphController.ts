@@ -78,6 +78,7 @@ export function useRelationshipGraphController() {
   const [targetDate, setTargetDate] = useState(localDateValue());
   const [dateRows, setDateRows] = useState<GroupGraphHistoryDateRow[]>([]);
   const [dateLoading, setDateLoading] = useState(false);
+  const [dateStatusError, setDateStatusError] = useState("");
   const [enqueueLlmJobs, setEnqueueLlmJobs] = useState(true);
   const [extractionBatchLimit, setExtractionBatchLimit] = useState("50");
   const [extractionContinuous, setExtractionContinuous] = useState(false);
@@ -412,28 +413,35 @@ export function useRelationshipGraphController() {
     const tenantId = config.tenantId.trim();
     if (!tenantId || !selectedGroupIsVerified) {
       setDateRows([]);
+      setDateStatusError("");
       setDateLoading(false);
       return;
     }
     const requestScopeKey = currentGraphScopeKey;
     setDateLoading(true);
+    setDateStatusError("");
     try {
       const result = await getGroupGraphHistoryDates(config, {
         tenant_id: tenantId,
         channel: channel.trim(),
         source_key: sourceKey.trim(),
         session_id: selectedGroupId,
+        // The history adapter uses the connection scope to resolve the
+        // account-wide legacy WeChat history. Keep this explicit so older
+        // deployments do not reject the request with an empty connection_id.
+        connection_id: "legacy-wechat-default",
         recent_days: HISTORY_RECENT_DAYS,
       });
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setDateRows(result.items || []);
+      setDateStatusError("");
       void loadJobStats();
     } catch (err) {
       if (activeGraphScopeKeyRef.current !== requestScopeKey) return;
       setDateRows([]);
-      setSyncOutput(formatJson({
-        error: err instanceof ApiError || err instanceof Error ? err.message : "history date status request failed",
-      }));
+      const message = err instanceof ApiError || err instanceof Error ? err.message : "history date status request failed";
+      setDateStatusError(message);
+      setSyncOutput(formatJson({ error: message }));
     } finally {
       if (activeGraphScopeKeyRef.current === requestScopeKey) {
         setDateLoading(false);
@@ -1354,6 +1362,7 @@ export function useRelationshipGraphController() {
     modeHiddenEdgeCount,
     graphSummaryText,
     selectedDateStatus,
+    dateStatusError,
     missingHistorySyncFields,
     historySyncHint,
     optionalUserScopeLabel,

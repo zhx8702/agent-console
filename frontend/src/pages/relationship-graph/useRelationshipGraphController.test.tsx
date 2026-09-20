@@ -347,4 +347,23 @@ describe("useRelationshipGraphController verified group loading", () => {
     ));
     expect(new Headers(extractionCall?.[2]?.init?.headers).has("Idempotency-Key")).toBe(false);
   });
+
+  it("keeps the graph usable and surfaces history-date failures", async () => {
+    apiMocks.getGroupGraph.mockResolvedValue(graphFor("group-a@chatroom"));
+    apiMocks.getGroupGraphHistoryDates.mockRejectedValue(new Error("connection_id cannot be empty"));
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph).not.toBeNull());
+    await act(async () => {
+      await result.current.loadGraphAndStatus();
+    });
+
+    expect(result.current.dateRows).toEqual([]);
+    expect(result.current.dateStatusError).toContain("connection_id cannot be empty");
+    expect(result.current.graph).not.toBeNull();
+    expect(apiMocks.getGroupGraphHistoryDates).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ connection_id: "legacy-wechat-default" }),
+    );
+  });
 });
