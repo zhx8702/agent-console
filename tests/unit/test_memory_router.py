@@ -1181,6 +1181,7 @@ async def test_memory_router_supports_layered_memory_endpoints() -> None:
     }
     assert history_dates_resp.json()["user_id_auto"] is True
     assert store.history_date_calls[0]["user_id"] is None
+    assert store.history_date_calls[0]["connection_id"] == "legacy-wechat-default"
     assert "private user text" not in str(history_dates_resp.json())
     assert list_items_resp.status_code == 200
     assert list_items_resp.json()["items"][0]["content"] == "重点客户"
