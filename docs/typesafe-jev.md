@@ -30,6 +30,8 @@ COMPOSE_TYPESAFE_PARTICIPATION_ENABLED=true
 群内求助使用独立的 `participation_shadow_only` 和 `help_sessions` 白名单，允许在记忆仍为观察模式时
 只对指定群启用主动答疑。会话 ID 使用消息中的规范 ID（`cx1:c:…@chatroom`）；微信群参与策略
 仍按管理界面的外部群 ID 配置。该群还需开启参与策略的 proactive_enabled、主动阶段和 rollout opt-in。
+用户明确指定需要启用的单个群，应将该群的 `proactive_rollout_percent` 设为 100；默认 5% 仍会
+按规范会话 ID 分桶，即使开关已开启也可能不生效。此设置只改变该群，不扩大 Jev 群白名单。
 
 明确 @ 或回复机器人仍按原流程处理。非点名消息由 Jev 判断是否求助，达到阈值才提供软参与信号，
 经过原有安静时段、频率、成员退出、已有人解答、发送前复核等限制后回答。不会把群内任意聊天都当成问题。
