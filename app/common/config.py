@@ -256,6 +256,18 @@ class Settings(BaseSettings):
     typesafe_shadow_only: bool = True
     typesafe_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 
+    @property
+    def typesafe_group_graph_shadow_enabled(self) -> bool:
+        """Compatibility name used by the group-graph shadow hook."""
+
+        return self.typesafe_enabled
+
+    @property
+    def typesafe_group_graph_shadow_timeout_seconds(self) -> float:
+        """Compatibility timeout name used by the group-graph shadow hook."""
+
+        return self.typesafe_timeout
+
     llm_provider: str = "fake"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
