@@ -36,4 +36,20 @@ describe("Jev tenant policy", () => {
     expect(mocks.request.mock.calls[1][1]).toBe("/v1/admin/jev/jobs/job/retry");
     expect(mocks.request.mock.calls[1][2].query.tenant_id).toBe("demo");
   });
+  it("explains a low-confidence reply and can filter its session", async () => {
+    mocks.request.mockResolvedValue({ ...dashboard, items: [{ id: "help", session_id: "room@chatroom", domain: "participation", status: "completed", applied: false, duration_ms: 108, attempts: 1, result: { answers: { decision: { choice: "reply", confidence: .61 } }, _audit: { reason: "low_confidence", min_confidence: .8, trace_id: "tr-help" } } }] });
+    render(<JevPanel />);
+    expect(await screen.findByText("建议回复")).toBeInTheDocument();
+    expect(screen.getByText("置信度未达到阈值")).toBeInTheDocument();
+    expect(screen.getByText("阈值 0.80")).toBeInTheDocument();
+    expect(screen.getByText("tr-help")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("评估会话"), { target: { value: "room@chatroom" } });
+    await waitFor(() => expect(mocks.request.mock.lastCall?.[2].query.session_id).toBe("room@chatroom"));
+  });
+  it("shows the effective memory disposition separately from the recommendation", async () => {
+    mocks.request.mockResolvedValueOnce({ ...dashboard, items: [{ id: "memory", domain: "memory", status: "completed", applied: true, duration_ms: 10, attempts: 1, result: { answers: { decision: { choice: "accepted", confidence: .95 } }, _audit: { reason: "evidence_review_required", effective_decision: "needs_review" } } }] });
+    render(<JevPanel />);
+    expect(await screen.findByText("实际处理：待人工审核")).toBeInTheDocument();
+    expect(screen.getByText("证据或敏感性检查要求人工审核")).toBeInTheDocument();
+  });
 });

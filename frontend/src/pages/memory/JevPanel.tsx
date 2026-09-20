@@ -6,10 +6,11 @@ import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
 const domains = { relationship: "群关系", memory: "长期记忆", intent: "意图判断", moderation: "内容审核", participation: "群内求助" };
 type Domain = keyof typeof domains;
 type Policy = Record<Domain, boolean> & { enabled: boolean; shadow_only: boolean; min_confidence: number; sample_rate: number; participation_shadow_only: boolean; help_sessions: string[] };
-type Evaluation = { id: string; domain: Domain; status: string; attempts: number; applied: boolean; error_type: string; duration_ms: number; target_id: number | null; retryable: boolean; result: { model?: string; answers?: Record<string, { choice?: string; confidence?: number; score?: number }> } | null };
+type Evaluation = { id: string; session_id?: string; domain: Domain; status: string; attempts: number; applied: boolean; error_type: string; duration_ms: number; target_id: number | null; retryable: boolean; result: { model?: string; _audit?: { reason?: string; trace_id?: string; min_confidence?: number; effective_decision?: string }; answers?: Record<string, { choice?: string; confidence?: number; score?: number }> } | null };
 type Dashboard = { policy: Policy; version: number; runtime: { enabled: boolean; key_configured: boolean; model: string }; summary: { domain: Domain; status: string; count: number; input_tokens: number; output_tokens: number; applied: number }[]; items: Evaluation[] };
 const statuses: Record<string, string> = { pending: "等待评估", running: "评估中", completed: "已完成", failed: "失败", skipped: "已跳过" };
-const choices: Record<string, string> = { accepted: "接受", needs_review: "待人工审核", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断" };
+const choices: Record<string, string> = { accepted: "接受", needs_review: "待人工审核", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断", reply: "建议回复", observe: "继续旁观" };
+const reasons: Record<string, string> = { applied: "达到阈值，已交给业务策略", no_change: "保留原流程，无需介入", low_confidence: "置信度未达到阈值", shadow_only: "观察模式，只记录建议", group_removed: "该群已移出答疑白名单", owner_disabled: "所属插件已停用", policy_disabled: "评估策略已停用", evaluation_failed: "评估失败，沿用原流程", online_timeout: "超过在线时限，沿用原流程", human_protected: "保留人工审核或置顶状态", invalid_decision: "判断无效，未应用", evidence_review_required: "证据或敏感性检查要求人工审核" };
 
 export function JevPanel() {
   const { config } = useConsoleConfig();
@@ -17,6 +18,7 @@ export function JevPanel() {
   const [draft, setDraft] = useState<Policy | null>(null);
   const [domain, setDomain] = useState("");
   const [status, setStatus] = useState("");
+  const [sessionId, setSessionId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -27,11 +29,11 @@ export function JevPanel() {
     const current = ++generation.current;
     setBusy(true); setError("");
     try {
-      const result = await apiRequest<Dashboard>(config, "/v1/admin/jev", { auth: true, query: { tenant_id: config.tenantId, domain, status } });
+      const result = await apiRequest<Dashboard>(config, "/v1/admin/jev", { auth: true, query: { tenant_id: config.tenantId, domain, status, session_id: sessionId.trim() } });
       if (current === generation.current) { setData(result); setDraft(result.policy); }
     } catch (e) { if (current === generation.current) setError(String(e)); }
     finally { if (current === generation.current) setBusy(false); }
-  }, [config, domain, status]);
+  }, [config, domain, status, sessionId]);
   useEffect(() => {
     setData(null); setDraft(null); setNotice(""); savedKey.current = null;
     if (config.tenantId) void load();
@@ -89,11 +91,13 @@ export function JevPanel() {
     </>}
     <label>场景<select aria-label="评估场景" value={domain} disabled={busy || dirty} onChange={e => setDomain(e.target.value)}><option value="">全部</option>{Object.entries(domains).map(([key,label]) => <option value={key} key={key}>{label}</option>)}</select></label>
     <label>状态<select aria-label="评估状态" value={status} disabled={busy || dirty} onChange={e => setStatus(e.target.value)}><option value="">全部</option>{Object.entries(statuses).map(([key,label]) => <option value={key} key={key}>{label}</option>)}</select></label>
-    <p>最近记录按审核优先级排序。用量来自上游成功响应，不代表完整账单。</p>
-    <div className="table-wrap"><table><thead><tr><th>场景 / 记忆</th><th>状态</th><th>判断</th><th>置信度</th><th>模型 / 质量 / 优先级</th><th>用时 / 尝试</th><th>处理</th></tr></thead><tbody>{(data?.items || []).map(item => <tr key={item.id}>
+    <label>会话筛选<input aria-label="评估会话" value={sessionId} disabled={dirty} placeholder="会话 ID，留空显示全部" onChange={e => setSessionId(e.target.value)} /></label>
+    <p>最近记录按审核优先级排序。用量来自上游成功响应，不代表完整账单。建议回复仍须通过群参与限制，已参与决策不代表微信已送达。</p>
+    <div className="table-wrap"><table><thead><tr><th>场景 / 记忆</th><th>状态</th><th>判断</th><th>置信度</th><th>模型 / 质量 / 优先级</th><th>用时 / 尝试</th><th>处理及原因</th><th>会话 / 追踪</th></tr></thead><tbody>{(data?.items || []).map(item => <tr key={item.id}>
       <td>{domains[item.domain]}{item.target_id ? ` #${item.target_id}` : ""}</td><td>{statuses[item.status] || item.status}{item.error_type && ` · ${item.error_type}`}</td>
-      <td>{choices[item.result?.answers?.decision?.choice || ""] || "—"}</td><td>{item.result?.answers?.decision?.confidence?.toFixed(2) ?? "—"}</td><td>{item.result?.model || "—"} / {item.result?.answers?.quality?.score ?? "—"} / {item.result?.answers?.priority?.score ?? "—"}</td><td>{item.duration_ms} ms / {item.attempts}</td>
-      <td>{item.applied ? "已参与决策" : "仅记录"}{item.retryable && <button disabled={busy || dirty} onClick={() => void retry(item.id)}>重新评估</button>}</td>
+      <td>{choices[item.result?.answers?.decision?.choice || ""] || item.result?.answers?.decision?.choice || "—"}{item.result?._audit?.effective_decision && <div>实际处理：{choices[item.result._audit.effective_decision] || item.result._audit.effective_decision}</div>}</td><td>{item.result?.answers?.decision?.confidence?.toFixed(2) ?? "—"}{item.result?._audit?.min_confidence != null && <div>阈值 {item.result._audit.min_confidence.toFixed(2)}</div>}</td><td>{item.result?.model || "—"} / {item.result?.answers?.quality?.score ?? "—"} / {item.result?.answers?.priority?.score ?? "—"}</td><td>{item.duration_ms} ms / {item.attempts}</td>
+      <td>{item.applied ? "已参与决策" : "仅记录"}{item.result?._audit?.reason && <div>{reasons[item.result._audit.reason] || item.result._audit.reason}</div>}{item.retryable && <button disabled={busy || dirty} onClick={() => void retry(item.id)}>重新评估</button>}</td>
+      <td className="mono">{item.session_id || "—"}{item.result?._audit?.trace_id && <div>{item.result._audit.trace_id}</div>}</td>
     </tr>)}</tbody></table></div>
     {data && data.items.length === 0 && <p>当前筛选条件下没有评估记录。</p>}
   </section>;

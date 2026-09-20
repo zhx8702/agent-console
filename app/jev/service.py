@@ -6,7 +6,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.common.logging import get_logger
-from app.jev.models import JevPolicy, answer, confidence, fingerprint, memory_fingerprint, questions
+from app.jev.models import (
+    JevPolicy,
+    answer,
+    confidence,
+    fingerprint,
+    memory_fingerprint,
+    questions,
+    with_audit,
+)
 from app.jev.store import JevStore
 
 log = get_logger(__name__)
@@ -111,6 +119,29 @@ class JevService:
 
     async def online(self, *, tenant_id: str, session_id: str, domain: str,
                      state: dict, trace_id: str) -> tuple[dict | None, bool]:
+        started = time.monotonic()
+        try:
+            return await asyncio.wait_for(self._online(
+                tenant_id=tenant_id, session_id=session_id, domain=domain,
+                state=state, trace_id=trace_id), self.settings.typesafe_online_timeout)
+        except TimeoutError:
+            self._failures += 1
+            if self._failures >= 3:
+                self._circuit_until = time.monotonic() + 30
+            # The deadline includes policy reads, owner checks, slot waiting and
+            # audit writes. Only this bounded, local timeout audit runs afterward.
+            try:
+                await asyncio.wait_for(self.store.record_online(
+                    tenant_id=tenant_id, session_id=session_id, domain=domain,
+                    key=fingerprint([trace_id, state, getattr(self.settings, "typesafe_model", "jev-latest")]),
+                    result=with_audit(None, reason="online_timeout", mode="fallback", trace_id=trace_id),
+                    duration_ms=int((time.monotonic()-started)*1000), error="TimeoutError", applied=False), .25)
+            except Exception:
+                log.warning("jev.timeout_audit_failed", domain=domain)
+            return None, False
+
+    async def _online(self, *, tenant_id: str, session_id: str, domain: str,
+                      state: dict, trace_id: str) -> tuple[dict | None, bool]:
         if not self.enabled:
             return None, False
         try:
@@ -126,7 +157,8 @@ class JevService:
             if shadow_only:
                 await asyncio.wait_for(self.store.enqueue(
                     tenant_id=tenant_id, session_id=session_id, domain=domain,
-                    fingerprint=key, input_hash=key, state=state), 1)
+                    fingerprint=key, input_hash=key,
+                    state={**state, "_audit_context": {"trace_id": trace_id[:64]}}), 1)
                 return None, False
             start = time.monotonic()
             result = None
@@ -141,17 +173,30 @@ class JevService:
             self._policies.pop(tenant_id, None)
             policy = await self.policy(tenant_id)
             shadow_only = policy.participation_shadow_only if domain == "participation" else policy.shadow_only
-            active = bool(result and policy.enabled and not shadow_only
-                          and (domain != "participation" or session_id in policy.help_sessions)
-                          and getattr(policy, domain) and confidence(result) >= policy.min_confidence)
-            # The caller only receives the active flag after current owner policy is rechecked.
-            active = active and await self.allowed(tenant_id, session_id, domain)
-            active = active and answer(result, "decision") == ({"intent": "abstain", "moderation": "flag", "participation": "reply"}.get(domain))
+            if error or not result:
+                reason = "evaluation_failed"
+            elif not policy.enabled or not getattr(policy, domain):
+                reason = "policy_disabled"
+            elif domain == "participation" and session_id not in policy.help_sessions:
+                reason = "group_removed"
+            elif shadow_only:
+                reason = "shadow_only"
+            elif confidence(result) < policy.min_confidence:
+                reason = "low_confidence"
+            elif not await self.allowed(tenant_id, session_id, domain):
+                reason = "owner_disabled"
+            elif answer(result, "decision") != {"intent": "abstain", "moderation": "flag", "participation": "reply"}.get(domain):
+                reason = "no_change"
+            else:
+                reason = "applied"
+            active = reason == "applied"
+            audited = with_audit(result, reason=reason, mode="shadow" if shadow_only else "active",
+                                 trace_id=trace_id, threshold=policy.min_confidence)
             await asyncio.wait_for(self.store.record_online(
                 tenant_id=tenant_id, session_id=session_id, domain=domain, key=key,
-                result=result, duration_ms=int((time.monotonic()-start)*1000), error=error,
+                result=audited, duration_ms=int((time.monotonic()-start)*1000), error=error,
                 applied=active), 1)
-            return result, active
+            return (audited if result else None), active
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -202,12 +247,20 @@ class JevService:
 
     async def _process(self, job: dict) -> None:
         started = time.monotonic()
+        state = dict(job["state"] or {})
+        audit_context = state.pop("_audit_context", {})
+        trace_id = str(audit_context.get("trace_id") or "")
         try:
+            self._policies.pop(job["tenant_id"], None)
             policy = await self.policy(job["tenant_id"])
             if not policy.enabled or not getattr(policy, job["domain"]) or not await self.allowed(job["tenant_id"], job["session_id"], job["domain"]):
-                await self.store.finish(job, status="skipped", error="disabled")
+                await self.store.finish(job, status="skipped", error="disabled",
+                    result=with_audit(None, reason="policy_disabled", mode="shadow", trace_id=trace_id))
                 return
-            state = job["state"]
+            if job["domain"] == "participation" and job["session_id"] not in policy.help_sessions:
+                await self.store.finish(job, status="skipped", error="group_removed",
+                    result=with_audit(None, reason="group_removed", mode="shadow", trace_id=trace_id))
+                return
             if job["target_id"] is not None:
                 state = await self.memory_store.jev_state(job)
                 if state is None:
@@ -221,12 +274,15 @@ class JevService:
                 policy = await self.policy(job["tenant_id"])
                 await self.memory_store.apply_jev_result(job, result, policy=policy, duration_ms=duration)
             else:
-                await self.store.finish(job, status="completed", result=result, duration_ms=duration)
+                await self.store.finish(job, status="completed", duration_ms=duration,
+                    result=with_audit(result, reason="shadow_only", mode="shadow",
+                                      trace_id=trace_id, threshold=policy.min_confidence))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             retry = int(job["attempts"]) < self.settings.typesafe_job_max_attempts
             await self.store.finish(job, status="pending" if retry else "failed", error=type(exc).__name__,
+                                    result=with_audit(None, reason="evaluation_failed", mode="queued", trace_id=trace_id),
                                     duration_ms=int((time.monotonic()-started)*1000),
                                     retry_seconds=min(300, 10 * 2 ** int(job["attempts"])))
             log.warning("jev.evaluation_failed", domain=job["domain"], error_type=type(exc).__name__)

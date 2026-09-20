@@ -6,7 +6,7 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.preprocessing.pii import detect_and_mask
 
@@ -27,8 +27,35 @@ class JevPolicy(BaseModel):
     help_sessions: list[str] = Field(default_factory=list, max_length=100)
     sample_rate: float = Field(default=1.0, ge=0, le=1)
 
+    @field_validator("help_sessions", mode="before")
+    @classmethod
+    def normalize_help_sessions(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        cleaned = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("help_sessions must contain group session IDs")
+            item = item.strip()
+            if not item:
+                continue
+            if len(item) > 256 or not item.endswith("@chatroom") or any(c.isspace() for c in item):
+                raise ValueError("help_sessions must contain group session IDs ending in @chatroom")
+            if item not in cleaned:
+                cleaned.append(item)
+        return cleaned
+
 
 Domain = Literal["relationship", "memory", "intent", "moderation", "participation"]
+
+
+def with_audit(result: dict | None, *, reason: str, mode: str, trace_id: str = "",
+               threshold: float | None = None, effective_decision: str = "") -> dict:
+    """Local decision metadata, never sent to the evaluator as evidence."""
+    return {**(result or {}), "_audit": {
+        "reason": reason, "mode": mode, "trace_id": trace_id[:64],
+        "min_confidence": threshold, "effective_decision": effective_decision,
+    }}
 
 
 def fingerprint(value: Any) -> str:

@@ -84,15 +84,15 @@ class JevStore:
              "output": int(usage.get("output_tokens") or 0), "applied": applied},
         )
 
-    async def dashboard(self, tenant_id: str, *, domain: str = "", status: str = "", limit: int = 50) -> dict:
-        where = "tenant_id=:tid AND (:domain='' OR domain=:domain)"
-        params: dict[str, Any] = {"tid": tenant_id, "domain": domain, "status": status, "limit": limit}
+    async def dashboard(self, tenant_id: str, *, domain: str = "", status: str = "", session_id: str = "", limit: int = 50) -> dict:
+        where = "tenant_id=:tid AND (:domain='' OR domain=:domain) AND (:sid='' OR session_id=:sid)"
+        params: dict[str, Any] = {"tid": tenant_id, "domain": domain, "status": status, "sid": session_id, "limit": limit}
         summary = await execute(
             "SELECT domain,status,count(*) AS count,sum(attempts) AS attempts,sum(input_tokens) AS input_tokens,"
             "sum(output_tokens) AS output_tokens,sum(duration_ms) AS total_duration_ms,"
             "count(*) FILTER (WHERE applied) AS applied FROM jev_evaluation WHERE " + where + " GROUP BY domain,status", params)
         items = await execute(
-            "SELECT id,domain,target_id,status,attempts,result,error_type,duration_ms,input_tokens,output_tokens,"
+            "SELECT id,session_id,domain,target_id,status,attempts,result,error_type,duration_ms,input_tokens,output_tokens,"
             "applied,created_at,updated_at,(status='failed' AND (target_id IS NOT NULL OR state::jsonb<>'{}'::jsonb)) AS retryable FROM jev_evaluation WHERE " + where + " AND (:status='' OR status=:status) "
             "ORDER BY CASE WHEN jsonb_typeof(result::jsonb #> '{answers,priority,score}')='number' THEN (result::jsonb #>> '{answers,priority,score}')::float ELSE 0 END DESC, created_at DESC LIMIT :limit", params)
         return {"summary": summary, "items": items}

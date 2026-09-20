@@ -122,3 +122,67 @@ async def test_help_seeking_has_independent_shadow_and_group_scope():
     svc.client.evaluate.assert_not_awaited()
     _, active = await svc.online(tenant_id='t',session_id='room@chatroom',domain='participation',state={},trace_id='t')
     assert active
+
+
+def test_help_group_ids_trim_deduplicate_and_reject_non_groups():
+    from pydantic import ValidationError
+    policy = JevPolicy(help_sessions=[' room@chatroom ', '', 'room@chatroom', 'other@chatroom'])
+    assert policy.help_sessions == ['room@chatroom', 'other@chatroom']
+    for invalid in [['user'], ['has spaces@chatroom'], [None]]:
+        with pytest.raises(ValidationError):
+            JevPolicy(help_sessions=invalid)
+
+
+async def test_low_confidence_reply_records_reason_and_trace_without_applying():
+    svc = service(JevPolicy(participation_shadow_only=False, help_sessions=['room@chatroom']), result('reply', .61))
+    response, active = await svc.online(tenant_id='t', session_id='room@chatroom', domain='participation',
+                                       state={'message':'how?'}, trace_id='trace-help')
+    assert not active
+    assert response['_audit'] == {'reason':'low_confidence', 'mode':'active', 'trace_id':'trace-help',
+                                  'min_confidence':.8, 'effective_decision':''}
+    assert svc.store.record_online.call_args.kwargs['result']['_audit'] == response['_audit']
+    assert '_audit' not in svc.client.evaluate.call_args.kwargs['state']
+
+
+async def test_whole_online_deadline_bounds_slow_owner_lookup():
+    svc = service(JevPolicy(shadow_only=False))
+    async def blocked(*args, **kwargs):
+        await asyncio.sleep(10)
+    svc.registry.scope_execution_allowed.side_effect = blocked
+    response = await asyncio.wait_for(svc.online(tenant_id='t',session_id='s',domain='moderation',
+                                                state={},trace_id='tr'), .15)
+    assert response == (None, False)
+    svc.client.evaluate.assert_not_awaited()
+    assert svc.store.record_online.call_args.kwargs['result']['_audit']['reason'] == 'online_timeout'
+
+
+async def test_whole_online_deadline_keeps_cancellation_visible():
+    svc = service()
+    svc.store.policy.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await svc.online(tenant_id='t',session_id='s',domain='intent',state={},trace_id='tr')
+    svc.store.record_online.assert_not_awaited()
+
+
+async def test_queued_help_revocation_blocks_upstream_even_with_cached_policy():
+    enabled = JevPolicy(help_sessions=['room@chatroom'])
+    svc = service(enabled)
+    await svc.policy('t')
+    svc.store.policy.return_value = (JevPolicy(), 2)
+    await svc._process({'tenant_id':'t', 'session_id':'room@chatroom', 'domain':'participation',
+                       'state':{'message':'help', '_audit_context':{'trace_id':'tr'}},
+                       'target_id':None, 'attempts':1})
+    svc.client.evaluate.assert_not_awaited()
+    assert svc.store.finish.call_args.kwargs['status'] == 'skipped'
+    assert svc.store.finish.call_args.kwargs['error'] == 'group_removed'
+
+
+async def test_queued_shadow_preserves_trace_without_sending_it_upstream():
+    svc = service()
+    await svc.online(tenant_id='t',session_id='s',domain='intent',state={'message':'hello'},trace_id='trace-intent')
+    state = svc.store.enqueue.call_args.kwargs['state']
+    await svc._process({'tenant_id':'t','session_id':'s','domain':'intent', 'state':state,
+                       'target_id':None, 'attempts':1})
+    assert svc.client.evaluate.call_args.kwargs['state'] == {'message':'hello'}
+    assert svc.store.finish.call_args.kwargs['result']['_audit']['trace_id'] == 'trace-intent'
+    assert state['_audit_context']['trace_id'] == 'trace-intent'

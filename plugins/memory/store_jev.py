@@ -5,7 +5,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from app.common.logging import get_logger
-from app.jev.models import answer, confidence, memory_fingerprint, probability, redact
+from app.jev.models import answer, confidence, memory_fingerprint, probability, redact, with_audit
 from plugins.memory import store as runtime
 
 log = get_logger(__name__)
@@ -141,7 +141,25 @@ class MemoryJevStoreMixin:
                     probability(result, "sensitive", fallback=1) >= 0.5 or
                     probability(result, "supported", fallback=0) < max(0.5, policy.min_confidence)):
                 decision = "needs_review"
+            if not policy.enabled or not getattr(policy, job["domain"]):
+                reason = "policy_disabled"
+            elif policy.shadow_only:
+                reason = "shadow_only"
+            elif human_reviewed or item.get("pinned") or item.get("source_type") in {"manual", "explicit_user"}:
+                reason = "human_protected"
+            elif confidence(result) < policy.min_confidence:
+                reason = "low_confidence"
+            elif not can_apply:
+                reason = "invalid_decision"
+            elif decision != answer(result, "decision"):
+                reason = "evidence_review_required"
+            else:
+                reason = "applied"
+            result = with_audit(result, reason=reason, mode="shadow" if policy.shadow_only else "active",
+                                threshold=policy.min_confidence, effective_decision=decision if can_apply else "")
             audit["applied"] = can_apply
+            audit["reason"] = reason
+            audit["effective_decision"] = decision if can_apply else ""
             await self.update_memory_item(int(item["id"]), value_json=value)
             if can_apply:
                 action = {"accepted": "accept", "rejected": "reject", "needs_review": "needs_review"}[decision]

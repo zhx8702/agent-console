@@ -101,6 +101,9 @@ async def test_freshness_and_active_review(env, mode):
         assert job['applied']
         assert current['acceptance_status'] == ('accepted' if mode == 'active' else 'needs_review')
         assert current['value']['acceptance']['reviewed_by'] == 'system/jev'
+        audit = job['result']['_audit']
+        assert audit['effective_decision'] == ('accepted' if mode == 'active' else 'needs_review')
+        assert audit['reason'] == ('applied' if mode == 'active' else 'evidence_review_required')
 
 
 async def test_claim_fencing_crash_recovery_and_finite_retries(env):
@@ -183,3 +186,17 @@ async def test_admin_policy_idempotency_version_and_tenant_scope(env, monkeypatc
         assert (await client.put(path, json=payload,headers=headers)).status_code == 403
         actor = Principal(subject='reviewer', roles=(AdminRole.REVIEWER.value,), tenant_ids=(tid,), group_ids=('s',), auth_kind='test')
         assert (await client.get(f'/v1/admin/jev?tenant_id={tid}')).status_code == 403
+
+
+async def test_dashboard_filters_scope_and_preserves_audit(env):
+    tid, store, _, _, response = env
+    await store.record_online(tenant_id=tid,session_id='room@chatroom',domain='participation',key='help',
+        result={**response,'_audit':{'trace_id':'trace-help','reason':'low_confidence'}},duration_ms=25)
+    await store.enqueue(tenant_id=tid,session_id='other@chatroom',domain='intent',fingerprint='other',input_hash='other')
+    dashboard = await store.dashboard(tid,session_id='room@chatroom')
+    assert len(dashboard['items']) == 1
+    assert dashboard['items'][0]['session_id'] == 'room@chatroom'
+    assert dashboard['items'][0]['result']['_audit']['trace_id'] == 'trace-help'
+    assert sum(x['count'] for x in dashboard['summary']) == 1
+    assert not (await store.dashboard(tid,session_id='missing@chatroom'))['items']
+    assert not (await store.dashboard('other-tenant',session_id='room@chatroom'))['items']

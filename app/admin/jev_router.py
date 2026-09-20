@@ -45,10 +45,11 @@ def build_jev_router(service, settings) -> APIRouter:
                         tenant_id: str = Query(min_length=1, max_length=64),
                         domain: Literal["", "relationship", "memory", "intent", "moderation", "participation"] = "",
                         status: Literal["", "pending", "running", "completed", "failed", "skipped"] = "",
+                        session_id: str = Query(default="", max_length=256),
                         limit: int = Query(default=50, ge=1, le=100)):
         principal_for(request, tenant_id)
         policy, version = await service.store.policy(tenant_id, service.defaults())
-        payload = await service.store.dashboard(tenant_id, domain=domain, status=status, limit=limit)
+        payload = await service.store.dashboard(tenant_id, domain=domain, status=status, session_id=session_id, limit=limit)
         response.headers["ETag"] = f'"{version}"'
         return {**payload, "policy": policy.model_dump(), "version": version,
                 "runtime": {"enabled": bool(settings.typesafe_enabled),
