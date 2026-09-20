@@ -143,3 +143,21 @@ API：
 
 迁移 `0054_jev_knowledge` 添加每日任务及候选表，`0055_jev_revisions` 添加修订和质量发现。
 回滚前先停用知识整理；旧应用可以保留新增表。开发和运行验证见 `docs/jev-knowledge-iteration.md`。
+
+
+## 历史分页与人工复盘
+
+知识面板支持候选与复盘状态筛选，以及任务、候选、复盘独立继续加载。
+列表按创建时间和 ID 排序；游标绑定当前租户、群及筛选条件。GET `/v1/admin/jev/knowledge`
+支持 `job_cursor` / `candidate_cursor` / `finding_cursor`、`candidate_status` / `finding_status`，
+返回 `pagination.jobs` / `pagination.candidates` / `pagination.findings` 作为下一页游标。
+`page_size` 为 1–100，任务单页最多 50 条。统计仍是当前群范围的观察发现数，不是漏答率。
+
+POST `/v1/admin/jev/knowledge/findings/{id}?tenant_id=…` 支持 `confirm` / `dismiss`，
+请求包括 `expected_status`、`reason` 与 `Idempotency-Key`。确认必须先调用证据接口，
+取得当前原文和处理/发送记录的 `evidence_hash` 并提交；证据变化时返回 409，需要重新查看。
+结果分别为 `confirmed`（人工确认）和 `dismissed`（人工排除），保留原 Jev 判断与人工处理信息。
+人工确认复盘不会自动调整群策略、发表知识或向群发送消息。
+
+正常安静时段、已有人解答、明确配额限制等不直接确认为漏答；缺少实际发送证据的回复质量结论待核验。
+知识比对不截取长文档后作确定判断；超过当前完整评估上限的文档及尚未解决的多文档冲突均保留待核验。

@@ -35,15 +35,28 @@ def register_knowledge_routes(router, jev, principal_for):
             raise HTTPException(503, "knowledge_service_unavailable")
         return jev.knowledge_service
 
+    from app.admin.jev_quality_router import register_quality_routes
     from app.admin.jev_revision_router import register_revision_routes
     register_revision_routes(router, service, principal_for)
+    register_quality_routes(router, service, principal_for)
 
     @router.get("/knowledge")
     @declare_route_permission(RoutePermission("GET", "/v1/admin/jev/knowledge", AdminPermission.READ))
     async def dashboard(request: Request, tenant_id: str = Query(min_length=1, max_length=64),
-                        session_id: str = Query(default="", max_length=256)):
+                        session_id: str = Query(default="", max_length=256),
+                        job_cursor: str = Query(default="", max_length=512),
+                        candidate_cursor: str = Query(default="", max_length=512),
+                        finding_cursor: str = Query(default="", max_length=512),
+                        candidate_status: Literal["", "pending", "running", "failed", "skipped", "needs_review", "ready", "revision_ready", "unresolved", "resolved", "published", "rejected", "duplicate"] = "",
+                        finding_status: Literal["", "needs_review", "supported", "rejected", "confirmed", "dismissed"] = "",
+                        page_size: int = Query(default=100, ge=1, le=100)):
         principal_for(request, tenant_id)
-        return await service().store.dashboard(tenant_id, session_id)
+        try:
+            return await service().store.dashboard(tenant_id, session_id, job_cursor=job_cursor,
+                candidate_cursor=candidate_cursor, finding_cursor=finding_cursor,
+                candidate_status=candidate_status, finding_status=finding_status, page_size=page_size)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid_knowledge_cursor") from exc
 
     @router.post("/knowledge/jobs/{job_id}/retry")
     @declare_route_permission(RoutePermission("POST", "/v1/admin/jev/knowledge/jobs/{job_id}/retry", AdminPermission.DANGER))
@@ -110,7 +123,11 @@ def register_knowledge_routes(router, jev, principal_for):
                 raise KnowledgeEvidenceChanged("source_removed_or_blocked")
         except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
             raise HTTPException(409, str(exc)) from exc
-        return {"messages": svc.message_payload(messages)}
+        from app.jev.models import fingerprint
+        payload = svc.message_payload(messages)
+        runtime = await svc.store.runtime_evidence(tenant_id, row["session_id"], ids)
+        safe_runtime = svc.runtime_payload(runtime)
+        return {"messages": payload, "evidence_hash": fingerprint({"messages": payload, "runtime": safe_runtime}), "runtime": safe_runtime}
 
     @router.post("/knowledge/candidates/{candidate_id}")
     @declare_route_permission(RoutePermission("POST", "/v1/admin/jev/knowledge/candidates/{candidate_id}", AdminPermission.DANGER))

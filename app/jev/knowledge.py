@@ -333,8 +333,13 @@ class JevKnowledgeService:
                         if doc:
                             docs[doc.id] = doc
             for doc in docs.values():
+                if len(doc.content) > 24000:
+                    comparisons.append({"doc_id": doc.id, "session_id": doc.session_id,
+                        "content_hash": doc.content_hash, "relation": "review", "confidence": 0,
+                        "result": {"reason": "comparison_document_too_large"}})
+                    continue
                 compared = await self.evaluate(row, questions=comparison_questions(), state={
-                    "candidate": draft.model_dump(), "existing": {"title": redact(doc.title), "content": redact(doc.content, limit=6000)}},
+                    "candidate": draft.model_dump(), "existing": {"title": redact(doc.title), "content": redact(doc.content, limit=24000)}},
                     purpose=f"compare:{doc.id}:{doc.content_hash}")
                 relation = answer(compared, "decision")
                 comparisons.append({"doc_id": doc.id, "session_id": doc.session_id, "content_hash": doc.content_hash,
@@ -353,8 +358,12 @@ class JevKnowledgeService:
             elif any(c["relation"] == "duplicate" for c in comparisons):
                 disposition, reason = "duplicate", "existing_knowledge_duplicate"
             if revision:
-                disposition = "revision_ready" if revision.get("status") == "ready" else "needs_review"
-                reason = "revision_supported" if disposition == "revision_ready" else "revision_requires_review"
+                other_conflicts = any(c["doc_id"] != revision.get("target_doc_id") and (
+                    c["relation"] not in {"duplicate", "unrelated"} or c["confidence"] < policy.knowledge_min_confidence)
+                    for c in comparisons)
+                disposition = "revision_ready" if revision.get("status") == "ready" and not other_conflicts else "needs_review"
+                reason = ("other_knowledge_requires_review" if other_conflicts else
+                    "revision_supported" if disposition == "revision_ready" else "revision_requires_review")
         if snapshot != await self.store.knowledge_snapshot(row["tenant_id"], row["session_id"], row["id"]):
             raise RuntimeError("knowledge_changed_during_review")
         result["_knowledge_snapshot"] = snapshot

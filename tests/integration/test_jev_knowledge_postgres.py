@@ -29,12 +29,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.skipif(not os.getenv('JEV_TES
 @pytest_asyncio.fixture
 async def env(monkeypatch):
     import app.admin.jev_knowledge_router as kr
+    import app.admin.jev_quality_router as qr
     import app.admin.jev_revision_router as rr
     import app.admin.jev_router as jr
     import app.jev.knowledge_store as ks
     import app.jev.store as js
     engine = create_async_engine(os.environ['JEV_TEST_DSN'])
-    for module in (kr, jr, rr, ks, js):
+    for module in (kr, jr, rr, qr, ks, js):
         monkeypatch.setattr(module, 'get_engine', lambda: engine)
     tid = 'knowledge-test-' + uuid4().hex[:12]
     policy = JevPolicy(knowledge=True, knowledge_sessions=['g@chatroom'])
@@ -378,3 +379,77 @@ async def test_real_kb_revision_lock_serializes_writers_and_failed_index_preserv
     finally:
         await kb.delete_document(tid,doc_id,session_id='g@chatroom')
         await engine.dispose()
+
+
+async def test_console_pages_survive_new_inserts_and_reject_cross_scope_cursor(env):
+    import json
+    tid,store,_,client=env
+    c=await candidate(env)
+    for i in range(5):
+        await execute("INSERT INTO jev_knowledge_candidate (id,job_id,tenant_id,session_id,fingerprint,draft,source_members,status) "
+            "VALUES (:id,:job,:tid,'g@chatroom',:hash,CAST(:draft AS JSON),'[]','unresolved')",
+            {'id':str(uuid4()),'job':c['job_id'],'tid':tid,'hash':str(i),'draft':json.dumps(c['draft'])})
+    first=await store.dashboard(tid,'g@chatroom',candidate_status='unresolved',page_size=2)
+    cursor=first['pagination']['candidates']
+    assert cursor and len(first['candidates'])==2
+    await execute("INSERT INTO jev_knowledge_candidate (id,job_id,tenant_id,session_id,fingerprint,draft,source_members,status) "
+        "VALUES (:id,:job,:tid,'g@chatroom','new',CAST(:draft AS JSON),'[]','unresolved')",
+        {'id':str(uuid4()),'job':c['job_id'],'tid':tid,'draft':json.dumps(c['draft'])})
+    second=await store.dashboard(tid,'g@chatroom',candidate_status='unresolved',candidate_cursor=cursor,page_size=2)
+    third=await store.dashboard(tid,'g@chatroom',candidate_status='unresolved',candidate_cursor=second['pagination']['candidates'],page_size=2)
+    ids=[r['id'] for page in [first,second,third] for r in page['candidates']]
+    assert len(ids)==len(set(ids))==5 and not third['pagination']['candidates']
+    for query in [{'session_id':'other@chatroom','candidate_status':'unresolved','candidate_cursor':cursor},
+                  {'session_id':'g@chatroom','candidate_status':'ready','candidate_cursor':cursor},
+                  {'candidate_cursor':'broken'}]:
+        response=await client.get('/v1/admin/jev/knowledge',params={'tenant_id':tid,**query})
+        assert response.status_code==400,response.text
+
+
+async def quality_finding(env):
+    tid,store,_,_=env
+    rows=await seed(tid)
+    await store.schedule(tid,'g@chatroom',date(2026,9,20),0,1000)
+    job=await store.claim('job')
+    finding={'finding':{'kind':'missed_help','title':'复盘候选','explanation':'待核验','evidence_ids':[rows[0]['id']],'trace_ids':[]},
+        'review':{'model':'jev-test'},'status':'needs_review','reason':'low_confidence'}
+    await store.save_page(job,rows,[],findings=[finding])
+    return (await store.dashboard(tid))['findings'][0]
+
+
+async def test_manual_quality_review_requires_current_evidence_and_is_idempotent(env):
+    tid,store,_,client=env
+    f=await quality_finding(env)
+    path=f"/v1/admin/jev/knowledge/findings/{f['id']}"
+    payload={'action':'confirm','expected_status':'needs_review','reason':'核对了原始问题和实际处理记录'}
+    missing=await client.post(path,params={'tenant_id':tid},json=payload,headers={'Idempotency-Key':'missing'})
+    assert missing.status_code==409,missing.text
+    evidence=await client.get(path+'/evidence',params={'tenant_id':tid})
+    assert evidence.status_code==200,evidence.text
+    payload['evidence_hash']=evidence.json()['evidence_hash']
+    confirmed=await client.post(path,params={'tenant_id':tid},json=payload,headers={'Idempotency-Key':'review'})
+    assert confirmed.status_code==200,confirmed.text
+    replay=await client.post(path,params={'tenant_id':tid},json=payload,headers={'Idempotency-Key':'review'})
+    assert replay.json()==confirmed.json()
+    stale=await client.post(path,params={'tenant_id':tid},json={**payload,'action':'dismiss'},headers={'Idempotency-Key':'different'})
+    assert stale.status_code==409
+    row=(await store.dashboard(tid))['findings'][0]
+    assert row['status']=='confirmed' and row['review']['model']=='jev-test'
+    assert row['review']['_operator']['reason']==payload['reason']
+    assert not (await store.dashboard(tid))['candidates']
+
+
+async def test_quality_confirmation_rejects_changed_evidence_and_dismissal_retains_reason(env):
+    tid,store,_,client=env
+    f=await quality_finding(env)
+    path=f"/v1/admin/jev/knowledge/findings/{f['id']}"
+    evidence=await client.get(path+'/evidence',params={'tenant_id':tid})
+    await execute("UPDATE plugin_wxbot_group_observations SET content='已经得到回答' WHERE id=:id",{'id':f['finding']['evidence_ids'][0]})
+    payload={'action':'confirm','expected_status':'needs_review','reason':'核验','evidence_hash':evidence.json()['evidence_hash']}
+    response=await client.post(path,params={'tenant_id':tid},json=payload,headers={'Idempotency-Key':'changed'})
+    assert response.status_code==409 and response.json()['detail']=='finding_evidence_changed_reload'
+    denied=await client.post(path,params={'tenant_id':'other'},json=payload,headers={'Idempotency-Key':'denied'})
+    assert denied.status_code==403
+    response=await client.post(path,params={'tenant_id':tid},json={**payload,'action':'dismiss','reason':'群友已经提供了正确答案'},headers={'Idempotency-Key':'dismiss'})
+    assert response.status_code==200,response.text
+    assert (await store.dashboard(tid,finding_status='dismissed'))['findings'][0]['review']['_operator']['reason']=='群友已经提供了正确答案'

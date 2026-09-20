@@ -84,10 +84,10 @@ class KnowledgeStore:
     async def runtime_evidence(self, tenant_id: str, session_id: str, ids: list[int]) -> list[dict]:
         return await execute(
             "SELECT o.id,p.trace_id,p.status AS processing_status,p.reason AS processing_reason,"
-            "COALESCE((SELECT json_agg(json_build_object('status',q.status,'reply_text',q.reply_text,'error',q.error)) "
+            "COALESCE((SELECT json_agg(json_build_object('status',q.status,'reply_text',q.reply_text,'error',q.error) ORDER BY q.id) "
             "FROM plugin_wxbot_reply_queue q WHERE q.tenant_id=p.tenant_id AND q.trace_id=p.trace_id "
             "AND p.trace_id<>''), '[]') AS deliveries, "
-            "COALESCE((SELECT json_agg(json_build_object('status',s.status,'reasons',s.reason_codes_json,'stage',s.runtime_stage)) "
+            "COALESCE((SELECT json_agg(json_build_object('status',s.status,'reasons',s.reason_codes_json,'stage',s.runtime_stage) ORDER BY s.id) "
             "FROM social_participation_event s WHERE s.tenant_id=p.tenant_id AND s.session_id=p.session_id "
             "AND s.trace_id=p.trace_id AND p.trace_id<>'' AND s.event_kind='runtime'), '[]') AS decisions "
             "FROM plugin_wxbot_group_observations o LEFT JOIN processed_messages p ON p.tenant_id=o.tenant_id "
@@ -213,14 +213,18 @@ class KnowledgeStore:
             {"tid": tenant_id, "sid": session_id, "candidate": candidate_id})
         return fingerprint(rows)
 
-    async def dashboard(self, tenant_id: str, session_id: str = "") -> dict:
-        params = {"tid": tenant_id, "sid": session_id}
-        where = "tenant_id=:tid AND (:sid='' OR session_id=:sid)"
-        jobs = await execute("SELECT * FROM jev_knowledge_job WHERE " + where + " ORDER BY period DESC,created_at DESC LIMIT 50", params)
-        candidates = await execute("SELECT * FROM jev_knowledge_candidate WHERE " + where + " ORDER BY created_at DESC LIMIT 100", params)
-        for row in [*jobs, *candidates]:
-            row.pop("lease_token", None)
-        findings = await execute("SELECT * FROM jev_quality_finding WHERE " + where + " ORDER BY created_at DESC LIMIT 100", params)
+    async def dashboard(self, tenant_id: str, session_id: str = "", *, job_cursor: str = "",
+                        candidate_cursor: str = "", finding_cursor: str = "", candidate_status: str = "",
+                        finding_status: str = "", page_size: int = 100) -> dict:
+        from app.jev.knowledge_pages import read_page
+        page_size = max(1, min(100, page_size))
+        jobs, job_next = await read_page("jobs", tenant_id, session_id, cursor=job_cursor, limit=min(50, page_size))
+        candidates, candidate_next = await read_page("candidates", tenant_id, session_id,
+            status=candidate_status, cursor=candidate_cursor, limit=page_size)
+        findings, finding_next = await read_page("findings", tenant_id, session_id,
+            status=finding_status, cursor=finding_cursor, limit=page_size)
         quality_summary = await execute("SELECT finding->>'kind' AS kind,status,count(*) AS count FROM jev_quality_finding WHERE "
-                                        + where + " GROUP BY finding->>'kind',status", params)
-        return {"jobs": jobs, "candidates": candidates, "findings": findings, "quality_summary": quality_summary}
+            "tenant_id=:tid AND (:sid='' OR session_id=:sid) GROUP BY finding->>'kind',status",
+            {"tid": tenant_id, "sid": session_id})
+        return {"jobs": jobs, "candidates": candidates, "findings": findings, "quality_summary": quality_summary,
+            "pagination": {"jobs": job_next, "candidates": candidate_next, "findings": finding_next}}

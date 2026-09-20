@@ -50,3 +50,40 @@ describe("daily knowledge review", () => {
     expect(screen.queryByText(/修复证书错误/)).not.toBeInTheDocument();
   });
 });
+
+it("loads older candidates without dropping visible records and applies status filters", async () => {
+  mocks.request.mockResolvedValueOnce({ jobs: [], candidates: [item], pagination: { candidates: "cursor-one" } })
+    .mockResolvedValueOnce({ jobs: [], candidates: [{ ...item, id: "older", draft: { ...item.draft, title: "历史证书方案" } }], pagination: {} })
+    .mockResolvedValueOnce({ jobs: [], candidates: [] });
+  render(<JevKnowledgePanel sessionId="group@chatroom" disabled={false} />);
+  fireEvent.click(screen.getByText("加载知识任务与候选"));
+  fireEvent.click(await screen.findByText("加载更多知识候选"));
+  await screen.findByText(/历史证书方案/);
+  expect(screen.getByText(/修复证书错误/)).toBeInTheDocument();
+  expect(mocks.request.mock.calls[1][2].query.candidate_cursor).toBe("cursor-one");
+  fireEvent.change(screen.getByLabelText("知识候选状态"), { target: { value: "needs_review" } });
+  expect(screen.queryByText(/历史证书方案/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText("加载知识任务与候选"));
+  await waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(3));
+  expect(mocks.request.mock.calls[2][2].query).toEqual({ tenant_id: "demo", session_id: "group@chatroom", candidate_status: "needs_review" });
+});
+
+it("requires viewed evidence before confirming a quality finding", async () => {
+  const finding = { id: "finding", status: "needs_review", reason: "low_confidence", finding: { title: "可能漏答", explanation: "待核验", kind: "missed_help", evidence_ids: [2], trace_ids: ["trace"] } };
+  mocks.request.mockResolvedValueOnce({ jobs: [], candidates: [], findings: [finding] })
+    .mockResolvedValueOnce({ messages: [{ id: 2, speaker: "member_1", text: "问题原文" }], evidence_hash: "current-evidence", runtime: [{ message_id: 2, processing_status: "permanent_failure", processing_reason: "provider_error", decisions: [], deliveries: [] }] })
+    .mockResolvedValueOnce({ status: "confirmed" })
+    .mockResolvedValueOnce({ jobs: [], candidates: [], findings: [{ ...finding, status: "confirmed", review: { _operator: { actor: "admin", reason: "核对失败记录" } } }] });
+  render(<JevKnowledgePanel sessionId="g" disabled={false} />);
+  fireEvent.click(screen.getByText("加载知识任务与候选"));
+  const confirm = await screen.findByText("确认复盘结论");
+  fireEvent.change(screen.getByLabelText("复盘处理说明 finding"), { target: { value: "核对失败记录" } });
+  expect(confirm).toBeDisabled();
+  fireEvent.click(screen.getByText("查看复盘证据"));
+  await screen.findByText("问题原文");
+  fireEvent.click(confirm);
+  fireEvent.click(screen.getByText("确认执行"));
+  await screen.findByText(/人工处理：admin/);
+  expect(JSON.parse(mocks.request.mock.calls[2][2].init.body)).toEqual({ action: "confirm", expected_status: "needs_review", reason: "核对失败记录", evidence_hash: "current-evidence" });
+  expect(screen.queryByText("确认复盘结论")).not.toBeInTheDocument();
+});

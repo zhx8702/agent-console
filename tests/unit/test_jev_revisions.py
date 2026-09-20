@@ -195,3 +195,43 @@ async def test_quality_findings_unknown_evidence_does_not_checkpoint():
     with pytest.raises(ValueError, match="unknown_quality_evidence"):
         await svc.extract_page(row())
     svc.store.save_page.assert_not_awaited()
+
+
+@pytest.mark.parametrize('reason',['quiet_hours','answered_by_member','soft_budget_hour_exhausted','member_opt_out'])
+async def test_expected_policy_behavior_cannot_be_confirmed_as_missed_help(reason):
+    finding=QualityFinding(kind='missed_help',title='漏答',explanation='未答',evidence_ids=[1])
+    runtime=[{'trace_id':'t','processing_status':'intentionally_suppressed','decisions':[{'reasons':[reason]}]}]
+    assert quality_disposition(finding,result('supported'),runtime,.9)==('rejected','expected_policy_behavior')
+
+
+@pytest.mark.parametrize('kind',['unhelpful_answer','unnecessary_reply','good_resolution'])
+def test_answer_quality_requires_sent_reply(kind):
+    finding=QualityFinding(kind=kind,title='回答复盘',explanation='评价回答',evidence_ids=[1])
+    assert quality_disposition(finding,result('supported'),[],.9)==('needs_review','delivered_answer_missing')
+    assert quality_disposition(finding,result('supported'),[{'deliveries':[{'status':'sent'}]}],.9)[0]=='supported'
+
+
+async def test_oversized_knowledge_comparison_stays_for_review():
+    svc=service()
+    doc=baseline()
+    doc.content='长正文'*8001
+    svc.kb.get_document.return_value=doc
+    svc.kb.search_documents.return_value=[SimpleNamespace(doc_id=7)]
+    await svc.review_candidate(row())
+    saved=svc.store.save_review.call_args.kwargs
+    assert saved['status']=='needs_review'
+    assert saved['comparisons'][0]['result']['reason']=='comparison_document_too_large'
+    assert svc.jev.client.evaluate.await_count==1  # No judgment on a silently truncated document.
+
+
+async def test_single_revision_does_not_clear_conflicts_with_other_knowledge():
+    svc=service()
+    first=baseline()
+    second=SimpleNamespace(**{**vars(first),'id':8,'session_id':''})
+    svc.kb.search_documents.return_value=[SimpleNamespace(doc_id=7),SimpleNamespace(doc_id=8)]
+    svc.kb.get_document.side_effect=[first,second]
+    svc.jev.client.evaluate.side_effect=[result(),result('supplement'),result('conflict')]
+    svc.build_revision=AsyncMock(return_value={'target_doc_id':7,'status':'ready'})
+    await svc.review_candidate(row())
+    saved=svc.store.save_review.call_args.kwargs
+    assert saved['status']=='needs_review' and saved['reason']=='other_knowledge_requires_review'
