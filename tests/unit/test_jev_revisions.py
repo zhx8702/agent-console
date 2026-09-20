@@ -9,7 +9,6 @@ import pytest
 
 from app.jev.knowledge import KnowledgeEvidenceChanged
 from app.jev.knowledge_publish import publish_candidate
-from app.jev.models import fingerprint
 from app.jev.quality import QualityFinding, quality_disposition
 from app.kb.ingest import KB_MUTATION_LOCK_KEY
 from app.kb.service import InMemoryKBStore
@@ -96,7 +95,7 @@ async def publication_fixture():
     svc.kb.add_document = AsyncMock(return_value=doc.id)
     review = result()
     review.update(
-        _knowledge_snapshot="snapshot", _evidence_hash=fingerprint(svc.message_payload(messages()))
+        _knowledge_snapshot="snapshot", _evidence_hash=svc.evidence_fingerprint(messages())
     )
     item = {
         **row(),
@@ -112,7 +111,7 @@ async def publication_fixture():
             "status": "ready",
             "evaluation": result("accept"),
             "source_members": ["a", "original"],
-            "evidence_hash": fingerprint(svc.message_payload(messages())),
+            "evidence_hash": svc.evidence_fingerprint(messages()),
         },
     }
     return svc, item, doc
@@ -235,3 +234,19 @@ async def test_single_revision_does_not_clear_conflicts_with_other_knowledge():
     await svc.review_candidate(row())
     saved=svc.store.save_review.call_args.kwargs
     assert saved['status']=='needs_review' and saved['reason']=='other_knowledge_requires_review'
+
+
+
+async def test_changes_outside_display_excerpt_invalidate_publication():
+    svc,item,_=await publication_fixture()
+    evidence=messages()
+    evidence[1]['content']='a'*3100+'success'
+    svc.store.evidence.return_value=evidence
+    item['review']['_evidence_hash']=svc.evidence_fingerprint(evidence)
+    display=svc.message_payload(evidence)
+    evidence[1]['content']='a'*3100+'actually failed'
+    assert svc.message_payload(evidence)==display
+    assert display[1]['truncated'] is True
+    with pytest.raises(KnowledgeEvidenceChanged,match='source_changed_reevaluate'):
+        await publish_candidate(svc,item,actor='admin',reason='reviewed')
+    svc.kb.add_document.assert_not_awaited()

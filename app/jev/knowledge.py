@@ -95,6 +95,17 @@ class JevKnowledgeService:
         return [row for row in messages if row.get("is_self_sent") or (row.get("sender_wxid") and row["sender_wxid"] not in blocked)]
 
     @staticmethod
+    def evidence_fingerprint(messages: list[dict]) -> str:
+        # Hash complete local evidence, including text beyond the redacted display excerpt.
+        fields = ("id", "message_id", "content", "sender_wxid", "is_self_sent", "occurred_ts")
+        return fingerprint([{key: row.get(key) for key in fields}
+            for row in sorted(messages, key=lambda row: int(row["id"]))])
+
+    @staticmethod
+    def quality_evidence_fingerprint(messages: list[dict], runtime: list[dict]) -> str:
+        return fingerprint({"sources": JevKnowledgeService.evidence_fingerprint(messages), "runtime": runtime})
+
+    @staticmethod
     def message_payload(messages: list[dict]) -> list[dict]:
         identities = {}
         for row in messages:
@@ -106,7 +117,7 @@ class JevKnowledgeService:
                 identities[str(row["sender_name"])] = token
         return [{"id": int(row["id"]), "speaker": "bot" if row.get("is_self_sent") else identities.get(row.get("sender_wxid"), "unknown"),
                  "is_bot": bool(row.get("is_self_sent")), "occurred_ts": row["occurred_ts"],
-                 "text": redact(row["content"], identities, 3000)} for row in messages]
+                 "text": redact(row["content"], identities, 3000), "truncated": len(str(row["content"])) > 3000} for row in messages]
 
     async def schedule(self, now: datetime):
         for tenant_id, policy in await self.store.policies():
@@ -303,7 +314,7 @@ class JevKnowledgeService:
                      and probability(evaluation, "sensitive", fallback=1) < .5)
         return {**proposal, **edited.model_dump(), "evaluation": evaluation,
                 "status": "ready" if supported else "needs_review", "source_members": members,
-                "evidence_hash": fingerprint(self.message_payload(evidence))}
+                "evidence_hash": self.evidence_fingerprint(evidence)}
 
     async def review_candidate(self, row: dict):
         policy = await self.require_scope(row["tenant_id"], row["session_id"])
@@ -373,11 +384,11 @@ class JevKnowledgeService:
         if snapshot != await self.store.knowledge_snapshot(row["tenant_id"], row["session_id"], row["id"]):
             raise RuntimeError("knowledge_changed_during_review")
         result["_knowledge_snapshot"] = snapshot
-        result["_evidence_hash"] = fingerprint(self.message_payload(evidence))
+        result["_evidence_hash"] = self.evidence_fingerprint(evidence)
         # No cached policy or stale member permission can authorize the saved recommendation.
         current_policy = await self.require_scope(row["tenant_id"], row["session_id"])
         _, fresh = await self.candidate_evidence(row)
-        if fingerprint(self.message_payload(fresh)) != fingerprint(self.message_payload(evidence)):
+        if self.evidence_fingerprint(fresh) != self.evidence_fingerprint(evidence):
             raise KnowledgeEvidenceChanged("source_changed")
         if current_policy.knowledge_min_confidence > policy.knowledge_min_confidence:
             disposition, reason = "needs_review", "threshold_changed"

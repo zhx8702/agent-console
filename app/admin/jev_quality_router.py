@@ -21,7 +21,7 @@ from app.admin.route_permissions import declare_route_permission
 from app.common.request_models import StrictRequestModel
 from app.infra.db import get_engine
 from app.jev.knowledge import KnowledgeScopeDisabled
-from app.jev.models import fingerprint, redact
+from app.jev.models import redact
 
 
 class FindingAction(StrictRequestModel):
@@ -64,7 +64,7 @@ def register_quality_routes(router, service, principal_for):
                     if set(ids) != {r['id'] for r in messages}:
                         raise HTTPException(409, 'source_removed_or_blocked')
                     runtime = await svc.store.runtime_evidence(tenant_id, row['session_id'], ids)
-                    current_hash = fingerprint({'messages': svc.message_payload(messages), 'runtime': svc.runtime_payload(runtime)})
+                    current_hash = svc.quality_evidence_fingerprint(messages, runtime)
                     if not body.evidence_hash or body.evidence_hash != current_hash:
                         raise HTTPException(409, 'finding_evidence_changed_reload')
                 status = 'confirmed' if body.action == 'confirm' else 'dismissed'

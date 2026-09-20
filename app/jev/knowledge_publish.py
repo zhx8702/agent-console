@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.jev.knowledge import KnowledgeEvidenceChanged
 from app.jev.knowledge_models import review_disposition
-from app.jev.models import answer, confidence, fingerprint, probability
+from app.jev.models import answer, confidence, probability
 
 
 async def publish_candidate(svc, item: dict, *, actor: str, reason: str, apply_revision: bool = False) -> tuple[int, dict]:
@@ -12,7 +12,7 @@ async def publish_candidate(svc, item: dict, *, actor: str, reason: str, apply_r
         policy = await svc.require_scope(tenant_id, session_id)
         draft, evidence = await svc.candidate_evidence(item)
         disposition, _ = review_disposition(draft, item["review"], policy.knowledge_min_confidence)
-        if item["review"].get("_evidence_hash") != fingerprint(svc.message_payload(evidence)):
+        if item["review"].get("_evidence_hash") != svc.evidence_fingerprint(evidence):
             raise KnowledgeEvidenceChanged("source_changed_reevaluate")
         if disposition != "ready":
             raise KnowledgeEvidenceChanged("candidate_threshold_or_evidence_changed")
@@ -24,7 +24,7 @@ async def publish_candidate(svc, item: dict, *, actor: str, reason: str, apply_r
                     or confidence(evaluation) < policy.knowledge_min_confidence
                     or probability(evaluation, "supported", fallback=0) < policy.knowledge_min_confidence
                     or probability(evaluation, "sensitive", fallback=1) >= .5
-                    or revision.get("evidence_hash") != fingerprint(svc.message_payload(evidence))):
+                    or revision.get("evidence_hash") != svc.evidence_fingerprint(evidence)):
                 raise KnowledgeEvidenceChanged("revision_not_supported")
             target = await svc.kb.get_document(tenant_id, revision["target_doc_id"], session_id=session_id)
             if target is None:

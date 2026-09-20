@@ -123,11 +123,10 @@ def register_knowledge_routes(router, jev, principal_for):
                 raise KnowledgeEvidenceChanged("source_removed_or_blocked")
         except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
             raise HTTPException(409, str(exc)) from exc
-        from app.jev.models import fingerprint
         payload = svc.message_payload(messages)
         runtime = await svc.store.runtime_evidence(tenant_id, row["session_id"], ids)
         safe_runtime = svc.runtime_payload(runtime)
-        return {"messages": payload, "evidence_hash": fingerprint({"messages": payload, "runtime": safe_runtime}), "runtime": safe_runtime}
+        return {"messages": payload, "evidence_hash": svc.quality_evidence_fingerprint(messages, runtime), "runtime": safe_runtime}
 
     @router.post("/knowledge/candidates/{candidate_id}")
     @declare_route_permission(RoutePermission("POST", "/v1/admin/jev/knowledge/candidates/{candidate_id}", AdminPermission.DANGER))

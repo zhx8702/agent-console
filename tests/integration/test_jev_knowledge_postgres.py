@@ -78,8 +78,7 @@ async def candidate(env):
     await store.save_page(job,messages,[draft])
     row = await store.claim('candidate')
     review = {'answers':{'decision':{'choice':'retain','confidence':.95},'supported':{'noul':.95},'resolved':{'noul':.95},'sensitive':{'noul':.01}}}
-    from app.jev.models import fingerprint
-    review["_evidence_hash"] = fingerprint(JevKnowledgeService.message_payload(messages))
+    review["_evidence_hash"] = JevKnowledgeService.evidence_fingerprint(messages)
     review["_knowledge_snapshot"] = await store.knowledge_snapshot(tid, "g@chatroom", row["id"])
     await store.save_review(row,status='ready',reason='supported_resolved_experience',review=review,comparisons=[])
     return (await store.dashboard(tid))['candidates'][0]
@@ -249,7 +248,6 @@ async def test_operator_retry_preserves_progress_and_idempotency(env):
 async def test_revision_edit_requires_reapproval_and_tracks_published_baseline(env):
     import json
 
-    from app.jev.models import fingerprint
     tid, store, svc, client=env
     c=await candidate(env)
     doc=SimpleNamespace(id=7,content_hash='a'*64,title='原始标题',content='仅测试环境',source='manual',url=None,meta={},session_id='g@chatroom')
@@ -269,7 +267,7 @@ async def test_revision_edit_requires_reapproval_and_tracks_published_baseline(e
     running=await store.claim('candidate')
     revision=running['revision']
     revision.update(status='ready',evaluation={'answers':{'decision':{'choice':'accept','confidence':.95},'supported':{'noul':.95},'sensitive':{'noul':0}}},
-        evidence_hash=fingerprint(svc.message_payload(await store.evidence(tid,'g@chatroom',c['draft']['evidence_ids']))))
+        evidence_hash=svc.evidence_fingerprint(await store.evidence(tid,'g@chatroom',c['draft']['evidence_ids'])))
     await store.save_review(running,status='revision_ready',reason='revision_supported',review=c['review'],comparisons=running['comparisons'],revision=revision)
     ready=await store.candidate(tid,'g@chatroom',c['id'])
     published=await client.post(path,params={'tenant_id':tid},json={'version':ready['version'],'action':'apply_revision','reason':'通过独立复核'},headers={'Idempotency-Key':'approve'})
@@ -443,8 +441,11 @@ async def test_quality_confirmation_rejects_changed_evidence_and_dismissal_retai
     tid,store,_,client=env
     f=await quality_finding(env)
     path=f"/v1/admin/jev/knowledge/findings/{f['id']}"
+    await execute("UPDATE plugin_wxbot_group_observations SET content=:content WHERE id=:id",
+        {'id':f['finding']['evidence_ids'][0],'content':'a'*3100+'still unanswered'})
     evidence=await client.get(path+'/evidence',params={'tenant_id':tid})
-    await execute("UPDATE plugin_wxbot_group_observations SET content='已经得到回答' WHERE id=:id",{'id':f['finding']['evidence_ids'][0]})
+    await execute("UPDATE plugin_wxbot_group_observations SET content=:content WHERE id=:id",
+        {'id':f['finding']['evidence_ids'][0],'content':'a'*3100+'already answered'})
     payload={'action':'confirm','expected_status':'needs_review','reason':'核验','evidence_hash':evidence.json()['evidence_hash']}
     response=await client.post(path,params={'tenant_id':tid},json=payload,headers={'Idempotency-Key':'changed'})
     assert response.status_code==409 and response.json()['detail']=='finding_evidence_changed_reload'

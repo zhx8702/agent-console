@@ -6,7 +6,7 @@ import { DangerAction } from "../../components/DangerAction";
 
 type Job = { id: string; session_id: string; period: string; status: string; scanned: number; candidate_count: number; quality_count?: number; error_type: string };
 type Candidate = { id: string; session_id: string; status: string; version: number; reason: string; error_type: string; kb_doc_id: number | null; revision?: Revision; draft: { title: string; question: string; environment: string; solution: string; outcome: string; evidence_ids: number[]; resolution_ids: number[] }; review: { answers?: { decision?: { confidence?: number } } }; comparisons: { doc_id: number; relation: string; confidence: number }[] };
-type Evidence = { id: number; speaker: string; text: string; occurred_ts: number };
+type Evidence = { truncated?: boolean; id: number; speaker: string; text: string; occurred_ts: number };
 type RuntimeEvidence = { message_id: number; processing_status: string; processing_reason: string; decisions: { status: string; reasons: string[] }[]; deliveries: { status: string; reply_text: string; error: string }[] };
 type Finding = { review?: { _operator?: { actor: string; reason: string; at: string } }; id: string; status: string; reason: string; finding: { kind: string; title: string; explanation: string; evidence_ids: number[]; trace_ids: string[] } };
 type Data = { pagination?: Record<"jobs" | "candidates" | "findings", string>; jobs: Job[]; candidates: Candidate[]; findings?: Finding[]; quality_summary?: { kind: string; status: string; count: number }[] };
@@ -130,7 +130,7 @@ export function JevKnowledgePanel({ sessionId, disabled }: { sessionId: string; 
           <h4>{item.finding.title} · {labels[item.status] || item.status}</h4><p>{item.finding.explanation}</p><p>{reasons[item.reason] || item.reason}</p>
           <p>消息：{item.finding.evidence_ids.join("、")}</p><p className="mono">追踪：{item.finding.trace_ids.join("、") || "无处理记录"}</p>
           <button disabled={busy || disabled} onClick={() => void showEvidence(item, "findings")}>查看复盘证据</button>
-          {evidence[`findings:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker}<p>{message.text}</p></blockquote>)}
+          {evidence[`findings:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker}<p>{message.text}</p>{message.truncated && <p>此处只展示长消息的部分内容，请结合原始消息核对完整上下文。</p>}</blockquote>)}
           {findingEvidence[item.id]?.runtime.map(record => <div key={record.message_id}>
             <p>消息 #{record.message_id} · 处理：{record.processing_status || "无记录"} · {record.processing_reason}</p>
             {record.decisions.map((decision, index) => <p key={index}>参与判断：{decision.status} · {(decision.reasons || []).join("、")}</p>)}
@@ -157,7 +157,7 @@ export function JevKnowledgePanel({ sessionId, disabled }: { sessionId: string; 
         {item.kb_doc_id && <p>已发布为知识文档 #{item.kb_doc_id}</p>}
         {item.revision?.id && <JevRevisionPanel candidateId={item.id} version={item.version} sessionId={item.session_id} revision={item.revision} disabled={busy || disabled || ["running", "pending"].includes(item.status)} onSaved={load} />}
         <button disabled={busy || disabled} onClick={() => void showEvidence(item)}>查看原始证据（脱敏）</button>
-        {evidence[`candidates:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker} · {new Date(message.occurred_ts * 1000).toLocaleString()}<p>{message.text}</p></blockquote>)}
+        {evidence[`candidates:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker} · {new Date(message.occurred_ts * 1000).toLocaleString()}<p>{message.text}</p>{message.truncated && <p>此处只展示长消息的部分内容，请结合原始消息核对完整上下文。</p>}</blockquote>)}
         {!["running", "published", "pending", "resolved"].includes(item.status) && <>
           <label>审核说明<input aria-label={`审核说明 ${item.id}`} value={notes[item.id] || ""} disabled={busy || disabled} onChange={e => setNotes({ ...notes, [item.id]: e.target.value })} /></label>
           {item.status === "ready" && <DangerAction label="发布到本群知识库" title="发布知识候选" impact={`将“${item.draft.title}”加入本群知识库，后续答疑可以引用。`} disabled={busy || disabled || !notes[item.id]?.trim()} onConfirm={() => act(item, "publish")} />}
