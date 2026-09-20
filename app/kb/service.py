@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol
 
 from sqlalchemy import delete, select, text
@@ -28,6 +30,28 @@ from app.models.kb import KBChunk, KBDocument
 if TYPE_CHECKING:
     from app.kb.ingest import IngestionService
     from app.kb.vector.base import VectorStore
+
+
+_HELD_KB_LOCKS: ContextVar[frozenset] = ContextVar("held_kb_mutation_locks", default=frozenset())
+
+
+def _reentrant_lock(method):
+    @wraps(method)
+    @asynccontextmanager
+    async def wrapped(self, tenant_id, session_id, resource_key):
+        # ContextVars propagate into child tasks; only the actual owning task may re-enter.
+        scope = (id(self), tenant_id, normalize_scope_session_id(session_id), resource_key, asyncio.current_task())
+        held = _HELD_KB_LOCKS.get()
+        if scope in held:
+            yield
+            return
+        async with method(self, tenant_id, session_id, resource_key):
+            token = _HELD_KB_LOCKS.set(held | {scope})
+            try:
+                yield
+            finally:
+                _HELD_KB_LOCKS.reset(token)
+    return wrapped
 
 
 @dataclass
@@ -182,6 +206,7 @@ class InMemoryKBStore:
         self._next_chunk_id = 1
         self._resource_locks: dict[str, asyncio.Lock] = {}
 
+    @_reentrant_lock
     @asynccontextmanager
     async def resource_lock(
         self,
@@ -419,6 +444,7 @@ class SQLAlchemyKBStore:
         self._session_factory = session_factory
         self._resource_locks: dict[str, asyncio.Lock] = {}
 
+    @_reentrant_lock
     @asynccontextmanager
     async def resource_lock(
         self,
@@ -786,6 +812,15 @@ class KnowledgeBaseService:
         self._vector = vector_store
         self._ingest = ingestion
         self._settings = settings or get_settings()
+
+    @asynccontextmanager
+    async def mutation_scope(self, tenant_id: str, session_ids: list[str]) -> AsyncIterator[None]:
+        """Hold existing KB writer locks across review validation and nested ingestion."""
+        from app.kb.ingest import KB_MUTATION_LOCK_KEY
+        async with AsyncExitStack() as stack:
+            for scope in sorted({normalize_scope_session_id(sid) for sid in session_ids}):
+                await stack.enter_async_context(self._store.resource_lock(tenant_id, scope, KB_MUTATION_LOCK_KEY))
+            yield
 
     async def add_text(
         self,

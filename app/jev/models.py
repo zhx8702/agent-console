@@ -99,7 +99,7 @@ def memory_fingerprint(item: dict) -> str:
 
 
 def redact(text: Any, identities: dict[str, str] | None = None, limit: int = 3000) -> str:
-    value = str(text or "")[:16000]
+    value = str(text or "")[:max(16000, min(limit, 24000))]
     for name, token in sorted((identities or {}).items(), key=lambda pair: -len(pair[0])):
         if name:
             value = value.replace(name, token)

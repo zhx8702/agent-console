@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -28,11 +29,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.skipif(not os.getenv('JEV_TES
 @pytest_asyncio.fixture
 async def env(monkeypatch):
     import app.admin.jev_knowledge_router as kr
+    import app.admin.jev_revision_router as rr
     import app.admin.jev_router as jr
     import app.jev.knowledge_store as ks
     import app.jev.store as js
     engine = create_async_engine(os.environ['JEV_TEST_DSN'])
-    for module in (kr, jr, ks, js):
+    for module in (kr, jr, rr, ks, js):
         monkeypatch.setattr(module, 'get_engine', lambda: engine)
     tid = 'knowledge-test-' + uuid4().hex[:12]
     policy = JevPolicy(knowledge=True, knowledge_sessions=['g@chatroom'])
@@ -40,7 +42,10 @@ async def env(monkeypatch):
     jev = JevService(Settings(typesafe_enabled=True), client=SimpleNamespace(evaluate=AsyncMock()))
     jev.registry = SimpleNamespace(scope_execution_allowed=AsyncMock(return_value=True))
     store = KnowledgeStore()
-    kb = SimpleNamespace(add_document=AsyncMock(return_value=123),get_document=AsyncMock(),list_documents=AsyncMock(return_value=[]))
+    @asynccontextmanager
+    async def mutation_scope(*args):
+        yield
+    kb = SimpleNamespace(mutation_scope=mutation_scope,add_document=AsyncMock(return_value=123),get_document=AsyncMock(),list_documents=AsyncMock(return_value=[]))
     svc = JevKnowledgeService(jev,llm=SimpleNamespace(chat=AsyncMock()),kb=kb,store=store)
     jev.knowledge_service = svc
     actor = Principal(subject='test-admin',roles=(AdminRole.TENANT_ADMIN.value,),tenant_ids=(tid,),auth_kind='test')
@@ -51,7 +56,7 @@ async def env(monkeypatch):
     app.include_router(jr.build_jev_router(jev,jev.settings))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
         yield tid, store, svc, client
-    for table in ('jev_knowledge_candidate','jev_knowledge_job','jev_evaluation','jev_policy','plugin_wxbot_group_observations','social_tenant_member_control'):
+    for table in ('jev_quality_finding','jev_knowledge_candidate','jev_knowledge_job','jev_evaluation','jev_policy','plugin_wxbot_group_observations','social_tenant_member_control'):
         await execute(f'DELETE FROM {table} WHERE tenant_id=:tid',{'tid':tid})
     await engine.dispose()
 
@@ -72,6 +77,8 @@ async def candidate(env):
     await store.save_page(job,messages,[draft])
     row = await store.claim('candidate')
     review = {'answers':{'decision':{'choice':'retain','confidence':.95},'supported':{'noul':.95},'resolved':{'noul':.95},'sensitive':{'noul':.01}}}
+    from app.jev.models import fingerprint
+    review["_evidence_hash"] = fingerprint(JevKnowledgeService.message_payload(messages))
     review["_knowledge_snapshot"] = await store.knowledge_snapshot(tid, "g@chatroom", row["id"])
     await store.save_review(row,status='ready',reason='supported_resolved_experience',review=review,comparisons=[])
     return (await store.dashboard(tid))['candidates'][0]
@@ -236,3 +243,138 @@ async def test_operator_retry_preserves_progress_and_idempotency(env):
     assert (await client.post(path,headers={'Idempotency-Key':'resume'})).json()==r.json()
     current=(await store.dashboard(tid))['jobs'][0]
     assert current['cursor_id']==rows[-1]['id'] and current['scanned']==2 and current['attempts']==0
+
+
+async def test_revision_edit_requires_reapproval_and_tracks_published_baseline(env):
+    import json
+
+    from app.jev.models import fingerprint
+    tid, store, svc, client=env
+    c=await candidate(env)
+    doc=SimpleNamespace(id=7,content_hash='a'*64,title='原始标题',content='仅测试环境',source='manual',url=None,meta={},session_id='g@chatroom')
+    svc.kb.get_document.return_value=doc
+    svc.kb.update_document=AsyncMock(return_value=7)
+    await execute("UPDATE jev_knowledge_candidate SET comparisons=CAST(:c AS JSON) WHERE id=:id",
+        {'id':c['id'],'c':json.dumps([{'doc_id':7,'session_id':'g@chatroom','content_hash':'a'*64}])})
+    path=f"/v1/admin/jev/knowledge/candidates/{c['id']}"
+    body={'version':c['version'],'target_doc_id':7,'base_hash':'a'*64,'title':'修正标题','content':'测试环境更新证书后恢复','reason':'核对群友结果'}
+    response=await client.post(path+'/revision',params={'tenant_id':tid},json=body,headers={'Idempotency-Key':'edit'})
+    assert response.status_code==200,response.text
+    assert response.json()['status']=='pending'
+    replay=await client.post(path+'/revision',params={'tenant_id':tid},json=body,headers={'Idempotency-Key':'edit'})
+    assert replay.json()==response.json()
+    premature=await client.post(path,params={'tenant_id':tid},json={'version':body['version']+1,'action':'apply_revision','reason':'审核'},headers={'Idempotency-Key':'premature'})
+    assert premature.status_code==409
+    running=await store.claim('candidate')
+    revision=running['revision']
+    revision.update(status='ready',evaluation={'answers':{'decision':{'choice':'accept','confidence':.95},'supported':{'noul':.95},'sensitive':{'noul':0}}},
+        evidence_hash=fingerprint(svc.message_payload(await store.evidence(tid,'g@chatroom',c['draft']['evidence_ids']))))
+    await store.save_review(running,status='revision_ready',reason='revision_supported',review=c['review'],comparisons=running['comparisons'],revision=revision)
+    ready=await store.candidate(tid,'g@chatroom',c['id'])
+    published=await client.post(path,params={'tenant_id':tid},json={'version':ready['version'],'action':'apply_revision','reason':'通过独立复核'},headers={'Idempotency-Key':'approve'})
+    assert published.status_code==200,published.text
+    svc.kb.update_document.assert_awaited_once()
+    history=await client.get('/v1/admin/jev/knowledge/documents/7/history',params={'tenant_id':tid,'session_id':'g@chatroom'})
+    assert history.status_code==200,history.text
+    assert history.json()['items'][0]['revision']['before']['content']=='仅测试环境'
+    other=await client.get('/v1/admin/jev/knowledge/documents/7/history',params={'tenant_id':tid,'session_id':'other@chatroom'})
+    assert other.json()['items']==[]
+
+
+async def test_changed_source_is_not_published(env):
+    tid,_,svc,client=env
+    c=await candidate(env)
+    await execute("UPDATE plugin_wxbot_group_observations SET content='仍然失败，先前判断有误' WHERE id=:id",{'id':c['draft']['resolution_ids'][0]})
+    response=await client.post(f"/v1/admin/jev/knowledge/candidates/{c['id']}",params={'tenant_id':tid},
+        json={'version':c['version'],'action':'publish','reason':'核对'},headers={'Idempotency-Key':'changed-source'})
+    assert response.status_code==409,response.text
+    svc.kb.add_document.assert_not_awaited()
+
+
+async def test_quality_findings_checkpoint_evidence_and_deduplication(env):
+    tid,store,_,client=env
+    rows=await seed(tid)
+    await store.schedule(tid,'g@chatroom',date(2026,9,20),0,1000)
+    job=await store.claim('job')
+    finding={'finding':{'kind':'missed_help','title':'可能漏答','explanation':'缺少运行记录','evidence_ids':[rows[0]['id']],'trace_ids':[]},
+        'review':{},'status':'needs_review','reason':'runtime_evidence_missing'}
+    assert await store.save_page(job,rows,[],findings=[finding,finding])
+    dashboard=await store.dashboard(tid)
+    assert dashboard['jobs'][0]['quality_count']==1
+    assert len(dashboard['findings'])==1 and not dashboard['candidates']
+    f=dashboard['findings'][0]
+    evidence=await client.get(f"/v1/admin/jev/knowledge/findings/{f['id']}/evidence",params={'tenant_id':tid})
+    assert evidence.status_code==200,evidence.text
+    assert evidence.json()['messages'][0]['id']==rows[0]['id']
+    runtime=await store.runtime_evidence(tid,'g@chatroom',[rows[0]['id']])
+    assert runtime[0]['trace_id'] is None and runtime[0]['deliveries']==[]
+
+
+async def test_older_relevant_unresolved_candidate_is_recalled(env):
+    import json
+    tid,store,_,_=env
+    c=await candidate(env)
+    await execute("UPDATE jev_knowledge_candidate SET status='unresolved',created_at=NOW()-INTERVAL '10 days' WHERE id=:id",{'id':c['id']})
+    for i in range(12):
+        draft={**c['draft'],'question':f'其他问题 {i}'}
+        await execute("INSERT INTO jev_knowledge_candidate (id,job_id,tenant_id,session_id,fingerprint,draft,source_members,status) "
+            "VALUES (:id,:job,:tid,'g@chatroom',:hash,CAST(:draft AS JSON),'[]','unresolved')",
+            {'id':str(uuid4()),'job':c['job_id'],'tid':tid,'hash':str(i),'draft':json.dumps(draft)})
+    recalled=await store.open_candidates(tid,'g@chatroom',messages=[{'content':'证书错误通过更新证书解决了'}])
+    assert recalled[0]['id']==c['id'] and len(recalled)==8
+
+
+async def test_optout_during_review_releases_lease(env):
+    tid,store,_,_=env
+    c=await candidate(env)
+    await execute("UPDATE jev_knowledge_candidate SET status='pending' WHERE id=:id",{'id':c['id']})
+    running=await store.claim('candidate')
+    await execute("INSERT INTO social_tenant_member_control (tenant_id,user_id,memory_opt_out,version) VALUES (:tid,'member',TRUE,1)",{'tid':tid})
+    assert not await store.save_review(running,status='ready',reason='reviewed',review=c['review'],comparisons=[])
+    current=await store.candidate(tid,'g@chatroom',c['id'])
+    assert current['status']=='skipped' and current['lease_token'] is None
+
+
+async def test_real_kb_revision_lock_serializes_writers_and_failed_index_preserves_baseline(env):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.kb.ingest import IngestionService
+    from app.kb.service import KnowledgeBaseService, SQLAlchemyKBStore
+    from app.kb.vector.memory_store import InMemoryVectorStore
+    from tests.unit._fake_llm import FakeEmbeddingsProvider
+
+    tid, _, _, _=env
+    engine=create_async_engine(os.environ['JEV_TEST_DSN'])
+    factory=async_sessionmaker(engine,expire_on_commit=False)
+    @asynccontextmanager
+    async def sessions():
+        async with factory() as session, session.begin():
+            yield session
+    store=SQLAlchemyKBStore(sessions)
+    vector=InMemoryVectorStore()
+    ingest=IngestionService(store,vector,FakeEmbeddingsProvider(),settings=Settings())
+    kb=KnowledgeBaseService(store,vector,ingest,settings=Settings())
+    doc_id=await kb.add_document(tenant_id=tid,session_id='g@chatroom',title='旧知识',content='旧正文有效')
+    attempted,finished=asyncio.Event(),asyncio.Event()
+    async def writer():
+        attempted.set()
+        await kb.update_document(tenant_id=tid,session_id='g@chatroom',doc_id=doc_id,title='并发标题',content='并发更新')
+        finished.set()
+    try:
+        async with kb.mutation_scope(tid,['','g@chatroom']):
+            async with asyncio.timeout(3):
+                await kb.update_document(tenant_id=tid,session_id='g@chatroom',doc_id=doc_id,title='修订标题',content='审核后的正文')
+            task=asyncio.create_task(writer())
+            await attempted.wait()
+            assert not finished.is_set()
+        await asyncio.wait_for(task,3)
+        baseline=await kb.get_document(tid,doc_id,session_id='g@chatroom')
+        vector.upsert=AsyncMock(side_effect=RuntimeError('index unavailable'))
+        with pytest.raises(RuntimeError,match='index unavailable'):
+            async with kb.mutation_scope(tid,['','g@chatroom']):
+                await kb.update_document(tenant_id=tid,session_id='g@chatroom',doc_id=doc_id,title='不应发布',content='失败正文')
+        retained=await kb.get_document(tid,doc_id,session_id='g@chatroom')
+        assert retained.content==baseline.content and retained.content_hash==baseline.content_hash
+    finally:
+        await kb.delete_document(tid,doc_id,session_id='g@chatroom')
+        await engine.dispose()

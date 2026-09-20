@@ -80,7 +80,7 @@ def test_group_webhook_upgrade_is_runtime_head(monkeypatch) -> None:
 
     assert migration.revision == "0052_wxbot_group_webhooks"
     assert migration.down_revision == "0051_draw_runtime_config"
-    assert RUNTIME_SCHEMA_REVISION == "0054_jev_knowledge"
+    assert RUNTIME_SCHEMA_REVISION == "0055_jev_revisions"
     assert ScriptDirectory.from_config(Config("alembic.ini")).get_heads() == [
         RUNTIME_SCHEMA_REVISION
     ]

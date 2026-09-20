@@ -1,0 +1,36 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, expect, it, vi } from "vitest";
+import { JevRevisionPanel } from "./JevRevisionPanel";
+const mocks = vi.hoisted(() => ({ request: vi.fn(), config: { tenantId: "demo" } }));
+vi.mock("../../lib/api", () => ({ apiRequest: mocks.request }));
+vi.mock("../../state/console-config", () => ({ useConsoleConfig: () => ({ config: mocks.config }) }));
+const revision = { id: "rev", target_doc_id: 7, base_hash: "a".repeat(64), title: "新标题", content: "修订内容", status: "ready", before: { title: "旧标题", content: "旧正文及限制" } };
+beforeEach(() => mocks.request.mockReset());
+it("preserves baseline and submits edits for fresh review with a stable retry key", async () => {
+  mocks.request.mockRejectedValueOnce(new Error("network")).mockResolvedValueOnce({ status: "pending" });
+  const saved = vi.fn().mockResolvedValue(undefined);
+  render(<JevRevisionPanel candidateId="c" version={3} sessionId="g" revision={revision} disabled={false} onSaved={saved} />);
+  expect(screen.getByText("旧正文及限制")).toBeInTheDocument();
+  const button = screen.getByText("保存草案并重新审核");
+  expect(button).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("修改说明 c"), { target: { value: "保留限制" } });
+  fireEvent.change(screen.getByLabelText("修订正文 c"), { target: { value: "仅限版本 2" } });
+  fireEvent.click(button);
+  await screen.findByRole("alert");
+  fireEvent.click(button);
+  await waitFor(() => expect(saved).toHaveBeenCalledOnce());
+  const options = mocks.request.mock.calls[0][2];
+  expect(JSON.parse(options.init.body)).toEqual({ version: 3, target_doc_id: 7, base_hash: revision.base_hash, title: "新标题", content: "仅限版本 2", reason: "保留限制" });
+  expect(options.init.headers["Idempotency-Key"]).toBe(mocks.request.mock.calls[1][2].init.headers["Idempotency-Key"]);
+});
+it("resets busy state on scope changes and ignores stale history", async () => {
+  let resolve!: (data: unknown) => void;
+  mocks.request.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+  const props = { candidateId: "c", version: 3, sessionId: "g", revision, disabled: false, onSaved: vi.fn() };
+  const view = render(<JevRevisionPanel {...props} />);
+  fireEvent.click(screen.getByText("查看该知识的修订记录"));
+  view.rerender(<JevRevisionPanel {...props} candidateId="d" revision={{ ...revision, id: "other" }} />);
+  expect(screen.getByText("查看该知识的修订记录")).toBeEnabled();
+  resolve({ items: [{ id: "old", revision: { ...revision, before: { title: "其他群历史", content: "私有内容" } } }] });
+  await waitFor(() => expect(screen.queryByText("私有内容")).not.toBeInTheDocument());
+});

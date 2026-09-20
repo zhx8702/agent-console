@@ -20,12 +20,12 @@ from app.admin.route_permissions import declare_route_permission
 from app.common.request_models import StrictRequestModel
 from app.infra.db import get_engine
 from app.jev.knowledge import KnowledgeEvidenceChanged, KnowledgeScopeDisabled
-from app.jev.knowledge_models import review_disposition
+from app.jev.knowledge_publish import publish_candidate
 
 
 class KnowledgeAction(StrictRequestModel):
     version: int = Field(ge=1)
-    action: Literal["publish", "reject", "retry"]
+    action: Literal["publish", "apply_revision", "reject", "retry"]
     reason: str = Field(min_length=1, max_length=500)
 
 
@@ -34,6 +34,9 @@ def register_knowledge_routes(router, jev, principal_for):
         if jev.knowledge_service is None:
             raise HTTPException(503, "knowledge_service_unavailable")
         return jev.knowledge_service
+
+    from app.admin.jev_revision_router import register_revision_routes
+    register_revision_routes(router, service, principal_for)
 
     @router.get("/knowledge")
     @declare_route_permission(RoutePermission("GET", "/v1/admin/jev/knowledge", AdminPermission.READ))
@@ -88,6 +91,27 @@ def register_knowledge_routes(router, jev, principal_for):
             raise HTTPException(409, str(exc)) from exc
         return {"messages": service().message_payload(messages)}
 
+    @router.get("/knowledge/findings/{finding_id}/evidence")
+    @declare_route_permission(RoutePermission("GET", "/v1/admin/jev/knowledge/findings/{finding_id}/evidence", AdminPermission.READ))
+    async def finding_evidence(finding_id: str, request: Request, tenant_id: str = Query(min_length=1, max_length=64)):
+        principal_for(request, tenant_id)
+        from app.jev.store import execute
+        rows = await execute("SELECT * FROM jev_quality_finding WHERE id=:id AND tenant_id=:tid", {"id": finding_id, "tid": tenant_id})
+        if not rows:
+            raise HTTPException(404, "finding_not_found")
+        svc = service()
+        row = rows[0]
+        try:
+            await svc.require_scope(tenant_id, row["session_id"])
+            ids = row["finding"]["evidence_ids"]
+            messages = await svc.store.evidence(tenant_id, row["session_id"], ids)
+            messages = await svc.permitted_messages(tenant_id, messages)
+            if {r["id"] for r in messages} != set(ids):
+                raise KnowledgeEvidenceChanged("source_removed_or_blocked")
+        except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"messages": svc.message_payload(messages)}
+
     @router.post("/knowledge/candidates/{candidate_id}")
     @declare_route_permission(RoutePermission("POST", "/v1/admin/jev/knowledge/candidates/{candidate_id}", AdminPermission.DANGER))
     async def act(candidate_id: str, body: KnowledgeAction, request: Request,
@@ -98,7 +122,7 @@ def register_knowledge_routes(router, jev, principal_for):
         async with get_engine().begin() as conn:
             async def mutate():
                 # Member locks precede candidate locks, matching the erasure path.
-                if body.action == "publish":
+                if body.action in {"publish", "apply_revision"}:
                     initial = (await conn.execute(text("SELECT source_members FROM jev_knowledge_candidate WHERE id=:id AND tenant_id=:tid"),
                                {"id": candidate_id, "tid": tenant_id})).mappings().first()
                     if initial:
@@ -116,46 +140,24 @@ def register_knowledge_routes(router, jev, principal_for):
                     raise HTTPException(409, "candidate_not_editable")
                 doc_id = None
                 status = "rejected" if body.action == "reject" else "pending"
-                if body.action == "publish":
-                    if item["status"] != "ready":
+                revision = dict(item.get("revision") or {})
+                if body.action in {"publish", "apply_revision"}:
+                    expected_status = "revision_ready" if body.action == "apply_revision" else "ready"
+                    if item["status"] != expected_status:
                         raise HTTPException(409, "candidate_requires_supported_review")
                     try:
-                        policy = await svc.require_scope(tenant_id, item["session_id"])
-                        draft, evidence = await svc.candidate_evidence(item)
-                        # Serialize against member opt-out/erasure during the indexing operation.
-                        for member in sorted({r["sender_wxid"] for r in evidence if not r.get("is_self_sent")}):
-                            await conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
-                                {"key": f"memory-member-v1:{tenant_id}:{member}"})
-                        draft, evidence = await svc.candidate_evidence(item)
+                        doc_id, revision = await publish_candidate(svc, item, actor=principal.subject,
+                            reason=body.reason, apply_revision=body.action == "apply_revision")
                     except (KnowledgeScopeDisabled, KnowledgeEvidenceChanged) as exc:
                         raise HTTPException(409, str(exc)) from exc
-                    disposition, _ = review_disposition(draft, item["review"], policy.knowledge_min_confidence)
-                    if disposition != "ready":
-                        raise HTTPException(409, "candidate_threshold_or_evidence_changed")
-                    if item["review"].get("_knowledge_snapshot") != await svc.store.knowledge_snapshot(tenant_id, item["session_id"], candidate_id):
-                        raise HTTPException(409, "knowledge_changed_reevaluate")
-                    # Existing knowledge may have changed since evaluation: never publish a stale comparison.
-                    for comparison in item["comparisons"]:
-                        doc = await svc.kb.get_document(tenant_id, comparison["doc_id"], session_id=comparison.get("session_id", item["session_id"]))
-                        if doc is None or doc.content_hash != comparison["content_hash"]:
-                            raise HTTPException(409, "knowledge_changed_reevaluate")
-                    content = (f"问题：{draft.question}\n\n适用环境：{draft.environment or '未注明'}\n\n"
-                               f"处理方法：{draft.solution}\n\n观察结果及限制：{draft.outcome}\n\n"
-                               "来源：群成员对话中的解决经验，仅适用于所述条件；未经独立外部核验。")
-                    metadata = {"candidate_id": candidate_id, "reviewed_by": principal.subject,
-                        "review_reason": body.reason, "evidence_ids": draft.evidence_ids,
-                        "resolution_ids": draft.resolution_ids, "source_members": sorted({r['sender_wxid'] for r in evidence if not r.get('is_self_sent')}),
-                        "verification": "human_reported_outcome", "jev": item["review"]}
-                    doc_id = await svc.kb.add_document(tenant_id=tenant_id, session_id=item["session_id"],
-                        title=draft.title, content=content, source="jev_group_knowledge", metadata=metadata)
                     status = "published"
-                elif body.action == "retry" and item["status"] not in {"failed", "skipped", "needs_review", "unresolved", "duplicate", "ready"}:
+                elif body.action == "retry" and item["status"] not in {"failed", "skipped", "needs_review", "unresolved", "duplicate", "ready", "revision_ready"}:
                     raise HTTPException(409, "candidate_not_retryable")
                 await conn.execute(text("UPDATE jev_knowledge_candidate SET status=:status,version=version+1,"
-                    "reviewed_by=:actor,reason=:reason,kb_doc_id=:doc,review=CAST(:review AS JSON),attempts=0,error_type='',"
+                    "reviewed_by=:actor,reason=:reason,kb_doc_id=:doc,review=CAST(:review AS JSON),revision=CAST(:revision AS JSON),attempts=0,error_type='',"
                     "next_run_at=NOW(),updated_at=NOW() WHERE id=:id"),
                     {"status": status, "actor": principal.subject, "reason": "operator_"+body.action,
-                     "doc": doc_id, "id": candidate_id, "review": json.dumps({**item["review"], "_operator": {"action": body.action, "reason": body.reason, "actor": principal.subject}})})
+                     "doc": doc_id, "id": candidate_id, "revision": json.dumps(revision), "review": json.dumps({**item["review"], "_operator": {"action": body.action, "reason": body.reason, "actor": principal.subject}})})
                 return MutationChange(response={"id": candidate_id, "status": status, "version": body.version+1, "kb_doc_id": doc_id},
                     before_state={"status": item["status"], "version": body.version},
                     after_state={"status": status, "kb_doc_id": doc_id}, resource_version=str(body.version+1))

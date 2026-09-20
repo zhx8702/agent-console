@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from datetime import date
 from uuid import uuid4
 
@@ -79,7 +81,22 @@ class KnowledgeStore:
                              {"tid": tenant_id, "ids": members})
         return {r["user_id"] for r in rows}
 
-    async def save_page(self, job: dict, page: list[dict], drafts: list[dict]) -> bool:
+    async def runtime_evidence(self, tenant_id: str, session_id: str, ids: list[int]) -> list[dict]:
+        return await execute(
+            "SELECT o.id,p.trace_id,p.status AS processing_status,p.reason AS processing_reason,"
+            "COALESCE((SELECT json_agg(json_build_object('status',q.status,'reply_text',q.reply_text,'error',q.error)) "
+            "FROM plugin_wxbot_reply_queue q WHERE q.tenant_id=p.tenant_id AND q.trace_id=p.trace_id "
+            "AND p.trace_id<>''), '[]') AS deliveries, "
+            "COALESCE((SELECT json_agg(json_build_object('status',s.status,'reasons',s.reason_codes_json,'stage',s.runtime_stage)) "
+            "FROM social_participation_event s WHERE s.tenant_id=p.tenant_id AND s.session_id=p.session_id "
+            "AND s.trace_id=p.trace_id AND p.trace_id<>'' AND s.event_kind='runtime'), '[]') AS decisions "
+            "FROM plugin_wxbot_group_observations o LEFT JOIN processed_messages p ON p.tenant_id=o.tenant_id "
+            "AND p.session_id=o.session_id AND p.message_id=o.message_id "
+            "WHERE o.tenant_id=:tid AND o.session_id=:sid AND o.id=ANY(:ids) ORDER BY o.id",
+            {"tid": tenant_id, "sid": session_id, "ids": ids})
+
+    async def save_page(self, job: dict, page: list[dict], drafts: list[dict], findings: list[dict] | None = None) -> bool:
+        findings = findings or []
         async with get_engine().begin() as conn:
             locked = (await conn.execute(text("SELECT id FROM jev_knowledge_job WHERE id=:id "
                 "AND status='running' AND lease_token=:token AND locked_until>NOW() FOR UPDATE"),
@@ -87,7 +104,7 @@ class KnowledgeStore:
             if not locked:
                 return False
             # Lock all contributing members in one deterministic order before any candidate write.
-            all_ids = sorted({i for draft in drafts for i in draft["evidence_ids"]})
+            all_ids = sorted({i for draft in [*drafts, *[f["finding"] for f in findings]] for i in draft["evidence_ids"]})
             evidence_query = text("SELECT id,sender_wxid,is_self_sent FROM plugin_wxbot_group_observations "
                                   "WHERE tenant_id=:tid AND session_id=:sid AND id=ANY(:ids)")
             evidence_params = {"tid": job["tenant_id"], "sid": job["session_id"], "ids": all_ids}
@@ -117,22 +134,53 @@ class KnowledgeStore:
                     {"id": str(uuid4()), "job": job["id"], "tid": job["tenant_id"], "sid": job["session_id"],
                      "hash": fingerprint(draft), "draft": json.dumps(draft, ensure_ascii=False), "members": json.dumps(members)})
                 inserted += int(row.first() is not None)
+            quality_inserted = 0
+            for finding in findings:
+                value = finding["finding"]
+                if not set(value["evidence_ids"]).issubset(indexed):
+                    continue
+                members = sorted({indexed[i]["sender_wxid"] for i in value["evidence_ids"] if not indexed[i]["is_self_sent"]})
+                if blocked.intersection(members):
+                    continue
+                inserted_finding = await conn.execute(text("INSERT INTO jev_quality_finding "
+                    "(id,job_id,tenant_id,session_id,fingerprint,finding,source_members,review,status,reason) "
+                    "VALUES (:id,:job,:tid,:sid,:fingerprint,CAST(:finding AS JSON),CAST(:members AS JSON),CAST(:review AS JSON),:status,:reason) "
+                    "ON CONFLICT DO NOTHING RETURNING id"), {"id": str(uuid4()), "job": job["id"], "tid": job["tenant_id"],
+                    "sid": job["session_id"], "fingerprint": fingerprint([value["kind"], sorted(value["evidence_ids"])]),
+                    "finding": json.dumps(value), "members": json.dumps(members), "review": json.dumps(finding["review"]),
+                    "status": finding["status"], "reason": finding["reason"]})
+                quality_inserted += int(inserted_finding.first() is not None)
             await conn.execute(text("UPDATE jev_knowledge_job SET cursor_id=:cursor,scanned=scanned+:scanned,"
-                "candidate_count=candidate_count+:count,status=:status,attempts=0,lease_token=NULL,locked_until=NULL,"
+                "candidate_count=candidate_count+:count,quality_count=quality_count+:quality_count,status=:status,attempts=0,lease_token=NULL,locked_until=NULL,"
                 "error_type='',updated_at=NOW() WHERE id=:id"),
                 {"id": job["id"], "cursor": max([int(r["id"]) for r in page], default=job["cursor_id"]),
-                 "scanned": len(page), "count": inserted, "status": "pending" if page else "completed"})
+                 "scanned": len(page), "count": inserted, "quality_count": quality_inserted, "status": "pending" if page else "completed"})
         return True
 
-    async def save_review(self, row: dict, *, status: str, reason: str, review: dict, comparisons: list[dict]) -> bool:
+    async def save_review(self, row: dict, *, status: str, reason: str, review: dict, comparisons: list[dict], revision: dict | None = None) -> bool:
+        revision = revision or {}
+        members = sorted(set(row.get("source_members") or []) | set(revision.get("source_members") or []))
         async with get_engine().begin() as conn:
+            for member in members:
+                await conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+                                   {"key": f"memory-member-v1:{row['tenant_id']}:{member}"})
+            blocked = (await conn.execute(text("SELECT 1 FROM social_tenant_member_control WHERE tenant_id=:tid "
+                "AND user_id=ANY(:members) AND (memory_opt_out OR deletion_state IN ('requested','failed')) LIMIT 1"),
+                {"tid": row["tenant_id"], "members": members})).first() if members else None
+            if blocked:
+                await conn.execute(text("UPDATE jev_knowledge_candidate SET status='skipped',reason='member_policy_changed',"
+                    "lease_token=NULL,locked_until=NULL,version=version+1,updated_at=NOW() "
+                    "WHERE id=:id AND status='running' AND lease_token=:token AND locked_until>NOW()"),
+                    {"id": row["id"], "token": row["lease_token"]})
+                return False
             updated = (await conn.execute(text("UPDATE jev_knowledge_candidate SET status=:status,reason=:reason,review=CAST(:review AS JSON),"
-                "comparisons=CAST(:comparisons AS JSON),version=version+1,lease_token=NULL,locked_until=NULL,"
+                "comparisons=CAST(:comparisons AS JSON),revision=CAST(:revision AS JSON),source_members=CAST(:members AS JSON),version=version+1,lease_token=NULL,locked_until=NULL,"
                 "error_type='',updated_at=NOW() WHERE id=:id AND status='running' AND lease_token=:token "
                 "AND locked_until>NOW() RETURNING id"), {"id": row["id"], "token": row["lease_token"], "status": status,
-                "reason": reason, "review": json.dumps(review), "comparisons": json.dumps(comparisons)})).first()
+                "reason": reason, "review": json.dumps(review), "comparisons": json.dumps(comparisons),
+                "revision": json.dumps(revision), "members": json.dumps(members)})).first()
             prior_id = (row.get("draft") or {}).get("resolves_candidate_id")
-            if updated and prior_id and status in {"ready", "duplicate"}:
+            if updated and prior_id and status in {"ready", "duplicate", "revision_ready"}:
                 await conn.execute(text("UPDATE jev_knowledge_candidate SET status='resolved',reason='followup_resolved',"
                     "version=version+1,review=CAST(CAST(review AS JSONB) || CAST(:link AS JSONB) AS JSON),updated_at=NOW() "
                     "WHERE id=:prior AND tenant_id=:tid AND session_id=:sid AND status='unresolved'"),
@@ -140,10 +188,18 @@ class KnowledgeStore:
                      "link": json.dumps({"resolution_candidate_id": row["id"]})})
         return bool(updated)
 
-    async def open_candidates(self, tenant_id: str, session_id: str) -> list[dict]:
+    async def open_candidates(self, tenant_id: str, session_id: str, *, messages: list[dict] | None = None) -> list[dict]:
+        # Rank the entire two-week unresolved set, not only the newest questions.
+        content = " ".join(str(r.get("content") or "") for r in messages or [])[:20000].lower()
+        terms = re.findall(r"[a-z0-9_][a-z0-9_.-]{2,}", content)
+        for word in re.findall(r"[\u4e00-\u9fff]+", content):
+            terms.extend(word[i:i+2] for i in range(len(word)-1))
+        tokens = [token for token, _ in Counter(terms).most_common(100)]
         return await execute("SELECT id,draft FROM jev_knowledge_candidate WHERE tenant_id=:tid AND session_id=:sid "
-                             "AND status='unresolved' AND created_at>NOW()-INTERVAL '14 days' ORDER BY created_at DESC LIMIT 5",
-                             {"tid": tenant_id, "sid": session_id})
+                             "AND status='unresolved' AND created_at>NOW()-INTERVAL '14 days' "
+                             "ORDER BY (SELECT COUNT(*) FROM unnest(CAST(:tokens AS TEXT[])) token "
+                             "WHERE strpos(lower(draft->>'question'),token)>0) DESC,created_at DESC LIMIT 8",
+                             {"tid": tenant_id, "sid": session_id, "tokens": tokens})
 
     async def candidate(self, tenant_id: str, session_id: str, candidate_id: str) -> dict | None:
         rows = await execute("SELECT * FROM jev_knowledge_candidate WHERE tenant_id=:tid AND session_id=:sid AND id=:id",
@@ -164,4 +220,7 @@ class KnowledgeStore:
         candidates = await execute("SELECT * FROM jev_knowledge_candidate WHERE " + where + " ORDER BY created_at DESC LIMIT 100", params)
         for row in [*jobs, *candidates]:
             row.pop("lease_token", None)
-        return {"jobs": jobs, "candidates": candidates}
+        findings = await execute("SELECT * FROM jev_quality_finding WHERE " + where + " ORDER BY created_at DESC LIMIT 100", params)
+        quality_summary = await execute("SELECT finding->>'kind' AS kind,status,count(*) AS count FROM jev_quality_finding WHERE "
+                                        + where + " GROUP BY finding->>'kind',status", params)
+        return {"jobs": jobs, "candidates": candidates, "findings": findings, "quality_summary": quality_summary}

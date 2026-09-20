@@ -42,7 +42,7 @@ def service():
     jev = JevService(Settings(typesafe_enabled=True), client=SimpleNamespace(evaluate=AsyncMock(return_value=result())))
     jev.store = SimpleNamespace(policy=AsyncMock(return_value=(policy, 1)), record_online=AsyncMock())
     jev.registry = SimpleNamespace(scope_execution_allowed=AsyncMock(return_value=True))
-    store = SimpleNamespace(open_candidates=AsyncMock(return_value=[]), candidate=AsyncMock(), knowledge_snapshot=AsyncMock(return_value="snapshot"), blocked_members=AsyncMock(return_value=set()), page=AsyncMock(return_value=messages()),
+    store = SimpleNamespace(runtime_evidence=AsyncMock(return_value=[]), open_candidates=AsyncMock(return_value=[]), candidate=AsyncMock(), knowledge_snapshot=AsyncMock(return_value="snapshot"), blocked_members=AsyncMock(return_value=set()), page=AsyncMock(return_value=messages()),
         context=AsyncMock(return_value=[]), save_page=AsyncMock(return_value=True), evidence=AsyncMock(return_value=messages()),
         save_review=AsyncMock(return_value=True), policies=AsyncMock(return_value=[('t', policy)]), schedule=AsyncMock())
     llm = SimpleNamespace(chat=AsyncMock(return_value=SimpleNamespace(content='{"candidates":['+draft().model_dump_json()+']}')))
@@ -159,8 +159,9 @@ async def test_ready_is_not_automatically_published():
 async def test_semantic_comparison_controls_disposition(relation, expected):
     svc = service()
     svc.kb.search_documents.return_value = [SimpleNamespace(doc_id=8)]
-    svc.kb.get_document.return_value = SimpleNamespace(id=8,session_id='g@chatroom',title='旧经验',content='旧步骤',content_hash='v1')
+    svc.kb.get_document.return_value = SimpleNamespace(id=8,session_id='g@chatroom',title='旧经验',content='旧步骤',content_hash='v1',meta={},source='manual',url=None)
     svc.jev.client.evaluate.side_effect = [result(), result(relation)]
+    svc.build_revision = AsyncMock(return_value={})
     await svc.review_candidate(row())
     assert svc.store.save_review.call_args.kwargs['status'] == expected
     assert svc.store.save_review.call_args.kwargs['comparisons'][0]['content_hash'] == 'v1'
