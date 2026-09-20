@@ -16,7 +16,7 @@ COMPOSE_TYPESAFE_MODEL=jev-latest
 COMPOSE_TYPESAFE_TIMEOUT=10
 COMPOSE_TYPESAFE_MAX_RETRIES=1
 COMPOSE_TYPESAFE_MIN_CONFIDENCE=0.8
-COMPOSE_TYPESAFE_ONLINE_TIMEOUT=1.5
+COMPOSE_TYPESAFE_ONLINE_TIMEOUT=10
 COMPOSE_TYPESAFE_WORKER_CONCURRENCY=4
 COMPOSE_TYPESAFE_JOB_MAX_ATTEMPTS=3
 COMPOSE_TYPESAFE_RELATIONSHIP_ENABLED=true
@@ -37,8 +37,9 @@ COMPOSE_TYPESAFE_PARTICIPATION_ENABLED=true
 
 明确 @ 或回复机器人仍按原流程处理。非点名消息由 Jev 判断是否求助，达到阈值才提供软参与信号，
 经过原有安静时段、频率、成员退出、已有人解答、发送前复核等限制后回答。不会把群内任意聊天都当成问题。
-通过 Jev 门槛的明确求助，正常软回复有效期为源消息收到后 120 秒，给检索和答案生成留出时间；
-普通软回复仍为 45 秒。生成完毕不会重置该求助期限，发送前仍会取消已被回答、已改话题或被更新请求取代的回复。
+通过 Jev 门槛的明确求助，普通文本答案生成完毕后重新安排发送窗口（120 秒）；不把流式生成耗时
+扣进普通软回复的 45 秒有效期。发送前仍会取消已被回答、已改话题或被更新请求取代的回复。
+这只调整求助答案的发送窗口；Grok 的流式首事件、空闲和最长运行限制独立生效。
 Jev 不生成聊天回复。开启答疑的群会检索当前群和租户可见的知识库，用原 LLM 组织回答；
 检索失败时继续正常回答。第三方总结必须标注来源和核验状态，不能视作官方文档。
 

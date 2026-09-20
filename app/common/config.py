@@ -258,7 +258,7 @@ class Settings(BaseSettings):
     typesafe_intent_enabled: bool = True
     typesafe_moderation_enabled: bool = True
     typesafe_participation_enabled: bool = True
-    typesafe_online_timeout: float = Field(default=1.5, gt=0, le=5)
+    typesafe_online_timeout: float = Field(default=10.0, gt=0, le=20)
     typesafe_worker_concurrency: int = Field(default=4, ge=1, le=8)
     typesafe_job_max_attempts: int = Field(default=3, ge=1, le=10)
     typesafe_shadow_only: bool = True

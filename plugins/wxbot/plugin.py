@@ -1059,7 +1059,7 @@ class WxbotPlugin(Plugin):
                     "signals.participation",
                     "signals.channel.wechat.participation",
                 },
-                timeout_seconds=4.0,
+                timeout_seconds=30.0,
                 error_policy="fail_closed",
             ),
             FlowStepDefinition(

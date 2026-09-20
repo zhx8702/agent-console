@@ -3295,6 +3295,45 @@ async def test_wxbot_reply_queue_retimes_completed_tool_result() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('confirmed_help', [True, False])
+async def test_help_answer_gets_send_window_after_long_stream_generation(confirmed_help):
+    store = _FakeStore()
+    ctx = _group_reply_policy_ctx('这个报错应该怎么排查？', mentioned_me=False)
+    received = datetime.now(UTC) - timedelta(seconds=180)
+    ctx.event.received_at = received
+    previous_expiry = received + timedelta(seconds=120 if confirmed_help else 45)
+    ctx.extras['wxbot_participation'] = {
+        'status':'may_reply', 'score':60,
+        'reason_codes':['jev_help_seeking:plus60'] if confirmed_help else ['explicit_question_to_bot:plus60'],
+        'not_before':received.isoformat(), 'expires_at':previous_expiry.isoformat(),
+        'mention_sender':False,
+    }
+    ctx.extras['wxbot_reply_policy'] = {
+        'allowed':True, 'participation_policy_version':3,
+        'humanization_stage':'proactive', 'humanization_cohort':'proactive_canary',
+        'send_revalidation_enabled':True,
+    }
+    ctx.extras['wxbot_humanization_features'] = {
+        'speech_budget_enabled':True, 'duplicate_guard_enabled':True, 'style_guard_enabled':True,
+    }
+    ctx.result = CapabilityResult(route=RouteType.LLM, reply_text='先核对接口返回的错误类型。')
+    ctx.reply = OutboundReply(tenant_id=ctx.event.tenant_id, channel=Channel.WECHAT,
+        user_id=ctx.event.user_id,session_id=ctx.event.session_id,type=ReplyType.TEXT,
+        segments=[ReplySegment(type=ReplyType.TEXT,content='先核对接口返回的错误类型。')],trace_id=ctx.trace_id)
+    generated_at = datetime.now(UTC)
+    await WxbotReplyQueueHook(store).run(ctx)
+    delivery = store.calls[0]['delivery']
+    expiry = datetime.fromisoformat(delivery['expires_at'])
+    if confirmed_help:
+        assert generated_at + timedelta(seconds=120) <= expiry <= datetime.now(UTC) + timedelta(seconds=120)
+    else:
+        assert expiry == previous_expiry
+    assert delivery['send_revalidation_enabled'] is True
+    assert delivery['source_message_id'] == ctx.event.message_id
+    assert delivery['speech_class'] == 'soft'
+
+
+@pytest.mark.asyncio
 async def test_wxbot_agent_scope_step_emits_map_progress_effect_when_opted_in() -> None:
     store = _FakeStore()
     step = WxbotAgentScopeEnrichStep(store, effect_handler_enabled=True)

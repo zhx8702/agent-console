@@ -152,6 +152,7 @@ class WxbotReplyPolicyHook:
     name: str = "wxbot.reply_policy"
     point: HookPoint = HookPoint.BEFORE_ROUTE
     priority: int = 20
+    timeout_seconds: float = 30.0
     participation_service: SocialParticipationService = field(
         default_factory=SocialParticipationService,
         repr=False,

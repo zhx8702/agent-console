@@ -302,6 +302,11 @@ class WxbotReplyQueueHook:
                 response_kind = "short"
         retimed_not_before = ""
         retimed_expires_at = ""
+        is_help_answer = bool(
+            participation_status == ParticipationStatus.MAY_REPLY.value
+            and isinstance(participation_state, dict)
+            and "jev_help_seeking:plus60" in (participation_state.get("reason_codes") or [])
+        )
         if (
             is_group
             and participation_status
@@ -309,7 +314,7 @@ class WxbotReplyQueueHook:
                 ParticipationStatus.MUST_REPLY.value,
                 ParticipationStatus.MAY_REPLY.value,
             }
-            and response_kind in {"tool_progress", "tool_result"}
+            and (response_kind in {"tool_progress", "tool_result"} or is_help_answer)
         ):
             retimed_context = ParticipationContext(
                 tenant_id=ctx.event.tenant_id,
@@ -317,6 +322,7 @@ class WxbotReplyQueueHook:
                 message_id=source_message_id,
                 now=datetime.now(UTC),
                 response_kind=response_kind,
+                help_seeking=is_help_answer,
             )
             retimed_status = ParticipationStatus(participation_status)
             retimed_not_before_value, retimed_expires_at_value = (

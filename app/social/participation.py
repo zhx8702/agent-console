@@ -602,8 +602,8 @@ class SocialParticipationService:
             lower, upper, ttl = 0.5, 1.5, 30.0
         elif status == ParticipationStatus.MAY_REPLY and context.help_seeking:
             # Problem-solving answers may take longer than a short interjection.
-            # Keep the deadline anchored to the source message; send-time topic,
-            # answer, privacy and budget checks still apply.
+            # The reply queue renews this window once generation finishes;
+            # send-time topic, answer, privacy and budget checks still apply.
             lower, upper, ttl = 2.0, 6.0, 120.0
         elif status == ParticipationStatus.MAY_REPLY:
             lower, upper, ttl = 2.0, 6.0, 45.0

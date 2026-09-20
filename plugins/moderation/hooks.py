@@ -80,6 +80,7 @@ class ModerationAuditHook:
     name: str = "moderation.audit"
     point: HookPoint = HookPoint.AFTER_PREPROCESS
     priority: int = 20
+    timeout_seconds: float = 30.0
 
     async def run(self, ctx: PipelineContext) -> None:
         event = ctx.event
@@ -385,7 +386,7 @@ class ModerationInspectInputStep:
     outputs: set[str] = field(
         default_factory=lambda: {"signals.moderation.input", "effects.write_audit_event"}
     )
-    timeout_seconds: float = 1.5
+    timeout_seconds: float = 30.0
     error_policy: str = "fail_open"
 
     async def run(self, ctx: PipelineContext) -> StepResult:

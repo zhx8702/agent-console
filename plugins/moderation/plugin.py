@@ -105,7 +105,7 @@ class ModerationPlugin(Plugin):
                 permissions=["storage:shared"],
                 inputs={"event", "session", "pre"},
                 outputs={"signals.moderation.input", "effects.write_audit_event"},
-                timeout_seconds=1.5,
+                timeout_seconds=30.0,
                 error_policy="fail_open",
             ),
             FlowStepDefinition(
