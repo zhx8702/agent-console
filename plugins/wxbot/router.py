@@ -2162,7 +2162,9 @@ def build_wxbot_router(
         _require_tenant_admin(store, request, tenant_id)
         limit = max(1, min(limit, 200))
         try:
-            connection_id = normalize_wxbot_event_connection_id(connection_id)
+            connection_id = normalize_wxbot_event_connection_id(
+                connection_id or getattr(store.settings, "channel_connection_id", "") or ""
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         rows = await store.list_member_events(
@@ -2185,7 +2187,9 @@ def build_wxbot_router(
         _require_tenant_admin(store, request, tenant_id)
         limit = max(1, min(limit, 200))
         try:
-            connection_id = normalize_wxbot_event_connection_id(connection_id)
+            connection_id = normalize_wxbot_event_connection_id(
+                connection_id or getattr(store.settings, "channel_connection_id", "") or ""
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         rows = await store.list_media_ready_events(
