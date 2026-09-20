@@ -55,18 +55,10 @@ class MemoryPlugin(Plugin):
             llm_service=getattr(ctx.container, "llm_service", None),
             vector_store=getattr(ctx.container, "vector_store", None),
         )
-        # TypeSafe is an optional structured-decision sidecar. Keep its import
-        # lazy so disabled/local installs do not make the memory plugin depend
-        # on the external SDK at import time.
-        if bool(getattr(ctx.settings, "typesafe_enabled", False)):
-            try:
-                from app.typesafe import TypeSafeClient
-
-                self._typesafe_client = TypeSafeClient(ctx.settings)
-                self._store.typesafe_client = self._typesafe_client
-            except Exception:
-                logger.warning("memory.typesafe_client_unavailable", exc_info=True)
-                self._typesafe_client = None
+        service = getattr(ctx.container, "jev_service", None)
+        self._store.jev_service = service
+        if service is not None:
+            service.memory_store = self._store
         self._store.runtime_scope_gates_required = True
         self._store.scope_execution_allowed = self._scope_execution_allowed
         self._store.history_scope_execution_allowed = self._wxbot_scope_execution_allowed

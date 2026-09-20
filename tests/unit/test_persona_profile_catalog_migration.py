@@ -49,7 +49,7 @@ def test_persona_profile_catalog_upgrade_restores_saved_skill_catalog(
     )
     assert (
         ScriptDirectory.from_config(Config("alembic.ini"))
-        .get_revision(RUNTIME_SCHEMA_REVISION)
+        .get_revision("0050_speaker_portrait_cursor")
         .down_revision
         == "0049_speaker_portrait_hot_update"
     )

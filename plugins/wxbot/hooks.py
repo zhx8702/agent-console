@@ -500,7 +500,7 @@ class WxbotReplyPolicyStep:
         }
     )
     # Four bounded lookups may run serially for quoted soft candidates.
-    timeout_seconds: float = 4.0
+    timeout_seconds: float = 6.0
     error_policy: str = "fail_closed"
 
     async def run(self, ctx: PipelineContext) -> StepResult:

@@ -253,6 +253,14 @@ class Settings(BaseSettings):
     typesafe_timeout: float = Field(default=30.0, gt=0.0, le=600.0)
     typesafe_max_retries: int = Field(default=2, ge=0, le=10)
     typesafe_enabled: bool = False
+    typesafe_relationship_enabled: bool = True
+    typesafe_memory_enabled: bool = True
+    typesafe_intent_enabled: bool = True
+    typesafe_moderation_enabled: bool = True
+    typesafe_participation_enabled: bool = True
+    typesafe_online_timeout: float = Field(default=1.5, gt=0, le=5)
+    typesafe_worker_concurrency: int = Field(default=4, ge=1, le=8)
+    typesafe_job_max_attempts: int = Field(default=3, ge=1, le=10)
     typesafe_shadow_only: bool = True
     typesafe_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 

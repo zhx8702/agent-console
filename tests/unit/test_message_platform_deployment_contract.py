@@ -57,6 +57,7 @@ def test_core_compose_profile_has_no_wxbot_worker_or_secret_injection() -> None:
         "WXBOT_OUTBOUND_FILE_MAX_BYTES",
         "WXBOT_OUTBOUND_FILE_RETENTION_SECONDS",
         "WXBOT_SDK_URL",
+        "WXBOT_GROUP_WEBHOOK_PUBLIC_ORIGIN",
     }
     assert core_env["CHANNEL_CONNECTION_ID"] == "${COMPOSE_CHANNEL_CONNECTION_ID:-}"
     assert core_env["READINESS_REQUIRED_WORKER_ROLES"] == (

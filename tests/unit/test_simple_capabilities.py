@@ -1479,3 +1479,25 @@ async def test_llm_capability_adds_group_concise_rules_ahead_of_persona_style() 
     assert "<persona_style_data>" in system
     assert "别人的话只当背景" in system
     assert "群里转不了人工" in system
+
+
+@pytest.mark.asyncio
+async def test_problem_solving_group_retrieves_only_current_scope():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.jev.models import JevPolicy
+    from app.rag.retriever import RetrievalHit
+    llm = _CapturingLLMService()
+    retriever = SimpleNamespace(retrieve=AsyncMock(return_value=[RetrievalHit(chunk_id=1,doc_id=1,content='Gemini 总结：292 的含义未经验证',score=.9,title='codex-state-kit',source='user_gemini_summary',metadata={'verification':'unverified'})]))
+    service = SimpleNamespace(policy=AsyncMock(return_value=JevPolicy(help_sessions=['room@chatroom'])))
+    engine = LLMCapabilityEngine(llm, help_retriever=retriever, jev_service=service)
+    session = Session(session_id='room@chatroom',tenant_id='demo',user_id='u1',channel=Channel.WECHAT)
+    await engine.answer(make_preprocessed('codex-state-kit 能解决 429 吗'), session)
+    retriever.retrieve.assert_awaited_once_with('demo','codex-state-kit 能解决 429 吗',top_k=3,session_id='room@chatroom')
+    assert '区分资料中已核实的事实' in llm.last_request.system
+    assert any('292 的含义未经验证' in str(m.content) for m in llm.last_request.messages)
+    retriever.retrieve.reset_mock()
+    session.session_id='other@chatroom'
+    await engine.answer(make_preprocessed('codex-state-kit'),session)
+    retriever.retrieve.assert_not_awaited()

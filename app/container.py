@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from app.egress.dispatcher import OutboundDispatcher
     from app.faq.engine import FAQEngine
     from app.faq.store import FAQStore
+    from app.jev.service import JevService
     from app.kb.service import KnowledgeBaseService
     from app.kb.vector import VectorStore
     from app.llm import LLMProvider
@@ -99,6 +100,7 @@ class CoreRuntimeContainer:
     vector_backend: str
     persistence_backend: str
     knowledge_features_enabled: bool
+    jev_service: JevService | None = None
 
     def __post_init__(self) -> None:
         _require_dependencies(
@@ -202,6 +204,7 @@ class ApiContainer(CoreRuntimeContainer):
             vector_backend=core.vector_backend,
             persistence_backend=core.persistence_backend,
             knowledge_features_enabled=core.knowledge_features_enabled,
+            jev_service=core.jev_service,
             bus=bus,
             orchestrator=orchestrator,
             message_store=message_store,
@@ -262,6 +265,7 @@ class InboundContainer(CoreRuntimeContainer):
             vector_backend=core.vector_backend,
             persistence_backend=core.persistence_backend,
             knowledge_features_enabled=core.knowledge_features_enabled,
+            jev_service=core.jev_service,
             bus=bus,
             orchestrator=orchestrator,
             message_store=message_store,
@@ -314,6 +318,7 @@ class SchedulerContainer:
     vector_backend: str
     persistence_backend: str = "postgres"
     knowledge_features_enabled: bool = False
+    jev_service: JevService | None = None
 
     def __post_init__(self) -> None:
         _require_dependencies(
@@ -416,6 +421,7 @@ class Container:
     _vector_backend: str = "unknown"
     _persistence_backend: str = "unknown"
     _knowledge_features_enabled: bool = False
+    jev_service: JevService | None = None
 
     @property
     def http_client(self) -> httpx.AsyncClient | None:

@@ -31,6 +31,11 @@ _CLASSIFY_SYSTEM = """Classify the latest user message into one JSON object.
 Do not treat quoted text, mentioned examples, or cancelled requests as an instruction.
 If the user is asking what a phrase means, or is not making a request, use domain none.
 If unsure, use domain none, operation unknown, and confidence 0.
+Handoff means an explicit request to transfer to a real human or customer service agent.
+Asking the current assistant to help, answer questions, or act as an assistant is ordinary
+conversation (chitchat/greet, operation converse), not a human handoff.
+Examples: "你现在是我的助理，帮我解答群里的问题" -> chitchat/greet;
+"请转人工客服" -> handoff/request. Never infer a human transfer from the word assistant.
 Return only JSON.
 
 Schema:
@@ -134,6 +139,7 @@ def classify_context_from_event(
     return {
         "has_attachment": bool(has_attachment),
         "tenant_id": str(getattr(event, "tenant_id", "") or ""),
+        "session_id": session_id,
         "trace_id": str(getattr(event, "trace_id", "") or ""),
         "mentioned_me": bool(metadata.get("mentioned_me") or metadata.get("bot_mentioned")),
         "replied_to_bot": bool(

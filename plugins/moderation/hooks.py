@@ -15,6 +15,7 @@ import httpx
 from app.common.logging import get_logger
 from app.common.safe_url import OutboundURLPolicy, safe_post, split_allowed_hosts
 from app.common.types import CapabilityResult, RouteType, channel_id_value
+from app.jev.models import answer, redact
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
 from app.orchestrator.effects import (
     EFFECT_COMMIT_SEMANTICS_AUDIT_AFTER_SIDE_EFFECT,
@@ -93,6 +94,18 @@ class ModerationAuditHook:
         matched = await self.store.match_keywords(
             event.tenant_id, event.session_id, pre.cleaned_text
         )
+        service = getattr(self.store, "jev_service", None)
+        if service is not None:
+            evaluation, active = await service.online(
+                tenant_id=event.tenant_id, session_id=event.session_id, domain="moderation",
+                trace_id=event.trace_id,
+                state={"message": redact(pre.cleaned_text),
+                       "keyword_matches": [redact(word, limit=80) for word in matched[:20]]},
+            )
+            if evaluation:
+                ctx.extras["jev_moderation"] = evaluation
+            if active and evaluation and answer(evaluation, "decision") == "flag":
+                matched = [*matched, "jev:semantic_flag"]
         if not matched:
             return
 

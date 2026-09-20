@@ -2862,12 +2862,14 @@ def _build_runtime_profile(
 # after the helper ports are initialized.  The facade remains MemoryStore.
 from plugins.memory.store_backfill import MemoryBackfillStoreMixin  # noqa: E402
 from plugins.memory.store_group_graph import MemoryGroupGraphStoreMixin  # noqa: E402
+from plugins.memory.store_jev import MemoryJevStoreMixin  # noqa: E402
 from plugins.memory.store_jobs import MemoryExtractionJobStoreMixin  # noqa: E402
 from plugins.memory.store_retrieval import MemoryRetrievalStoreMixin  # noqa: E402
 
 
 class MemoryStore(
     MemoryAdminMutationMixin,
+    MemoryJevStoreMixin,
     MemoryRetrievalStoreMixin,
     MemoryExtractionJobStoreMixin,
     MemoryGroupGraphStoreMixin,
@@ -4653,7 +4655,7 @@ class MemoryStore(
                     ),
                 },
             )
-            return await self.get_memory_item(int(current["id"]))
+            return await self._queue_jev_item(await self.get_memory_item(int(current["id"])))
 
         if existing:
             logger.info(
@@ -4722,7 +4724,7 @@ class MemoryStore(
             item = self._finalize_memory_item(rows[0])
             if not item.get("source_evidence"):
                 item["source_evidence"] = source_evidence
-            return item
+            return await self._queue_jev_item(item)
 
         # A concurrent insert or the dedupe index's allowed-session hash may
         # have won the race. Re-read and compare the full audience contract;

@@ -453,6 +453,7 @@ class ParticipationPreviewRequest(StrictContract):
     explicit_command: bool = False
     safety_response_required: bool = False
     explicit_question_to_bot: bool = False
+    help_seeking: bool = False
     keyword_triggered: bool = False
     topic_continuation: bool = False
     unfinished_task_continuation: bool = False

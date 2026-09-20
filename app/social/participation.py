@@ -74,6 +74,7 @@ class ParticipationContext:
 
     # Soft score signals.
     explicit_question_to_bot: bool = False
+    help_seeking: bool = False
     keyword_triggered: bool = False
     topic_continuation: bool = False
     unfinished_task_continuation: bool = False
@@ -221,6 +222,7 @@ class SocialParticipationService:
             60,
             "explicit_question_to_bot",
         )
+        score = _add_signal(score, reasons, context.help_seeking, 60, "jev_help_seeking")
         score = _add_signal(
             score,
             reasons,

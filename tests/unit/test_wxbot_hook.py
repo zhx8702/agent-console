@@ -3606,3 +3606,28 @@ async def test_wxbot_agent_intent_hook_marks_moderation_event_queries() -> None:
 
     assert pipeline_ctx.extras["router_signals"]["tools_available"] is True
     assert pipeline_ctx.extras["agent_tool_scope"] == "group_plugin_status"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reply', [True, False])
+async def test_jev_help_nomination_only_in_enabled_group(reply):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.jev.models import JevPolicy
+    store = _FakeStore()
+    ctx = _group_reply_policy_ctx('Codex 调用一直出现 429，有什么排查办法？', mentioned_me=False, pre_intent=IntentCoarse.UNKNOWN)
+    document = _public_group_policy(rollout_stage='proactive')
+    document.policy = document.policy.model_copy(update={'proactive_enabled':True, 'rollout_opt_in':True, 'proactive_rollout_percent':100, 'quiet_start_hour':0,'quiet_end_hour':0})
+    store.jev_service = SimpleNamespace(policy=AsyncMock(return_value=JevPolicy(participation_shadow_only=False, help_sessions=[ctx.event.session_id])),
+        online=AsyncMock(return_value=({'answers':{'decision':{'choice':'reply' if reply else 'observe','confidence':.95}}}, reply)))
+    hook = WxbotReplyPolicyHook(store, social_policy_store=_SocialPolicyStore(document))
+    if reply:
+        await hook.run(ctx)
+        assert ctx.extras['wxbot_participation']['status'] == 'may_reply'
+        assert 'jev_help_seeking:plus60' in ctx.extras['wxbot_participation']['reason_codes']
+    else:
+        with pytest.raises(HookAbort):
+            await hook.run(ctx)
+        assert ctx.extras['wxbot_participation']['status'] == 'observe_only'
+    store.jev_service.online.assert_awaited_once()

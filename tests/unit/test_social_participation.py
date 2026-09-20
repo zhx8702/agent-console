@@ -303,3 +303,15 @@ def test_invalid_policy_bounds_are_rejected() -> None:
         ParticipationPolicy(prompt_context_retention_seconds=86_401)
     with pytest.raises(ValueError):
         ParticipationPolicy(mention_sender_strategy="always")  # type: ignore[arg-type]
+
+
+def test_jev_help_seeking_nominates_soft_reply_with_existing_guards():
+    service = SocialParticipationService()
+    context = _ctx(help_seeking=True, base_eligible=True)
+    decision = service.decide(context)
+    assert decision.status == ParticipationStatus.MAY_REPLY
+    assert 'jev_help_seeking:plus60' in decision.reason_codes
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, valid_member_answer_exists=True)).status == ParticipationStatus.CANCEL
+    assert service.decide(context, ParticipationPolicy(enabled=False)).status == ParticipationStatus.OBSERVE_ONLY
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, directed_to_other_member=True)).status == ParticipationStatus.OBSERVE_ONLY
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, soft_replies_last_10m=2)).status != ParticipationStatus.MAY_REPLY

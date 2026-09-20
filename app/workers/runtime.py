@@ -246,6 +246,10 @@ async def _cleanup_worker_resources(
     *,
     close_bus: bool = True,
 ) -> None:
+    jev_service = getattr(container, "jev_service", None)
+    if jev_service is not None:
+        with suppress(Exception):
+            await jev_service.close()
     plugin_registry = _container_plugin_registry(container)
     if plugin_registry is not None:
         with suppress(Exception):

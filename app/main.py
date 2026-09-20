@@ -73,6 +73,8 @@ from app.infra.runtime_schema import (
     verify_runtime_schema,
 )
 from app.ingress.router import build_router as build_ingress_router
+from app.jev.intent import JevIntentClassifier
+from app.jev.service import JevService
 from app.kb.ingest import IngestionService
 from app.kb.service import InMemoryKBStore, KnowledgeBaseService, SQLAlchemyKBStore
 from app.kb.vector.memory_store import InMemoryVectorStore
@@ -725,7 +727,10 @@ async def _build_scheduler_container(settings: Settings) -> SchedulerContainer:
         redis_ok=True,
     )
     plugin_manager = PluginManager(registry, plugin_state_store, plugin_ctx)
+    jev_service = JevService(settings)
+    jev_service.registry = registry
     container = SchedulerContainer(
+        jev_service=jev_service,
         plugin_registry=registry,
         plugin_manager=plugin_manager,
         llm_service=llm_service,
@@ -743,6 +748,7 @@ async def _build_scheduler_container(settings: Settings) -> SchedulerContainer:
     )
     plugin_ctx.container = container
     await registry.initialize_all(plugin_ctx)
+    jev_service.start()
     return container
 
 
@@ -853,7 +859,8 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         ingest.set_cache_invalidator(retriever.invalidate)
 
     # Core modules
-    preprocessor = build_preprocessor(LlmIntentClassifier(llm_service))
+    jev_service = JevService(s)
+    preprocessor = build_preprocessor(JevIntentClassifier(LlmIntentClassifier(llm_service), jev_service))
     rule_router = build_rule_router(s)
     safety_raw = build_safety(s)
     postprocessor = build_postprocessor()
@@ -865,7 +872,7 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
     if s.knowledge_features_enabled:
         faq_engine = FAQEngine(vector_store, llm_service, s, faq_store=faq_store)  # type: ignore[arg-type]
         rag_engine = RAGEngine(retriever, llm_service, s)  # type: ignore[arg-type]
-    llm_capability = LLMCapabilityEngine(llm_service, settings=s)
+    llm_capability = LLMCapabilityEngine(llm_service, settings=s, help_retriever=retriever, jev_service=jev_service)
     if db_ok:
         await agent_store.ensure_tables()
         effective_agent_store = agent_store
@@ -972,7 +979,9 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         if plugin_state_store is not None
         else None
     )
+    jev_service.registry = registry
     core_container = CoreRuntimeContainer(
+        jev_service=jev_service,
         session_manager=session_manager,
         preprocessor=preprocessor,
         router=rule_router,  # type: ignore[arg-type]
@@ -1294,6 +1303,9 @@ def _mount_routes(app: FastAPI, container: ApiContainer) -> None:
     app.include_router(build_ingress_router(container))
     app.include_router(build_group_webhook_router(container))
     app.include_router(build_admin_auth_router(settings))
+    if getattr(container, "jev_service", None) is not None:
+        from app.admin.jev_router import build_jev_router
+        app.include_router(build_jev_router(container.jev_service, settings))
     # The API advertises only adapters contributed by currently loaded
     # plugins. A built-in descriptor without its plugin/provider would make an
     # unavailable platform look configurable and enabled.
@@ -1397,6 +1409,8 @@ def create_app() -> FastAPI:
         finally:
             log.info("app.shutting_down")
 
+            if getattr(container, "jev_service", None) is not None:
+                await container.jev_service.close()
             if container.plugin_registry is not None:
                 await container.plugin_registry.shutdown_all()
 

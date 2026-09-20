@@ -231,6 +231,7 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
                 <div><dt>验收原因</dt><dd>{selectedEdge.acceptance_reason || evidenceQuality(evidence).reason || "-"}</dd></div>
                 <div><dt>可能冲突</dt><dd>{evidenceQuality(evidence).conflicts || 0}</dd></div>
                 <div><dt>置信度</dt><dd>{formatConfidence(selectedEdge.confidence)}</dd></div>
+                {selectedEdge.jev && <div><dt>Jev 评估</dt><dd>{selectedEdge.jev.model} · {selectedEdge.jev.decision?.choice || "—"} · 置信度 {formatConfidence(selectedEdge.jev.decision?.confidence)} · 证据质量 {selectedEdge.jev.quality?.score ?? "—"} · {selectedEdge.jev.applied ? "已参与决策" : "观察记录"}</dd></div>}
                 <div><dt>证据数</dt><dd>{selectedEdge.evidence_count ?? 0}</dd></div>
                 <div><dt>消息数</dt><dd>{selectedEdge.source_message_count ?? "-"}</dd></div>
                 <div><dt>首次出现</dt><dd>{formatTimestamp(selectedEdge.first_seen)}</dd></div>

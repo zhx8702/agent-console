@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.common.config import Settings
+from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent_classify import StaticIntentClassifier
+from app.jev.intent import JevIntentClassifier
+from app.jev.models import JevPolicy, confidence, memory_fingerprint, probability, redact
+from app.jev.service import JevService
+
+
+def result(choice='accepted', confidence_value=.95):
+    return {'model': 'jev-test', 'answers': {'decision': {'choice': choice, 'confidence': confidence_value},
+        'supported': {'noul': .95}, 'sensitive': {'noul': .01}}, 'usage': {'input_tokens': 10, 'output_tokens': 2}}
+
+
+def service(policy=None, response=None):
+    settings = Settings(typesafe_enabled=True, typesafe_online_timeout=.02)
+    store = SimpleNamespace(policy=AsyncMock(return_value=(policy or JevPolicy(), 1)),
+        enqueue=AsyncMock(return_value='job'), record_online=AsyncMock(), finish=AsyncMock())
+    client = SimpleNamespace(evaluate=AsyncMock(return_value=response or result()), aclose=AsyncMock())
+    svc = JevService(settings, client=client, store=store)
+    svc.registry = SimpleNamespace(scope_execution_allowed=AsyncMock(return_value=True))
+    return svc
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), -1, 2, None, 'bad'])
+def test_confidence_is_finite_and_bounded(value):
+    assert confidence(result(confidence_value=value)) == 0
+    assert probability({'answers': {'supported': {'noul': value}}}, 'supported', fallback=0) == 0
+
+
+def test_redaction_and_fingerprint():
+    masked = redact('wxid_someone https://secret.test apikey_secret cx1:p:abcd person Alice', {'Alice': 'person_1'})
+    assert all(x not in masked for x in ('wxid_someone', 'secret.test', 'apikey_secret', 'cx1:p:abcd', 'Alice'))
+    item = {'value': {'relation': {'predicate': 'friend'}}, 'status': 'active'}
+    audited = {**item, 'value': {'jev': result(), 'relation': {'predicate': 'friend', 'typesafe_shadow': result()}}}
+    assert memory_fingerprint(item) == memory_fingerprint(audited)
+    assert memory_fingerprint(item) != memory_fingerprint({**item, 'pinned': True})
+
+
+async def test_shadow_queues_without_calling_upstream():
+    svc = service()
+    assert await svc.online(tenant_id='t', session_id='s', domain='intent', state={'message':'hi'}, trace_id='tr') == (None, False)
+    svc.store.enqueue.assert_awaited_once()
+    svc.client.evaluate.assert_not_awaited()
+
+
+async def test_timeout_falls_back_and_is_audited():
+    svc = service(JevPolicy(shadow_only=False))
+    async def slow(**kwargs):
+        await asyncio.sleep(10)
+    svc.client.evaluate.side_effect = slow
+    assert await asyncio.wait_for(svc.online(tenant_id='t', session_id='s', domain='intent', state={}, trace_id='tr'), .2) == (None, False)
+    assert svc.store.record_online.call_args.kwargs['error'] == 'TimeoutError'
+
+
+async def test_policy_change_during_request_prevents_apply():
+    svc = service(JevPolicy(shadow_only=False), result('flag'))
+    svc.store.policy.side_effect = [(JevPolicy(shadow_only=False), 1), (JevPolicy(shadow_only=True), 2)]
+    _, active = await svc.online(tenant_id='t', session_id='s', domain='moderation', state={}, trace_id='tr')
+    assert not active
+    assert not svc.store.record_online.call_args.kwargs['applied']
+
+
+async def test_owner_denied_and_zero_sampling_skip():
+    svc = service()
+    svc.registry.scope_execution_allowed.return_value = False
+    await svc.online(tenant_id='t', session_id='s', domain='moderation', state={}, trace_id='tr')
+    svc.store.enqueue.assert_not_awaited()
+    svc.client.evaluate.assert_not_awaited()
+    svc = service(JevPolicy(sample_rate=0))
+    await svc.online(tenant_id='t', session_id='s', domain='intent', state={}, trace_id='tr')
+    svc.store.enqueue.assert_not_awaited()
+
+
+async def test_jev_can_correct_assistant_request_but_never_invent_tool():
+    primary = StaticIntentClassifier(IntentDecision.from_dict({'domain':'handoff','action':'request','confidence':.95}))
+    svc = service(JevPolicy(shadow_only=False))
+    response = result('abstain')
+    response['answers']['domain'] = {'choice':'chitchat','confidence':.95}
+    svc.online = AsyncMock(return_value=(response, True))
+    classifier = JevIntentClassifier(primary, svc)
+    decision = await classifier.classify('你现在是我的助理，帮我解答群里的问题', context={'tenant_id':'t','mentioned_me':True})
+    assert decision.domain is IntentDomain.CHITCHAT
+    assert not decision.needs_tool
+    response['answers']['domain']['choice'] = 'draw'
+    decision = await classifier.classify('请帮我处理这个请求', context={'tenant_id':'t','mentioned_me':True})
+    assert decision.domain is IntentDomain.NONE
+    assert not decision.needs_tool
+
+
+async def test_slow_jev_does_not_block_window_persistence():
+    from plugins.memory.store import MemoryStore
+    store = MemoryStore(SimpleNamespace(typesafe_enabled=True, typesafe_group_graph_shadow_timeout_seconds=.1))
+    async def slow(**kwargs):
+        await asyncio.sleep(10)
+    store.typesafe_client = SimpleNamespace(evaluate_group_relationship=AsyncMock(side_effect=slow))
+    store._load_group_relationship_events = AsyncMock(return_value=[{'id':1}])
+    store._build_group_relationship_windows = lambda *a, **k: [{'index':0,'event_ids':[1],'sender_ids':['a','b'],'first_event_id':1,'last_event_id':1,'rows':[]}]
+    store._load_group_member_directory = AsyncMock(return_value={})
+    store._resolve_group_graph_session_ids = AsyncMock(return_value=['room@chatroom'])
+    store._build_deterministic_group_window_candidates = lambda *a, **k: [{'subject':'a','object':f'b{i}','predicate':'replied_to','signals':{'quote':1},'evidence_event_ids':[1]} for i in range(20)]
+    store._apply_group_relationship_window_candidate = AsyncMock(return_value={'id':1})
+    for name in ('_refresh_legacy_cache_for_item_scope','_sync_memory_graph_for_item_safe','_sync_memory_vector_for_item_safe'):
+        setattr(store, name, AsyncMock())
+    response = await store.run_group_relationship_window_catchup(tenant_id='demo',channel='wechat',source_key='wxbot',session_id='room@chatroom',date='2026-09-20',max_windows_per_run=1,include_llm=False,time_budget_seconds=1)
+    assert store._apply_group_relationship_window_candidate.await_count == 20
+    assert response['next_cursor_event_id'] == 1
+    store.typesafe_client.evaluate_group_relationship.assert_not_awaited()
+
+
+async def test_help_seeking_has_independent_shadow_and_group_scope():
+    policy = JevPolicy(shadow_only=True, participation_shadow_only=False, help_sessions=['room@chatroom'])
+    svc = service(policy, result('reply'))
+    assert await svc.online(tenant_id='t',session_id='other@chatroom',domain='participation',state={},trace_id='t') == (None,False)
+    svc.client.evaluate.assert_not_awaited()
+    _, active = await svc.online(tenant_id='t',session_id='room@chatroom',domain='participation',state={},trace_id='t')
+    assert active

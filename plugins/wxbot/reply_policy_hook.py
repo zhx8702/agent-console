@@ -348,6 +348,7 @@ class WxbotReplyPolicyHook:
             "explicit_command": bool(context.explicit_command),
             "safety_response_required": bool(context.safety_response_required),
             "explicit_question_to_bot": bool(context.explicit_question_to_bot),
+            "help_seeking": bool(context.help_seeking),
             "keyword_triggered": bool(context.keyword_triggered),
             "rapid_multi_party_chat": bool(context.rapid_multi_party_chat),
             "valid_member_answer_exists": bool(context.valid_member_answer_exists),
@@ -910,6 +911,25 @@ class WxbotReplyPolicyHook:
             or humanization_features.shadow_only
             or humanization_features.contextual_soft_reply_enabled
         )
+        jev_help_seeking = False
+        jev_service = getattr(self.store, "jev_service", None)
+        if (jev_service is not None and not hard_addressed and mode != "off"
+                and runtime_participation_policy.enabled and runtime_participation_policy.proactive_enabled
+                and rollout_proactive_enabled and soft_reply_enabled
+                and not member_soft_reply_opt_out and not member_privacy_error
+                and not _has_leading_mention_prefix(content)):
+            jev_policy = await jev_service.policy(ctx.event.tenant_id)
+            if jev_policy.enabled and jev_policy.participation and session_id in jev_policy.help_sessions:
+                from app.jev.models import redact
+                evaluation, jev_help_seeking = await jev_service.online(
+                    tenant_id=ctx.event.tenant_id, session_id=session_id, domain="participation",
+                    trace_id=ctx.trace_id, state={"message": redact(content), "role": "group problem-solving assistant"},
+                )
+                if evaluation:
+                    ctx.extras["jev_participation"] = evaluation
+                if not jev_policy.participation_shadow_only:
+                    allowed = jev_help_seeking
+                    reason = "jev_help_seeking" if jev_help_seeking else "jev_no_clear_help_request"
         cursor_ready = await self._record_interaction_cursor(ctx)
         snapshot: dict[str, object] = {}
         context_error = ""
@@ -975,6 +995,7 @@ class WxbotReplyPolicyHook:
                 explicit_command=explicit_command,
                 safety_response_required=safety_response_required,
                 explicit_question_to_bot=explicit_question_to_bot,
+                help_seeking=jev_help_seeking,
                 keyword_triggered=keyword_triggered,
                 topic_continuation=bool(ctx.event.metadata.get("topic_continuation")),
                 unfinished_task_continuation=bool(

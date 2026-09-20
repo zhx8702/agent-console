@@ -611,6 +611,7 @@ export function edgeImportance(edge: GroupGraphEdge, nodesById: Map<string, Grou
     + Math.min(evidence, 40) * 4
     + days * 6
     + confidence * 18
+    + (edge.jev?.applied && Number.isFinite(edge.jev.quality?.score) ? Math.max(0, Math.min(1, edge.jev.quality?.score || 0)) * 12 : 0)
     + (sourceImportance + targetImportance) * 0.7
     + (CORE_EDGE_TYPES.has(type) ? 18 : 0)
     + (connectsPerson && connectsTopic ? 14 : 0)

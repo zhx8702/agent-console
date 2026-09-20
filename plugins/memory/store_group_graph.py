@@ -125,6 +125,7 @@ def _group_graph_edge_quality(item: dict[str, Any] | None) -> dict[str, Any]:
         max(evidence_dates) if evidence_dates else None
     )
     return {
+        "jev": value.get("jev") or relation.get("typesafe_shadow"),
         "evidence_dates": evidence_dates,
         "acceptance_score": _clamp_score(score) if score is not None else None,
         "acceptance_reason": reason[:80] or None,
@@ -1580,6 +1581,7 @@ class MemoryGroupGraphStoreMixin:
                 "confidence": confidence,
                 "acceptance_status": edge_acceptance,
                 "acceptance_score": quality["acceptance_score"],
+                "jev": quality["jev"],
                 "acceptance_reason": quality["acceptance_reason"],
                 "evidence_count": max(1, source_ref_count, stored_evidence_count),
                 "evidence_dates": evidence_dates,
@@ -2845,7 +2847,7 @@ class MemoryGroupGraphStoreMixin:
             day_count=day_count,
             auto_accept=auto_accept,
         )
-        if prior_acceptance_status in {"accepted", "rejected"}:
+        if prior_acceptance_status in {"accepted", "rejected"} or existing_acceptance.get("reviewed_by") == "system/jev":
             acceptance_status = prior_acceptance_status
             acceptance_reason = str(
                 existing_acceptance.get("reason") or relation_payload.get("reason") or policy_reason
@@ -3064,6 +3066,7 @@ class MemoryGroupGraphStoreMixin:
             "llm_jobs_enqueued": 0,
             "llm_failures": 0,
             "typesafe_shadow": {
+                "mode": "queued",
                 "attempted": 0,
                 "completed": 0,
                 "failed": 0,
@@ -3103,9 +3106,7 @@ class MemoryGroupGraphStoreMixin:
         llm_jobs_enqueued = 0
         llm_jobs_seen = 0
         llm_failures = 0
-        typesafe_shadow_attempted = 0
-        typesafe_shadow_completed = 0
-        typesafe_shadow_failed = 0
+        jev_queued = 0
         generated_from = [
             (
                 "plugin_wxbot_group_observations"
@@ -3203,35 +3204,8 @@ class MemoryGroupGraphStoreMixin:
                 deterministic_candidates,
                 llm_candidates,
             )
-            # TypeSafe is a shadow verifier: its result is carried as bounded
-            # audit metadata only.  The deterministic acceptance policy below
-            # remains the sole source of persistence/acceptance decisions.
-            for candidate_index, candidate in enumerate(candidates):
-                shadow_result = await self._run_typesafe_group_shadow(
-                    candidate=candidate,
-                    window=window,
-                    target_date=target_date,
-                )
-                if shadow_result is None:
-                    continue
-                summary.setdefault(
-                    "typesafe_shadow", {"attempted": 0, "completed": 0, "failed": 0}
-                )
-                typesafe_shadow_attempted += 1
-                status = str(shadow_result.get("status") or "completed")
-                if status == "completed":
-                    typesafe_shadow_completed += 1
-                    summary["typesafe_shadow"]["completed"] += 1
-                else:
-                    typesafe_shadow_failed += 1
-                    summary["typesafe_shadow"]["failed"] += 1
-                summary["typesafe_shadow"]["attempted"] += 1
-                # Do not mutate the merged candidate in place: a caller may
-                # reuse it for retries and shadow metadata is observational.
-                candidates[candidate_index] = {
-                    **candidate,
-                    "typesafe_shadow": shadow_result,
-                }
+            # Evaluation is durably enqueued by memory persistence. External
+            # calls never consume this extraction's checkpoint budget.
             if not candidates:
                 if not summary.get("llm_job"):
                     # Nothing found and nothing deferred: the window is done.
@@ -3279,6 +3253,7 @@ class MemoryGroupGraphStoreMixin:
                     total_skipped += 1
                     continue
                 summary["applied_count"] += 1
+                jev_queued += int(bool(item.get("_jev_queued")))
                 total_applied += 1
                 await self._refresh_legacy_cache_for_item_scope(item)
                 await self._sync_memory_graph_for_item_safe(item)
@@ -3293,9 +3268,8 @@ class MemoryGroupGraphStoreMixin:
         base_payload["llm_jobs_enqueued"] = llm_jobs_enqueued
         base_payload["llm_failures"] = llm_failures
         base_payload["typesafe_shadow"] = {
-            "attempted": typesafe_shadow_attempted,
-            "completed": typesafe_shadow_completed,
-            "failed": typesafe_shadow_failed,
+            "mode": "queued", "queued": jev_queued,
+            "attempted": 0, "completed": 0, "failed": 0,
         }
         base_payload["generated_from"] = generated_from
         base_payload["totals"] = {
@@ -3682,6 +3656,7 @@ class MemoryGroupGraphStoreMixin:
             "  JOIN plugin_memory_fact fact ON fact.memory_item_id = item.id "
             "  WHERE item.deleted_at IS NULL AND item.status = 'pending' "
             "    AND item.source_type = :llm_source "
+            "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{acceptance,reviewed_by}', '') NOT IN ('system/jev') "
             "    AND fact.object_entity_id IS NOT NULL "
             "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{kind}', '') = 'group_window_relation' "
             "    AND COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{acceptance,status}', '') "

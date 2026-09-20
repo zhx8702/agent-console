@@ -8,6 +8,7 @@ own their own provider, retries, and failure policy.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -54,7 +55,8 @@ class TypeSafeEvaluation:
         if value is None and answer.get("type") == "noul":
             value = answer.get("noul")
         try:
-            return max(0.0, min(1.0, float(value or 0.0)))
+            number = float(value or 0.0)
+            return number if math.isfinite(number) and 0 <= number <= 1 else 0.0
         except (TypeError, ValueError):
             return 0.0
 

@@ -243,6 +243,8 @@ class FlowRuntimeCoordinator:
                 route_label=route_label,
                 reason=stop_reason or "degraded_reply_queued",
             )
+        if queued_count > 0:
+            return ProcessingOutcome.completed(route_label=route_label, reason="channel_reply_queued")
         if bool(ctx.extras.get("suppress_outbound")) or result.status in {
             "stopped",
             "deferred",

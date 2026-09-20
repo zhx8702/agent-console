@@ -488,6 +488,7 @@ export type GroupGraphNode = {
 };
 
 export type GroupGraphEdge = {
+  jev?: { model?: string; applied?: boolean; decision?: { choice?: string; confidence?: number }; quality?: { score?: number }; priority?: { score?: number } } | null;
   id: string;
   from?: string;
   to?: string;
