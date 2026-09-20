@@ -922,9 +922,17 @@ class WxbotReplyPolicyHook:
             jev_policy = await jev_service.policy(ctx.event.tenant_id)
             if jev_policy.enabled and jev_policy.participation and session_id in jev_policy.help_sessions:
                 from app.jev.models import redact
+                jev_state = {"message": redact(content), "role": "group problem-solving assistant"}
+                context_builder = getattr(jev_service, "participation_state", None)
+                if callable(context_builder):
+                    jev_state = await context_builder(
+                        tenant_id=ctx.event.tenant_id, session_id=session_id, message=content,
+                        sender_id=str(ctx.event.metadata.get("sender_wxid") or ctx.event.user_id or ""),
+                        message_id=str(ctx.event.message_id or ""),
+                    )
                 evaluation, jev_help_seeking = await jev_service.online(
                     tenant_id=ctx.event.tenant_id, session_id=session_id, domain="participation",
-                    trace_id=ctx.trace_id, state={"message": redact(content), "role": "group problem-solving assistant"},
+                    trace_id=ctx.trace_id, state=jev_state,
                 )
                 if evaluation:
                     ctx.extras["jev_participation"] = evaluation

@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiRequest } from "../../lib/api";
 import { useConsoleConfig } from "../../state/console-config";
+import { JevKnowledgePanel } from "./JevKnowledgePanel";
 import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
 
-const domains = { relationship: "群关系", memory: "长期记忆", intent: "意图判断", moderation: "内容审核", participation: "群内求助" };
+const domains = { relationship: "群关系", memory: "长期记忆", intent: "意图判断", moderation: "内容审核", participation: "群内求助", knowledge: "群知识迭代" };
 type Domain = keyof typeof domains;
-type Policy = Record<Domain, boolean> & { enabled: boolean; shadow_only: boolean; min_confidence: number; sample_rate: number; participation_shadow_only: boolean; help_sessions: string[] };
+type Policy = Record<Domain, boolean> & { enabled: boolean; shadow_only: boolean; min_confidence: number; sample_rate: number; participation_shadow_only: boolean; help_sessions: string[]; knowledge_sessions?: string[]; knowledge_daily_hour?: number; knowledge_timezone?: string; knowledge_min_confidence?: number };
 type Evaluation = { id: string; session_id?: string; domain: Domain; status: string; attempts: number; applied: boolean; error_type: string; duration_ms: number; target_id: number | null; retryable: boolean; result: { model?: string; _audit?: { reason?: string; trace_id?: string; min_confidence?: number; effective_decision?: string }; answers?: Record<string, { choice?: string; confidence?: number; score?: number }> } | null };
 type Dashboard = { policy: Policy; version: number; runtime: { enabled: boolean; key_configured: boolean; model: string }; summary: { domain: Domain; status: string; count: number; input_tokens: number; output_tokens: number; applied: number }[]; items: Evaluation[] };
 const statuses: Record<string, string> = { pending: "等待评估", running: "评估中", completed: "已完成", failed: "失败", skipped: "已跳过" };
-const choices: Record<string, string> = { accepted: "接受", needs_review: "待人工审核", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断", reply: "建议回复", observe: "继续旁观" };
+const choices: Record<string, string> = { accepted: "接受", needs_review: "待人工审核", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断", reply: "建议回复", observe: "继续旁观", retain: "保留知识候选", reject: "不建议入库", unresolved: "问题未解决", duplicate: "重复知识", supplement: "补充知识", conflict: "知识冲突", unrelated: "不同主题" };
 const reasons: Record<string, string> = { applied: "达到阈值，已交给业务策略", no_change: "保留原流程，无需介入", low_confidence: "置信度未达到阈值", shadow_only: "观察模式，只记录建议", group_removed: "该群已移出答疑白名单", owner_disabled: "所属插件已停用", policy_disabled: "评估策略已停用", evaluation_failed: "评估失败，沿用原流程", online_timeout: "超过在线时限，沿用原流程", human_protected: "保留人工审核或置顶状态", invalid_decision: "判断无效，未应用", evidence_review_required: "证据或敏感性检查要求人工审核" };
 
 export function JevPanel() {
@@ -81,9 +82,14 @@ export function JevPanel() {
         {!draft.shadow_only && <p>达到阈值的结果可调整自动生成记忆的接受状态、撤回不支持的意图或增加审核标记。人工审核、置顶记忆和已有敏感词拦截会保留。</p>}
         <label>最低置信度<input aria-label="最低置信度" type="number" min="0" max="1" step="0.01" value={draft.min_confidence} onChange={e => setDraft({ ...draft, min_confidence: Number(e.target.value) })} /></label>
         <label>采样比例<input aria-label="采样比例" type="number" min="0" max="1" step="0.05" value={draft.sample_rate} onChange={e => setDraft({ ...draft, sample_rate: Number(e.target.value) })} /></label>
-        {Object.entries(domains).map(([key, label]) => <label key={key}><input type="checkbox" checked={draft[key as Domain]} onChange={e => setDraft({ ...draft, [key]: e.target.checked })} />{label}</label>)}
+        {Object.entries(domains).map(([key, label]) => <label key={key}><input type="checkbox" checked={Boolean(draft[key as Domain])} onChange={e => setDraft({ ...draft, [key]: e.target.checked })} />{label}</label>)}
         <label><input type="checkbox" checked={draft.participation_shadow_only} onChange={e => setDraft({ ...draft, participation_shadow_only: e.target.checked })} />群内求助仅记录建议</label>
         <label>主动答疑群（每行一个会话 ID）<textarea aria-label="主动答疑群" value={draft.help_sessions.join("\n")} onChange={e => setDraft({ ...draft, help_sessions: e.target.value.split("\n") })} /></label>
+        <label>每日知识整理群（每行一个会话 ID）<textarea aria-label="每日知识整理群" value={(draft.knowledge_sessions || []).join("\n")} onChange={e => setDraft({ ...draft, knowledge_sessions: e.target.value.split("\n") })} /></label>
+        <label>每日整理时间（小时）<input aria-label="每日知识整理时间" type="number" min="0" max="23" value={draft.knowledge_daily_hour ?? 3} onChange={e => setDraft({ ...draft, knowledge_daily_hour: Number(e.target.value) })} /></label>
+        <label>整理时区<input aria-label="知识整理时区" value={draft.knowledge_timezone || "Asia/Shanghai"} onChange={e => setDraft({ ...draft, knowledge_timezone: e.target.value })} /></label>
+        <label>知识审核最低置信度<input aria-label="知识审核最低置信度" type="number" min="0.8" max="1" step="0.01" value={draft.knowledge_min_confidence ?? .9} onChange={e => setDraft({ ...draft, knowledge_min_confidence: Number(e.target.value) })} /></label>
+        <p>每日整理前一天的群聊，补查最近 7 天。知识候选独立审核，发布后才进入答疑检索；不会自动覆盖已有知识。</p>
         <p>求助判断单独选择观察或参与决策，仅对以上群生效，还需开启该群主动参与。明确求助时按问题回答，保留安静时段、频率限制和成员退出设置。</p>
         <button disabled={!dirty} onClick={() => void save()}>保存策略</button><button disabled={!dirty} onClick={() => setDraft(data.policy)}>放弃修改</button>
       </fieldset>
@@ -100,5 +106,6 @@ export function JevPanel() {
       <td className="mono">{item.session_id || "—"}{item.result?._audit?.trace_id && <div>{item.result._audit.trace_id}</div>}</td>
     </tr>)}</tbody></table></div>
     {data && data.items.length === 0 && <p>当前筛选条件下没有评估记录。</p>}
+    <JevKnowledgePanel sessionId={sessionId.trim()} disabled={dirty || busy} />
   </section>;
 }

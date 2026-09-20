@@ -99,3 +99,36 @@ sudo AGENT_CONSOLE_ENV_FILE=.env bash scripts/deploy-server.sh
 
 迁移 0053 新建策略与队列表。部署前保留旧代码/环境/镜像；部署后检查健康、队列领取、实际结果和微信 SDK。
 禁用总开关不删除已有记忆；回滚应用时可保留新增表。
+
+
+## 每日群知识候选
+
+租户策略新增 `knowledge`（默认 false）、`knowledge_sessions`（独立白名单）、
+`knowledge_daily_hour`（默认 3）、`knowledge_timezone`（默认 Asia/Shanghai）、
+`knowledge_min_confidence`（默认 0.90）。不跟随答疑开关自动扩大知识采集范围。
+配置会话 ID 必须与归档消息一致，托管连接使用规范 `cx1:c:…@chatroom` ID。
+
+scheduler 独立任务扫描前一天及最近七天的归档消息；50 条一页，保存游标、处理量和候选数。
+每个任务租约 15 分钟，失败最多三次；页面成功后重置尝试次数。完成日期出现晚到消息时自动继续。
+Grok 以流式活动计时整理问题、环境、步骤、结果和原始消息 ID，Jev 独立审核可复用性、
+支持度、敏感性和解决状态。机器人发言不能充当成功确认，缺失或被删除的来源不能发表。
+提取保留上页上下文，并带入最近 14 天最多五个未解决候选的原始证据；新增反馈须另经
+Jev 判断确实解决同一个问题，才能关联旧候选。该上限不意味着所有未解决问题都已自动跟进。
+
+达到知识门槛的条目还要检索本群及租户公共知识，逐一判断重复、补充、冲突或无关。
+检索失败会重试，不按“没有旧知识”处理；知识库在评估后发生变更时，发布要求重新审核。
+控制台“记忆 → Jev 评估 → 每日知识候选”显示最近任务、结构化候选、脱敏原文和判断。
+明确通过的候选可由租户管理员填写审核说明后发布到本群知识库；其他候选可排除或重新审核。
+不会自动发布，不会自动覆盖人工文档；补充/冲突的可审核修订版本流程仍需后续完善。
+
+成员退出在外发前、保存候选的事务内及发布前复查。成员遗忘流程同步清除候选及派生知识的
+索引与正文；索引清理失败会交给原有持久化删除流程重试，不报告删除完成。
+
+API：
+- GET `/v1/admin/jev/knowledge?tenant_id=…&session_id=…`
+- GET `/v1/admin/jev/knowledge/candidates/{id}/evidence?tenant_id=…`
+- POST `/v1/admin/jev/knowledge/candidates/{id}?tenant_id=…`：版本、publish/reject/retry、审核说明，需 Idempotency-Key。
+- POST `/v1/admin/jev/knowledge/jobs/{id}/retry?tenant_id=…`：保留已处理游标，需 Idempotency-Key。
+
+迁移 `0054_jev_knowledge` 添加每日任务及候选表；回滚前先停用知识整理。当前实现还需完成
+线上启用与真实消息验证；开发验证记录见 `docs/jev-knowledge-iteration.md`。

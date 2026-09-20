@@ -13,6 +13,7 @@ from app.jev.models import (
     fingerprint,
     memory_fingerprint,
     questions,
+    redact,
     with_audit,
 )
 from app.jev.store import JevStore
@@ -25,6 +26,7 @@ class JevService:
         self.settings = settings
         self.store = store or JevStore()
         self.client = client
+        self.knowledge_service: Any = None
         self.memory_store: Any = None
         self.registry: Any = None
         self._task: asyncio.Task | None = None
@@ -76,6 +78,28 @@ class JevService:
             return await self.registry.scope_execution_allowed("wxbot", tenant_id=tenant_id, session_id=session_id) is True
         return True
 
+    async def participation_state(self, *, tenant_id: str, session_id: str,
+                                  message: str, sender_id: str = "", message_id: str = "") -> dict:
+        state: dict[str, Any] = {"message": redact(message), "role": "group problem-solving assistant"}
+        try:
+            rows = await asyncio.wait_for(self.store.recent_participation_messages(tenant_id, session_id), 1)
+            rows = [r for r in reversed(rows) if not message_id or r["message_id"] != message_id]
+            identities = {sender_id: "current_speaker"} if sender_id else {}
+            for row in rows:
+                member = row.get("sender_wxid") or ""
+                token = "assistant" if row.get("is_self_sent") else identities.setdefault(member, f"member_{len(identities)+1}")
+                if len(row.get("sender_name") or "") >= 2:
+                    identities[row["sender_name"]] = token
+            state["message"] = redact(message, identities)
+            state["recent_messages"] = [{"speaker": "assistant" if r.get("is_self_sent") else identities.get(r["sender_wxid"], "unknown"),
+                "text": redact(r["content"], identities, 600)} for r in rows]
+            state["current_speaker"] = "current_speaker"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("jev.participation_context_unavailable", error_type=type(exc).__name__)
+        return state
+
     async def enqueue_memory(self, item: dict, *, run: Any) -> bool:
         if not self.enabled or item.get("source_type") in {"manual", "explicit_user"}:
             return False
@@ -95,13 +119,16 @@ class JevService:
             fingerprint=key, input_hash=digest, target_id=int(item["id"]), run=run))
 
     async def evaluate(self, domain: str, state: dict, *, timeout: float) -> dict:
+        return await self.evaluate_questions(questions(domain), state, timeout=timeout)
+
+    async def evaluate_questions(self, question_set: dict, state: dict, *, timeout: float) -> dict:
         if time.monotonic() < self._circuit_until:
             raise RuntimeError("circuit_open")
         if self.client is None:
             from app.typesafe import TypeSafeClient
             self.client = TypeSafeClient(self.settings)
         try:
-            response = await asyncio.wait_for(self.client.evaluate(state=state, questions=questions(domain)), timeout)
+            response = await asyncio.wait_for(self.client.evaluate(state=state, questions=question_set), timeout)
             if response is None:
                 raise ValueError("empty_result")
             result = response.as_dict() if hasattr(response, "as_dict") else response
@@ -208,6 +235,8 @@ class JevService:
             self._task = asyncio.create_task(self._loop(), name="jev-evaluations")
 
     async def close(self) -> None:
+        if self.knowledge_service is not None:
+            await self.knowledge_service.close()
         if self._task:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)

@@ -186,3 +186,26 @@ async def test_queued_shadow_preserves_trace_without_sending_it_upstream():
     assert svc.client.evaluate.call_args.kwargs['state'] == {'message':'hello'}
     assert svc.store.finish.call_args.kwargs['result']['_audit']['trace_id'] == 'trace-intent'
     assert state['_audit_context']['trace_id'] == 'trace-intent'
+
+
+async def test_participation_context_preserves_speaker_without_identifiers():
+    svc = service()
+    svc.store.recent_participation_messages = AsyncMock(return_value=[
+        {'message_id':'current','sender_wxid':'wxid_a','sender_name':'小甲','content':'还是不行','is_self_sent':False},
+        {'message_id':'reply','sender_wxid':'wxid_bot','sender_name':'机器人','content':'试试更新证书','is_self_sent':True},
+        {'message_id':'question','sender_wxid':'wxid_a','sender_name':'小甲','content':'小甲的证书报错','is_self_sent':False},
+    ])
+    state = await svc.participation_state(tenant_id='t',session_id='room@chatroom',message='还是不行',sender_id='wxid_a',message_id='current')
+    assert state['message']=='还是不行'
+    assert len(state['recent_messages'])==2
+    assert state['recent_messages'][0]['speaker']=='current_speaker'
+    assert state['recent_messages'][1]['speaker']=='assistant'
+    assert '小甲' not in str(state) and 'wxid_a' not in str(state)
+
+
+async def test_participation_context_failure_keeps_current_message():
+    svc = service()
+    svc.store.recent_participation_messages=AsyncMock(side_effect=RuntimeError('db unavailable'))
+    state=await svc.participation_state(tenant_id='t',session_id='room@chatroom',message='请帮忙')
+    assert state['message']=='请帮忙'
+    assert 'recent_messages' not in state

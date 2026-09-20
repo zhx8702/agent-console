@@ -946,7 +946,8 @@ class KnowledgeBaseService:
         return result
 
     async def search_documents(
-        self, tenant_id: str, query: str, session_id: str | None = None, top_k: int = 5
+        self, tenant_id: str, query: str, session_id: str | None = None, top_k: int = 5,
+        *, raise_on_error: bool = False,
     ) -> list[DocumentSearchHit]:
         query = (query or "").strip()
         if not query:
@@ -961,8 +962,12 @@ class KnowledgeBaseService:
                 )
             )
         except Exception:
+            if raise_on_error:
+                raise
             return []
         if not resp.vectors:
+            if raise_on_error:
+                raise RuntimeError("knowledge_embedding_unavailable")
             return []
 
         normalized = normalize_scope_session_id(session_id)

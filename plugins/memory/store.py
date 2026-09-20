@@ -7616,6 +7616,9 @@ class MemoryStore(
             tenant_id=tenant,
             user_id=member,
         )
+        knowledge = getattr(getattr(self, "jev_service", None), "knowledge_service", None)
+        if memory_channel == "wechat" and knowledge is not None:
+            await knowledge.erase_member(tenant_id=tenant, user_id=member, run=_exec)
         scope = {
             "tid": tenant,
             "uid": member,

@@ -74,6 +74,7 @@ from app.infra.runtime_schema import (
 )
 from app.ingress.router import build_router as build_ingress_router
 from app.jev.intent import JevIntentClassifier
+from app.jev.knowledge import JevKnowledgeService
 from app.jev.service import JevService
 from app.kb.ingest import IngestionService
 from app.kb.service import InMemoryKBStore, KnowledgeBaseService, SQLAlchemyKBStore
@@ -729,6 +730,7 @@ async def _build_scheduler_container(settings: Settings) -> SchedulerContainer:
     plugin_manager = PluginManager(registry, plugin_state_store, plugin_ctx)
     jev_service = JevService(settings)
     jev_service.registry = registry
+    jev_service.knowledge_service = JevKnowledgeService(jev_service, llm=llm_service, kb=kb_service)
     container = SchedulerContainer(
         jev_service=jev_service,
         plugin_registry=registry,
@@ -749,6 +751,7 @@ async def _build_scheduler_container(settings: Settings) -> SchedulerContainer:
     plugin_ctx.container = container
     await registry.initialize_all(plugin_ctx)
     jev_service.start()
+    jev_service.knowledge_service.start()
     return container
 
 
@@ -980,6 +983,7 @@ async def build_container(settings: Settings | None = None) -> RuntimeContainer:
         else None
     )
     jev_service.registry = registry
+    jev_service.knowledge_service = JevKnowledgeService(jev_service, llm=llm_service, kb=kb_service)
     core_container = CoreRuntimeContainer(
         jev_service=jev_service,
         session_manager=session_manager,

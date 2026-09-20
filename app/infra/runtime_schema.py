@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0053_jev_evaluations"
+RUNTIME_SCHEMA_REVISION = "0054_jev_knowledge"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
 # 0046 adds durable memory-event provenance, evidence, and physical expiry.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
@@ -19,6 +19,8 @@ RUNTIME_SCHEMA_TABLES = frozenset(
         "app_schema_contract",
         "jev_policy",
         "jev_evaluation",
+        "jev_knowledge_job",
+        "jev_knowledge_candidate",
         "channel_connection",
         "plugin_agent_session_policy",
         "plugin_agent_tool_audit",

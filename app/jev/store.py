@@ -98,6 +98,16 @@ class JevStore:
         return {"summary": summary, "items": items}
 
 
+    async def recent_participation_messages(self, tenant_id: str, session_id: str) -> list[dict]:
+        return await execute(
+            "SELECT o.id,o.message_id,o.sender_wxid,o.sender_name,o.content,o.is_self_sent,o.occurred_ts "
+            "FROM plugin_wxbot_group_observations o LEFT JOIN social_tenant_member_control c "
+            "ON c.tenant_id=o.tenant_id AND c.user_id=o.sender_wxid "
+            "WHERE o.tenant_id=:tid AND o.session_id=:sid "
+            "AND o.occurred_ts>=EXTRACT(EPOCH FROM NOW())-1200 "
+            "AND NOT COALESCE(c.memory_opt_out,FALSE) AND COALESCE(c.deletion_state,'none') NOT IN ('requested','failed') "
+            "ORDER BY o.id DESC LIMIT 8", {"tid": tenant_id, "sid": session_id})
+
     async def memory_changes(self, since, item_id: int) -> list[dict]:
         return await execute(
             "SELECT id,updated_at FROM plugin_memory_item WHERE deleted_at IS NULL "

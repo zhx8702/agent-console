@@ -43,7 +43,7 @@ def build_jev_router(service, settings) -> APIRouter:
     @declare_route_permission(RoutePermission("GET", "/v1/admin/jev", AdminPermission.READ))
     async def dashboard(request: Request, response: Response,
                         tenant_id: str = Query(min_length=1, max_length=64),
-                        domain: Literal["", "relationship", "memory", "intent", "moderation", "participation"] = "",
+                        domain: Literal["", "relationship", "memory", "intent", "moderation", "participation", "knowledge"] = "",
                         status: Literal["", "pending", "running", "completed", "failed", "skipped"] = "",
                         session_id: str = Query(default="", max_length=256),
                         limit: int = Query(default=50, ge=1, le=100)):
@@ -115,4 +115,6 @@ def build_jev_router(service, settings) -> APIRouter:
                 raise HTTPException(409, "idempotency_key_conflict") from exc
         return outcome.response
 
+    from app.admin.jev_knowledge_router import register_knowledge_routes
+    register_knowledge_routes(router, service, principal_for)
     return router

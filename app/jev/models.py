@@ -26,8 +26,23 @@ class JevPolicy(BaseModel):
     participation_shadow_only: bool = True
     help_sessions: list[str] = Field(default_factory=list, max_length=100)
     sample_rate: float = Field(default=1.0, ge=0, le=1)
+    knowledge: bool = False
+    knowledge_sessions: list[str] = Field(default_factory=list, max_length=100)
+    knowledge_daily_hour: int = Field(default=3, ge=0, le=23)
+    knowledge_timezone: str = "Asia/Shanghai"
+    knowledge_min_confidence: float = Field(default=0.9, ge=0.8, le=1.0)
 
-    @field_validator("help_sessions", mode="before")
+    @field_validator("knowledge_timezone")
+    @classmethod
+    def valid_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("unknown timezone") from exc
+        return value
+
+    @field_validator("help_sessions", "knowledge_sessions", mode="before")
     @classmethod
     def normalize_help_sessions(cls, value: Any) -> Any:
         if not isinstance(value, list):
@@ -139,6 +154,9 @@ def questions(domain: str) -> dict:
         return {"decision": {"type": "choice", "instructions": untrusted +
             "Decide whether the current speaker is sincerely seeking help or asking an answerable question to the group. "
             "A concrete problem description or troubleshooting request can seek help without a question mark. "
+            "Use recent_messages only to resolve the CURRENT message's references and follow-up intent. "
+            "For example, 'still broken' after troubleshooting is a continued request, while 'fixed, thanks' is resolved. "
+            "Do not answer an old question just because it appears in history. Keep speakers and concurrent topics distinct. "
             "Do not join rhetorical questions, jokes, advertisements, pasted articles, quoted questions, "
             "requests addressed to another named member, resolved issues or ordinary conversation. "
             "The assistant helps solve problems; it should not respond just because a product keyword appears.",
