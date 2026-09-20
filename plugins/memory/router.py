@@ -1489,6 +1489,7 @@ def build_memory_router(
         acceptance_status: str | None = Query(default=None),
         min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
         limit: int = Query(default=500, ge=1, le=500),
+        cursor: str | None = Query(default=None, max_length=64),
     ):
         await _require_group_read_access(
             request,
@@ -1511,6 +1512,7 @@ def build_memory_router(
             acceptance_status=acceptance_status,
             min_confidence=min_confidence,
             limit=limit,
+            cursor=cursor,
         )
         safe_payload = _scrub_group_graph_payload(payload)
         if not isinstance(safe_payload, dict):

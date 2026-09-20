@@ -1045,7 +1045,7 @@ async def test_graph_read_reports_evidence_dates_merges_pairs_and_backfills_endp
         "total": 2780,
         "truncated": True,
         "order": "strength_desc",
-        "next_cursor": None,
+        "next_cursor": "500",
     }
     fact_sql = next(sql for sql in seen if "FROM plugin_memory_fact fact" in sql and "COUNT" not in sql)
     assert "= 'accepted' AND backing.status = 'active'" in fact_sql
@@ -2220,6 +2220,7 @@ async def test_list_imported_targets_include_observation_only_days(
     assert any("plugin_wxbot_group_observations" in sql for sql in seen_sql)
     assert [(item["date"], item["source"]) for item in targets] == [
         ("2026-09-07", "observation"),
+        ("2026-09-06", "observation"),
         ("2026-09-06", "memory_event"),
     ]
     observation_day = targets[0]
@@ -2227,13 +2228,17 @@ async def test_list_imported_targets_include_observation_only_days(
     assert observation_day["event_count"] == 1200
     assert observation_day["last_observation_id"] == 154626
     assert observation_day["last_event_id"] == 0
-    # A day with imported events keeps memory events as its source even when
-    # observations also exist for it.
-    mixed_day = targets[1]
-    assert mixed_day["memory_event_count"] == 5
-    assert mixed_day["observation_count"] == 900
-    assert mixed_day["last_event_id"] == 60
-    assert mixed_day["last_observation_id"] == 153000
+    # A day with both streams gets independent targets and cursors.
+    mixed_observation = next(
+        item for item in targets if item["date"] == "2026-09-06" and item["source"] == "observation"
+    )
+    assert mixed_observation["observation_count"] == 900
+    assert mixed_observation["last_observation_id"] == 153000
+    mixed_event = next(
+        item for item in targets if item["date"] == "2026-09-06" and item["source"] == "memory_event"
+    )
+    assert mixed_event["memory_event_count"] == 5
+    assert mixed_event["last_event_id"] == 60
 
 
 @pytest.mark.asyncio
@@ -2369,7 +2374,7 @@ async def test_auto_extract_cursor_is_scoped_to_its_source(
     )
 
     assert await store._load_group_graph_auto_extract_cursor(**scope, source="observation") == 154626
-    assert await store._load_group_graph_auto_extract_cursor(**scope, source="memory_event") == 0
+    assert await store._load_group_graph_auto_extract_cursor(**scope, source="memory_event") == 731
 
 
 @pytest.mark.asyncio

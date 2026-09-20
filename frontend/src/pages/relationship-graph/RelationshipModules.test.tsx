@@ -258,6 +258,7 @@ describe("relationship graph modules", () => {
       graphNodes: [node, otherNode],
       graphSummaryText: "摘要视图：显示 2 个核心节点 / 1 条高信号关系。",
       loading: false,
+      loadNextGraphPage: vi.fn(),
       visibleGraphEdges: [edge],
       layout: new Map([
         [node.id, { x: 120, y: 120 }],
