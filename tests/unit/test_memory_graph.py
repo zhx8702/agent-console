@@ -3583,6 +3583,246 @@ async def test_group_relationship_graph_uses_observation_sender_names(
 
 
 @pytest.mark.asyncio
+async def test_group_relationship_graph_maps_canonical_participant_display_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace())
+    hashed = "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7"
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_entity" in sql:
+            return [
+                {
+                    "id": 1,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "entity_type": "person",
+                    "name": hashed,
+                    "normalized_name": hashed,
+                    "aliases_json": "[]",
+                    "confidence": 0.9,
+                    "status": "active",
+                    "created_at": "2026-09-01T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                },
+                {
+                    "id": 2,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "entity_type": "person",
+                    "name": "xxtwobb",
+                    "normalized_name": "xxtwobb",
+                    "aliases_json": "[]",
+                    "confidence": 0.88,
+                    "status": "active",
+                    "created_at": "2026-09-01T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                },
+            ]
+        if "FROM plugin_memory_fact fact" in sql:
+            return [
+                {
+                    "id": 10,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "subject_entity_id": 2,
+                    "subject_name": "xxtwobb",
+                    "predicate": "replied_to",
+                    "object_entity_id": 1,
+                    "object_name": hashed,
+                    "object_value": "",
+                    "memory_item_id": 100,
+                    "source_event_id": 500,
+                    "confidence": 0.9,
+                    "status": "active",
+                    "valid_at": "2026-09-10T00:00:00",
+                    "invalid_at": None,
+                    "created_at": "2026-09-10T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                }
+            ]
+        if "FROM plugin_memory_item WHERE id = ANY" in sql:
+            return [
+                {
+                    "id": 100,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "session_id": "49025625236@chatroom",
+                    "scope_type": "session",
+                    "source_type": "deterministic_group_window",
+                    "memory_type": "note",
+                    "value_json": '{"acceptance":{"status":"accepted"}}',
+                    "normalized_key": "relation:replied_to",
+                    "confidence": 0.9,
+                    "status": "active",
+                    "pinned": False,
+                    "priority": 0,
+                    "sensitivity": "normal",
+                    "source_event_id": 500,
+                    "source_trace_id": "",
+                    "occurrence_count": 1,
+                    "first_seen_at": "2026-09-10T00:00:00",
+                    "last_seen_at": "2026-09-10T00:00:00",
+                    "created_at": "2026-09-10T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                    "deleted_at": None,
+                }
+            ]
+        if "FROM plugin_wxbot_group_membership" in sql:
+            return [{"user_wxid": hashed, "user_name": "Rumor%"}]
+        return []
+
+    async def fake_display_map(**kwargs: Any) -> dict[str, dict[str, str]]:
+        return {}
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_load_wechat_group_contact_display_map", fake_display_map)
+
+    graph = await store.get_group_relationship_graph(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="49025625236@chatroom",
+        limit=10,
+    )
+
+    labels = {node["technical_label"]: node["display_label"] for node in graph["nodes"]}
+    assert labels[hashed] == "Rumor%"
+
+
+@pytest.mark.asyncio
+async def test_group_relationship_graph_attaches_spoken_alias_from_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace())
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if "FROM plugin_memory_entity" in sql:
+            return [
+                {
+                    "id": 1,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "entity_type": "person",
+                    "name": "wxid_qianyu",
+                    "normalized_name": "wxid_qianyu",
+                    "aliases_json": "[]",
+                    "confidence": 0.9,
+                    "status": "active",
+                    "created_at": "2026-09-01T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                },
+                {
+                    "id": 2,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "entity_type": "person",
+                    "name": "wxid_hai",
+                    "normalized_name": "wxid_hai",
+                    "aliases_json": "[]",
+                    "confidence": 0.88,
+                    "status": "active",
+                    "created_at": "2026-09-01T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                },
+            ]
+        if "FROM plugin_memory_fact fact" in sql:
+            return [
+                {
+                    "id": 10,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "subject_entity_id": 2,
+                    "subject_name": "wxid_hai",
+                    "predicate": "addressed",
+                    "object_entity_id": 1,
+                    "object_name": "wxid_qianyu",
+                    "object_value": "",
+                    "memory_item_id": 100,
+                    "source_event_id": 500,
+                    "confidence": 0.9,
+                    "status": "active",
+                    "valid_at": "2026-09-10T00:00:00",
+                    "invalid_at": None,
+                    "created_at": "2026-09-10T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                }
+            ]
+        if "FROM plugin_memory_item WHERE id = ANY" in sql:
+            return [
+                {
+                    "id": 100,
+                    "tenant_id": "demo",
+                    "channel": "wechat",
+                    "source_key": "wxbot",
+                    "user_id": "__group__",
+                    "session_id": "49025625236@chatroom",
+                    "scope_type": "session",
+                    "source_type": "deterministic_group_window",
+                    "memory_type": "note",
+                    "value_json": '{"acceptance":{"status":"accepted"}}',
+                    "normalized_key": "relation:addressed",
+                    "confidence": 0.9,
+                    "status": "active",
+                    "pinned": False,
+                    "priority": 0,
+                    "sensitivity": "normal",
+                    "source_event_id": 500,
+                    "source_trace_id": "",
+                    "occurrence_count": 1,
+                    "first_seen_at": "2026-09-10T00:00:00",
+                    "last_seen_at": "2026-09-10T00:00:00",
+                    "created_at": "2026-09-10T00:00:00",
+                    "updated_at": "2026-09-10T00:00:00",
+                    "deleted_at": None,
+                }
+            ]
+        if "FROM plugin_wxbot_group_membership" in sql:
+            return [{"user_wxid": "wxid_qianyu", "user_name": "千羽"}]
+        if "FROM plugin_wxbot_group_observations" in sql and "content LIKE" in sql:
+            return [
+                {"content": "@千羽 外号石头哥", "metadata_json": "{}"},
+                {"content": "傻逼就是@千羽", "metadata_json": "{}"},
+            ]
+        if "FROM plugin_wxbot_group_observations" in sql:
+            return [{"sender_wxid": "wxid_qianyu", "sender_name": "千羽"}]
+        return []
+
+    async def fake_display_map(**kwargs: Any) -> dict[str, dict[str, str]]:
+        return {}
+
+    monkeypatch.setattr(memory_store_module, "_exec", fake_exec)
+    monkeypatch.setattr(store, "_load_wechat_group_contact_display_map", fake_display_map)
+
+    graph = await store.get_group_relationship_graph(
+        tenant_id="demo",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="49025625236@chatroom",
+        limit=10,
+    )
+
+    qianyu = next(node for node in graph["nodes"] if node["technical_label"] == "wxid_qianyu")
+    assert qianyu["display_label"] == "千羽"
+    assert "石头哥" in (qianyu.get("aliases") or [])
+    assert "傻逼" in (qianyu.get("aliases") or [])
+
+
+@pytest.mark.asyncio
 async def test_load_wechat_group_contact_display_map_falls_back_on_sdk_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

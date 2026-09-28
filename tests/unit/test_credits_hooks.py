@@ -65,6 +65,7 @@ class _FakeCreditStore:
             amap_route_map_credit_cost=amap_route_map_cost,
         )
         self.adjust_calls: list[dict[str, object]] = []
+        self.transfer_calls: list[dict[str, object]] = []
         self.checkin_calls: list[dict[str, object]] = []
         self.reserve_calls: list[dict[str, object]] = []
         self.capture_calls: list[dict[str, object]] = []
@@ -195,6 +196,30 @@ class _FakeCreditStore:
         )
         self.balance += delta
         return self.balance
+
+    async def transfer(
+        self,
+        tenant_id: str,
+        session_id: str,
+        from_user_id: str,
+        to_user_id: str,
+        amount: int,
+        *,
+        actor: str = "",
+        reference: str = "",
+    ) -> dict[str, int]:
+        self.transfer_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "from_user_id": from_user_id,
+                "to_user_id": to_user_id,
+                "amount": amount,
+                "actor": actor,
+                "reference": reference,
+            }
+        )
+        return {"from_balance": self.balance - amount, "to_balance": amount}
 
     async def reserve_charge(
         self,
@@ -1545,3 +1570,132 @@ async def test_get_checkin_status_handles_missing_today_row(monkeypatch: pytest.
     assert status["checked_in_today"] is False
     assert status["current_streak"] == 0
     assert status["next_reward"] == 10
+
+
+def _grant_handler(store: _FakeCreditStore):
+    return next(
+        item for item in build_credit_command_definitions(store) if item.command == "/赠送"
+    )
+
+
+def _transfer_handler(store: _FakeCreditStore):
+    return next(
+        item for item in build_credit_command_definitions(store) if item.command == "/转账"
+    )
+
+
+@pytest.mark.asyncio
+async def test_grant_uses_at_wxid_instead_of_nickname() -> None:
+    store = _FakeCreditStore()
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="/grant @小海 1000",
+        metadata={
+            "sender_wxid": "wxid_admin",
+            "bot_wxid": "wxid_bot",
+            "at_wxids": ["wxid_y6pffyzca2e122"],
+        },
+    )
+
+    reply = await _grant_handler(store).handler(ctx, ["@小海", "1000"])
+
+    assert store.adjust_calls[0]["user_id"] == "wxid_y6pffyzca2e122"
+    assert store.adjust_calls[0]["delta"] == 1000
+    assert store.adjust_calls[0]["display_name"] == "小海"
+    assert "小海" in reply
+    assert "1000" in reply
+
+
+@pytest.mark.asyncio
+async def test_grant_uses_at_wxid_when_mention_token_already_stripped() -> None:
+    store = _FakeCreditStore()
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="@机器人 /grant @小海 1000",
+        metadata={
+            "sender_wxid": "wxid_admin",
+            "mentioned_me": True,
+            "bot_wxid": "wxid_bot",
+            "at_wxids": ["wxid_bot", "wxid_y6pffyzca2e122"],
+        },
+    )
+
+    reply = await _grant_handler(store).handler(ctx, ["1000"])
+
+    assert store.adjust_calls[0]["user_id"] == "wxid_y6pffyzca2e122"
+    assert store.adjust_calls[0]["delta"] == 1000
+    assert "1000" in reply
+
+
+@pytest.mark.asyncio
+async def test_grant_rejects_nickname_without_mention_id() -> None:
+    store = _FakeCreditStore()
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="/grant @小海 1000",
+        metadata={"sender_wxid": "wxid_admin", "bot_wxid": "wxid_bot"},
+    )
+
+    with pytest.raises(ValueError, match="请 @ 对方"):
+        await _grant_handler(store).handler(ctx, ["@小海", "1000"])
+
+    assert store.adjust_calls == []
+
+
+@pytest.mark.asyncio
+async def test_grant_still_accepts_explicit_wxid() -> None:
+    store = _FakeCreditStore()
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="/grant wxid_y6pffyzca2e122 1000",
+        metadata={"sender_wxid": "wxid_admin"},
+    )
+
+    await _grant_handler(store).handler(ctx, ["wxid_y6pffyzca2e122", "1000"])
+
+    assert store.adjust_calls[0]["user_id"] == "wxid_y6pffyzca2e122"
+
+
+@pytest.mark.asyncio
+async def test_grant_rejects_multiple_member_mentions() -> None:
+    store = _FakeCreditStore()
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="/grant @小海 @鲸落 1000",
+        metadata={
+            "sender_wxid": "wxid_admin",
+            "bot_wxid": "wxid_bot",
+            "at_wxids": ["wxid_y6pffyzca2e122", "wxid_jingluo"],
+        },
+    )
+
+    with pytest.raises(ValueError, match="一次只能指定一个成员"):
+        await _grant_handler(store).handler(ctx, ["@小海", "@鲸落", "1000"])
+
+    assert store.adjust_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_uses_at_wxid_instead_of_nickname() -> None:
+    store = _FakeCreditStore(balance=50)
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="room@chatroom",
+        content="/转账 @小海 10",
+        metadata={
+            "sender_wxid": "wxid_admin",
+            "bot_wxid": "wxid_bot",
+            "at_wxids": ["wxid_y6pffyzca2e122"],
+        },
+    )
+
+    reply = await _transfer_handler(store).handler(ctx, ["@小海", "10"])
+
+    assert store.transfer_calls[0]["to_user_id"] == "wxid_y6pffyzca2e122"
+    assert store.transfer_calls[0]["amount"] == 10
+    assert "小海" in reply

@@ -39,12 +39,37 @@ describe("Jev tenant policy", () => {
   it("explains a low-confidence reply and can filter its session", async () => {
     mocks.request.mockResolvedValue({ ...dashboard, items: [{ id: "help", session_id: "room@chatroom", domain: "participation", status: "completed", applied: false, duration_ms: 108, attempts: 1, result: { answers: { decision: { choice: "reply", confidence: .61 } }, _audit: { reason: "low_confidence", min_confidence: .8, trace_id: "tr-help" } } }] });
     render(<JevPanel />);
-    expect(await screen.findByText("建议回复")).toBeInTheDocument();
-    expect(screen.getByText("置信度未达到阈值")).toBeInTheDocument();
+    expect(await screen.findAllByText("建议回复")).not.toHaveLength(0);
+    expect(screen.getAllByText("置信度未达到阈值").length).toBeGreaterThan(0);
     expect(screen.getByText("阈值 0.80")).toBeInTheDocument();
     expect(screen.getByText("tr-help")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("评估会话"), { target: { value: "room@chatroom" } });
     await waitFor(() => expect(mocks.request.mock.lastCall?.[2].query.session_id).toBe("room@chatroom"));
+  });
+  it("shows help-desk conflicts, funnel, and the original message for a blocked reply", async () => {
+    mocks.request.mockResolvedValue({
+      ...dashboard,
+      desk: { session_id: "room@chatroom", in_help_sessions: true, participation_enabled: true, participation_shadow_only: false, min_confidence: .8, channel: { reply_mode: "contains", configured_reply_mode: "contains", inherits_global_keywords: false, keyword_count: 46, mention_sender: false, has_session_row: true }, conflicts: [] },
+      funnel: { evaluated: 4, lanes: { observe: 2, reply_blocked: 1, reply_applied: 1, failed: 0, pending: 0, other: 0 }, blocked_reasons: { low_confidence: 1 } },
+      items: [{ id: "help", session_id: "room@chatroom", domain: "participation", status: "completed", applied: false, duration_ms: 80, attempts: 1, result: { answers: { decision: { choice: "reply", confidence: .71 } }, _audit: { reason: "low_confidence", min_confidence: .8, trace_id: "tr-312" } }, turn: { lane: "reply_blocked", message: "一直 312 要换节点吗", keyword_hit: true, outcome: "jev_blocked" } }],
+    });
+    render(<JevPanel />);
+    expect(await screen.findByText(/已在主动答疑白名单/)).toBeInTheDocument();
+    expect(screen.getByText(/关键词 46 个/)).toBeInTheDocument();
+    expect(screen.getByText(/建议回复未应用 1/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "建议回复但未应用" })).toHaveTextContent("一直 312 要换节点吗");
+    expect(screen.getAllByText("关键词会命中").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Jev 建议回复但未应用").length).toBeGreaterThan(0);
+  });
+  it("flags a help group that is still in observe mode or missing keywords", async () => {
+    mocks.request.mockResolvedValue({
+      ...dashboard,
+      desk: { session_id: "room@chatroom", in_help_sessions: true, participation_enabled: true, participation_shadow_only: true, min_confidence: .8, channel: { reply_mode: "contains", configured_reply_mode: "contains", inherits_global_keywords: true, keyword_count: 0, mention_sender: false, has_session_row: true }, conflicts: ["jev_observe_only", "contains_without_keywords"] },
+      funnel: { evaluated: 0, lanes: { observe: 0, reply_blocked: 0, reply_applied: 0, failed: 0, pending: 0, other: 0 }, blocked_reasons: {} },
+    });
+    render(<JevPanel />);
+    expect(await screen.findByText("求助判断仍是观察模式，只记录建议，不会主动开口")).toBeInTheDocument();
+    expect(screen.getByText("回复模式是包含关键词，但当前没有关键词")).toBeInTheDocument();
   });
   it("shows the effective memory disposition separately from the recommendation", async () => {
     mocks.request.mockResolvedValueOnce({ ...dashboard, items: [{ id: "memory", domain: "memory", status: "completed", applied: true, duration_ms: 10, attempts: 1, result: { answers: { decision: { choice: "accepted", confidence: .95 } }, _audit: { reason: "evidence_review_required", effective_decision: "needs_review" } } }] });

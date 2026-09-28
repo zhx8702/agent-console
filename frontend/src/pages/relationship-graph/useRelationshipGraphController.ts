@@ -210,8 +210,7 @@ export function useRelationshipGraphController() {
   const graphStateMessage = graphError || projectedGraphStateMessage;
   const pendingReviewCount = pendingTotal
     ?? (pendingEdges.length
-      || Number(windowStatsAcceptance.needs_review || 0)
-      + Number(windowStatsAcceptance.candidate || 0));
+      || Number(windowStatsAcceptance.needs_review || 0));
 
   const scopeQuery = useMemo(() => {
     const tenantId = config.tenantId.trim();

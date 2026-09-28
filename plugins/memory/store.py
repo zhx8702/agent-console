@@ -82,8 +82,15 @@ except ImportError:  # pragma: no cover
     _DCTX = None
 
 
-_GROUP_PREFIX_RE = re.compile(r"^([a-zA-Z0-9_@]+):\n(.*)$", re.DOTALL)
-_GROUP_EVENT_SENDER_PREFIX_RE = re.compile(r"^([a-zA-Z0-9_@.\-]+):\s+")
+_CANONICAL_PARTICIPANT_TOKEN = r"cx1:p:[a-fA-F0-9]{16,64}"
+_CANONICAL_PARTICIPANT_RE = re.compile(rf"(?i)^{_CANONICAL_PARTICIPANT_TOKEN}$")
+_GROUP_PREFIX_RE = re.compile(
+    rf"^({_CANONICAL_PARTICIPANT_TOKEN}|[a-zA-Z0-9_@]+):\n(.*)$",
+    re.DOTALL,
+)
+_GROUP_EVENT_SENDER_PREFIX_RE = re.compile(
+    rf"^({_CANONICAL_PARTICIPANT_TOKEN}|[a-zA-Z0-9_@.\-]+):\s+"
+)
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]+|\d+[.)、])\s*")
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -124,6 +131,7 @@ MEMORY_ACCEPTANCE_REVIEW_ACTIONS = {
     "accept",
     "reject",
     "needs_review",
+    "candidate",
     "mark_joke",
     "expire",
     "supersede",
@@ -2097,10 +2105,11 @@ def _group_graph_label_is_technical(value: Any) -> bool:
     label = _normalize_line(str(value or ""))
     if not label:
         return True
-    if _looks_like_wechat_username(label):
+    if _looks_like_canonical_participant_id(label):
         return True
     return bool(
-        re.match(r"(?i)^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?)", label)
+        re.match(r"(?i)^cx1:[pcm]:", label)
+        or re.match(r"(?i)^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?)", label)
         or re.match(r"(?i)^[a-z0-9_@.\-]{24,}$", label)
         or re.match(r"(?i)^entity:\d+$", label)
     )
@@ -2123,10 +2132,17 @@ def _group_graph_entity_display_label(row: dict[str, Any]) -> str:
     return _group_graph_node_id(row)
 
 
+def _looks_like_canonical_participant_id(value: Any) -> bool:
+    username = _normalize_line(_sanitize_db_text(value))
+    return bool(_CANONICAL_PARTICIPANT_RE.fullmatch(username))
+
+
 def _looks_like_wechat_username(value: Any) -> bool:
     username = _normalize_line(_sanitize_db_text(value))
     if not username or username.endswith("@chatroom"):
         return False
+    if _looks_like_canonical_participant_id(username):
+        return True
     if re.match(r"(?i)^(wxid_|gh_|openid_|unionid_)", username):
         return True
     if re.match(r"(?i)^[a-z0-9_@.\-]{24,}$", username):

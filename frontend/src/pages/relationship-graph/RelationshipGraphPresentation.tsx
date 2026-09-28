@@ -464,7 +464,7 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                 <p className="section-kicker">审核</p>
                 <h3 id="relationship-review-queue-title">待审核队列</h3>
                 <p className="muted-copy">
-                  引用、@ 这类直接互动即时通过；模型推断的关系在跨天复现、同窗有 3 条以上消息支撑，或与已通过的关系相互印证（同一主题已有人在聊、两人已有直接互动）后由系统自动通过，14 天内都没印证的自动过期。这里是还在等印证的候选，人工点不点都不影响自动流程；最多显示 100 条。
+                  引用、@ 即时通过。参与、报障、给资源、协作、问答这类关键关系进本队列。闲聊「提到」和空泛兴趣先挂起，不占待审；跨天复现、同窗 3 条以上证据、或与已通过关系印证后自动通过。人工点不点都不影响自动流程；最多显示 100 条。
                 </p>
               </div>
               <span className="relationship-queue-count" title={pendingTotal !== null ? `共 ${pendingTotal} 条待印证，显示前 ${pendingShown} 条` : undefined}>

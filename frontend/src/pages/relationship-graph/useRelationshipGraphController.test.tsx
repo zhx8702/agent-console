@@ -234,7 +234,7 @@ describe("useRelationshipGraphController verified group loading", () => {
     });
     expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ acceptance_status: "needs_review,candidate" }),
+      expect.objectContaining({ acceptance_status: "needs_review" }),
     );
 
     await act(async () => {
@@ -265,7 +265,7 @@ describe("useRelationshipGraphController verified group loading", () => {
       acceptance_status: "needs_review",
     };
     apiMocks.getGroupGraph.mockImplementation((_config, query) => {
-      if (query.acceptance_status === "needs_review,candidate") {
+      if (query.acceptance_status === "needs_review") {
         return Promise.resolve({
           nodes: [
             { id: "person:review-a", type: "person", label: "待审成员甲" },
@@ -282,7 +282,7 @@ describe("useRelationshipGraphController verified group loading", () => {
     await waitFor(() => expect(result.current.pendingEdges).toEqual([pendingEdge]));
     expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ acceptance_status: "needs_review,candidate" }),
+      expect.objectContaining({ acceptance_status: "needs_review" }),
     );
     expect(result.current.nodesById.get("person:review-a")?.label).toBe("待审成员甲");
     expect(result.current.nodesById.get("topic:review-b")?.label).toBe("待审话题乙");
@@ -297,7 +297,7 @@ describe("useRelationshipGraphController verified group loading", () => {
       acceptance_status: "needs_review",
     };
     apiMocks.getGroupGraph.mockImplementation((_config, query) => (
-      query.acceptance_status === "needs_review,candidate"
+      query.acceptance_status === "needs_review"
         ? Promise.reject(new Error("admin session required"))
         : Promise.resolve({
             nodes: [

@@ -13,6 +13,8 @@ from plugins.memory.plugin import MemoryPlugin
 from plugins.memory.store import MemoryStore
 from plugins.memory.store_group_graph import (
     _group_graph_edge_quality,
+    _group_relation_acceptance_decision,
+    _group_relation_needs_human_review,
     _prefer_operator_group_session_id,
 )
 
@@ -625,8 +627,8 @@ async def test_window_candidate_direct_signal_is_accepted_on_first_sight(
 async def test_window_candidate_weak_signal_waits_for_repetition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """co_participated and single-day LLM edges stay needs_review; a second day
-    with evidence promotes an LLM edge to accepted and activates the item."""
+    """co_participated is held as candidate; a key single-day LLM edge stays
+    needs_review; a second day with evidence promotes it to accepted."""
 
     store = MemoryStore(SimpleNamespace(memory_group_graph_auto_accept=True))
     inserted: list[dict[str, Any]] = []
@@ -661,8 +663,8 @@ async def test_window_candidate_weak_signal_waits_for_repetition(
         ),
     )
     assert inserted[-1]["status"] == "pending"
-    assert inserted[-1]["value_json"]["acceptance"]["status"] == "needs_review"
-    assert inserted[-1]["value_json"]["acceptance"]["reason"] == "group_window_weak_signal"
+    assert inserted[-1]["value_json"]["acceptance"]["status"] == "candidate"
+    assert inserted[-1]["value_json"]["acceptance"]["reason"] == "group_window_low_value_hold"
 
     llm_day_one = _candidate(
         predicate="asked",
@@ -701,6 +703,37 @@ async def test_window_candidate_weak_signal_waits_for_repetition(
     assert value["acceptance"]["day_count"] == 2
     assert day_two["status"] == "active"
     assert value["relation"]["strength"] > day_one["value_json"]["relation"]["strength"]
+
+
+def test_group_relation_review_keeps_key_claims_and_holds_gossip() -> None:
+    assert _group_relation_needs_human_review("works_on", "topic") is True
+    assert _group_relation_needs_human_review("asked", "person") is True
+    assert _group_relation_needs_human_review("provided_resource", "artifact") is True
+    assert _group_relation_needs_human_review("interested_in", "tool") is True
+    assert _group_relation_needs_human_review("interested_in", "topic") is False
+    assert _group_relation_needs_human_review("mentioned", "topic") is False
+    assert _group_relation_needs_human_review("co_participated", "person") is False
+
+    weak = {"quote": 0, "mention": 0, "prefix_reply": 0, "co_participation": 0, "llm": 1}
+    assert _group_relation_acceptance_decision(
+        weak, day_count=1, auto_accept=True, predicate="works_on", object_type="topic",
+    ) == ("needs_review", "group_window_weak_signal")
+    assert _group_relation_acceptance_decision(
+        weak, day_count=1, auto_accept=True, predicate="interested_in", object_type="tool",
+    ) == ("needs_review", "group_window_weak_signal")
+    assert _group_relation_acceptance_decision(
+        weak, day_count=1, auto_accept=True, predicate="interested_in", object_type="topic",
+    ) == ("candidate", "group_window_low_value_hold")
+    assert _group_relation_acceptance_decision(
+        weak, day_count=1, auto_accept=True, predicate="mentioned", object_type="topic",
+    ) == ("candidate", "group_window_low_value_hold")
+    assert _group_relation_acceptance_decision(
+        {**weak, "mention": 1, "llm": 0},
+        day_count=1,
+        auto_accept=True,
+        predicate="addressed",
+        object_type="person",
+    ) == ("accepted", "group_window_direct_signal")
 
 
 @pytest.mark.asyncio
@@ -1094,7 +1127,7 @@ def test_llm_candidates_must_resolve_people_to_real_participants() -> None:
             # Real participant -> real participant: kept as is.
             {"subject": "wxid_a", "predicate": "answered", "object": "q813235683",
              "object_type": "person", "confidence": 0.8, "evidence_event_ids": [1, 7]},
-            # A term the model typed as a person becomes a topic for mention-like predicates.
+            # LLM "mentioned" is owned by the rule layer and is dropped.
             {"subject": "wxid_a", "predicate": "mentioned", "object": "缩水",
              "object_type": "person", "confidence": 0.9, "evidence_event_ids": [2, 7]},
             # ...but a person-only predicate with a phantom person is dropped.
@@ -1119,21 +1152,23 @@ def test_llm_candidates_must_resolve_people_to_real_participants() -> None:
         directory=directory,
     )
 
-    assert skipped == 2
+    assert skipped == 4
     assert [(c["subject"], c["predicate"], c["object"], c["object_type"]) for c in candidates] == [
         ("wxid_a", "answered", "q813235683", "person"),
-        ("wxid_a", "mentioned", "缩水", "topic"),
-        ("wxid_b", "addressed", "wxid_quiet", "person"),
         ("wxid_b", "interested_in", "并发", "topic"),
     ]
     assert all(c["signals"]["llm"] == 2 for c in candidates)
 
-    # Without participant context (legacy callers) nothing is resolved or dropped.
+    # Rule-layer predicates stay dropped even for legacy callers without a directory.
     legacy, legacy_skipped = store._parse_group_window_candidates(
         payload, allowed_event_ids={1, 2, 3, 4, 5, 6, 7}
     )
-    assert legacy_skipped == 0
-    assert len(legacy) == 6
+    assert legacy_skipped == 3
+    assert [(c["predicate"], c["object"]) for c in legacy] == [
+        ("answered", "q813235683"),
+        ("asked", "wxid_b"),
+        ("interested_in", "并发"),
+    ]
 
 
 def test_llm_candidates_drop_noise_shapes_seen_in_production() -> None:
@@ -1180,10 +1215,9 @@ def test_llm_candidates_drop_noise_shapes_seen_in_production() -> None:
         participants=participants,
     )
 
-    assert skipped == 8
+    assert skipped == 9
     assert [(c["subject"], c["predicate"], c["object"], c["object_type"]) for c in candidates] == [
         ("wxid_a", "interested_in", "DeepSeek", "tool"),
-        ("wxid_b", "mentioned", "苹果5x", "topic"),
     ]
 
 
@@ -1210,8 +1244,12 @@ async def test_llm_prompt_excludes_rule_layer_predicates_and_asks_for_terms() ->
 
     assert len(requests) == 1
     system = str(requests[0].system)
-    assert "co_participated" not in system
-    assert "replied_to" in system
+    allowed = system.split("Allowed predicates:")[1].split(".")[0]
+    assert "co_participated" not in allowed
+    assert "mentioned" not in allowed
+    assert "replied_to" not in allowed
+    assert "addressed" not in allowed
+    assert "do not emit mentioned, replied_to, addressed or co_participated" in system
     assert "at least two different messages" in system
     assert "Chinese chat -> Chinese term" in system
 
@@ -1640,19 +1678,29 @@ async def test_group_relation_auto_review_accepts_only_corroborated_candidates(
         assert kwargs == {"limit": 200, "tenant_id": None}
         return [
             # Term already used by another accepted relation in this group.
-            {"id": 1, "object_type": "tool", "term_corroborated": True, "pair_corroborated": False},
-            # Term nobody else has an accepted relation with: stays pending.
-            {"id": 2, "object_type": "topic", "term_corroborated": False, "pair_corroborated": False},
+            {"id": 1, "predicate": "works_on", "object_type": "tool",
+             "acceptance_status": "needs_review", "term_corroborated": True, "pair_corroborated": False},
+            # Key claim nobody else has: stays in the human queue.
+            {"id": 2, "predicate": "works_on", "object_type": "topic",
+             "acceptance_status": "needs_review", "term_corroborated": False, "pair_corroborated": False},
             # Two people who already share an accepted direct edge.
-            {"id": 3, "object_type": "person", "term_corroborated": True, "pair_corroborated": True},
+            {"id": 3, "predicate": "collaborated_with", "object_type": "person",
+             "acceptance_status": "needs_review", "term_corroborated": True, "pair_corroborated": True},
             # Person pair without any accepted edge: stays pending, even though the
             # other person is the object of accepted relations elsewhere.
-            {"id": 4, "object_type": "person", "term_corroborated": True, "pair_corroborated": False},
+            {"id": 4, "predicate": "collaborated_with", "object_type": "person",
+             "acceptance_status": "needs_review", "term_corroborated": True, "pair_corroborated": False},
+            # Gossip already in review: parked as candidate, not discarded.
+            {"id": 5, "predicate": "mentioned", "object_type": "topic",
+             "acceptance_status": "needs_review", "term_corroborated": False, "pair_corroborated": False},
+            # Already held: do not rewrite every tick.
+            {"id": 6, "predicate": "mentioned", "object_type": "topic",
+             "acceptance_status": "candidate", "term_corroborated": False, "pair_corroborated": False},
         ]
 
     async def fake_review(item_id: int, **kwargs: Any) -> dict[str, Any] | None:
         reviews.append((item_id, kwargs["action"], kwargs["review_reason"], kwargs["reviewed_by"]))
-        return {"id": item_id, "acceptance_status": "accepted"}
+        return {"id": item_id, "acceptance_status": kwargs["action"]}
 
     monkeypatch.setattr(store, "_list_group_relation_auto_review_candidates", fake_candidates)
     monkeypatch.setattr(store, "review_memory_item_acceptance", fake_review)
@@ -1662,12 +1710,14 @@ async def test_group_relation_auto_review_accepts_only_corroborated_candidates(
     assert reviews == [
         (1, "accept", "group_window_term_corroborated", "system/auto-review"),
         (3, "accept", "group_window_pair_corroborated", "system/auto-review"),
+        (5, "candidate", "group_window_low_value_hold", "system/auto-review"),
     ]
-    assert summary["scanned"] == 4
+    assert summary["scanned"] == 6
     assert summary["accepted"] == 2
     assert summary["accepted_term"] == 1
     assert summary["accepted_pair"] == 1
-    assert summary["remaining"] == 2
+    assert summary["held"] == 1
+    assert summary["remaining"] == 3
     assert summary["stop_reason"] == "completed"
 
     assert (await store.run_group_relation_auto_review(limit=0))["stop_reason"] == "disabled"
@@ -2610,3 +2660,246 @@ async def test_scope_gate_denial_is_logged(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert await store._group_graph_auto_extract_scope_allowed("demo", "room-a@chatroom") is False
     assert logged[-1][1]["reason"] == "plugin_scope_disabled"
+
+
+def test_english_group_nick_is_not_a_technical_label() -> None:
+    from plugins.memory.store import _group_graph_label_is_technical
+
+    assert _group_graph_label_is_technical("Polaris") is False
+    assert _group_graph_label_is_technical("Andy") is False
+    assert _group_graph_label_is_technical(
+        "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7"
+    ) is True
+    assert _group_graph_label_is_technical("wxid_c8ytspb9f0522") is True
+
+
+def test_canonical_participant_id_parses_and_collapses_to_sender() -> None:
+    from plugins.memory.store import (
+        _looks_like_canonical_participant_id,
+        _looks_like_wechat_username,
+        _split_group_event_text,
+    )
+    from plugins.memory.store_group_graph import GroupMemberDirectory
+
+    hashed = "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7"
+    assert _looks_like_canonical_participant_id(hashed)
+    assert _looks_like_wechat_username(hashed)
+    assert not _looks_like_canonical_participant_id(
+        "cx1:c:5406bbc5f1c4a2d927779f69911ca5b22544aad6bf3843be@chatroom"
+    )
+    sender, body = _split_group_event_text(f"{hashed}: 先吃一下再说吧")
+    assert sender == hashed
+    assert body == "先吃一下再说吧"
+
+    directory = GroupMemberDirectory()
+    directory.add_member(hashed, "Rumor%")
+    directory.add_sender("wxid_rumor", "Rumor%")
+    assert directory.resolve_id(hashed) == "wxid_rumor"
+    assert directory.resolve_name("Rumor%") == "wxid_rumor"
+
+
+def test_spoken_alias_binds_known_member_but_rejects_insults() -> None:
+    from plugins.memory.store_group_graph import (
+        GroupMemberDirectory,
+        _iter_spoken_alias_bindings,
+        bind_spoken_member_aliases,
+    )
+
+    assert list(_iter_spoken_alias_bindings("@千羽 外号石头哥")) == [("千羽", "石头哥")]
+    assert list(_iter_spoken_alias_bindings("外号老王就是@千羽")) == [("千羽", "老王")]
+    assert list(_iter_spoken_alias_bindings("傻逼就是@千羽")) == [("千羽", "傻逼")]
+
+    directory = GroupMemberDirectory()
+    directory.add_sender("wxid_qianyu", "千羽")
+    bind_spoken_member_aliases(
+        directory,
+        [
+            "@千羽 外号石头哥",
+            "傻逼就是@千羽",
+            "外号老王就是@千羽",
+            "@千羽 外号Stone",
+            "赶紧恢复 5H 限制吧 傻逼O➗",
+        ],
+    )
+    assert directory.resolve_name("石头哥") == "wxid_qianyu"
+    assert directory.resolve_name("老王") == "wxid_qianyu"
+    assert directory.resolve_name("Stone") == "wxid_qianyu"
+    assert directory.resolve_name("傻逼") == "wxid_qianyu"
+    assert directory.spoken_by_id["wxid_qianyu"] == ["石头哥", "傻逼", "老王", "Stone"]
+
+
+def test_directed_epithet_binds_quote_target_not_product() -> None:
+    from plugins.memory.store_group_graph import (
+        GroupMemberDirectory,
+        bind_directed_epithet_aliases,
+        bind_spoken_member_aliases,
+    )
+
+    directory = GroupMemberDirectory()
+    directory.add_sender("wxid_qianyu", "千羽")
+    bind_directed_epithet_aliases(
+        directory,
+        [
+            {
+                "body": "傻逼啊",
+                "quote_from": "wxid_qianyu",
+                "quote_sender_name": "千羽",
+            },
+            {
+                "body": "傻逼openai",
+                "quote_from": "wxid_other",
+                "quote_sender_name": "别人",
+            },
+        ],
+    )
+    assert directory.resolve_name("傻逼") == "wxid_qianyu"
+    assert directory.resolve_name("sb") is None
+
+    later = GroupMemberDirectory()
+    later.add_sender("wxid_qianyu", "千羽")
+    bind_spoken_member_aliases(later, ["千羽这个sb"])
+    assert later.resolve_name("sb") == "wxid_qianyu"
+
+
+def test_collapse_hashed_person_nodes_only_merges_unambiguous_twins() -> None:
+    from plugins.memory.store_group_graph import _collapse_hashed_person_nodes
+
+    hashed = "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7"
+    nodes = {
+        "entity:1": {
+            "id": "entity:1",
+            "type": "person",
+            "label": hashed,
+            "display_label": "Rumor%",
+            "technical_label": hashed,
+            "aliases": [],
+            "evidence_count": 2,
+            "source_ref_count": 1,
+            "confidence": 0.7,
+            "first_seen": "2026-09-01",
+            "last_seen": "2026-09-08",
+        },
+        "entity:2": {
+            "id": "entity:2",
+            "type": "person",
+            "label": "wxid_rumor",
+            "display_label": "Rumor%",
+            "technical_label": "wxid_rumor",
+            "aliases": ["Rumor%"],
+            "evidence_count": 3,
+            "source_ref_count": 2,
+            "confidence": 0.9,
+            "first_seen": "2026-08-20",
+            "last_seen": "2026-09-10",
+        },
+        "entity:3": {
+            "id": "entity:3",
+            "type": "person",
+            "label": "xxtwobb",
+            "display_label": "xxtwobb",
+            "technical_label": "xxtwobb",
+            "aliases": [],
+            "evidence_count": 1,
+            "source_ref_count": 1,
+            "confidence": 0.8,
+            "first_seen": "2026-09-02",
+            "last_seen": "2026-09-02",
+        },
+    }
+    edges = [
+        {
+            "id": "fact:10",
+            "source": "entity:3",
+            "target": "entity:1",
+            "type": "replied_to",
+            "evidence_count": 1,
+            "confidence": 0.9,
+        }
+    ]
+    _collapse_hashed_person_nodes(nodes, edges)
+    assert "entity:1" not in nodes
+    assert nodes["entity:2"]["evidence_count"] == 5
+    assert edges == [
+        {
+            "id": "fact:10",
+            "source": "entity:3",
+            "target": "entity:2",
+            "type": "replied_to",
+            "evidence_count": 1,
+            "confidence": 0.9,
+        }
+    ]
+
+    twins = {
+        "entity:4": {
+            "id": "entity:4",
+            "type": "person",
+            "label": "wxid_andy_a",
+            "display_label": "Andy",
+            "technical_label": "wxid_andy_a",
+            "aliases": [],
+            "evidence_count": 1,
+            "source_ref_count": 1,
+            "confidence": 0.8,
+            "first_seen": "2026-09-01",
+            "last_seen": "2026-09-01",
+        },
+        "entity:5": {
+            "id": "entity:5",
+            "type": "person",
+            "label": "wxid_andy_b",
+            "display_label": "Andy",
+            "technical_label": "wxid_andy_b",
+            "aliases": [],
+            "evidence_count": 1,
+            "source_ref_count": 1,
+            "confidence": 0.8,
+            "first_seen": "2026-09-01",
+            "last_seen": "2026-09-01",
+        },
+    }
+    twin_edges = [
+        {
+            "id": "fact:11",
+            "source": "entity:4",
+            "target": "entity:5",
+            "type": "addressed",
+            "evidence_count": 1,
+            "confidence": 0.7,
+        }
+    ]
+    _collapse_hashed_person_nodes(twins, twin_edges)
+    assert set(twins) == {"entity:4", "entity:5"}
+    assert twin_edges[0]["source"] == "entity:4"
+
+
+def test_deterministic_rules_resolve_hashed_quote_and_spoken_alias() -> None:
+    store = MemoryStore(SimpleNamespace())
+    from plugins.memory.store_group_graph import GroupMemberDirectory
+
+    hashed = "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7"
+    directory = GroupMemberDirectory()
+    directory.add_member(hashed, "千羽")
+    window = {
+        "index": 1,
+        "first_event_id": 1,
+        "last_event_id": 4,
+        "rows": [
+            _observation_row(1, "wxid_qianyu", "配置好了", sender_name="千羽"),
+            _observation_row(2, "wxid_hai", "@千羽 外号石头", sender_name="小海"),
+            _observation_row(
+                3,
+                "wxid_hai",
+                "看这个",
+                sender_name="小海",
+                quote_from=hashed,
+                quote_sender_name="千羽",
+            ),
+            _observation_row(4, "wxid_z", "@石头 那个链接呢", sender_name="Z"),
+        ],
+    }
+
+    candidates = store._build_deterministic_group_window_candidates(window, directory=directory)
+    by_key = {(c["subject"], c["predicate"], c["object"]): c for c in candidates}
+    assert by_key[("wxid_hai", "replied_to", "wxid_qianyu")]["reason"] == "deterministic_quote_reply"
+    assert by_key[("wxid_z", "addressed", "wxid_qianyu")]["signals"]["mention"] == 1

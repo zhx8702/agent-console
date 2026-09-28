@@ -230,37 +230,38 @@ def test_custom_phrase_history_and_identity_disclosure_use_the_real_guard() -> N
     assert len(always.text) <= 70
 
 
-def test_line_breaks_are_kept_as_sentence_boundaries() -> None:
+def test_short_replies_inline_newlines_with_punctuation() -> None:
     guard = NaturalReplyStyleGuard()
     result = guard.apply(
-        "是啊\nflutter调ui怎么调都怪\n还是扔给ai写rn得了",
-        deterministic_key="newline-two",
-        eligible=True,
-    )
-
-    assert result.text.splitlines()[0] == "是啊"
-    if result.mode == "one_sentence":
-        assert result.text == "是啊"
-    else:
-        assert "\n" in result.text
-        assert "flutter调ui怎么调都怪" in result.text
-
-
-def test_persona_style_keeps_portrait_cadence_and_line_breaks() -> None:
-    guard = NaturalReplyStyleGuard()
-    text = "第一句完整意思。\n第二句接着说。\n第三句也按画像留下。"
-    result = guard.apply(
-        text,
-        deterministic_key="persona-keep",
+        "数字世界一零一壹，加减乘除一土一洋\n对上没\nhhh",
+        deterministic_key="couplet-inline",
         eligible=True,
         preserve_persona_style=True,
     )
 
     assert result.mode == "persona"
-    assert "第三句也按画像留下。" in result.text
-    assert result.text.splitlines() == [
-        "第一句完整意思。",
-        "第二句接着说。",
-        "第三句也按画像留下。",
-    ]
+    assert "\n" not in result.text
+    assert result.text == "数字世界一零一壹，加减乘除一土一洋。对上没，hhh"
+    assert "short_lines_inlined" in result.reason_codes
+    assert "length_shaped" not in result.reason_codes
+
+
+def test_long_replies_keep_line_breaks() -> None:
+    guard = NaturalReplyStyleGuard()
+    text = (
+        "这一段把整件事的背景、条件和限制都说清楚，已经明显超过短回复的一行容量了。\n"
+        "接下来再补一层操作步骤和注意点，方便对方可读，而不是挤在同一行里发。\n"
+        "最后把风险和回滚也写上，避免只剩一句结论。"
+    )
+    result = guard.apply(
+        text,
+        deterministic_key="persona-keep-long",
+        eligible=True,
+        preserve_persona_style=True,
+    )
+
+    assert result.mode == "persona"
+    assert "\n" in result.text
+    assert result.text.splitlines()[0].startswith("这一段把整件事的背景")
+    assert "short_lines_inlined" not in result.reason_codes
     assert "length_shaped" not in result.reason_codes

@@ -53,6 +53,20 @@ const MEMORY_WORKSPACE_TABS = [
 
 type MemoryWorkspaceTab = (typeof MEMORY_WORKSPACE_TABS)[number]["id"];
 
+function memoryTabFromSearch(value: string | null): MemoryWorkspaceTab {
+  return MEMORY_WORKSPACE_TABS.some((item) => item.id === value)
+    ? (value as MemoryWorkspaceTab)
+    : "profiles";
+}
+
+function memoryTabFromLocation(): MemoryWorkspaceTab {
+  try {
+    return memoryTabFromSearch(new URLSearchParams(window.location.search).get("tab"));
+  } catch {
+    return "profiles";
+  }
+}
+
 export function MemoryWorkspace() {
   const {
     config,
@@ -94,9 +108,9 @@ export function MemoryWorkspace() {
   const [memoryItemsOutput, setMemoryItemsOutput] = useState('{\n  "status": "waiting"\n}');
   const [memoryGraphOutput, setMemoryGraphOutput] = useState('{\n  "status": "waiting"\n}');
   const [profileEnrichmentOutput, setProfileEnrichmentOutput] = useState('{\n  "status": "waiting"\n}');
-  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<MemoryWorkspaceTab>("profiles");
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<MemoryWorkspaceTab>(memoryTabFromLocation);
   const [visitedWorkspaceTabs, setVisitedWorkspaceTabs] = useState<Set<MemoryWorkspaceTab>>(
-    () => new Set(["profiles"]),
+    () => new Set<MemoryWorkspaceTab>(["profiles", memoryTabFromLocation()]),
   );
 
   const selectedSession = useMemo(
@@ -983,7 +997,14 @@ export function MemoryWorkspace() {
           )}
         </div>
 
-        <div id="memory-workspace-panel-jev" role="tabpanel" aria-labelledby="memory-workspace-tab-jev" hidden={activeWorkspaceTab !== "jev"}>
+        <div
+          id="memory-workspace-panel-jev"
+          className="memory-workspace-panel"
+          role="tabpanel"
+          aria-labelledby="memory-workspace-tab-jev"
+          tabIndex={0}
+          hidden={activeWorkspaceTab !== "jev"}
+        >
           {visitedWorkspaceTabs.has("jev") && <JevPanel />}
         </div>
 

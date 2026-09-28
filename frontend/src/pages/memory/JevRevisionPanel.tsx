@@ -37,20 +37,24 @@ export function JevRevisionPanel({ candidateId, version, sessionId, revision, di
     } catch (e) { if (current === generation.current) setError(String(e)); }
     finally { if (current === generation.current) setBusy(false); }
   }
-  return <section aria-label="知识修订草案">
-    <h5>知识 #{revision.target_doc_id} 的修订草案</h5>
-    <p>基于版本 <code>{revision.base_hash}</code> · Jev 置信度 {revision.evaluation?.answers?.decision?.confidence?.toFixed(2) ?? "待审核"}</p>
-    <details><summary>查看修订前正文</summary><h6>{revision.before.title}</h6><pre style={{ whiteSpace: "pre-wrap" }}>{revision.before.content}</pre></details>
-    <label>修订标题<input aria-label={`修订标题 ${candidateId}`} value={title} disabled={disabled || busy || revision.status === "published"} onChange={e => setTitle(e.target.value)} /></label>
-    <label>修订正文<textarea aria-label={`修订正文 ${candidateId}`} rows={12} value={content} disabled={disabled || busy || revision.status === "published"} onChange={e => setContent(e.target.value)} /></label>
+  return <section className="jev-blocked-card" aria-label="知识修订草案">
+    <h4>知识 #{revision.target_doc_id} 的修订草案</h4>
+    <p className="muted-copy">基于版本 <code>{revision.base_hash}</code> · Jev 置信度 {revision.evaluation?.answers?.decision?.confidence?.toFixed(2) ?? "待审核"}</p>
+    <details><summary>查看修订前正文</summary><h6>{revision.before.title}</h6><pre className="panel-output">{revision.before.content}</pre></details>
+    <label className="field">修订标题<input aria-label={`修订标题 ${candidateId}`} value={title} disabled={disabled || busy || revision.status === "published"} onChange={e => setTitle(e.target.value)} /></label>
+    <label className="field">修订正文<textarea aria-label={`修订正文 ${candidateId}`} rows={12} value={content} disabled={disabled || busy || revision.status === "published"} onChange={e => setContent(e.target.value)} /></label>
     {revision.status !== "published" && <>
-      <label>修改说明<input aria-label={`修改说明 ${candidateId}`} value={reason} disabled={disabled || busy} onChange={e => setReason(e.target.value)} /></label>
-      <button disabled={disabled || busy || !reason.trim() || !title.trim() || !content.trim()} onClick={() => void save()}>保存草案并重新审核</button>
-      <p>修改后需要重新通过 Jev 审核，再由管理员批准更新。旧正文会保留在修订记录中。</p>
+      <label className="field">修改说明<input aria-label={`修改说明 ${candidateId}`} value={reason} disabled={disabled || busy} onChange={e => setReason(e.target.value)} /></label>
+      <div className="action-row">
+        <button className="button button-primary button-compact" type="button" disabled={disabled || busy || !reason.trim() || !title.trim() || !content.trim()} onClick={() => void save()}>保存草案并重新审核</button>
+      </div>
+      <p className="muted-copy">修改后需要重新通过 Jev 审核，再由管理员批准更新。旧正文会保留在修订记录中。</p>
     </>}
-    <button disabled={busy || disabled} onClick={() => void loadHistory()}>查看该知识的修订记录</button>
-    {history?.map(entry => <details key={entry.id}><summary>{entry.revision.before.title} · {entry.revision.base_hash} → {entry.revision.result_hash}</summary><pre style={{ whiteSpace: "pre-wrap" }}>{entry.revision.before.content}</pre></details>)}
-    {history?.length === 0 && <p>尚无已批准的 Jev 修订记录。</p>}
-    {error && <p role="alert">{error}</p>}
+    <div className="action-row">
+      <button className="button button-secondary button-compact" type="button" disabled={busy || disabled} onClick={() => void loadHistory()}>查看该知识的修订记录</button>
+    </div>
+    {history?.map(entry => <details key={entry.id}><summary>{entry.revision.before.title} · {entry.revision.base_hash} → {entry.revision.result_hash}</summary><pre className="panel-output">{entry.revision.before.content}</pre></details>)}
+    {history?.length === 0 && <p className="muted-copy">尚无已批准的 Jev 修订记录。</p>}
+    {error ? <p role="alert">{error}</p> : null}
   </section>;
 }

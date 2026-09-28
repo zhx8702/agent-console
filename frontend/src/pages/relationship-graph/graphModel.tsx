@@ -190,7 +190,7 @@ export function edgeCanReturnToReview(status?: string | null) {
   return normalized === "accepted" || normalized === "rejected" || normalized === "candidate";
 }
 
-export const PENDING_REVIEW_STATUS = "needs_review,candidate";
+export const PENDING_REVIEW_STATUS = "needs_review";
 
 export const GRAPH_RANGE_PRESETS = [
   { days: 7, label: "近7天" },
@@ -413,9 +413,10 @@ export function truncateMiddle(value: string, head = 10, tail = 4) {
 export function isTechnicalUserId(value: string) {
   const normalized = String(value || "").trim();
   if (!normalized) return false;
+  if (/^cx1:[pcm]:/i.test(normalized)) return true;
   if (/^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?|entity:)/i.test(normalized)) return true;
   if (/^[a-z0-9_@.-]{24,}$/i.test(normalized)) return true;
-  return /^[a-z][a-z0-9_.-]{5,31}$/.test(normalized) && !/[^\x00-\x7F]/.test(normalized);
+  return false;
 }
 
 export function shortTechnicalId(value?: string | null) {
@@ -1186,6 +1187,7 @@ const POLICY_LABELS: Record<string, string> = {
   group_window_llm_repeated_evidence: "同一窗口内有 3 条以上消息支撑，自动通过",
   group_window_repeated_weak_signal: "弱信号跨天重复出现，自动通过",
   group_window_weak_signal: "只有单日弱信号，等待印证",
+  group_window_low_value_hold: "闲聊提到或空泛兴趣，先挂起不占待审",
   group_window_term_corroborated: "同一主题已有其他已通过的关系，系统印证通过",
   group_window_pair_corroborated: "两人之间已有其他已通过的互动，系统印证通过",
   group_window_auto_accept: "旧版策略：全部自动通过",

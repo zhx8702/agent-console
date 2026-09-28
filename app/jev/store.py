@@ -6,7 +6,9 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
+from app.channel.session_aliases import session_policy_aliases
 from app.infra.db import get_engine
+from app.jev.desk import attach_turns, funnel_from_rows
 from app.jev.models import JevPolicy
 
 
@@ -95,8 +97,122 @@ class JevStore:
             "SELECT id,session_id,domain,target_id,status,attempts,result,error_type,duration_ms,input_tokens,output_tokens,"
             "applied,created_at,updated_at,(status='failed' AND (target_id IS NOT NULL OR state::jsonb<>'{}'::jsonb)) AS retryable FROM jev_evaluation WHERE " + where + " AND (:status='' OR status=:status) "
             "ORDER BY CASE WHEN jsonb_typeof(result::jsonb #> '{answers,priority,score}')='number' THEN (result::jsonb #>> '{answers,priority,score}')::float ELSE 0 END DESC, created_at DESC LIMIT :limit", params)
-        return {"summary": summary, "items": items}
+        participation = await execute(
+            "SELECT status,applied,error_type,result FROM jev_evaluation WHERE tenant_id=:tid AND domain='participation' "
+            "AND (:sid='' OR session_id=:sid)", {"tid": tenant_id, "sid": session_id})
+        aliases = await session_policy_aliases(tenant_id, session_id) if session_id else []
+        channel = await self.channel_overlay(tenant_id, session_id, aliases=aliases) if session_id else None
+        social = await self.social_overlay(tenant_id, aliases) if session_id else None
+        attach_turns(
+            items,
+            await self.participation_runtime(tenant_id, items),
+            keywords=list((channel or {}).get("keywords") or []),
+            reply_mode=str((channel or {}).get("reply_mode") or ""),
+        )
+        return {"summary": summary, "items": items, "funnel": funnel_from_rows(participation),
+                "channel": channel, "aliases": aliases, "social": social}
 
+    async def desk_overlay(self, tenant_id: str, session_id: str) -> tuple[list[str], dict | None, dict | None]:
+        aliases = await session_policy_aliases(tenant_id, session_id)
+        channel = await self.channel_overlay(tenant_id, session_id, aliases=aliases)
+        social = await self.social_overlay(tenant_id, aliases)
+        return aliases, channel, social
+
+    async def social_overlay(self, tenant_id: str, aliases: list[str]) -> dict:
+        for sid in aliases:
+            rows = await execute(
+                "SELECT group_enabled, global_enabled, tenant_enabled, policy_json "
+                "FROM social_group_policy WHERE tenant_id=:tid AND session_id=:sid",
+                {"tid": tenant_id, "sid": sid},
+            )
+            if not rows:
+                continue
+            policy = rows[0].get("policy_json") or {}
+            if isinstance(policy, str):
+                policy = json.loads(policy)
+            if not isinstance(policy, dict):
+                policy = {}
+            return {
+                "effective_enabled": bool(
+                    rows[0].get("global_enabled") and rows[0].get("tenant_enabled") and rows[0].get("group_enabled")
+                ),
+                "group_enabled": bool(rows[0].get("group_enabled")),
+                "proactive_enabled": bool(policy.get("proactive_enabled")),
+            }
+        return {"effective_enabled": True, "group_enabled": True, "proactive_enabled": False}
+
+    async def channel_overlay(self, tenant_id: str, session_id: str, *, aliases: list[str] | None = None) -> dict:
+        from plugins.wxbot.store import (
+            _GLOBAL_POLICY_COLUMNS,
+            _SESSION_POLICY_COLUMNS,
+            _normalize_global_policy,
+            _session_policy_document,
+        )
+        global_rows = await execute(
+            f"SELECT {_GLOBAL_POLICY_COLUMNS} FROM plugin_wxbot_tenant_policy WHERE tenant_id=:tid",
+            {"tid": tenant_id})
+        lookup_ids = aliases or [session_id]
+        session_rows: list[dict] = []
+        matched_session_id = session_id
+        for sid in lookup_ids:
+            session_rows = await execute(
+                f"SELECT {_SESSION_POLICY_COLUMNS} FROM plugin_wxbot_session_policy "
+                "WHERE tenant_id=:tid AND session_id=:sid",
+                {"tid": tenant_id, "sid": sid})
+            if session_rows:
+                matched_session_id = sid
+                break
+        document = _session_policy_document(
+            session_rows[0] if session_rows else None,
+            tenant_id,
+            matched_session_id,
+            _normalize_global_policy(global_rows[0] if global_rows else None, tenant_id),
+        )
+        keywords = [str(item) for item in (document.get("trigger_keywords") or []) if str(item).strip()]
+        return {
+            "reply_mode": str(document.get("effective_mode") or "off"),
+            "configured_reply_mode": str(document.get("reply_mode") or "inherit"),
+            "inherits_global_keywords": bool(document.get("inherits_global_keywords")),
+            "keyword_count": len(keywords),
+            "keywords": keywords,
+            "mention_sender": bool(document.get("effective_mention_sender")),
+            "has_session_row": bool(session_rows),
+        }
+
+    async def participation_runtime(self, tenant_id: str, items: list[dict]) -> dict[str, dict]:
+        traces = []
+        for item in items:
+            if item.get("domain") != "participation":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            audit = result.get("_audit") if isinstance(result.get("_audit"), dict) else {}
+            trace = str(audit.get("trace_id") or "").strip()
+            if trace:
+                traces.append(trace)
+        if not traces:
+            return {}
+        rows = await execute(
+            "SELECT p.trace_id,p.status AS processing_status,p.reason AS processing_reason,p.message_id,"
+            "o.content,o.is_self_sent,"
+            "COALESCE(c.memory_opt_out,FALSE) OR COALESCE(c.deletion_state,'none') IN ('requested','failed') AS hidden, "
+            "COALESCE((SELECT json_agg(json_build_object('status',q.status) ORDER BY q.id) "
+            "FROM plugin_wxbot_reply_queue q WHERE q.tenant_id=p.tenant_id AND q.trace_id=p.trace_id "
+            "AND p.trace_id<>''), '[]') AS deliveries, "
+            "COALESCE((SELECT json_agg(json_build_object('status',s.status,'reasons',s.reason_codes_json) ORDER BY s.id) "
+            "FROM social_participation_event s WHERE s.tenant_id=p.tenant_id AND s.session_id=p.session_id "
+            "AND s.trace_id=p.trace_id AND p.trace_id<>'' AND s.event_kind='runtime'), '[]') AS decisions "
+            "FROM processed_messages p "
+            "LEFT JOIN plugin_wxbot_group_observations o ON o.tenant_id=p.tenant_id "
+            "AND o.session_id=p.session_id AND o.message_id=p.message_id "
+            "LEFT JOIN social_tenant_member_control c ON c.tenant_id=o.tenant_id AND c.user_id=o.sender_wxid "
+            "WHERE p.tenant_id=:tid AND p.trace_id=ANY(:traces)",
+            {"tid": tenant_id, "traces": traces})
+        indexed: dict[str, dict] = {}
+        for row in rows:
+            trace = str(row.get("trace_id") or "")
+            if trace and trace not in indexed:
+                indexed[trace] = row
+        return indexed
 
     async def recent_participation_messages(self, tenant_id: str, session_id: str) -> list[dict]:
         return await execute(

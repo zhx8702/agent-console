@@ -574,6 +574,7 @@ button {
   border-bottom: 1px dashed var(--line);
 }
 
+.panel-header h2,
 .panel-header h3,
 .group-behavior-page .panel-header h2 {
   margin: 0;
@@ -2296,6 +2297,82 @@ tbody tr.table-row-active:hover {
 
 .memory-workspace-panel[hidden] {
   display: none;
+}
+
+.jev-workspace {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.jev-workspace > .panel > .status-grid:first-of-type,
+.jev-workspace > .panel-hero > .status-grid {
+  margin-top: var(--space-4);
+}
+
+.jev-workspace .table-wrap {
+  margin-top: var(--space-4);
+}
+
+.jev-workspace .alert + .action-row,
+.jev-workspace .muted-copy + .action-row {
+  margin-top: var(--space-4);
+}
+
+.jev-policy-fieldset {
+  margin: var(--space-5) 0 0;
+  padding: var(--space-4) 0 0;
+  border: 0;
+  border-top: 1px dashed var(--line);
+  min-inline-size: 0;
+}
+
+.jev-policy-fieldset > .section-kicker {
+  margin-bottom: var(--space-3);
+  padding: 0;
+}
+
+.jev-policy-fieldset .form-grid,
+.jev-policy-fieldset .muted-copy,
+.jev-policy-fieldset .action-row {
+  margin-top: var(--space-3);
+}
+
+.jev-blocked-list {
+  display: grid;
+  gap: var(--space-3);
+  margin: var(--space-5) 0 0;
+  padding-top: var(--space-4);
+  border-top: 1px dashed var(--line);
+}
+
+.jev-blocked-list > .panel-header {
+  margin-bottom: var(--space-3);
+}
+
+.jev-blocked-card {
+  display: grid;
+  gap: var(--space-1-5);
+  padding: var(--space-3) var(--space-3-5);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-alt);
+}
+
+.jev-blocked-card p,
+.jev-blocked-card h4,
+.jev-blocked-card h6 {
+  margin: 0;
+}
+
+.jev-blocked-card pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.jev-table-note {
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
 }
 
 .memory-profile-grid {

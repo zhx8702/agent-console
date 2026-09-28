@@ -3672,3 +3672,52 @@ async def test_jev_help_nomination_only_in_enabled_group(reply):
             await hook.run(ctx)
         assert ctx.extras['wxbot_participation']['status'] == 'observe_only'
     store.jev_service.online.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_jev_observe_does_not_veto_keyword_help_desk_hits() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.jev.models import JevPolicy
+
+    store = _FakeStore()
+    store.policy["trigger_keywords"] = ["代理", "降智", "312", "292"]
+    ctx = _group_reply_policy_ctx(
+        "是不是还要买一个动态代理？",
+        mentioned_me=False,
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
+    document = _public_group_policy(rollout_stage="proactive")
+    document.policy = document.policy.model_copy(
+        update={
+            "proactive_enabled": True,
+            "rollout_opt_in": True,
+            "proactive_rollout_percent": 100,
+            "quiet_start_hour": 0,
+            "quiet_end_hour": 0,
+            "threshold": 5,
+        }
+    )
+    store.jev_service = SimpleNamespace(
+        policy=AsyncMock(
+            return_value=JevPolicy(
+                participation_shadow_only=False,
+                help_sessions=[ctx.event.session_id],
+            )
+        ),
+        online=AsyncMock(
+            return_value=(
+                {"answers": {"decision": {"choice": "observe", "confidence": 0.9}}},
+                False,
+            )
+        ),
+    )
+    hook = WxbotReplyPolicyHook(store, social_policy_store=_SocialPolicyStore(document))
+
+    await hook.run(ctx)
+
+    assert ctx.extras["wxbot_participation"]["status"] == "may_reply"
+    assert ctx.extras["wxbot_reply_policy"]["reason"] == "reply_mode_contains_match"
+    assert "keyword_trigger:plus35" in ctx.extras["wxbot_participation"]["reason_codes"]
+    store.jev_service.online.assert_awaited_once()

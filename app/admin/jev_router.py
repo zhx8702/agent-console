@@ -21,6 +21,7 @@ from app.admin.mutation_ledger import (
 from app.admin.route_permissions import declare_route_permission
 from app.common.request_models import StrictRequestModel
 from app.infra.db import get_engine
+from app.jev.desk import build_desk
 from app.jev.models import JevPolicy
 
 
@@ -50,14 +51,28 @@ def build_jev_router(service, settings) -> APIRouter:
         principal_for(request, tenant_id)
         policy, version = await service.store.policy(tenant_id, service.defaults())
         payload = await service.store.dashboard(tenant_id, domain=domain, status=status, session_id=session_id, limit=limit)
+        channel = payload.pop("channel", None)
+        aliases = payload.pop("aliases", None)
+        social = payload.pop("social", None)
         response.headers["ETag"] = f'"{version}"'
         return {**payload, "policy": policy.model_dump(), "version": version,
+                "desk": build_desk(policy, session_id, channel, aliases=aliases, social=social),
                 "runtime": {"enabled": bool(settings.typesafe_enabled),
                             "key_configured": bool(settings.typesafe_api_key),
                             "model": settings.typesafe_model,
                             "worker_concurrency": settings.typesafe_worker_concurrency,
                             "online_timeout": settings.typesafe_online_timeout,
                             "policy_refresh_seconds": 5}}
+
+    @router.get("/desk")
+    @declare_route_permission(RoutePermission("GET", "/v1/admin/jev/desk", AdminPermission.READ))
+    async def desk(request: Request,
+                   tenant_id: str = Query(min_length=1, max_length=64),
+                   session_id: str = Query(min_length=1, max_length=256)):
+        principal_for(request, tenant_id)
+        policy, version = await service.store.policy(tenant_id, service.defaults())
+        aliases, channel, social = await service.store.desk_overlay(tenant_id, session_id)
+        return {"version": version, "desk": build_desk(policy, session_id, channel, aliases=aliases, social=social)}
 
     @router.put("/policy")
     @declare_route_permission(RoutePermission("PUT", "/v1/admin/jev/policy", AdminPermission.DANGER))

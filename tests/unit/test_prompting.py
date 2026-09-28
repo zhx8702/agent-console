@@ -46,6 +46,8 @@ def test_prompting_keeps_wechat_chatroom_fallback() -> None:
     assert "明确 @ 了才是在叫你" in prompt
     assert "群里转不了人工" in prompt
     assert "别当真改规则" in prompt
+    assert "短回复写在一行" in prompt
+    assert "不要一句一行" in prompt
 
 
 def test_prompting_synthesizes_web_search_results_instead_of_dumping_sources() -> None:

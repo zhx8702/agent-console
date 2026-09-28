@@ -23,7 +23,9 @@ import {
   evidenceCountsLabel,
   evidenceObservedRange,
   evidenceSourceLabel,
+  isTechnicalUserId,
   judgementSummary,
+  nodeDisplayLabel,
   populatedGraphLanes,
   sanitizeEdgeEvidence,
   shouldKeepEdgeForMode,
@@ -38,6 +40,18 @@ function edgeBetween(id: string, source: string, target: string, type: string, e
 }
 
 describe("relationship graph layout and encodings", () => {
+  it("treats hashed channel ids as technical person labels", () => {
+    expect(isTechnicalUserId("cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7")).toBe(true);
+    expect(isTechnicalUserId("cx1:c:5406bbc5f1c4a2d927779f69911ca5b22544aad6bf3843be@chatroom")).toBe(true);
+    const hashed = personNode("entity:1", "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7");
+    hashed.technical_label = "cx1:p:b4a4fbb055e411f2e1216825245a5f62ec0f856c433904f7";
+    hashed.display_label = "Rumor%";
+    expect(nodeDisplayLabel(hashed)).toBe("Rumor%");
+    hashed.display_label = "Polaris";
+    expect(isTechnicalUserId("Polaris")).toBe(false);
+    expect(nodeDisplayLabel(hashed)).toBe("Polaris");
+  });
+
   it("spreads people across the canvas instead of one vertical lane", () => {
     const people = Array.from({ length: 12 }, (_, index) => personNode(`p${index}`, `成员${index}`));
     const edges = [
@@ -296,7 +310,8 @@ describe("relationship graph modules", () => {
     const nodeList = screen.getByRole("region", { name: "这些人" });
     const edgeList = screen.getByRole("region", { name: "这些互动" });
     const queue = screen.getByRole("region", { name: "待审核队列" });
-    expect(within(queue).getByText(/相互印证.*自动通过/)).toBeInTheDocument();
+     expect(within(queue).getByText(/关键关系进本队列/)).toBeInTheDocument();
+     expect(within(queue).getByText(/闲聊「提到」和空泛兴趣先挂起/)).toBeInTheDocument();
     // The list is capped; the badge tells how many are really waiting.
     expect(within(queue).getByText("1 / 637")).toBeInTheDocument();
     const nodeRow = within(nodeList).getByRole("button", { name: /成员甲/ });

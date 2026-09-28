@@ -45,6 +45,7 @@ from plugins.memory.store import (
     _group_history_user_scope,
     _is_group_session_id,
     _loads_json_object_or_array,
+    _looks_like_canonical_participant_id,
     _looks_like_wechat_username,
     _memory_status_for_acceptance,
     _merge_group_graph_aliases,
@@ -351,8 +352,31 @@ GROUP_RELATION_MIN_WEAK_DAYS = 2
 GROUP_RELATION_MIN_WEAK_COUNT = 3
 # Actor recorded on acceptance audits written by the corroboration sweep.
 GROUP_RELATION_AUTO_REVIEWER = "system/auto-review"
-# The rule layer owns these; a model re-stating them adds nothing but noise.
-LLM_EXCLUDED_PREDICATES = frozenset({"co_participated"})
+# The rule layer owns interaction edges. An LLM restating @ / quote / "also
+# mentioned this noun" is the bulk of the review-queue noise; durable work and
+# help claims stay allowed.
+LLM_EXCLUDED_PREDICATES = frozenset(
+    {"co_participated", "mentioned", "replied_to", "addressed"}
+)
+# First-day weak LLM claims that a human should still see. Everything else is
+# held as candidate so a later day or corroboration can promote it.
+GROUP_RELATION_REVIEW_PREDICATES = frozenset(
+    {
+        "works_on",
+        "maintains",
+        "reported_issue",
+        "fixed_issue",
+        "tested",
+        "provided_resource",
+        "collaborated_with",
+        "requested",
+        "asked",
+        "answered",
+    }
+)
+GROUP_RELATION_REVIEW_OBJECT_TYPES = frozenset(
+    {"tool", "project", "artifact", "task"}
+)
 # Objects for the pseudo-entity "the group" ("asked the group") are dropped.
 LLM_GROUP_PSEUDO_OBJECTS = frozenset({"group", "the group", "群", "群聊", "大家", "everyone", "all"})
 LLM_TERM_MIN_LENGTH = 2
@@ -415,11 +439,47 @@ def _normalize_group_name(value: Any) -> str:
 _LLM_TERM_WORD_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 # wxid_xxx, bare QQ-style numbers and letter+digits account ids: member
 # identifiers, never topics.
-_PARTICIPANT_ID_RE = re.compile(r"^(?:wxid_[\w-]+|\d{5,}|[a-z]\d{6,})$", re.IGNORECASE)
+_PARTICIPANT_ID_RE = re.compile(
+    r"^(?:cx1:p:[a-f0-9]{16,64}|wxid_[\w-]+|\d{5,}|[a-z]\d{6,})$",
+    re.IGNORECASE,
+)
+_SPOKEN_ALIAS_BIND_RE = re.compile(
+    r"(?:外号|绰号|别名)\s*[:：]?\s*(?P<alias>[\w\u4e00-\u9fff]{2,12}?)"
+    r"\s*(?:就是|是)\s*@?(?P<who>[^\s\u2005\u00a0]{1,32})"
+    r"|@(?P<who_at>[^\s\u2005\u00a0]{1,32})\s*(?:外号|绰号|也叫|又叫)\s*"
+    r"(?P<alias_at>[\w\u4e00-\u9fff]{2,12})"
+    r"|(?P<alias_is>[\w\u4e00-\u9fff]{2,12})\s*就是\s*@"
+    r"(?P<who_is>[^\s\u2005\u00a0]{1,32})"
+)
+_SPOKEN_ALIAS_BLOCKLIST = frozenset(
+    {
+        "那个",
+        "这个",
+        "什么",
+        "怎么",
+        "谁啊",
+        "兄弟",
+        "哥们",
+        "老板",
+        "老师",
+    }
+)
+_SPOKEN_EPITHET_ALIASES = frozenset({"傻逼", "傻比", "傻b", "sb", "白痴", "蠢货"})
+_EPITHET_PRODUCT_RE = re.compile(
+    r"(?i)(傻逼|傻比|傻b|\bsb\b)\s*(openai|gpt|claude|grok|o畜|o➗|ultra|tibo|todesk|ali\b|cc\b)"
+)
+_EPITHET_CALL_RE = re.compile(
+    r"(?i)^(?:你这个|你这|这个|那个)?(?P<e>傻逼|傻比|傻b|sb)[啊呀呢吗吧了！!?.。]*$"
+)
+_EPITHET_NAMED_RE = re.compile(
+    r"(?P<who>[\w\u4e00-\u9fff]{2,16})\s*(?:这个|那[个只])?(?P<e>傻逼|傻比|傻b|sb)\b",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_participant_id(value: str) -> bool:
-    return bool(_PARTICIPANT_ID_RE.match(_normalize_line(str(value or ""))))
+    text = _normalize_line(str(value or ""))
+    return bool(_PARTICIPANT_ID_RE.fullmatch(text)) or _looks_like_canonical_participant_id(text)
 
 
 def _is_usable_llm_term(value: str) -> bool:
@@ -487,6 +547,8 @@ class GroupMemberDirectory:
         self.names_by_id: dict[str, str] = {}
         self.ids_by_name: dict[str, str] = {}
         self.sender_ids: set[str] = set()
+        self.id_aliases: dict[str, set[str]] = {}
+        self.spoken_by_id: dict[str, list[str]] = {}
         self._sorted_names: list[str] | None = None
 
     def add_sender(self, member_id: Any, name: Any = None) -> None:
@@ -504,12 +566,19 @@ class GroupMemberDirectory:
         if display and display != canonical:
             self.names_by_id.setdefault(canonical, display)
             key = _normalize_group_name(display)
-            if key and (
-                key not in self.ids_by_name
-                or (prefer and self.ids_by_name[key] not in self.sender_ids)
-            ):
-                self.ids_by_name[key] = canonical
-                self._sorted_names = None
+            if key:
+                existing = self.ids_by_name.get(key)
+                if existing and existing != canonical:
+                    self._link_ids(existing, canonical)
+                if key not in self.ids_by_name or (
+                    prefer and self.ids_by_name[key] not in self.sender_ids
+                ):
+                    self.ids_by_name[key] = canonical
+                    self._sorted_names = None
+
+    def _link_ids(self, first: str, second: str) -> None:
+        self.id_aliases.setdefault(first, set()).add(second)
+        self.id_aliases.setdefault(second, set()).add(first)
 
     def resolve_name(self, name: Any) -> str | None:
         key = _normalize_group_name(name)
@@ -517,13 +586,21 @@ class GroupMemberDirectory:
             return None
         exact = self.ids_by_name.get(key)
         if exact:
-            return exact
+            return self._prefer_sender(exact)
         if self._sorted_names is None:
             self._sorted_names = sorted(self.ids_by_name, key=len, reverse=True)
         for known in self._sorted_names:
             if len(known) >= 2 and key.startswith(known):
-                return self.ids_by_name[known]
+                return self._prefer_sender(self.ids_by_name[known])
         return None
+
+    def _prefer_sender(self, member_id: str) -> str:
+        if member_id in self.sender_ids:
+            return member_id
+        for alias in self.id_aliases.get(member_id, ()):
+            if alias in self.sender_ids:
+                return alias
+        return member_id
 
     def resolve_id(self, raw_id: Any, *, fallback_name: Any = None) -> str | None:
         candidate = _normalize_line(_sanitize_db_text(raw_id))[:200]
@@ -536,8 +613,213 @@ class GroupMemberDirectory:
             return via_name
         if candidate and candidate in self.names_by_id:
             via_alias = self.resolve_name(self.names_by_id[candidate])
-            return via_alias or candidate
+            return via_alias or self._prefer_sender(candidate)
+        if candidate and candidate in self.id_aliases:
+            return self._prefer_sender(candidate)
         return None
+
+    def add_spoken_alias(self, member_id: str, alias: str) -> None:
+        display = _normalize_line(_sanitize_db_text(alias))[:80]
+        if not member_id or not display:
+            return
+        self.add_member(member_id, display)
+        resolved = self._prefer_sender(member_id)
+        aliases = self.spoken_by_id.setdefault(resolved, [])
+        if display not in aliases:
+            aliases.append(display)
+
+
+def _spoken_alias_is_usable(alias: str) -> bool:
+    text = _normalize_line(alias)
+    if len(text) < 2 or len(text) > 12:
+        return False
+    if _normalize_group_name(text) in _SPOKEN_ALIAS_BLOCKLIST:
+        return False
+    if _looks_like_participant_id(text) or _group_graph_label_is_technical(text):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fffA-Za-z]", text))
+
+
+def _iter_spoken_alias_bindings(text: str) -> Iterable[tuple[str, str]]:
+    for match in _SPOKEN_ALIAS_BIND_RE.finditer(str(text or "")):
+        who = (
+            match.group("who")
+            or match.group("who_at")
+            or match.group("who_is")
+            or ""
+        ).strip()
+        alias = (
+            match.group("alias")
+            or match.group("alias_at")
+            or match.group("alias_is")
+            or ""
+        ).strip()
+        if who and alias and _spoken_alias_is_usable(alias):
+            yield who, alias
+
+
+def _spoken_epithet_in_call(text: str) -> str | None:
+    body = _MENTION_TOKEN_RE.sub("", str(text or "")).strip()
+    if not body or _EPITHET_PRODUCT_RE.search(body):
+        return None
+    match = _EPITHET_CALL_RE.fullmatch(_normalize_line(body))
+    if not match:
+        return None
+    epithet = _normalize_group_name(match.group("e"))
+    return epithet if epithet in _SPOKEN_EPITHET_ALIASES else match.group("e")
+
+
+def bind_spoken_member_aliases(directory: GroupMemberDirectory, texts: Iterable[Any]) -> None:
+    """Attach chat nicknames to already-known members.
+
+    Binds when a message names a known member (外号/绰号/就是/@), including
+    group epithets like 傻逼/sb when they are aimed at that member.
+    Product-directed insults (傻逼openai) stay unbound.
+    """
+
+    for raw in texts:
+        for who, alias in _iter_spoken_alias_bindings(str(raw or "")):
+            member_id = directory.resolve_name(who) or directory.resolve_id(who)
+            if member_id:
+                directory.add_spoken_alias(member_id, alias)
+        for match in _EPITHET_NAMED_RE.finditer(str(raw or "")):
+            who = match.group("who").strip()
+            alias = match.group("e").strip()
+            if _EPITHET_PRODUCT_RE.search(str(raw or "")):
+                continue
+            member_id = directory.resolve_name(who) or directory.resolve_id(who)
+            if member_id and _spoken_alias_is_usable(alias):
+                directory.add_spoken_alias(member_id, alias)
+
+
+def bind_directed_epithet_aliases(
+    directory: GroupMemberDirectory,
+    events: Iterable[dict[str, Any]],
+) -> None:
+    """Bind 傻逼/sb when the message is aimed at one known member."""
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        body = str(event.get("body") or event.get("content") or "")
+        epithet = _spoken_epithet_in_call(body)
+        if not epithet:
+            continue
+        quote_from = event.get("quote_from") or ""
+        quote_name = event.get("quote_sender_name") or event.get("quote_name") or ""
+        observation = event.get("observation") if isinstance(event.get("observation"), dict) else {}
+        quote_from = quote_from or observation.get("quote_from") or ""
+        quote_name = quote_name or observation.get("quote_sender_name") or ""
+        member_id = directory.resolve_id(quote_from, fallback_name=quote_name)
+        if not member_id:
+            at_ids = event.get("at_wxids") or observation.get("at_wxids") or []
+            resolved = [
+                directory.resolve_id(item)
+                for item in at_ids
+                if directory.resolve_id(item)
+            ]
+            if len(resolved) == 1:
+                member_id = resolved[0]
+        if member_id:
+            directory.add_spoken_alias(member_id, epithet)
+
+
+def _person_node_technical_id(node: dict[str, Any]) -> str:
+    return _normalize_line(node.get("technical_label") or node.get("label") or "")
+
+
+def _merge_collapsed_person_node(keep: dict[str, Any], dropped: dict[str, Any]) -> None:
+    keep["aliases"] = _merge_group_graph_aliases(
+        keep.get("aliases") or [],
+        [
+            *(dropped.get("aliases") or []),
+            dropped.get("display_label"),
+            dropped.get("label"),
+        ],
+    )
+    keep["evidence_count"] = int(keep.get("evidence_count") or 0) + int(
+        dropped.get("evidence_count") or 0
+    )
+    keep["source_ref_count"] = int(keep.get("source_ref_count") or 0) + int(
+        dropped.get("source_ref_count") or 0
+    )
+    keep["confidence"] = max(
+        _clamp_score(keep.get("confidence"), 0.0),
+        _clamp_score(dropped.get("confidence"), 0.0),
+    )
+    first_seen = [keep.get("first_seen"), dropped.get("first_seen")]
+    last_seen = [keep.get("last_seen"), dropped.get("last_seen")]
+    keep["first_seen"] = min((item for item in first_seen if item), default=keep.get("first_seen"))
+    keep["last_seen"] = max((item for item in last_seen if item), default=keep.get("last_seen"))
+
+
+def _collapse_hashed_person_nodes(
+    nodes: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    """Fold ``cx1:p:`` person nodes into the matching wxid/account node.
+
+    Only merges when exactly one non-hash account shares the same display name.
+    Two real people with the same nickname stay separate.
+    """
+
+    groups: dict[str, list[str]] = {}
+    for node_id, node in nodes.items():
+        if str(node.get("type") or "") != "person":
+            continue
+        label = _normalize_group_name(node.get("display_label"))
+        if not label or _group_graph_label_is_technical(label):
+            continue
+        groups.setdefault(label, []).append(node_id)
+
+    remap: dict[str, str] = {}
+    for ids in groups.values():
+        hashes = [
+            node_id
+            for node_id in ids
+            if _looks_like_canonical_participant_id(_person_node_technical_id(nodes[node_id]))
+        ]
+        accounts = [
+            node_id
+            for node_id in ids
+            if node_id not in hashes
+            and _looks_like_wechat_username(_person_node_technical_id(nodes[node_id]))
+        ]
+        if len(accounts) != 1 or not hashes:
+            continue
+        keep = accounts[0]
+        for drop in hashes:
+            if drop == keep or drop not in nodes:
+                continue
+            _merge_collapsed_person_node(nodes[keep], nodes[drop])
+            remap[drop] = keep
+            del nodes[drop]
+
+    if not remap:
+        return
+    merged_edges: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for edge in edges:
+        source = remap.get(str(edge.get("source") or ""), str(edge.get("source") or ""))
+        target = remap.get(str(edge.get("target") or ""), str(edge.get("target") or ""))
+        if not source or not target or source == target:
+            continue
+        edge["source"] = source
+        edge["target"] = target
+        key = (source, str(edge.get("type") or ""), target)
+        existing = seen.get(key)
+        if existing:
+            existing["evidence_count"] = int(existing.get("evidence_count") or 0) + int(
+                edge.get("evidence_count") or 0
+            )
+            existing["confidence"] = max(
+                _clamp_score(existing.get("confidence"), 0.0),
+                _clamp_score(edge.get("confidence"), 0.0),
+            )
+            continue
+        seen[key] = edge
+        merged_edges.append(edge)
+    edges[:] = merged_edges
 
 
 def _empty_group_signals() -> dict[str, int]:
@@ -616,11 +898,30 @@ def _group_relation_strength(signals: dict[str, int], day_count: int) -> float:
     return round(_clamp_score(1.0 - math.exp(-exponent), 0.0), 4)
 
 
+def _group_relation_needs_human_review(
+    predicate: str,
+    object_type: str = "",
+) -> bool:
+    """Key work/help claims stay in the review queue; gossip does not.
+
+    ``interested_in`` a concrete tool/project is often the first sighting of a
+    real ask (proxy, model, service). A vague topic mention is not.
+    """
+
+    predicate = str(predicate or "").strip().lower()
+    if predicate in GROUP_RELATION_REVIEW_PREDICATES:
+        return True
+    object_type = str(object_type or "").strip().lower()
+    return predicate == "interested_in" and object_type in GROUP_RELATION_REVIEW_OBJECT_TYPES
+
+
 def _group_relation_acceptance_decision(
     signals: dict[str, int],
     *,
     day_count: int,
     auto_accept: bool,
+    predicate: str = "",
+    object_type: str = "",
 ) -> tuple[str, str]:
     """Deterministic acceptance policy for group window relations."""
 
@@ -638,6 +939,8 @@ def _group_relation_acceptance_decision(
         and int(day_count) >= GROUP_RELATION_MIN_WEAK_DAYS
     ):
         return "accepted", "group_window_repeated_weak_signal"
+    if not _group_relation_needs_human_review(predicate, object_type):
+        return "candidate", "group_window_low_value_hold"
     return "needs_review", "group_window_weak_signal"
 
 
@@ -1637,6 +1940,12 @@ class MemoryGroupGraphStoreMixin:
                 session_ids=scoped_session_ids or [str(session_id)],
                 nodes=nodes,
             )
+            await self._apply_group_graph_spoken_aliases(
+                tenant_id=tenant_id,
+                session_ids=scoped_session_ids or [str(session_id)],
+                nodes=nodes,
+            )
+            _collapse_hashed_person_nodes(nodes, edges)
 
         node_items = list(nodes.values())[:safe_limit]
         total_edges = len(edges) if facts_complete else max(total_matching_facts, len(edges))
@@ -1844,6 +2153,93 @@ class MemoryGroupGraphStoreMixin:
                     local_map[matched_username],
                     overwrite_technical=True,
                 )
+
+    async def _apply_group_graph_spoken_aliases(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: list[str],
+        nodes: dict[str, dict[str, Any]],
+    ) -> None:
+        rooms = [
+            _normalize_line(_sanitize_db_text(session_id))
+            for session_id in session_ids
+            if _is_group_session_id(session_id)
+        ]
+        if not rooms or not nodes:
+            return
+        directory = GroupMemberDirectory()
+        for node in nodes.values():
+            if str(node.get("type") or "") != "person":
+                continue
+            directory.add_member(
+                node.get("technical_label") or node.get("label"),
+                node.get("display_label") or node.get("label"),
+            )
+        try:
+            member_rows = await _exec(
+                "SELECT user_wxid, user_name "
+                "FROM plugin_wxbot_group_membership "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND user_wxid <> ''",
+                {"tid": str(tenant_id or "").strip(), "sids": rooms},
+            )
+        except Exception:
+            member_rows = []
+        for row in member_rows or []:
+            user_id = _normalize_line(_sanitize_db_text(row.get("user_wxid")))
+            if _looks_like_canonical_participant_id(user_id):
+                directory.add_member(user_id, row.get("user_name"))
+            else:
+                directory.add_sender(user_id, row.get("user_name"))
+        try:
+            texts = await _exec(
+                "SELECT content, metadata_json "
+                "FROM plugin_wxbot_group_observations "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND ("
+                "content LIKE '%外号%' OR content LIKE '%绰号%' OR content LIKE '%别名%' "
+                "OR content LIKE '%也叫%' OR content LIKE '%又叫%' OR content LIKE '%就是@%' "
+                "OR content LIKE '%傻逼%' OR content LIKE '%傻比%' OR content LIKE '%傻b%' "
+                "OR content ~* '\\ysb\\y'"
+                ") "
+                "ORDER BY occurred_ts DESC, id DESC "
+                "LIMIT 200",
+                {"tid": str(tenant_id or "").strip(), "sids": rooms},
+            )
+        except Exception:
+            texts = []
+        bind_spoken_member_aliases(
+            directory,
+            [row.get("content") for row in texts or []],
+        )
+        directed_events: list[dict[str, Any]] = []
+        for row in texts or []:
+            observation = _observation_interaction_metadata(row.get("metadata_json"))
+            directed_events.append(
+                {
+                    "body": row.get("content") or "",
+                    "observation": observation,
+                }
+            )
+        bind_directed_epithet_aliases(directory, directed_events)
+        for node in nodes.values():
+            if str(node.get("type") or "") != "person":
+                continue
+            member_id = (
+                directory.resolve_id(node.get("technical_label"))
+                or directory.resolve_id(node.get("label"))
+                or directory.resolve_name(node.get("display_label"))
+            )
+            if not member_id:
+                continue
+            spoken = list(directory.spoken_by_id.get(member_id) or [])
+            for linked in directory.id_aliases.get(member_id, ()):
+                spoken = _merge_group_graph_aliases(
+                    spoken, directory.spoken_by_id.get(linked) or []
+                )
+            if spoken:
+                node["aliases"] = _merge_group_graph_aliases(node.get("aliases") or [], spoken)
 
     async def get_group_relationship_edge_evidence(
         self,
@@ -2238,6 +2634,11 @@ class MemoryGroupGraphStoreMixin:
                     "observation": observation,
                 }
             )
+        bind_spoken_member_aliases(
+            local_directory,
+            [item.get("body") for item in events],
+        )
+        bind_directed_epithet_aliases(local_directory, events)
 
         candidates_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         unresolved_targets = 0
@@ -2446,6 +2847,10 @@ class MemoryGroupGraphStoreMixin:
             member_rows = []
         for row in member_rows or []:
             directory.add_member(row.get("user_wxid"), row.get("user_name"))
+        bind_spoken_member_aliases(
+            directory,
+            [row.get("user_text") for row in event_rows],
+        )
         return directory
 
     async def _extract_group_relationship_window_candidates(
@@ -2484,13 +2889,14 @@ class MemoryGroupGraphStoreMixin:
             "common spelling of product names, at most 12 Chinese characters or 4 English words, "
             "and reuse one spelling for the same term. "
             "(4) Do not emit 'the group', '大家' or the chat itself as an object, and do not report "
-            "who merely talked in the same time span; direct replies and @-mentions are already "
-            "tracked, so prefer asked/answered/requested/provided_resource/collaborated_with between "
-            "people and interested_in/reported_issue/works_on/maintains/tested/fixed_issue/asked "
-            "between a person and a term. "
-            "(5) interested_in means the person wants, likes, uses or asks how to get the thing. "
-            "Mocking it, criticizing it, gossiping about it, or discussing whether this system "
-            "labelled it correctly is mentioned, never interested_in. "
+            "who merely talked in the same time span. Direct replies and @-mentions are already "
+            "tracked: do not emit mentioned, replied_to, addressed or co_participated. Prefer "
+            "asked/answered/requested/provided_resource/collaborated_with between people and "
+            "reported_issue/works_on/maintains/tested/fixed_issue/asked between a person and a term. "
+            "(5) interested_in means the person wants, likes, uses or asks how to get a concrete "
+            "tool, product or service. Mocking it, criticizing it, gossiping about it, chatting "
+            "about a game or celebrity, or discussing whether this system labelled it correctly "
+            "is not a relation; skip it. "
             "(6) reason is one short sentence in the group's language that names the concrete "
             "behaviour (what was asked, compared, complained about), so a reviewer can find the "
             "messages; never quote a message verbatim. Return an empty list rather than guessing."
@@ -2846,6 +3252,10 @@ class MemoryGroupGraphStoreMixin:
             signals,
             day_count=day_count,
             auto_accept=auto_accept,
+            predicate=str(candidate.get("predicate") or relation_payload.get("predicate") or ""),
+            object_type=str(
+                candidate.get("object_type") or relation_payload.get("object_type") or ""
+            ),
         )
         if prior_acceptance_status in {"accepted", "rejected"} or existing_acceptance.get("reviewed_by") == "system/jev":
             acceptance_status = prior_acceptance_status
@@ -3651,7 +4061,9 @@ class MemoryGroupGraphStoreMixin:
             "         fact.subject_entity_id AS subject_id, fact.object_entity_id AS object_id, "
             "         fact.predicate, "
             "         COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{relation,object_type}', 'person') "
-            "           AS object_type "
+            "           AS object_type, "
+            "         COALESCE(NULLIF(item.value_json, '')::jsonb #>> '{acceptance,status}', '') "
+            "           AS acceptance_status "
             "  FROM plugin_memory_item item "
             "  JOIN plugin_memory_fact fact ON fact.memory_item_id = item.id "
             "  WHERE item.deleted_at IS NULL AND item.status = 'pending' "
@@ -3666,7 +4078,7 @@ class MemoryGroupGraphStoreMixin:
             "  LIMIT :limit"
             ") "
             "SELECT pending.id, pending.tenant_id, pending.session_id, pending.predicate, "
-            "       pending.object_type, "
+            "       pending.object_type, pending.acceptance_status, "
             "  EXISTS ("
             "    SELECT 1 FROM plugin_memory_fact other "
             "    JOIN plugin_memory_item other_item ON other_item.id = other.memory_item_id "
@@ -3702,12 +4114,14 @@ class MemoryGroupGraphStoreMixin:
     ) -> dict[str, Any]:
         """Accept pending model relations that the accepted graph already corroborates.
 
-        Single-window model claims wait in needs_review. Instead of a human
-        clicking through them, this pass promotes the ones the rest of the
-        group's graph supports: a term that some member already has an accepted
-        relation with, or two people who already have an accepted direct edge.
-        Uncorroborated claims stay pending until they repeat on another day or
-        governance expires them after the review retention window.
+        Single-window model claims wait. Instead of a human clicking through
+        them, this pass promotes the ones the rest of the group's graph
+        supports: a term that some member already has an accepted relation
+        with, or two people who already have an accepted direct edge.
+        Uncorroborated gossip (mentioned / vague interested_in) is parked as
+        candidate so it leaves the human queue without being discarded.
+        Key work/help claims stay in needs_review until they repeat, get
+        corroborated, or governance expires them.
         """
 
         settings = getattr(self, "settings", None)
@@ -3728,6 +4142,7 @@ class MemoryGroupGraphStoreMixin:
             "accepted": 0,
             "accepted_term": 0,
             "accepted_pair": 0,
+            "held": 0,
             "failed": 0,
             "remaining": 0,
             "stop_reason": "disabled" if effective_limit <= 0 else "completed",
@@ -3741,12 +4156,22 @@ class MemoryGroupGraphStoreMixin:
         summary["scanned"] = len(candidates)
         for candidate in candidates:
             object_type = str(candidate.get("object_type") or "person").strip().lower()
+            predicate = str(candidate.get("predicate") or "")
             if object_type != "person" and candidate.get("term_corroborated"):
+                action = "accept"
                 reason = "group_window_term_corroborated"
                 bucket = "accepted_term"
             elif object_type == "person" and candidate.get("pair_corroborated"):
+                action = "accept"
                 reason = "group_window_pair_corroborated"
                 bucket = "accepted_pair"
+            elif (
+                not _group_relation_needs_human_review(predicate, object_type)
+                and str(candidate.get("acceptance_status") or "") == "needs_review"
+            ):
+                action = "candidate"
+                reason = "group_window_low_value_hold"
+                bucket = "held"
             else:
                 summary["remaining"] += 1
                 continue
@@ -3754,7 +4179,7 @@ class MemoryGroupGraphStoreMixin:
             try:
                 reviewed = await self.review_memory_item_acceptance(
                     item_id,
-                    action="accept",
+                    action=action,
                     review_reason=reason,
                     reviewed_by=GROUP_RELATION_AUTO_REVIEWER,
                 )
@@ -3770,7 +4195,8 @@ class MemoryGroupGraphStoreMixin:
             if not reviewed:
                 summary["failed"] += 1
                 continue
-            summary["accepted"] += 1
+            if action == "accept":
+                summary["accepted"] += 1
             summary[bucket] += 1
         if len(candidates) >= effective_limit:
             summary["stop_reason"] = "batch_limit_reached"
@@ -3780,6 +4206,7 @@ class MemoryGroupGraphStoreMixin:
             accepted=summary["accepted"],
             accepted_term=summary["accepted_term"],
             accepted_pair=summary["accepted_pair"],
+            held=summary["held"],
             failed=summary["failed"],
             remaining=summary["remaining"],
             stop_reason=summary["stop_reason"],

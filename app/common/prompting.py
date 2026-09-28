@@ -93,9 +93,10 @@ def _scene_reply_rules(session: Session) -> str:
     if is_group:
         scene_name = "微信群聊" if is_wechat else "群聊或频道"
         cadence = (
-            "断句跟这个人平时一样：该句号、问号或换行就断开，不要挤成一句没有标点的长串。\n"
+            "短回复写在一行，用逗号或句号隔开，不要一句一行。"
+            "只有较长说明、分点清单或对方要求展开时才换行。\n"
             if persona_cos_active(session)
-            else ""
+            else "短回复写在一行，用逗号或句号隔开，不要一句一行。\n"
         )
         return (
             f"现在是{scene_name}。按这个人平时在群里的样子回，短、直接，别写成小作文。\n"

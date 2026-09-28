@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Alert } from "../../components";
 import { apiRequest } from "../../lib/api";
 import { useConsoleConfig } from "../../state/console-config";
 import { JevRevisionPanel, type Revision } from "./JevRevisionPanel";
@@ -107,29 +108,58 @@ export function JevKnowledgePanel({ sessionId, disabled }: { sessionId: string; 
       if (current === generation.current) await load();
     } finally { if (current === generation.current) setBusy(false); }
   }
-  return <section aria-label="每日知识候选">
-    <h3>每日知识候选</h3>
-    <p>按群和状态查看知识任务与候选，可继续加载历史记录。未发布的候选不会用于回答。置信度表示模型判断，不代表独立事实核验。</p>
-    <label>知识候选状态<select aria-label="知识候选状态" value={candidateStatus} disabled={disabled || busy} onChange={e => setCandidateStatus(e.target.value)}>
-      <option value="">全部状态</option>{["pending", "running", "needs_review", "ready", "revision_ready", "unresolved", "resolved", "duplicate", "published", "rejected", "failed", "skipped"].map(status => <option key={status} value={status}>{labels[status]}</option>)}
-    </select></label>
-    <label>复盘状态<select aria-label="复盘状态" value={findingStatus} disabled={disabled || busy} onChange={e => setFindingStatus(e.target.value)}>
-      <option value="">全部状态</option>{["needs_review", "supported", "rejected", "confirmed", "dismissed"].map(status => <option key={status} value={status}>{labels[status] || status}</option>)}
-    </select></label>
-    <button disabled={disabled || busy} onClick={() => void load()}>加载知识任务与候选</button>
-    {error && <p role="alert">{error}</p>}
+  return <section className="panel" aria-label="每日知识候选">
+    <div className="panel-header">
+      <div>
+        <p className="section-kicker">知识迭代</p>
+        <h3>每日知识候选</h3>
+      </div>
+    </div>
+    <p className="muted-copy">按群和状态查看知识任务与候选，可继续加载历史记录。未发布的候选不会用于回答。置信度表示模型判断，不代表独立事实核验。</p>
+    <div className="page-ops-bar">
+      <label className="field">
+        <span>知识候选状态</span>
+        <select aria-label="知识候选状态" value={candidateStatus} disabled={disabled || busy} onChange={e => setCandidateStatus(e.target.value)}>
+          <option value="">全部状态</option>{["pending", "running", "needs_review", "ready", "revision_ready", "unresolved", "resolved", "duplicate", "published", "rejected", "failed", "skipped"].map(status => <option key={status} value={status}>{labels[status]}</option>)}
+        </select>
+      </label>
+      <label className="field">
+        <span>复盘状态</span>
+        <select aria-label="复盘状态" value={findingStatus} disabled={disabled || busy} onChange={e => setFindingStatus(e.target.value)}>
+          <option value="">全部状态</option>{["needs_review", "supported", "rejected", "confirmed", "dismissed"].map(status => <option key={status} value={status}>{labels[status] || status}</option>)}
+        </select>
+      </label>
+      <div className="action-row">
+        <button className="button button-secondary" type="button" disabled={disabled || busy} onClick={() => void load()}>加载知识任务与候选</button>
+      </div>
+    </div>
+    {error ? <Alert variant="danger" title="知识任务未完成">{error}</Alert> : null}
     {data && <>
-      <div className="table-wrap"><table><thead><tr><th>日期 / 群</th><th>状态</th><th>扫描消息 / 知识候选 / 质量发现</th></tr></thead><tbody>{data.jobs.map(job => <tr key={job.id}><td>{job.period}<div className="mono">{job.session_id}</div></td><td>{labels[job.status] || job.status} {job.error_type}{["failed", "skipped"].includes(job.status) && <button disabled={busy || disabled} onClick={() => void retryJob(job)}>继续整理</button>}</td><td>{job.scanned} / {job.candidate_count} / {job.quality_count ?? 0}</td></tr>)}</tbody></table></div>
-      {data.pagination?.jobs && <button disabled={busy || disabled} onClick={() => void loadMore("jobs")}>加载更早的整理任务</button>}
-      {data.jobs.length === 0 && <p>当前范围尚无知识整理任务。</p>}
+      <div className="table-wrap"><table><thead><tr><th>日期 / 群</th><th>状态</th><th>扫描消息 / 知识候选 / 质量发现</th></tr></thead><tbody>{data.jobs.map(job => <tr key={job.id}><td>{job.period}<div className="mono">{job.session_id}</div></td><td>{labels[job.status] || job.status} {job.error_type}{["failed", "skipped"].includes(job.status) && <button className="button button-secondary button-compact" type="button" disabled={busy || disabled} onClick={() => void retryJob(job)}>继续整理</button>}</td><td>{job.scanned} / {job.candidate_count} / {job.quality_count ?? 0}</td></tr>)}</tbody></table></div>
+      {data.pagination?.jobs ? <div className="action-row"><button className="button button-secondary" type="button" disabled={busy || disabled} onClick={() => void loadMore("jobs")}>加载更早的整理任务</button></div> : null}
+      {data.jobs.length === 0 ? <p className="muted-copy">当前范围尚无知识整理任务。</p> : null}
       <section aria-label="每日回答质量复盘">
-        <h3>每日回答质量复盘</h3>
-        <p>与知识候选独立展示，不进入答疑知识库。“证据支持”是 Jev 的复核结果；待核验项不作为已确认故障统计。</p>
-        {(data.quality_summary || []).map(row => <p key={`${row.kind}:${row.status}`}>{({ missed_help: "疑似漏答", unhelpful_answer: "回答无帮助", unnecessary_reply: "多余回复", good_resolution: "有效解决" } as Record<string,string>)[row.kind] || row.kind} · {labels[row.status] || row.status}：{row.count}</p>)}
-        {(data.findings || []).map(item => <article key={item.id} className="panel">
+        <div className="panel-header">
+          <div>
+            <p className="section-kicker">质量复盘</p>
+            <h3>每日回答质量复盘</h3>
+          </div>
+        </div>
+        <p className="muted-copy">与知识候选独立展示，不进入答疑知识库。“证据支持”是 Jev 的复核结果；待核验项不作为已确认故障统计。</p>
+        {(data.quality_summary || []).length > 0 ? (
+          <div className="status-grid">
+            {(data.quality_summary || []).map(row => (
+              <article className="status-tile" key={`${row.kind}:${row.status}`}>
+                <span>{({ missed_help: "疑似漏答", unhelpful_answer: "回答无帮助", unnecessary_reply: "多余回复", good_resolution: "有效解决" } as Record<string,string>)[row.kind] || row.kind} · {labels[row.status] || row.status}</span>
+                <strong>{row.count}</strong>
+              </article>
+            ))}
+          </div>
+        ) : null}
+        {(data.findings || []).map(item => <article key={item.id} className="jev-blocked-card">
           <h4>{item.finding.title} · {labels[item.status] || item.status}</h4><p>{item.finding.explanation}</p><p>{reasons[item.reason] || item.reason}</p>
           <p>消息：{item.finding.evidence_ids.join("、")}</p><p className="mono">追踪：{item.finding.trace_ids.join("、") || "无处理记录"}</p>
-          <button disabled={busy || disabled} onClick={() => void showEvidence(item, "findings")}>查看复盘证据</button>
+          <button className="button button-secondary button-compact" type="button" disabled={busy || disabled} onClick={() => void showEvidence(item, "findings")}>查看复盘证据</button>
           {evidence[`findings:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker}<p>{message.text}</p>{message.truncated && <p>此处只展示长消息的部分内容，请结合原始消息核对完整上下文。</p>}</blockquote>)}
           {findingEvidence[item.id]?.runtime.map(record => <div key={record.message_id}>
             <p>消息 #{record.message_id} · 处理：{record.processing_status || "无记录"} · {record.processing_reason}</p>
@@ -138,16 +168,16 @@ export function JevKnowledgePanel({ sessionId, disabled }: { sessionId: string; 
           </div>)}
           {item.review?._operator && <p>人工处理：{item.review._operator.actor} · {item.review._operator.reason}</p>}
           {!["confirmed", "dismissed"].includes(item.status) && <>
-            <label>复盘处理说明<input aria-label={`复盘处理说明 ${item.id}`} value={notes[`finding:${item.id}`] || ""} disabled={busy || disabled} onChange={e => setNotes({ ...notes, [`finding:${item.id}`]: e.target.value })} /></label>
+            <label className="field">复盘处理说明<input aria-label={`复盘处理说明 ${item.id}`} value={notes[`finding:${item.id}`] || ""} disabled={busy || disabled} onChange={e => setNotes({ ...notes, [`finding:${item.id}`]: e.target.value })} /></label>
             <DangerAction label="确认复盘结论" title="确认复盘结论" impact="记录人工核验结果；不会自动修改群参与策略或发布知识。" disabled={busy || disabled || !notes[`finding:${item.id}`]?.trim() || !findingEvidence[item.id]?.hash} onConfirm={() => reviewFinding(item, "confirm")} />
             <DangerAction label="排除复盘误报" title="排除复盘误报" impact="保留原始模型判断和排除原因，标记为人工排除。" disabled={busy || disabled || !notes[`finding:${item.id}`]?.trim()} onConfirm={() => reviewFinding(item, "dismiss")} />
             {!findingEvidence[item.id]?.hash && <p>确认前请先查看复盘证据和实际发送记录。</p>}
           </>}
         </article>)}
-        {data.pagination?.findings && <button disabled={busy || disabled} onClick={() => void loadMore("findings")}>加载更多复盘记录</button>}
-        {data.findings?.length === 0 && <p>当前范围没有质量复盘发现。</p>}
+        {data.pagination?.findings ? <div className="action-row"><button className="button button-secondary" type="button" disabled={busy || disabled} onClick={() => void loadMore("findings")}>加载更多复盘记录</button></div> : null}
+        {data.findings?.length === 0 ? <p className="muted-copy">当前范围没有质量复盘发现。</p> : null}
       </section>
-      {data.candidates.map(item => <article key={item.id} className="panel">
+      {data.candidates.map(item => <article key={item.id} className="jev-blocked-card">
         <h4>{item.draft.title} · {labels[item.status] || item.status}</h4>
         <p className="mono">{item.session_id}</p>
         <p>{reasons[item.reason] || item.reason} {item.error_type} · Jev 置信度 {item.review?.answers?.decision?.confidence?.toFixed(2) ?? "—"}</p>
@@ -156,17 +186,17 @@ export function JevKnowledgePanel({ sessionId, disabled }: { sessionId: string; 
         {item.comparisons.map(c => <p key={c.doc_id}>知识 #{c.doc_id}：{relations[c.relation] || c.relation}（{c.confidence.toFixed(2)}）</p>)}
         {item.kb_doc_id && <p>已发布为知识文档 #{item.kb_doc_id}</p>}
         {item.revision?.id && <JevRevisionPanel candidateId={item.id} version={item.version} sessionId={item.session_id} revision={item.revision} disabled={busy || disabled || ["running", "pending"].includes(item.status)} onSaved={load} />}
-        <button disabled={busy || disabled} onClick={() => void showEvidence(item)}>查看原始证据（脱敏）</button>
+        <button className="button button-secondary button-compact" type="button" disabled={busy || disabled} onClick={() => void showEvidence(item)}>查看原始证据（脱敏）</button>
         {evidence[`candidates:${item.id}`]?.map(message => <blockquote key={message.id}>#{message.id} · {message.speaker} · {new Date(message.occurred_ts * 1000).toLocaleString()}<p>{message.text}</p>{message.truncated && <p>此处只展示长消息的部分内容，请结合原始消息核对完整上下文。</p>}</blockquote>)}
         {!["running", "published", "pending", "resolved"].includes(item.status) && <>
-          <label>审核说明<input aria-label={`审核说明 ${item.id}`} value={notes[item.id] || ""} disabled={busy || disabled} onChange={e => setNotes({ ...notes, [item.id]: e.target.value })} /></label>
+          <label className="field">审核说明<input aria-label={`审核说明 ${item.id}`} value={notes[item.id] || ""} disabled={busy || disabled} onChange={e => setNotes({ ...notes, [item.id]: e.target.value })} /></label>
           {item.status === "ready" && <DangerAction label="发布到本群知识库" title="发布知识候选" impact={`将“${item.draft.title}”加入本群知识库，后续答疑可以引用。`} disabled={busy || disabled || !notes[item.id]?.trim()} onConfirm={() => act(item, "publish")} />}
           {item.status === "revision_ready" && <DangerAction label="批准修订现有知识" title="批准知识修订" impact={`将修订内容写入知识 #${item.revision?.target_doc_id}，保留旧版本记录。`} disabled={busy || disabled || !notes[item.id]?.trim()} onConfirm={() => act(item, "apply_revision")} />}
           <DangerAction label="排除候选" title="排除知识候选" impact="该候选不会进入知识库。" disabled={busy || disabled || !notes[item.id]?.trim()} onConfirm={() => act(item, "reject")} />
-          {item.status !== "rejected" && <button disabled={busy || disabled || !notes[item.id]?.trim()} onClick={() => void act(item, "retry").catch(e => setError(String(e)))}>重新审核候选</button>}
+          {item.status !== "rejected" && <button className="button button-secondary button-compact" type="button" disabled={busy || disabled || !notes[item.id]?.trim()} onClick={() => void act(item, "retry").catch(e => setError(String(e)))}>重新审核候选</button>}
         </>}
       </article>)}
-      {data.pagination?.candidates && <button disabled={busy || disabled} onClick={() => void loadMore("candidates")}>加载更多知识候选</button>}
+      {data.pagination?.candidates ? <div className="action-row"><button className="button button-secondary" type="button" disabled={busy || disabled} onClick={() => void loadMore("candidates")}>加载更多知识候选</button></div> : null}
     </>}
   </section>;
 }

@@ -939,6 +939,43 @@ async def test_group_activity_blocks_deceptive_identity_claims(reply: str) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "发下具体提示或截图看看，用的哪个版本？",
+        "逆转失败的话发张图过来",
+        "把 screenshot 贴一下我帮你看",
+    ],
+)
+async def test_group_activity_blocks_image_solicit_warmup(reply: str) -> None:
+    store = _FakeStore()
+    store.has_completed = True
+    service, _, _, outbound = _service(
+        _messages(190 * 60, 200 * 60),
+        store=store,
+        agent=_FakeAgent(reply),
+    )
+
+    decision = await service.process_session(_config(), dry_run=False)
+
+    assert decision.status == "skipped"
+    assert decision.reason == "generation_image_solicit"
+    assert outbound.sent == []
+
+
+def test_group_activity_prompt_forbids_image_requests() -> None:
+    service, _, _, _ = _service([])
+    prompt = service._build_prompt(
+        {"session_name": "codex降智交流群", "session_id": "room@chatroom"},
+        [{"timestamp": "2026-09-25 15:50:00", "sender_name": "L", "text": "逆转失败了"}],
+        idle_minutes=180,
+        disclose_identity=False,
+    )
+    assert "不要向群友索要截图" in prompt
+    assert "看不到清晰图片" in prompt
+
+
+@pytest.mark.asyncio
 async def test_group_activity_generation_failure_is_closed_and_audited() -> None:
     class _FailingAgent(_FakeAgent):
         async def answer(self, pre, session, hints=None):

@@ -936,9 +936,12 @@ class WxbotReplyPolicyHook:
                 )
                 if evaluation:
                     ctx.extras["jev_participation"] = evaluation
-                if not jev_policy.participation_shadow_only:
-                    allowed = jev_help_seeking
-                    reason = "jev_help_seeking" if jev_help_seeking else "jev_no_clear_help_request"
+                if not jev_policy.participation_shadow_only and jev_help_seeking:
+                    # Jev can nominate extra replies. Uncertain or observe
+                    # results keep the channel keyword / mention policy so a
+                    # help-desk group does not go silent on 降智/代理 questions.
+                    allowed = True
+                    reason = "jev_help_seeking"
         cursor_ready = await self._record_interaction_cursor(ctx)
         snapshot: dict[str, object] = {}
         context_error = ""
