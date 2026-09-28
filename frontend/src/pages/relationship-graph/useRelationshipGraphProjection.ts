@@ -12,6 +12,7 @@ import type { ConsoleConfig } from "../../state/console-config";
 import {
   DEFAULT_EDGE_TYPES,
   DEFAULT_NODE_TYPES,
+  FOLDED_BY_DEFAULT_EDGE_TYPES,
   GRAPH_VIEW_BUDGETS,
   buildAnonymousGraphLabels,
   buildGraphLayout,
@@ -155,21 +156,32 @@ export function useRelationshipGraphProjection({
     ),
     [filteredNodeIds, forcedGraphNodeIds, modeFilteredEdges, nodesById],
   );
-  const graphNodes = useMemo(
+  const selectedGraphNodes = useMemo(
     () => selectGraphNodes(modeFilteredNodes, rankedGraphEdges, graphBudget.nodes, forcedGraphNodeIds),
     [forcedGraphNodeIds, graphBudget.nodes, modeFilteredNodes, rankedGraphEdges],
   );
-  const graphNodeIds = useMemo(() => new Set(graphNodes.map((node) => node.id)), [graphNodes]);
+  const selectedGraphNodeIds = useMemo(() => new Set(selectedGraphNodes.map((node) => node.id)), [selectedGraphNodes]);
   const graphEdges = useMemo(
-    () => rankedGraphEdges.filter((edge) => graphNodeIds.has(displayEdgeSource(edge)) && graphNodeIds.has(displayEdgeTarget(edge))),
-    [graphNodeIds, rankedGraphEdges],
+    () => rankedGraphEdges.filter((edge) => selectedGraphNodeIds.has(displayEdgeSource(edge)) && selectedGraphNodeIds.has(displayEdgeTarget(edge))),
+    [selectedGraphNodeIds, rankedGraphEdges],
   );
-  const layout = useMemo(() => buildGraphLayout(graphNodes, graphEdges), [graphEdges, graphNodes]);
+  const budgetedGraphEdges = useMemo(() => graphEdges.slice(0, graphBudget.edges), [graphBudget.edges, graphEdges]);
+  // Outside 全部, a node whose every edge fell under the edge budget would render
+  // as an unexplained isolated dot; drop it unless the user pinned it.
+  const graphNodes = useMemo(() => {
+    if (graphViewMode === "all") return selectedGraphNodes;
+    const connected = new Set<string>();
+    for (const edge of budgetedGraphEdges) {
+      connected.add(displayEdgeSource(edge));
+      connected.add(displayEdgeTarget(edge));
+    }
+    return selectedGraphNodes.filter((node) => connected.has(node.id) || forcedGraphNodeIds.has(node.id));
+  }, [budgetedGraphEdges, forcedGraphNodeIds, graphViewMode, selectedGraphNodes]);
+  const layout = useMemo(() => buildGraphLayout(graphNodes, budgetedGraphEdges), [budgetedGraphEdges, graphNodes]);
   const visibleGraphEdges = useMemo(
-    () => graphEdges
-      .filter((edge) => layout.has(displayEdgeSource(edge)) && layout.has(displayEdgeTarget(edge)))
-      .slice(0, graphBudget.edges),
-    [graphBudget.edges, graphEdges, layout],
+    () => budgetedGraphEdges
+      .filter((edge) => layout.has(displayEdgeSource(edge)) && layout.has(displayEdgeTarget(edge))),
+    [budgetedGraphEdges, layout],
   );
   const visibleLabels = useMemo(
     () => buildVisibleLabels(
@@ -189,7 +201,7 @@ export function useRelationshipGraphProjection({
   const modeHiddenEdgeCount = Math.max(0, visibleEdges.length - rankedGraphEdges.length);
   const graphSummaryText = graphViewMode === "all"
     ? `现在能看到 ${graphNodes.length} 个人或主题，${visibleGraphEdges.length} 条互动。`
-    : `先看最常一起出现的 ${graphNodes.length} 个人或主题、${visibleGraphEdges.length} 条互动；其余 ${modeHiddenNodeCount + hiddenGraphNodeCount} 人 / ${modeHiddenEdgeCount + hiddenGraphEdgeCount} 条被收进摘要。`;
+    : `按互动强度先看前 ${graphNodes.length} 个人或主题、${visibleGraphEdges.length} 条互动；其余 ${modeHiddenNodeCount + hiddenGraphNodeCount} 人 / ${modeHiddenEdgeCount + hiddenGraphEdgeCount} 条（含默认折叠的同窗共现）在"人物"或"全部"里。`;
   const selectedDateStatus = useMemo(
     () => dateRows.find((row) => row.date === targetDate),
     [dateRows, targetDate],
@@ -262,6 +274,11 @@ export function useRelationshipGraphProjection({
     }
     return ids;
   }, [selectedNode, visibleGraphEdges]);
+  const foldedEdgeCount = useMemo(
+    () => filteredEdges.filter((edge) => FOLDED_BY_DEFAULT_EDGE_TYPES.has(String(edge.label || edge.type || "").toLowerCase())).length,
+    [filteredEdges],
+  );
+  const onlyFoldedEdges = filteredEdges.length > 0 && foldedEdgeCount === filteredEdges.length;
   const graphStateMessage = loading
     ? "正在加载关系图，请稍候。"
     : graph === null
@@ -270,6 +287,8 @@ export function useRelationshipGraphProjection({
         ? "当前范围没有关系图数据。可点“显示全部关系”、放宽审核状态，或打开抽取控制同步近 7 天。"
         : !filteredNodes.length && (nodeSearch.trim() || edgeSearch.trim())
           ? "当前搜索没有匹配节点或关系；请调整节点/关系关键词。"
+          : !graphNodes.length && graphViewMode === "readable" && onlyFoldedEdges
+            ? `当前只有 ${foldedEdgeCount} 条“同一时段一起聊过”这类弱关系，默认视图已折叠。切到“人物”或“全部”可以查看；运行一次新的抽取后会出现引用回复、@ 等直接互动。`
           : !graphNodes.length
             ? "当前视图模式隐藏了所有可见节点；可切换到“全部”或调整搜索条件。"
       : "";

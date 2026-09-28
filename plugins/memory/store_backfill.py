@@ -858,6 +858,17 @@ class MemoryBackfillStoreMixin:
 
         recent_days = max(1, min(int(recent_days or 14), 90))
         today = datetime.now().date()
+        # Imported events and relations live under the operator session id while
+        # the console addresses the group by its runtime alias; count both.
+        resolver = getattr(self, "_resolve_group_graph_session_ids", None)
+        session_ids = [session_id]
+        if callable(resolver):
+            try:
+                session_ids = await resolver(tenant_id=tenant_id, session_id=session_id) or [
+                    session_id
+                ]
+            except Exception:
+                session_ids = [session_id]
         rows: list[dict[str, Any]] = []
         for offset in range(recent_days):
             day = today - timedelta(days=offset)
@@ -875,20 +886,27 @@ class MemoryBackfillStoreMixin:
                 "SELECT COUNT(*) AS count FROM plugin_memory_event "
                 "WHERE tenant_id = :tid AND channel = :channel "
                 "AND source_key IN (:source_key, '*') "
-                "AND user_id = :uid AND session_id = :sid "
+                "AND user_id = :uid AND session_id = ANY(:sids) "
                 "AND created_at >= :start_at AND created_at < :end_at",
                 {
                     "tid": tenant_id,
                     "channel": channel,
                     "source_key": source_key,
                     "uid": user_id,
-                    "sid": session_id,
+                    "sids": session_ids,
                     "start_at": start_at,
                     "end_at": end_at,
                 },
             )
-            raw_count = len(messages)
-            imported_count = int((imported[0] if imported else {}).get("count") or 0)
+            observation_count = await self._count_group_observations_for_day(
+                tenant_id=tenant_id,
+                session_ids=session_ids,
+                start_at=start_at,
+                end_at=end_at,
+            )
+            raw_count = max(len(messages), observation_count)
+            memory_event_count = int((imported[0] if imported else {}).get("count") or 0)
+            imported_count = memory_event_count + observation_count
             job_counts = await self.get_llm_extraction_job_status_counts_for_day(
                 tenant_id=tenant_id,
                 channel=channel,
@@ -911,6 +929,8 @@ class MemoryBackfillStoreMixin:
                     "date": day.isoformat(),
                     "raw_message_count": raw_count,
                     "imported_count": imported_count,
+                    "memory_event_count": memory_event_count,
+                    "observation_count": observation_count,
                     "job_counts": job_counts,
                     "status": status,
                 }
@@ -921,12 +941,41 @@ class MemoryBackfillStoreMixin:
             "channel": channel,
             "source_key": source_key,
             "session_id": session_id,
+            "session_ids": session_ids,
             "user_id": user_id,
             "user_id_scope": user_id,
             "user_id_auto": user_id_auto,
             "recent_days": recent_days,
             "items": rows,
         }
+
+    async def _count_group_observations_for_day(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: list[str],
+        start_at: datetime,
+        end_at: datetime,
+    ) -> int:
+        rooms = [str(item).strip() for item in session_ids if str(item or "").strip()]
+        if not rooms:
+            return 0
+        try:
+            rows = await _exec(
+                "SELECT COUNT(*) AS count FROM plugin_wxbot_group_observations "
+                "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
+                "AND occurred_ts >= :start_ts AND occurred_ts < :end_ts "
+                "AND sender_wxid <> '' AND content <> ''",
+                {
+                    "tid": str(tenant_id or "").strip(),
+                    "sids": rooms,
+                    "start_ts": int(start_at.timestamp()),
+                    "end_ts": int(end_at.timestamp()),
+                },
+            )
+        except Exception:
+            return 0
+        return int((rows[0] if rows else {}).get("count") or 0)
 
     async def _live_group_backfill_messages(
         self,

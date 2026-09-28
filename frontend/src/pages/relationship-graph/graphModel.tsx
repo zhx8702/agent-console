@@ -2,6 +2,7 @@ import type {
   GroupGraphEdge,
   GroupGraphEdgeEvidenceEntity,
   GroupGraphEdgeEvidenceResponse,
+  GroupGraphEdgeJudgement,
   GroupGraphNode,
   GroupGraphResponse,
   MemoryBackfillResponse,
@@ -133,12 +134,15 @@ export const GRAPH_VIEW_BUDGETS: Record<GraphViewMode, { nodes: number; edges: n
 };
 
 export const GRAPH_VIEW_MODES: Array<{ value: GraphViewMode; label: string; description: string }> = [
-  { value: "readable", label: "可读", description: "核心摘要，隐藏低信号关系和值节点" },
-  { value: "core", label: "核心", description: "优先高连接关系" },
-  { value: "people", label: "人物", description: "只看人物之间的关系" },
+  { value: "readable", label: "可读", description: "按互动强度取前 N 条直接互动（引用、@、问答），隐藏同窗共现和值节点" },
+  { value: "core", label: "核心", description: "优先高连接关系，按强度取前 N" },
+  { value: "people", label: "人物", description: "只看人物之间的关系（含同窗共现）" },
   { value: "topics", label: "主题", description: "人物与主题/项目/工具" },
   { value: "all", label: "全部", description: "显示当前查询返回的关系" },
 ];
+
+/** Same-window co-participation is folded out of the default view; it says little more than "both were online". */
+export const FOLDED_BY_DEFAULT_EDGE_TYPES = new Set(["co_participated"]);
 
 export type NodeVisualType = "person" | "topic" | "product" | "tool" | "value" | "other";
 
@@ -214,17 +218,40 @@ export function isPendingReviewStatus(status?: string | null) {
   return normalized === "needs_review" || normalized === "candidate";
 }
 
+/** Evidence count (messages / observations behind the edge) on a log scale so 1, 4, 20 and 100 are all distinguishable. */
 export function edgeStrokeWidth(edge: GroupGraphEdge) {
-  return Math.min(5, 1.15 + Number(edge.evidence_count || 0) * 0.32);
+  const evidence = Math.max(0, Number(edge.evidence_count || 0));
+  const scaled = Math.log1p(evidence) / Math.log1p(60);
+  return Math.min(5.5, 0.9 + 4.6 * Math.min(1, scaled));
+}
+
+/** Most recent evidence date drives opacity; fall back to the row timestamp for legacy edges. */
+export function edgeLastSeenValue(edge: GroupGraphEdge) {
+  return edge.last_seen_date || edge.last_seen || null;
 }
 
 export function edgeRecencyOpacity(edge: GroupGraphEdge) {
-  if (!edge.last_seen) return 0.82;
-  const ageDays = (Date.now() - new Date(edge.last_seen).getTime()) / 86_400_000;
+  const lastSeen = edgeLastSeenValue(edge);
+  if (!lastSeen) return 0.82;
+  const ageDays = (Date.now() - new Date(lastSeen).getTime()) / 86_400_000;
   if (!Number.isFinite(ageDays) || ageDays <= 7) return 0.9;
   if (ageDays <= 14) return 0.68;
   if (ageDays <= 30) return 0.46;
   return 0.28;
+}
+
+export function formatStrength(value?: number | null) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+export function edgeStrengthValue(edge: GroupGraphEdge) {
+  const strength = Number(edge.strength);
+  if (Number.isFinite(strength) && strength > 0) return strength;
+  // Legacy edges without a stored strength: approximate from evidence and days.
+  const evidence = Number(edge.evidence_count || 0);
+  const days = Number(edge.evidence_day_count || (edge.evidence_dates || []).length || 0);
+  return 1 - Math.exp(-(evidence / 3 + Math.max(0, days - 1) / 4));
 }
 
 export function restoreGraphSelection(selection: Selection, graph: GroupGraphResponse): Selection {
@@ -411,10 +438,21 @@ export function isTechnicalLabel(value?: string | null) {
   return !normalized || isTechnicalUserId(normalized) || /^entity:\d+$/i.test(normalized);
 }
 
+/**
+ * Only people carry opaque ids (wxid_..., openid) that must be hidden behind
+ * a nickname or "成员 N". A topic/tool/project label is the term itself:
+ * "cursor" or "uniapp" is a name, not an account id.
+ */
+function labelLooksTechnical(node: GroupGraphNode, value?: string | null) {
+  if (isPersonNode(node)) return isTechnicalLabel(value);
+  const normalized = String(value || "").trim();
+  return !normalized || /^entity:\d+$/i.test(normalized);
+}
+
 export function nodeDisplayLabel(node?: GroupGraphNode | null) {
   if (!node) return "";
   const candidates = [node.display_label, node.label, ...(node.aliases || [])];
-  const friendly = candidates.find((value) => value && !isTechnicalLabel(value));
+  const friendly = candidates.find((value) => value && !labelLooksTechnical(node, value));
   if (friendly) return String(friendly);
   return shortTechnicalId(node.technical_label || node.label || node.id) || shortTechnicalId(node.id) || node.type || "?";
 }
@@ -453,15 +491,14 @@ export function safeNodeAliases(node?: GroupGraphNode | null) {
 export function graphLabelCandidate(node: GroupGraphNode) {
   if (nodeVisualType(node) === "value") return "值节点";
   const candidates = [node.display_label, node.label, ...(node.aliases || [])];
-  const friendly = candidates.find((value) => value && !isTechnicalLabel(value));
+  const friendly = candidates.find((value) => value && !labelLooksTechnical(node, value));
   if (friendly) return String(friendly).replace(/^user:/i, "");
   return "";
 }
 
 export function buildAnonymousGraphLabels(nodes: GroupGraphNode[]) {
   const technicalNodes = nodes
-    .filter((node) => !graphLabelCandidate(node))
-    .filter((node) => nodeVisualType(node) !== "value")
+    .filter((node) => isPersonNode(node) && !graphLabelCandidate(node))
     .sort((first, second) => (
       String(first.technical_label || first.label || first.id).localeCompare(String(second.technical_label || second.label || second.id))
     ));
@@ -569,12 +606,16 @@ export function edgeImportance(edge: GroupGraphEdge, nodesById: Map<string, Grou
   const evidence = edge.evidence_count || 0;
   const connectsPerson = isPersonNode(sourceNode) || isPersonNode(targetNode);
   const connectsTopic = isTopicLikeNode(sourceNode) || isTopicLikeNode(targetNode);
-  return evidence * 28
+  const days = Number(edge.evidence_day_count || (edge.evidence_dates || []).length || 0);
+  return edgeStrengthValue(edge) * 60
+    + Math.min(evidence, 40) * 4
+    + days * 6
     + confidence * 18
     + (sourceImportance + targetImportance) * 0.7
     + (CORE_EDGE_TYPES.has(type) ? 18 : 0)
     + (connectsPerson && connectsTopic ? 14 : 0)
     + (isPersonNode(sourceNode) && isPersonNode(targetNode) ? 8 : 0)
+    - (FOLDED_BY_DEFAULT_EDGE_TYPES.has(type) ? 30 : 0)
     - (isLowValueEdge(edge) ? 35 : 0)
     - (nodeVisualType(sourceNode) === "value" || nodeVisualType(targetNode) === "value" ? 28 : 0);
 }
@@ -645,6 +686,9 @@ export function shouldKeepEdgeForMode(
   const targetType = nodeVisualType(targetNode);
   if (isLowValueEdge(edge)) return false;
   if (sourceType === "value" || targetType === "value") return false;
+  // The default summary shows direct interactions only; co-participation is
+  // still reachable through the 人物 / 全部 modes or by selecting a node.
+  if (mode === "readable" && FOLDED_BY_DEFAULT_EDGE_TYPES.has(normalizedEdgeType(edge))) return false;
 
   if (mode === "people") return isPersonNode(sourceNode) && isPersonNode(targetNode);
   if (mode === "topics") {
@@ -723,60 +767,169 @@ export function connectedPersonAnchor(
   return totalWeight ? weightedY / totalWeight : undefined;
 }
 
-export function buildGraphLayout(nodes: GroupGraphNode[], edges: GroupGraphEdge[] = []) {
-  const lanes: Record<string, { x: number; top: number; bottom: number }> = {
-    person: { x: 138, top: 82, bottom: 558 },
-    core: { x: 360, top: 96, bottom: 528 },
-    topic: { x: 604, top: 76, bottom: 540 },
-    product: { x: 752, top: 92, bottom: 520 },
-    value: { x: 806, top: 430, bottom: 570 },
-    other: { x: 472, top: 132, bottom: 548 },
+/** Right-hand lanes for non-person nodes. People take the remaining width with a force layout. */
+export const GRAPH_LANES: Record<"topic" | "product" | "value" | "other", { x: number; top: number; bottom: number; label: string }> = {
+  topic: { x: 640, top: 76, bottom: 540, label: "主题 / 项目" },
+  product: { x: 772, top: 92, bottom: 520, label: "产品 / 工具" },
+  other: { x: 706, top: 120, bottom: 560, label: "其他" },
+  value: { x: 836, top: 430, bottom: 570, label: "值" },
+};
+
+export type GraphLaneKey = keyof typeof GRAPH_LANES;
+
+/** Minimum vertical distance between two nodes in the same side lane. */
+export const LANE_MIN_GAP = 26;
+/** Horizontal offset of the second column when a lane holds more nodes than its height allows. */
+export const LANE_STAGGER_X = 30;
+
+export function laneKeyForNode(node: GroupGraphNode): GraphLaneKey | "person" {
+  if (isPersonNode(node)) return "person";
+  const visualType = nodeVisualType(node);
+  if (visualType === "product" || visualType === "tool") return "product";
+  if (visualType === "topic") return "topic";
+  if (visualType === "value") return "value";
+  return "other";
+}
+
+/** Deterministic LCG so the same graph always lands in the same layout. */
+function seededRandom(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
   };
+}
+
+/**
+ * Force-directed placement for the person subgraph inside a rectangle.
+ * Edges pull proportionally to log(evidence); nodes repel; a light gravity
+ * keeps the cluster centred. Runs synchronously in a few milliseconds for the
+ * ≤72 nodes the view budgets allow.
+ */
+export function forceLayoutPersons(
+  people: GroupGraphNode[],
+  edges: GroupGraphEdge[],
+  region: { left: number; right: number; top: number; bottom: number },
+) {
+  const points = new Map<string, GraphPoint>();
+  const count = people.length;
+  if (!count) return points;
+  const width = region.right - region.left;
+  const height = region.bottom - region.top;
+  const centerX = region.left + width / 2;
+  const centerY = region.top + height / 2;
+  if (count === 1) {
+    points.set(people[0].id, { x: centerX, y: centerY });
+    return points;
+  }
+  const index = new Map(people.map((node, position) => [node.id, position]));
+  const random = seededRandom(20260916 + count);
+  const xs = new Float64Array(count);
+  const ys = new Float64Array(count);
+  const degree = buildDegreeMap(edges);
+  // Start on a ring ordered by degree so hubs begin near the middle.
+  const ordered = [...people].sort((first, second) => (degree.get(second.id) || 0) - (degree.get(first.id) || 0));
+  ordered.forEach((node, position) => {
+    const slot = index.get(node.id) ?? position;
+    const angle = (position / count) * Math.PI * 2;
+    const radius = Math.min(width, height) * (0.08 + 0.34 * (position / count)) * (0.85 + 0.3 * random());
+    xs[slot] = centerX + radius * Math.cos(angle);
+    ys[slot] = centerY + radius * Math.sin(angle);
+  });
+  let maxEvidence = 1;
+  for (const edge of edges) maxEvidence = Math.max(maxEvidence, Number(edge.evidence_count || 0));
+  const springs = edges
+    .map((edge) => ({
+      a: index.get(displayEdgeSource(edge)) ?? -1,
+      b: index.get(displayEdgeTarget(edge)) ?? -1,
+      weight: Math.log1p(Number(edge.evidence_count || 0)) / Math.log1p(maxEvidence),
+    }))
+    .filter((spring) => spring.a >= 0 && spring.b >= 0 && spring.a !== spring.b);
+  const ideal = Math.sqrt((width * height) / count) * 1.05;
+  const minDistance = 38;
+  let temperature = width / 6;
+  const dx = new Float64Array(count);
+  const dy = new Float64Array(count);
+  for (let iteration = 0; iteration < 260; iteration += 1) {
+    dx.fill(0);
+    dy.fill(0);
+    for (let i = 0; i < count; i += 1) {
+      for (let j = i + 1; j < count; j += 1) {
+        let deltaX = xs[i] - xs[j];
+        let deltaY = ys[i] - ys[j];
+        let squared = deltaX * deltaX + deltaY * deltaY;
+        if (squared < 0.01) {
+          deltaX = random() - 0.5;
+          deltaY = random() - 0.5;
+          squared = deltaX * deltaX + deltaY * deltaY;
+        }
+        const distance = Math.sqrt(squared);
+        let force = (ideal * ideal) / distance;
+        if (distance < minDistance) force += (minDistance - distance) * 3;
+        const fx = (deltaX / distance) * force;
+        const fy = (deltaY / distance) * force;
+        dx[i] += fx;
+        dy[i] += fy;
+        dx[j] -= fx;
+        dy[j] -= fy;
+      }
+    }
+    for (const spring of springs) {
+      const deltaX = xs[spring.a] - xs[spring.b];
+      const deltaY = ys[spring.a] - ys[spring.b];
+      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY) + 0.01;
+      const force = ((distance * distance) / ideal) * (0.25 + 1.1 * spring.weight);
+      const fx = (deltaX / distance) * force;
+      const fy = (deltaY / distance) * force;
+      dx[spring.a] -= fx;
+      dy[spring.a] -= fy;
+      dx[spring.b] += fx;
+      dy[spring.b] += fy;
+    }
+    for (let i = 0; i < count; i += 1) {
+      dx[i] += (centerX - xs[i]) * 0.012;
+      dy[i] += (centerY - ys[i]) * 0.012;
+      const magnitude = Math.sqrt(dx[i] * dx[i] + dy[i] * dy[i]) || 1;
+      const step = Math.min(magnitude, temperature);
+      xs[i] = Math.max(region.left, Math.min(region.right, xs[i] + (dx[i] / magnitude) * step));
+      ys[i] = Math.max(region.top, Math.min(region.bottom, ys[i] + (dy[i] / magnitude) * step));
+    }
+    temperature = Math.max(0.6, temperature * 0.985);
+  }
+  people.forEach((node, position) => points.set(node.id, { x: xs[position], y: ys[position] }));
+  return points;
+}
+
+export function buildGraphLayout(nodes: GroupGraphNode[], edges: GroupGraphEdge[] = []) {
   const degree = buildDegreeMap(edges);
   const nodesById = new Map(nodes.map((node) => [node.id, node]));
   const sortedNodes = sortNodesByImportance(nodes, degree);
-  const topCoreIds = new Set(sortedNodes.filter((node) => !isPersonNode(node)).slice(0, Math.min(6, sortedNodes.length)).map((node) => node.id));
-  const laneNodes = new Map<string, GroupGraphNode[]>([
+  const laneNodes = new Map<GraphLaneKey | "person", GroupGraphNode[]>([
     ["person", []],
-    ["core", []],
     ["topic", []],
     ["product", []],
-    ["value", []],
     ["other", []],
+    ["value", []],
   ]);
-
   for (const node of sortedNodes) {
-    const visualType = nodeVisualType(node);
-    if (isPersonNode(node)) {
-      laneNodes.get("person")?.push(node);
-    } else if (["product", "tool"].includes(visualType)) {
-      laneNodes.get("product")?.push(node);
-    } else if (visualType === "topic") {
-      laneNodes.get("topic")?.push(node);
-    } else if (topCoreIds.has(node.id) && visualType !== "value") {
-      laneNodes.get("core")?.push(node);
-    } else if (visualType === "value") {
-      laneNodes.get("value")?.push(node);
-    } else {
-      laneNodes.get("other")?.push(node);
-    }
+    laneNodes.get(laneKeyForNode(node))?.push(node);
   }
 
-  const layout = new Map<string, GraphPoint>();
-  const personItems = laneNodes.get("person") || [];
-  const personSlots = centerSlotOrder(personItems.length);
-  personItems.forEach((node, index) => {
-    const lane = lanes.person;
-    const slot = personSlots[index] ?? index;
-    layout.set(node.id, {
-      x: lane.x + Math.min(36, (degree.get(node.id) || 0) * 2.4),
-      y: laneY(slot, personItems.length, lane.top, lane.bottom),
-    });
-  });
+  const hasSideLanes = (["topic", "product", "other", "value"] as GraphLaneKey[]).some(
+    (lane) => (laneNodes.get(lane) || []).length > 0,
+  );
+  const personRegion = hasSideLanes
+    ? { left: 60, right: 540, top: 72, bottom: GRAPH_CANVAS_HEIGHT - 40 }
+    : { left: 60, right: GRAPH_CANVAS_WIDTH - 60, top: 72, bottom: GRAPH_CANVAS_HEIGHT - 40 };
+  const people = laneNodes.get("person") || [];
+  const personEdges = edges.filter((edge) => (
+    isPersonNode(nodesById.get(displayEdgeSource(edge))) && isPersonNode(nodesById.get(displayEdgeTarget(edge)))
+  ));
+  const layout = forceLayoutPersons(people, personEdges, personRegion);
 
   for (const [laneKey, laneItems] of laneNodes.entries()) {
-    if (laneKey === "person") continue;
-    const lane = lanes[laneKey] || lanes.other;
+    if (laneKey === "person" || !laneItems.length) continue;
+    const lane = GRAPH_LANES[laneKey];
     const ordered = [...laneItems].sort((first, second) => {
       const firstAnchor = connectedPersonAnchor(first, edges, layout, degree, nodesById);
       const secondAnchor = connectedPersonAnchor(second, edges, layout, degree, nodesById);
@@ -787,19 +940,45 @@ export function buildGraphLayout(nodes: GroupGraphNode[], edges: GroupGraphEdge[
       return importanceDiff || nodeDisplayLabel(first).localeCompare(nodeDisplayLabel(second));
     });
     const count = Math.max(ordered.length, 1);
-    ordered.forEach((node, index) => {
+    // Anchoring a term next to the people who use it pulls many terms toward
+    // the same hub; keep at least LANE_MIN_GAP between neighbours, and when the
+    // lane is too full for that, spread evenly over two staggered columns.
+    const dense = ordered.length * LANE_MIN_GAP > lane.bottom - lane.top;
+    const ys = ordered.map((node, position) => {
+      const spreadY = laneY(position, count, lane.top, lane.bottom);
+      if (dense) return spreadY;
       const anchor = connectedPersonAnchor(node, edges, layout, degree, nodesById);
-      const spreadY = laneY(index, count, lane.top, lane.bottom);
-      const y = anchor === undefined ? spreadY : Math.max(lane.top, Math.min(lane.bottom, anchor * 0.7 + spreadY * 0.3));
+      return anchor === undefined ? spreadY : Math.max(lane.top, Math.min(lane.bottom, anchor * 0.6 + spreadY * 0.4));
+    });
+    if (!dense) {
+      for (let index = 1; index < ys.length; index += 1) ys[index] = Math.max(ys[index], ys[index - 1] + LANE_MIN_GAP);
+      const overflow = ys[ys.length - 1] - lane.bottom;
+      if (overflow > 0) {
+        for (let index = 0; index < ys.length; index += 1) ys[index] -= overflow;
+        for (let index = ys.length - 2; index >= 0; index -= 1) ys[index] = Math.min(ys[index], ys[index + 1] - LANE_MIN_GAP);
+      }
+    }
+    ordered.forEach((node, position) => {
       const xPull = Math.min(44, (degree.get(node.id) || 0) * 4);
+      const stagger = dense && position % 2 === 1 ? LANE_STAGGER_X : 0;
       layout.set(node.id, {
-        x: Math.max(56, Math.min(GRAPH_CANVAS_WIDTH - 56, lane.x - (laneKey === "topic" || laneKey === "product" ? xPull : 0))),
-        y,
+        x: Math.max(56, Math.min(GRAPH_CANVAS_WIDTH - 56, lane.x - (laneKey === "topic" || laneKey === "product" ? xPull : 0) + stagger)),
+        y: ys[position],
       });
     });
   }
 
   return layout;
+}
+
+/** Which side lanes actually hold nodes, so the canvas only labels populated columns. */
+export function populatedGraphLanes(nodes: GroupGraphNode[]) {
+  const lanes = new Set<GraphLaneKey>();
+  for (const node of nodes) {
+    const lane = laneKeyForNode(node);
+    if (lane !== "person") lanes.add(lane);
+  }
+  return lanes;
 }
 
 export function estimatedLabelSize(text: string) {
@@ -841,6 +1020,30 @@ export function labelCandidates(point: GraphPoint, text: string) {
   ));
 }
 
+/**
+ * Candidate order per node kind. Side-lane nodes sit in tight columns, so
+ * their labels go sideways, away from the neighbouring lane: topics point
+ * left toward the people, products/tools point right toward the canvas edge.
+ */
+export function labelCandidatesForNode(node: GroupGraphNode, point: GraphPoint, text: string) {
+  const candidates = labelCandidates(point, text);
+  const lane = laneKeyForNode(node);
+  if (lane === "person" || lane === "value") return candidates;
+  const preferred: Array<"start" | "end" | "middle"> = lane === "topic" ? ["end", "start"] : ["start", "end"];
+  return [...candidates].sort((first, second) => {
+    const rank = (anchor: "start" | "end" | "middle") => {
+      const index = preferred.indexOf(anchor);
+      return index === -1 ? preferred.length : index;
+    };
+    return rank(first.anchor) - rank(second.anchor);
+  });
+}
+
+/** Footprint of a node circle, so labels are not painted over neighbouring nodes. */
+function nodeFootprint(point: GraphPoint) {
+  return { left: point.x - 11, right: point.x + 11, top: point.y - 11, bottom: point.y + 11 };
+}
+
 export function buildVisibleLabels(
   nodes: GroupGraphNode[],
   edges: GroupGraphEdge[],
@@ -857,6 +1060,12 @@ export function buildVisibleLabels(
     requiredIds.add(displayEdgeSource(selectedEdge));
     requiredIds.add(displayEdgeTarget(selectedEdge));
   }
+  // A topic/tool dot without its name says nothing, and lane nodes sit in a
+  // column where labels rarely collide, so they are labelled regardless of budget.
+  for (const node of nodes) {
+    const lane = laneKeyForNode(node);
+    if (lane !== "person" && lane !== "value") requiredIds.add(node.id);
+  }
 
   const sorted = [...nodes].sort((first, second) => {
     const firstRequired = requiredIds.has(first.id);
@@ -865,7 +1074,14 @@ export function buildVisibleLabels(
     const scoreDiff = nodeImportance(second, degree) - nodeImportance(first, degree);
     return scoreDiff || graphNodeLabel(first, anonymousLabels).localeCompare(graphNodeLabel(second, anonymousLabels));
   });
-  const placedBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+  // Other nodes' circles count as occupied from the start: a label that
+  // covers a neighbouring dot is worse than a label placed on its other side.
+  const footprints = new Map<string, { left: number; right: number; top: number; bottom: number }>();
+  for (const node of nodes) {
+    const point = layout.get(node.id);
+    if (point) footprints.set(node.id, nodeFootprint(point));
+  }
+  const placedBoxes: Array<{ left: number; right: number; top: number; bottom: number }> = [...footprints.values()];
   const labels = new Map<string, GraphLabelPlacement>();
 
   for (const node of sorted) {
@@ -875,8 +1091,9 @@ export function buildVisibleLabels(
     const point = layout.get(node.id);
     if (!point) continue;
     const text = graphNodeLabel(node, anonymousLabels);
-    const candidates = labelCandidates(point, text);
-    const candidate = candidates.find((item) => !placedBoxes.some((box) => boxesOverlap(item.box, box)))
+    const candidates = labelCandidatesForNode(node, point, text);
+    const ownFootprint = footprints.get(node.id);
+    const candidate = candidates.find((item) => !placedBoxes.some((box) => box !== ownFootprint && boxesOverlap(item.box, box)))
       || (required ? candidates[0] : undefined);
     if (!candidate) continue;
     labels.set(node.id, { nodeId: node.id, text, x: candidate.x, y: candidate.y, anchor: candidate.anchor });
@@ -933,7 +1150,72 @@ export function sanitizeEdgeEvidence(payload: GroupGraphEdgeEvidenceResponse): G
 
 export function evidenceCountsLabel(evidence?: GroupGraphEdgeEvidenceResponse | null) {
   const counts = evidence?.evidence_counts || {};
-  return `记忆项 ${counts.memory_items ?? 0} / 事件 ${counts.events ?? 0} / 片段 ${counts.episodes ?? 0}`;
+  const base = `记忆项 ${counts.memory_items ?? 0} / 事件 ${counts.events ?? 0} / 片段 ${counts.episodes ?? 0}`;
+  const observations = counts.observations ?? 0;
+  return observations > 0 ? `${base} / 群消息 ${observations}` : base;
+}
+
+export function evidenceSourceLabel(value?: string | null) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "observation") return "实时群消息";
+  if (normalized === "mixed") return "导入事件 + 实时群消息";
+  if (normalized === "memory_event") return "导入事件";
+  return "";
+}
+
+export function evidenceObservedRange(evidence?: GroupGraphEdgeEvidenceResponse | null) {
+  const first = evidence?.edge?.first_observed_at;
+  const last = evidence?.edge?.last_observed_at;
+  if (!first && !last) return "";
+  if (first && last && first !== last) return `${formatTimestamp(first)} → ${formatTimestamp(last)}`;
+  return formatTimestamp(first || last);
+}
+
+const SIGNAL_LABELS: Record<string, string> = {
+  quote: "引用回复",
+  mention: "@ 提及",
+  prefix_reply: "前缀回复",
+  co_participation: "同窗共现",
+  llm: "模型判定的支撑消息",
+};
+
+const POLICY_LABELS: Record<string, string> = {
+  group_window_direct_signal: "有引用 / @ 这类直接互动，立即通过",
+  group_window_llm_multi_day: "模型关系在不止一天里出现，自动通过",
+  group_window_llm_repeated_evidence: "同一窗口内有 3 条以上消息支撑，自动通过",
+  group_window_repeated_weak_signal: "弱信号跨天重复出现，自动通过",
+  group_window_weak_signal: "只有单日弱信号，等待印证",
+  group_window_term_corroborated: "同一主题已有其他已通过的关系，系统印证通过",
+  group_window_pair_corroborated: "两人之间已有其他已通过的互动，系统印证通过",
+  group_window_auto_accept: "旧版策略：全部自动通过",
+  group_window_relation: "自动通过已关闭，等待人工",
+};
+
+/** Human-readable breakdown of why an edge exists; empty when the payload has nothing to say. */
+export function judgementSummary(judgement?: GroupGraphEdgeJudgement | null) {
+  if (!judgement) return null;
+  const signals = Object.entries(judgement.signals || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([key, count]) => `${SIGNAL_LABELS[key] || key} ${count} 条`);
+  const policyKey = String(judgement.policy || "").trim();
+  const reviewKey = String(judgement.review_reason || "").trim();
+  const policyText = POLICY_LABELS[reviewKey] || POLICY_LABELS[policyKey] || policyKey || "";
+  const reviewer = String(judgement.reviewed_by || "").trim();
+  const reviewerText = !reviewer
+    ? ""
+    : reviewer === "system/auto-review"
+      ? "系统印证扫描"
+      : reviewer === "system/auto"
+        ? "策略自动通过"
+        : reviewer;
+  return {
+    method: extractionMethodLabel(judgement.extraction_method),
+    signals,
+    policyText,
+    reviewerText,
+    modelReason: String(judgement.model_reason || "").trim(),
+    dayCount: Number(judgement.day_count || 0),
+  };
 }
 
 export function evidenceRecordMeta(record: GroupGraphEdgeEvidenceEntity) {

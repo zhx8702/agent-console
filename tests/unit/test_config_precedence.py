@@ -209,7 +209,9 @@ def test_memory_llm_extraction_defaults_are_enabled() -> None:
     assert settings.memory_group_graph_auto_extract_llm_enabled is True
     assert settings.memory_graph_retrieval_enabled is True
     assert settings.memory_group_graph_auto_extract_lookback_days == 7
-    assert settings.memory_group_graph_auto_extract_sync_enabled is True
+    # Live groups stream into plugin_wxbot_group_observations; the legacy SDK
+    # history sync before each tick is opt-in.
+    assert settings.memory_group_graph_auto_extract_sync_enabled is False
     assert settings.memory_group_graph_auto_extract_sync_max_messages == 200
     assert settings.memory_llm_extraction_job_timeout_seconds == 90.0
     assert settings.memory_llm_extraction_job_lock_ttl_seconds == 150.0

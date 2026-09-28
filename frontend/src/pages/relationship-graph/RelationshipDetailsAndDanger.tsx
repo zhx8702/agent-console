@@ -7,6 +7,8 @@ import {
   displayEdgeSource,
   displayEdgeTarget,
   evidenceCountsLabel,
+  evidenceObservedRange,
+  evidenceSourceLabel,
   formatConfidence,
   formatTimestamp,
   graphNodeLabel,
@@ -19,6 +21,7 @@ import {
   edgeCanReturnToReview,
   evidenceQuality,
   extractionMethodLabel,
+  judgementSummary,
   counterpartEdges,
   firstMemoryItemId,
   formatAcceptanceScore,
@@ -169,6 +172,7 @@ export function RelationshipUnavailableReset() {
 export function RelationshipDetailPanel(controller: RelationshipGraphController) {
   const {
     selection,
+    setSelection,
     selectedNode,
     selectedEdge,
     nodesById,
@@ -185,6 +189,7 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
   const replaceableEdges = selectedEdge
     ? counterpartEdges(selectedEdge, [...(graphEdges || []), ...(pendingEdges || [])])
     : [];
+  const judgement = judgementSummary(evidence?.judgement);
 
   return (
         <section className="panel relationship-detail-panel">
@@ -193,6 +198,16 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
               <p className="section-kicker">详情</p>
               <h3>{selection ? (selection.kind === "node" ? "这个人" : "这条互动") : "点一个人或一条线"}</h3>
             </div>
+            {selection && (
+              <button
+                type="button"
+                className="button button-secondary button-compact"
+                onClick={() => setSelection(null)}
+                title="回到整张图（也可以点空白处或按 Esc）"
+              >
+                取消选中
+              </button>
+            )}
           </div>
           {!selection && (
             <div className="relationship-empty is-compact">
@@ -359,10 +374,39 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
                   <>
                     <dl className="relationship-detail-list">
                       <div><dt>证据来源</dt><dd>{evidenceCountsLabel(evidence)}</dd></div>
+                      {evidenceSourceLabel(evidence.evidence_source) && (
+                        <div><dt>证据类型</dt><dd>{evidenceSourceLabel(evidence.evidence_source)}</dd></div>
+                      )}
                       <div><dt>审核状态</dt><dd><span className={acceptanceClass(evidence.edge?.acceptance_status)}>{acceptanceStatusLabel(evidence.edge?.acceptance_status)}</span></dd></div>
                       <div><dt>首次出现</dt><dd>{formatTimestamp(evidence.edge?.first_seen)}</dd></div>
                       <div><dt>最近出现</dt><dd>{formatTimestamp(evidence.edge?.last_seen)}</dd></div>
+                      {evidenceObservedRange(evidence) && (
+                        <div><dt>群消息时间</dt><dd>{evidenceObservedRange(evidence)}</dd></div>
+                      )}
+                      {(evidence.evidence_counts?.evidence_days ?? 0) > 0 && (
+                        <div><dt>覆盖天数</dt><dd>{evidence.evidence_counts?.evidence_days}</dd></div>
+                      )}
                     </dl>
+                    {judgement && (
+                      <div className="relationship-judgement" data-testid="relationship-judgement">
+                        <h4>怎么判定的</h4>
+                        <dl className="relationship-detail-list">
+                          <div><dt>抽取方式</dt><dd>{judgement.method}</dd></div>
+                          {judgement.signals.length > 0 && (
+                            <div><dt>信号</dt><dd>{judgement.signals.join("，")}</dd></div>
+                          )}
+                          {judgement.policyText && (
+                            <div><dt>通过依据</dt><dd>{judgement.policyText}</dd></div>
+                          )}
+                          {judgement.reviewerText && (
+                            <div><dt>判定者</dt><dd>{judgement.reviewerText}</dd></div>
+                          )}
+                          {judgement.modelReason && (
+                            <div><dt>模型理由</dt><dd>{judgement.modelReason}<small className="muted-copy"> 模型自己的转述，不是聊天原文；主题词可能是模型归纳的（如把成员名归为组合名），按"群消息时间"去原聊天里核对。</small></dd></div>
+                          )}
+                        </dl>
+                      </div>
+                    )}
                     <TechnicalDetails summary="查看证据技术详情" value={evidence} />
                   </>
                 )}
