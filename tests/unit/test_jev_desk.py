@@ -1,4 +1,7 @@
-from app.channel.session_aliases import collect_session_aliases
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.channel.session_aliases import collect_session_aliases, session_policy_aliases
 from app.jev.desk import (
     attach_turns,
     build_desk,
@@ -35,6 +38,39 @@ def test_session_aliases_include_external_and_canonical_ids():
         }],
     )
     assert aliases == ["cx1:c:room@chatroom", "49025625236@chatroom"]
+
+
+@pytest.mark.asyncio
+async def test_session_policy_aliases_survive_missing_sessions_table() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        aliases = await session_policy_aliases("tenant-a", "room@chatroom", db=db)
+    await engine.dispose()
+    assert aliases == ["room@chatroom"]
+
+
+@pytest.mark.asyncio
+async def test_session_policy_aliases_read_sqlite_json_metadata() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            "CREATE TABLE sessions (tenant_id TEXT, session_id TEXT, metadata TEXT)"
+        )
+        await connection.exec_driver_sql(
+            "INSERT INTO sessions (tenant_id, session_id, metadata) VALUES "
+            "('tenant-a', 'cx1:c:room@chatroom', "
+            "'{\"external_conversation_id\":\"49025625236@chatroom\"}')"
+        )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        aliases = await session_policy_aliases(
+            "tenant-a",
+            "49025625236@chatroom",
+            db=db,
+        )
+    await engine.dispose()
+    assert aliases == ["49025625236@chatroom", "cx1:c:room@chatroom"]
 
 
 def test_lanes_split_observe_blocked_applied_and_timeout():

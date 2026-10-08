@@ -527,7 +527,7 @@ class SocialPolicyStore:
                         row = candidate
                         write_session_id = sid
                         break
-                before = await self._group_document(db, write_session_id, row)
+                before = await self._group_document(db, tenant_id, write_session_id, row)
                 if expected_version != before.version:
                     raise VersionConflictError(
                         expected=expected_version,
