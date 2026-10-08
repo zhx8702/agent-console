@@ -37,7 +37,7 @@ describe("relationship graph API contracts", () => {
     await getGroupGraph(config, {
       tenant_id: "default",
       session_id: "group-a@chatroom",
-      acceptance_status: "needs_review,candidate",
+      acceptance_status: "needs_review",
     });
     await getGroupGraphEdgeEvidence(config, "edge/1", {
       tenant_id: "default",

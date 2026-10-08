@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 
 from app.common.logging import get_logger
 from app.infra.db import get_session_factory
@@ -45,6 +46,7 @@ class MemoryPlugin(Plugin):
         self._effect_handler_enabled = False
         self._governance_task: asyncio.Task[None] | None = None
         self._group_graph_auto_extract_task: asyncio.Task[None] | None = None
+        self._typesafe_client: Any | None = None
 
     async def initialize(self, ctx: PluginContext) -> None:
         self._ctx = ctx
@@ -53,6 +55,10 @@ class MemoryPlugin(Plugin):
             llm_service=getattr(ctx.container, "llm_service", None),
             vector_store=getattr(ctx.container, "vector_store", None),
         )
+        service = getattr(ctx.container, "jev_service", None)
+        self._store.jev_service = service
+        if service is not None:
+            service.memory_store = self._store
         self._store.runtime_scope_gates_required = True
         self._store.scope_execution_allowed = self._scope_execution_allowed
         self._store.history_scope_execution_allowed = self._wxbot_scope_execution_allowed
@@ -154,6 +160,11 @@ class MemoryPlugin(Plugin):
             self._group_graph_auto_extract_task.cancel()
             await asyncio.gather(self._group_graph_auto_extract_task, return_exceptions=True)
             self._group_graph_auto_extract_task = None
+        if self._typesafe_client is not None:
+            close = getattr(self._typesafe_client, "aclose", None)
+            if callable(close):
+                await close()
+            self._typesafe_client = None
         self._store = None
         self._ctx = None
         self._effect_handler_enabled = False

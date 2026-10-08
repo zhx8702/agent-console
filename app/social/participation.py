@@ -74,6 +74,7 @@ class ParticipationContext:
 
     # Soft score signals.
     explicit_question_to_bot: bool = False
+    help_seeking: bool = False
     keyword_triggered: bool = False
     topic_continuation: bool = False
     unfinished_task_continuation: bool = False
@@ -221,6 +222,7 @@ class SocialParticipationService:
             60,
             "explicit_question_to_bot",
         )
+        score = _add_signal(score, reasons, context.help_seeking, 60, "jev_help_seeking")
         score = _add_signal(
             score,
             reasons,
@@ -598,6 +600,11 @@ class SocialParticipationService:
             lower, upper, ttl = 0.4, 1.2, 20.0
         elif kind == "tool_result":
             lower, upper, ttl = 0.5, 1.5, 30.0
+        elif status == ParticipationStatus.MAY_REPLY and context.help_seeking:
+            # Problem-solving answers may take longer than a short interjection.
+            # The reply queue renews this window once generation finishes;
+            # send-time topic, answer, privacy and budget checks still apply.
+            lower, upper, ttl = 2.0, 6.0, 120.0
         elif status == ParticipationStatus.MAY_REPLY:
             lower, upper, ttl = 2.0, 6.0, 45.0
         else:

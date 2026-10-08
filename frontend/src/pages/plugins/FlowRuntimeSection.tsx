@@ -537,23 +537,12 @@ export function FlowRuntimeSection({
   return (
     <>
       <section className="panel panel-scroll plugins-flow-panel span-3">
+        <div className="plugins-flow-shell">
         <details className="plugins-flow-details" ref={flowDetailsRef} open={selectedTraceId ? true : undefined}>
         <summary className="panel-header">
           <div>
             <p className="section-kicker">消息流运行状态</p>
             <h3>Flow / Effect 运行视图</h3>
-          </div>
-          <div className="action-row">
-            <button
-              className="button button-secondary"
-              type="button"
-              onClick={(event) => {
-                event.preventDefault();
-                void loadFlowRuntimeStatus();
-              }}
-            >
-              {flowLoading ? "刷新中..." : "刷新 Runtime"}
-            </button>
           </div>
         </summary>
         {flowError && <p className="muted-copy">{flowError}</p>}
@@ -999,6 +988,18 @@ export function FlowRuntimeSection({
 
         </div>
         </details>
+        <div className="action-row plugins-flow-refresh">
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => {
+              void loadFlowRuntimeStatus();
+            }}
+          >
+            {flowLoading ? "刷新中..." : "刷新 Runtime"}
+          </button>
+        </div>
+        </div>
       </section>
     </>
   );

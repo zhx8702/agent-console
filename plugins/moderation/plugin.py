@@ -42,6 +42,7 @@ class ModerationPlugin(Plugin):
     async def initialize(self, ctx: PluginContext) -> None:
         self._ctx = ctx
         self._store = ModerationStore(ctx.settings)
+        self._store.jev_service = getattr(ctx.container, "jev_service", None)
         self._store.scope_execution_allowed = self._scope_execution_allowed
         self._effect_handler_enabled = any(
             bool(getattr(ctx.settings, name, False))
@@ -104,7 +105,7 @@ class ModerationPlugin(Plugin):
                 permissions=["storage:shared"],
                 inputs={"event", "session", "pre"},
                 outputs={"signals.moderation.input", "effects.write_audit_event"},
-                timeout_seconds=1.5,
+                timeout_seconds=30.0,
                 error_policy="fail_open",
             ),
             FlowStepDefinition(

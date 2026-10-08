@@ -227,6 +227,35 @@ def test_send_time_revalidation_clears_mentions_when_group_strategy_is_now_never
     assert revalidated.mention_sender is False
 
 
+def test_confirmed_help_survives_slow_generation_but_still_expires():
+    service = SocialParticipationService()
+    help_decision = service.decide(_ctx(base_eligible=True, help_seeking=True))
+    ordinary = service.decide(_ctx(base_eligible=True, explicit_question_to_bot=True))
+    assert help_decision.status is ParticipationStatus.MAY_REPLY
+    assert help_decision.expires_at == NOW + timedelta(seconds=120)
+    assert ordinary.expires_at == NOW + timedelta(seconds=45)
+    generated = service.revalidate(help_decision, _ctx(now=NOW + timedelta(seconds=56)))
+    assert generated.status is ParticipationStatus.MAY_REPLY
+    assert generated.expires_at == help_decision.expires_at
+    expired = service.revalidate(generated, _ctx(now=NOW + timedelta(seconds=120)))
+    assert expired.status is ParticipationStatus.CANCEL
+    assert expired.reason_codes[-1] == "reply_expired"
+
+
+@pytest.mark.parametrize('signal,reason', [
+    ('valid_member_answer_exists', 'answered_before_send'),
+    ('topic_changed', 'topic_changed_before_send'),
+    ('superseded_by_newer_message', 'superseded_before_send'),
+])
+def test_confirmed_help_still_cancels_when_conversation_moves_on(signal, reason):
+    service = SocialParticipationService()
+    decision = service.decide(_ctx(base_eligible=True, help_seeking=True))
+    current = _ctx(now=NOW + timedelta(seconds=56), **{signal: True})
+    checked = service.revalidate(decision, current)
+    assert checked.status is ParticipationStatus.CANCEL
+    assert checked.reason_codes[-1] == reason
+
+
 def test_must_reply_revalidation_ignores_unrelated_chatter_and_short_expiry() -> None:
     service = SocialParticipationService()
     decision = ParticipationDecision(
@@ -303,3 +332,15 @@ def test_invalid_policy_bounds_are_rejected() -> None:
         ParticipationPolicy(prompt_context_retention_seconds=86_401)
     with pytest.raises(ValueError):
         ParticipationPolicy(mention_sender_strategy="always")  # type: ignore[arg-type]
+
+
+def test_jev_help_seeking_nominates_soft_reply_with_existing_guards():
+    service = SocialParticipationService()
+    context = _ctx(help_seeking=True, base_eligible=True)
+    decision = service.decide(context)
+    assert decision.status == ParticipationStatus.MAY_REPLY
+    assert 'jev_help_seeking:plus60' in decision.reason_codes
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, valid_member_answer_exists=True)).status == ParticipationStatus.CANCEL
+    assert service.decide(context, ParticipationPolicy(enabled=False)).status == ParticipationStatus.OBSERVE_ONLY
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, directed_to_other_member=True)).status == ParticipationStatus.OBSERVE_ONLY
+    assert service.decide(_ctx(help_seeking=True, base_eligible=True, soft_replies_last_10m=2)).status != ParticipationStatus.MAY_REPLY

@@ -14,6 +14,7 @@ import { BackfillPanel } from "./BackfillPanel";
 import { DebugOutputs } from "./DebugOutputs";
 import { ExtractionJobsWorkbench } from "./ExtractionJobsWorkbench";
 import { IdentityProfilePanel } from "./IdentityProfilePanel";
+import { JevPanel } from "./JevPanel";
 import { MemoryGraphWorkbench } from "./MemoryGraphWorkbench";
 import { MemoryItemsWorkbench } from "./MemoryItemsWorkbench";
 import { MemoryRuntimeStatusPanel } from "./MemoryRuntimeStatusPanel";
@@ -45,11 +46,26 @@ const MEMORY_WORKSPACE_TABS = [
   { id: "items", label: "单条记忆" },
   { id: "enrichment", label: "画像复核" },
   { id: "maintenance", label: "任务维护" },
+  { id: "jev", label: "Jev 评估" },
   { id: "backfill", label: "历史回填" },
   { id: "graph", label: "技术图谱" },
 ] as const;
 
 type MemoryWorkspaceTab = (typeof MEMORY_WORKSPACE_TABS)[number]["id"];
+
+function memoryTabFromSearch(value: string | null): MemoryWorkspaceTab {
+  return MEMORY_WORKSPACE_TABS.some((item) => item.id === value)
+    ? (value as MemoryWorkspaceTab)
+    : "profiles";
+}
+
+function memoryTabFromLocation(): MemoryWorkspaceTab {
+  try {
+    return memoryTabFromSearch(new URLSearchParams(window.location.search).get("tab"));
+  } catch {
+    return "profiles";
+  }
+}
 
 export function MemoryWorkspace() {
   const {
@@ -92,9 +108,9 @@ export function MemoryWorkspace() {
   const [memoryItemsOutput, setMemoryItemsOutput] = useState('{\n  "status": "waiting"\n}');
   const [memoryGraphOutput, setMemoryGraphOutput] = useState('{\n  "status": "waiting"\n}');
   const [profileEnrichmentOutput, setProfileEnrichmentOutput] = useState('{\n  "status": "waiting"\n}');
-  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<MemoryWorkspaceTab>("profiles");
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<MemoryWorkspaceTab>(memoryTabFromLocation);
   const [visitedWorkspaceTabs, setVisitedWorkspaceTabs] = useState<Set<MemoryWorkspaceTab>>(
-    () => new Set(["profiles"]),
+    () => new Set<MemoryWorkspaceTab>(["profiles", memoryTabFromLocation()]),
   );
 
   const selectedSession = useMemo(
@@ -979,6 +995,17 @@ export function MemoryWorkspace() {
               onLoadEvents={loadEvents}
             />
           )}
+        </div>
+
+        <div
+          id="memory-workspace-panel-jev"
+          className="memory-workspace-panel"
+          role="tabpanel"
+          aria-labelledby="memory-workspace-tab-jev"
+          tabIndex={0}
+          hidden={activeWorkspaceTab !== "jev"}
+        >
+          {visitedWorkspaceTabs.has("jev") && <JevPanel />}
         </div>
 
         <div

@@ -28,6 +28,8 @@ _IDENTITY_DISCLOSURE_RE = re.compile(
 )
 _IDENTITY_DISCLOSURE_PREFIX = "我是 AI 助手。"
 _MAX_EMOJI_FREQUENCY = 0.15
+_SHORT_REPLY_INLINE_CHARS = 80
+_TERMINAL_PUNCT = "，,。.!！?？；;：:…~～"
 _CATCHPHRASES = (
     "哈哈",
     "确实",
@@ -104,8 +106,8 @@ class NaturalReplyStyleGuard:
         verbosity = str(profile.get("verbosity") or "concise").strip().lower()
         bucket = _bucket(deterministic_key, "length", 100)
         if preserve_persona_style:
-            # Distilled group portraits already own cadence and line breaks.
-            # Length shaping here would flatten them into a generic one-liner.
+            # Portraits own length and catchphrases. They must not keep a
+            # 3-line couplet; short bursts are still inlined below.
             mode = "persona"
             sentence_limit = 0
             char_limit = 0
@@ -181,7 +183,10 @@ class NaturalReplyStyleGuard:
             if shortened != value:
                 reasons.append("length_shaped")
             value = shortened
-        value = _normalize_spacing(value)
+        inlined = _inline_short_newlines(value)
+        if inlined != value:
+            reasons.append("short_lines_inlined")
+        value = _normalize_spacing(inlined)
         if identity_prefix:
             value = f"{identity_prefix}{value}"
         if allowed_emoji:
@@ -295,9 +300,42 @@ def _split_sentences(text: str) -> list[str]:
     return parts
 
 
+def _join_inline(parts: list[str]) -> str:
+    joined: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not joined:
+            joined.append(part)
+            continue
+        prev = joined[-1]
+        if prev[-1:] not in _TERMINAL_PUNCT:
+            sep = "。" if len(prev) >= 10 or len(part) >= 8 else "，"
+            joined[-1] = prev + sep
+        joined.append(part)
+    return "".join(joined)
+
+
+def _inline_short_newlines(text: str) -> str:
+    """Keep WeChat short replies on one line.
+
+    Long explanations, requested lists and already-single-line text are left
+    alone. A couplet or three-word follow-up is joined with punctuation.
+    """
+
+    value = _normalize_spacing(text)
+    lines = [line.strip() for line in value.split("\n") if line.strip()]
+    if len(lines) <= 1 or _LIST_PREFIX_RE.search(value):
+        return value
+    if sum(len(line) for line in lines) > _SHORT_REPLY_INLINE_CHARS:
+        return value
+    return _join_inline(lines)
+
+
 def _limit_sentences(text: str, count: int, char_limit: int) -> str:
     sentences = _split_sentences(text)
-    selected = "\n".join(sentences[:count]) if sentences else _normalize_spacing(text)
+    selected = _join_inline(sentences[:count]) if sentences else _normalize_spacing(text)
     if len(selected) <= char_limit:
         return selected
     # Only soft, non-factual replies reach this guard. Prefer a nearby natural

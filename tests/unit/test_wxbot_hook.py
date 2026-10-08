@@ -3295,6 +3295,45 @@ async def test_wxbot_reply_queue_retimes_completed_tool_result() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('confirmed_help', [True, False])
+async def test_help_answer_gets_send_window_after_long_stream_generation(confirmed_help):
+    store = _FakeStore()
+    ctx = _group_reply_policy_ctx('这个报错应该怎么排查？', mentioned_me=False)
+    received = datetime.now(UTC) - timedelta(seconds=180)
+    ctx.event.received_at = received
+    previous_expiry = received + timedelta(seconds=120 if confirmed_help else 45)
+    ctx.extras['wxbot_participation'] = {
+        'status':'may_reply', 'score':60,
+        'reason_codes':['jev_help_seeking:plus60'] if confirmed_help else ['explicit_question_to_bot:plus60'],
+        'not_before':received.isoformat(), 'expires_at':previous_expiry.isoformat(),
+        'mention_sender':False,
+    }
+    ctx.extras['wxbot_reply_policy'] = {
+        'allowed':True, 'participation_policy_version':3,
+        'humanization_stage':'proactive', 'humanization_cohort':'proactive_canary',
+        'send_revalidation_enabled':True,
+    }
+    ctx.extras['wxbot_humanization_features'] = {
+        'speech_budget_enabled':True, 'duplicate_guard_enabled':True, 'style_guard_enabled':True,
+    }
+    ctx.result = CapabilityResult(route=RouteType.LLM, reply_text='先核对接口返回的错误类型。')
+    ctx.reply = OutboundReply(tenant_id=ctx.event.tenant_id, channel=Channel.WECHAT,
+        user_id=ctx.event.user_id,session_id=ctx.event.session_id,type=ReplyType.TEXT,
+        segments=[ReplySegment(type=ReplyType.TEXT,content='先核对接口返回的错误类型。')],trace_id=ctx.trace_id)
+    generated_at = datetime.now(UTC)
+    await WxbotReplyQueueHook(store).run(ctx)
+    delivery = store.calls[0]['delivery']
+    expiry = datetime.fromisoformat(delivery['expires_at'])
+    if confirmed_help:
+        assert generated_at + timedelta(seconds=120) <= expiry <= datetime.now(UTC) + timedelta(seconds=120)
+    else:
+        assert expiry == previous_expiry
+    assert delivery['send_revalidation_enabled'] is True
+    assert delivery['source_message_id'] == ctx.event.message_id
+    assert delivery['speech_class'] == 'soft'
+
+
+@pytest.mark.asyncio
 async def test_wxbot_agent_scope_step_emits_map_progress_effect_when_opted_in() -> None:
     store = _FakeStore()
     step = WxbotAgentScopeEnrichStep(store, effect_handler_enabled=True)
@@ -3606,3 +3645,79 @@ async def test_wxbot_agent_intent_hook_marks_moderation_event_queries() -> None:
 
     assert pipeline_ctx.extras["router_signals"]["tools_available"] is True
     assert pipeline_ctx.extras["agent_tool_scope"] == "group_plugin_status"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reply', [True, False])
+async def test_jev_help_nomination_only_in_enabled_group(reply):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.jev.models import JevPolicy
+    store = _FakeStore()
+    ctx = _group_reply_policy_ctx('Codex 调用一直出现 429，有什么排查办法？', mentioned_me=False, pre_intent=IntentCoarse.UNKNOWN)
+    document = _public_group_policy(rollout_stage='proactive')
+    document.policy = document.policy.model_copy(update={'proactive_enabled':True, 'rollout_opt_in':True, 'proactive_rollout_percent':100, 'quiet_start_hour':0,'quiet_end_hour':0})
+    store.jev_service = SimpleNamespace(policy=AsyncMock(return_value=JevPolicy(participation_shadow_only=False, help_sessions=[ctx.event.session_id])),
+        online=AsyncMock(return_value=({'answers':{'decision':{'choice':'reply' if reply else 'observe','confidence':.95}}}, reply)))
+    hook = WxbotReplyPolicyHook(store, social_policy_store=_SocialPolicyStore(document))
+    if reply:
+        await hook.run(ctx)
+        assert ctx.extras['wxbot_participation']['status'] == 'may_reply'
+        assert 'jev_help_seeking:plus60' in ctx.extras['wxbot_participation']['reason_codes']
+        expiry = datetime.fromisoformat(ctx.extras['wxbot_participation']['expires_at'])
+        assert expiry == ctx.event.received_at + timedelta(seconds=120)
+    else:
+        with pytest.raises(HookAbort):
+            await hook.run(ctx)
+        assert ctx.extras['wxbot_participation']['status'] == 'observe_only'
+    store.jev_service.online.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_jev_observe_does_not_veto_keyword_help_desk_hits() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.jev.models import JevPolicy
+
+    store = _FakeStore()
+    store.policy["trigger_keywords"] = ["代理", "降智", "312", "292"]
+    ctx = _group_reply_policy_ctx(
+        "是不是还要买一个动态代理？",
+        mentioned_me=False,
+        pre_intent=IntentCoarse.UNKNOWN,
+    )
+    document = _public_group_policy(rollout_stage="proactive")
+    document.policy = document.policy.model_copy(
+        update={
+            "proactive_enabled": True,
+            "rollout_opt_in": True,
+            "proactive_rollout_percent": 100,
+            "quiet_start_hour": 0,
+            "quiet_end_hour": 0,
+            "threshold": 5,
+        }
+    )
+    store.jev_service = SimpleNamespace(
+        policy=AsyncMock(
+            return_value=JevPolicy(
+                participation_shadow_only=False,
+                help_sessions=[ctx.event.session_id],
+            )
+        ),
+        online=AsyncMock(
+            return_value=(
+                {"answers": {"decision": {"choice": "observe", "confidence": 0.9}}},
+                False,
+            )
+        ),
+    )
+    hook = WxbotReplyPolicyHook(store, social_policy_store=_SocialPolicyStore(document))
+
+    await hook.run(ctx)
+
+    assert ctx.extras["wxbot_participation"]["status"] == "may_reply"
+    assert ctx.extras["wxbot_reply_policy"]["reason"] == "reply_mode_contains_match"
+    assert "keyword_trigger:plus35" in ctx.extras["wxbot_participation"]["reason_codes"]
+    store.jev_service.online.assert_awaited_once()

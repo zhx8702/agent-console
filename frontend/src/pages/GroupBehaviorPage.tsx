@@ -7,6 +7,7 @@ import {
 } from "../components";
 import { DiscardChangesDialog } from "./group-behavior/DiscardChangesDialog";
 import { GroupPolicyPanel } from "./group-behavior/GroupPolicyPanel";
+import { JevDeskStatus } from "./group-behavior/JevDeskStatus";
 import { MemberPrivacyPanel } from "./group-behavior/MemberPrivacyPanel";
 import { ParticipationEventsPanel } from "./group-behavior/ParticipationEventsPanel";
 import { ParticipationSimulatorPanel } from "./group-behavior/ParticipationSimulatorPanel";
@@ -259,6 +260,8 @@ export function GroupBehaviorPage() {
           }}
         />
       </section>
+
+      <JevDeskStatus sessionId={groupId} />
 
       <section className="panel span-3">
         <Tabs

@@ -49,6 +49,10 @@ from plugins.wxbot.message_reader import WxbotMessageReader
 log = get_logger(__name__)
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 _BAD_OUTPUT_RE = re.compile(r"(以下是|总结|群聊记录|聊天记录|系统提示|系统指令|提示词)", re.IGNORECASE)
+_IMAGE_SOLICIT_RE = re.compile(
+    r"(?:截图|发图|传图|晒图|补图|来张图|发张图|拍一张|照片|相片|图片|screenshot)",
+    re.IGNORECASE,
+)
 _DECEPTIVE_IDENTITY_RE = re.compile(
     r"(?:我(?:就)?是|本助手是|其实是|这里是).{0,4}(?:真人|人类|人工客服)|"
     r"(?:我不是|并非).{0,4}(?:AI|人工智能|机器人|程序)|"
@@ -1411,6 +1415,7 @@ class GroupActivityService:
             f"{chr(10).join(lines)}\n\n"
             "请基于当前群 skill 能查到的信息和上面的聊天上下文，生成一句适合直接发到群里的中文暖场话题。"
             "只输出一句话，不要@任何人，不要解释，长度 10 到 45 个中文字符。"
+            "不要向群友索要截图、照片或让对方发图；这个通道看不到清晰图片，只问能用文字说清的现象、版本或报错原文。"
             "不得声称自己是真人、人类或已经发生人工接管。"
             "不得生成或猜测付款、授权、身份核验、账户状态、凭据等高风险事实。"
             + (
@@ -1452,6 +1457,8 @@ class GroupActivityService:
             return "", "generation_identity_deception"
         if _BAD_OUTPUT_RE.search(value):
             return "", "generation_prompt_leak"
+        if _IMAGE_SOLICIT_RE.search(value):
+            return "", "generation_image_solicit"
         if len(value) > 80:
             return "", "generation_too_long"
         return value, "generation_valid"

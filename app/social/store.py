@@ -12,6 +12,7 @@ from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.admin.authorization import Principal
+from app.channel.session_aliases import session_policy_aliases
 from app.models.reliability import MessageEffectIntentRow
 from app.models.social import (
     AuditEventRow,
@@ -474,10 +475,14 @@ class SocialPolicyStore:
         session_id: str,
     ) -> GroupParticipationPolicyDocument:
         async with self._session_factory() as db:
-            row = await db.get(
-                SocialGroupPolicyRow,
-                {"tenant_id": tenant_id, "session_id": session_id},
-            )
+            row = None
+            for sid in await session_policy_aliases(tenant_id, session_id, db=db):
+                row = await db.get(
+                    SocialGroupPolicyRow,
+                    {"tenant_id": tenant_id, "session_id": sid},
+                )
+                if row is not None:
+                    break
             return await self._group_document(db, tenant_id, session_id, row)
 
     async def put_group_policy(
@@ -507,15 +512,22 @@ class SocialPolicyStore:
                 if replay is not None:
                     return MutationResult(document=replay, replayed=True)
 
-                row = await db.scalar(
-                    select(SocialGroupPolicyRow)
-                    .where(
-                        SocialGroupPolicyRow.tenant_id == tenant_id,
-                        SocialGroupPolicyRow.session_id == session_id,
+                row = None
+                write_session_id = session_id
+                for sid in await session_policy_aliases(tenant_id, session_id, db=db):
+                    candidate = await db.scalar(
+                        select(SocialGroupPolicyRow)
+                        .where(
+                            SocialGroupPolicyRow.tenant_id == tenant_id,
+                            SocialGroupPolicyRow.session_id == sid,
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
-                )
-                before = await self._group_document(db, tenant_id, session_id, row)
+                    if candidate is not None:
+                        row = candidate
+                        write_session_id = sid
+                        break
+                before = await self._group_document(db, tenant_id, write_session_id, row)
                 if expected_version != before.version:
                     raise VersionConflictError(
                         expected=expected_version,
@@ -558,7 +570,7 @@ class SocialPolicyStore:
                     voice_profile = update.voice_profile
 
                 if voice_profile is not None:
-                    _require_voice_profile_scope(voice_profile, session_id=session_id)
+                    _require_voice_profile_scope(voice_profile, session_id=write_session_id)
 
                 now = datetime.now(UTC)
                 new_version = before.version + 1
@@ -570,7 +582,7 @@ class SocialPolicyStore:
                 if row is None:
                     row = SocialGroupPolicyRow(
                         tenant_id=tenant_id,
-                        session_id=session_id,
+                        session_id=write_session_id,
                         version=new_version,
                     )
                     db.add(row)
@@ -591,7 +603,7 @@ class SocialPolicyStore:
                     await self._upsert_voice_profile(
                         db,
                         tenant_id=tenant_id,
-                        session_id=session_id,
+                        session_id=write_session_id,
                         profile=versioned_voice,
                         parent_version=before.version,
                         rollback_from_version=rollback_from,
@@ -607,7 +619,7 @@ class SocialPolicyStore:
                     db.add(
                         VoiceProfileHistoryRow(
                             tenant_id=tenant_id,
-                            session_id=session_id,
+                            session_id=write_session_id,
                             profile_id=before.voice_profile.profile_id,
                             version=new_version,
                             parent_version=before.version,
@@ -639,7 +651,7 @@ class SocialPolicyStore:
                 db.add(
                     SocialGroupPolicyHistoryRow(
                         tenant_id=tenant_id,
-                        session_id=session_id,
+                        session_id=write_session_id,
                         version=new_version,
                         parent_version=before.version,
                         rollback_from_version=rollback_from,
@@ -651,7 +663,7 @@ class SocialPolicyStore:
                 db.add(
                     _audit_row(
                         tenant_id=tenant_id,
-                        session_id=session_id,
+                        session_id=write_session_id,
                         user_id="",
                         principal=principal,
                         action=(

@@ -234,7 +234,7 @@ describe("useRelationshipGraphController verified group loading", () => {
     });
     expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ acceptance_status: "needs_review,candidate" }),
+      expect.objectContaining({ acceptance_status: "needs_review" }),
     );
 
     await act(async () => {
@@ -265,7 +265,7 @@ describe("useRelationshipGraphController verified group loading", () => {
       acceptance_status: "needs_review",
     };
     apiMocks.getGroupGraph.mockImplementation((_config, query) => {
-      if (query.acceptance_status === "needs_review,candidate") {
+      if (query.acceptance_status === "needs_review") {
         return Promise.resolve({
           nodes: [
             { id: "person:review-a", type: "person", label: "待审成员甲" },
@@ -282,7 +282,7 @@ describe("useRelationshipGraphController verified group loading", () => {
     await waitFor(() => expect(result.current.pendingEdges).toEqual([pendingEdge]));
     expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ acceptance_status: "needs_review,candidate" }),
+      expect.objectContaining({ acceptance_status: "needs_review" }),
     );
     expect(result.current.nodesById.get("person:review-a")?.label).toBe("待审成员甲");
     expect(result.current.nodesById.get("topic:review-b")?.label).toBe("待审话题乙");
@@ -297,7 +297,7 @@ describe("useRelationshipGraphController verified group loading", () => {
       acceptance_status: "needs_review",
     };
     apiMocks.getGroupGraph.mockImplementation((_config, query) => (
-      query.acceptance_status === "needs_review,candidate"
+      query.acceptance_status === "needs_review"
         ? Promise.reject(new Error("admin session required"))
         : Promise.resolve({
             nodes: [
@@ -346,5 +346,55 @@ describe("useRelationshipGraphController verified group loading", () => {
       path === "/plugins/memory/group-graph/extract-daily"
     ));
     expect(new Headers(extractionCall?.[2]?.init?.headers).has("Idempotency-Key")).toBe(false);
+  });
+
+  it("keeps the graph usable and surfaces history-date failures", async () => {
+    apiMocks.getGroupGraph.mockResolvedValue(graphFor("group-a@chatroom"));
+    apiMocks.getGroupGraphHistoryDates.mockRejectedValue(new Error("connection_id cannot be empty"));
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph).not.toBeNull());
+    await act(async () => {
+      await result.current.loadGraphAndStatus();
+    });
+
+    expect(result.current.dateRows).toEqual([]);
+    expect(result.current.dateStatusError).toContain("connection_id cannot be empty");
+    expect(result.current.graph).not.toBeNull();
+    expect(apiMocks.getGroupGraphHistoryDates).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ connection_id: "legacy-wechat-default" }),
+    );
+  });
+
+  it("loads and merges a server graph page when a cursor is available", async () => {
+    const firstPage = {
+      ...graphFor("group-a@chatroom"),
+      nodes: [{ id: "person:a", type: "person", label: "甲" }],
+      edges: [{ id: "edge-1", from: "person:a", to: "person:a", type: "mentioned" }],
+      page: { limit: 1, total: 2, truncated: true, next_cursor: "cursor-2" },
+    };
+    const secondPage = {
+      ...graphFor("group-a@chatroom"),
+      nodes: [{ id: "person:b", type: "person", label: "乙" }],
+      edges: [{ id: "edge-2", from: "person:b", to: "person:b", type: "mentioned" }],
+      page: { limit: 1, total: 2, truncated: false, next_cursor: null },
+    };
+    apiMocks.getGroupGraph.mockImplementation((_config, query) => (
+      query.cursor === "cursor-2" ? Promise.resolve(secondPage) : Promise.resolve(firstPage)
+    ));
+
+    const { result } = renderHook(() => useRelationshipGraphController());
+    await waitFor(() => expect(result.current.graph?.page?.next_cursor).toBe("cursor-2"));
+    await act(async () => {
+      await result.current.loadNextGraphPage();
+    });
+
+    expect(apiMocks.getGroupGraph).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ cursor: "cursor-2" }),
+    );
+    expect(result.current.graph?.edges.map((edge) => edge.id)).toEqual(["edge-1", "edge-2"]);
+    expect(result.current.graph?.page?.next_cursor).toBeNull();
   });
 });

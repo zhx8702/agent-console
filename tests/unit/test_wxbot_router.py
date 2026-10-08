@@ -2504,6 +2504,33 @@ def test_wxbot_router_exposes_bridge_status_and_admin_endpoints() -> None:
         assert expected_call in bridge.calls
 
 
+@pytest.mark.parametrize("endpoint,recorded", [
+    ("member-events", "member_event_connections"),
+    ("media-ready-events", "media_event_connections"),
+])
+@pytest.mark.parametrize("configured,explicit,expected", [
+    ("wechat-current", "", "wechat-current"),
+    ("wechat-current", "wechat-other", "wechat-other"),
+    ("wechat-current", "legacy-wechat-default", "legacy-wechat-default"),
+    ("", "", "legacy-wechat-default"),
+])
+def test_wxbot_event_queries_default_to_current_connection(
+    endpoint: str, recorded: str, configured: str, explicit: str, expected: str,
+) -> None:
+    client, store, _bridge, _scheduler, _agent_store = _build_client()
+    store.settings.channel_connection_id = configured
+    params = {"tenant_id": "demo", "limit": 2}
+    if explicit:
+        params["connection_id"] = explicit
+    with client:
+        response = client.get(
+            f"/admin/{endpoint}", params=params,
+            headers={"Authorization": "Bearer token"},
+        )
+    assert response.status_code == 200
+    assert getattr(store, recorded) == [expected]
+
+
 def test_wxbot_admin_event_queries_reject_invalid_connection_scope() -> None:
     client, store, _bridge, _scheduler, _agent_store = _build_client()
 

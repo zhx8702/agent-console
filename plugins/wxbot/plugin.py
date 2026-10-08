@@ -565,6 +565,7 @@ class WxbotPlugin(Plugin):
         self._background_stop = asyncio.Event()
         self._background_enabled = True
         self._store = WxbotStore(ctx.settings)
+        self._store.jev_service = getattr(ctx.container, "jev_service", None)
         policy_store = getattr(ctx.container, "social_policy_store", None)
         if policy_store is None:
             policy_store = SocialPolicyStore(get_session_factory())
@@ -1058,7 +1059,7 @@ class WxbotPlugin(Plugin):
                     "signals.participation",
                     "signals.channel.wechat.participation",
                 },
-                timeout_seconds=4.0,
+                timeout_seconds=30.0,
                 error_policy="fail_closed",
             ),
             FlowStepDefinition(

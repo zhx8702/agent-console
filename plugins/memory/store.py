@@ -82,8 +82,15 @@ except ImportError:  # pragma: no cover
     _DCTX = None
 
 
-_GROUP_PREFIX_RE = re.compile(r"^([a-zA-Z0-9_@]+):\n(.*)$", re.DOTALL)
-_GROUP_EVENT_SENDER_PREFIX_RE = re.compile(r"^([a-zA-Z0-9_@.\-]+):\s+")
+_CANONICAL_PARTICIPANT_TOKEN = r"cx1:p:[a-fA-F0-9]{16,64}"
+_CANONICAL_PARTICIPANT_RE = re.compile(rf"(?i)^{_CANONICAL_PARTICIPANT_TOKEN}$")
+_GROUP_PREFIX_RE = re.compile(
+    rf"^({_CANONICAL_PARTICIPANT_TOKEN}|[a-zA-Z0-9_@]+):\n(.*)$",
+    re.DOTALL,
+)
+_GROUP_EVENT_SENDER_PREFIX_RE = re.compile(
+    rf"^({_CANONICAL_PARTICIPANT_TOKEN}|[a-zA-Z0-9_@.\-]+):\s+"
+)
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]+|\d+[.)、])\s*")
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -124,6 +131,7 @@ MEMORY_ACCEPTANCE_REVIEW_ACTIONS = {
     "accept",
     "reject",
     "needs_review",
+    "candidate",
     "mark_joke",
     "expire",
     "supersede",
@@ -2097,10 +2105,11 @@ def _group_graph_label_is_technical(value: Any) -> bool:
     label = _normalize_line(str(value or ""))
     if not label:
         return True
-    if _looks_like_wechat_username(label):
+    if _looks_like_canonical_participant_id(label):
         return True
     return bool(
-        re.match(r"(?i)^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?)", label)
+        re.match(r"(?i)^cx1:[pcm]:", label)
+        or re.match(r"(?i)^(wxid_|gh_|openid_|unionid_|user[_-]?|userid|uid[_:-]?)", label)
         or re.match(r"(?i)^[a-z0-9_@.\-]{24,}$", label)
         or re.match(r"(?i)^entity:\d+$", label)
     )
@@ -2123,10 +2132,17 @@ def _group_graph_entity_display_label(row: dict[str, Any]) -> str:
     return _group_graph_node_id(row)
 
 
+def _looks_like_canonical_participant_id(value: Any) -> bool:
+    username = _normalize_line(_sanitize_db_text(value))
+    return bool(_CANONICAL_PARTICIPANT_RE.fullmatch(username))
+
+
 def _looks_like_wechat_username(value: Any) -> bool:
     username = _normalize_line(_sanitize_db_text(value))
     if not username or username.endswith("@chatroom"):
         return False
+    if _looks_like_canonical_participant_id(username):
+        return True
     if re.match(r"(?i)^(wxid_|gh_|openid_|unionid_)", username):
         return True
     if re.match(r"(?i)^[a-z0-9_@.\-]{24,}$", username):
@@ -2862,12 +2878,14 @@ def _build_runtime_profile(
 # after the helper ports are initialized.  The facade remains MemoryStore.
 from plugins.memory.store_backfill import MemoryBackfillStoreMixin  # noqa: E402
 from plugins.memory.store_group_graph import MemoryGroupGraphStoreMixin  # noqa: E402
+from plugins.memory.store_jev import MemoryJevStoreMixin  # noqa: E402
 from plugins.memory.store_jobs import MemoryExtractionJobStoreMixin  # noqa: E402
 from plugins.memory.store_retrieval import MemoryRetrievalStoreMixin  # noqa: E402
 
 
 class MemoryStore(
     MemoryAdminMutationMixin,
+    MemoryJevStoreMixin,
     MemoryRetrievalStoreMixin,
     MemoryExtractionJobStoreMixin,
     MemoryGroupGraphStoreMixin,
@@ -4657,7 +4675,7 @@ class MemoryStore(
                     ),
                 },
             )
-            return await self.get_memory_item(int(current["id"]))
+            return await self._queue_jev_item(await self.get_memory_item(int(current["id"])))
 
         if existing:
             logger.info(
@@ -4726,7 +4744,7 @@ class MemoryStore(
             item = self._finalize_memory_item(rows[0])
             if not item.get("source_evidence"):
                 item["source_evidence"] = source_evidence
-            return item
+            return await self._queue_jev_item(item)
 
         # A concurrent insert or the dedupe index's allowed-session hash may
         # have won the race. Re-read and compare the full audience contract;
@@ -6124,7 +6142,11 @@ class MemoryStore(
             status=status,
             include_deleted=include_deleted,
         )
-        params["lim"] = max(1, min(int(limit or 5000), 10000))
+        # Audit/statistics callers may need to scan more than the historical
+        # 10k preview cap.  Individual API endpoints still clamp their public
+        # limits; this internal reader accepts a larger bounded page so group
+        # window totals are not silently truncated.
+        params["lim"] = max(1, min(int(limit or 5000), 100000))
         rows = await _exec(
             "SELECT id, tenant_id, channel, source_key, user_id, session_id, scope_type, source_type, "
             "memory_type, value_json, confidence, status, pinned, priority, sensitivity, "
@@ -7614,6 +7636,9 @@ class MemoryStore(
             tenant_id=tenant,
             user_id=member,
         )
+        knowledge = getattr(getattr(self, "jev_service", None), "knowledge_service", None)
+        if memory_channel == "wechat" and knowledge is not None:
+            await knowledge.erase_member(tenant_id=tenant, user_id=member, run=_exec)
         scope = {
             "tid": tenant,
             "uid": member,

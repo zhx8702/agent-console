@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 import plugins.memory.store as memory_store_module
+import plugins.memory.store_backfill as memory_backfill_module
 from app.social.contracts import MemberPrivacyValues
 from plugins.memory.store import (
     GROUP_HISTORY_USER_ID_SCOPE,
@@ -168,6 +169,32 @@ async def test_sdk_query_read_uses_exact_private_origin_auth_and_bounded_post(
     }
     assert captured["max_response_bytes"] == 10 * 1024 * 1024
     assert captured["timeout_seconds"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_group_graph_history_dates_scopes_legacy_connection_for_sdk_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryStore(SimpleNamespace(wxbot_default_tenant_id="default"))
+    observed_scopes: list[tuple[str, str] | None] = []
+
+    async def fake_history_dates(**kwargs: Any) -> dict[str, Any]:
+        observed_scopes.append(memory_backfill_module._ACTIVE_LEGACY_WXBOT_HISTORY_SCOPE.get())
+        return {"ok": True, "items": [], "scope": kwargs}
+
+    monkeypatch.setattr(store, "_get_group_graph_history_dates", fake_history_dates)
+    result = await store.get_group_graph_history_dates(
+        tenant_id="default",
+        channel="wechat",
+        source_key="wxbot",
+        session_id="room-a@chatroom",
+        user_id=None,
+        connection_id="legacy-wechat-default",
+    )
+
+    assert result["ok"] is True
+    assert observed_scopes == [("default", "legacy-wechat-default")]
+    assert memory_backfill_module._ACTIVE_LEGACY_WXBOT_HISTORY_SCOPE.get() is None
 
 
 def test_group_relationship_edge_evidence_payload_keeps_only_safe_fields() -> None:

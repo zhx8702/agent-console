@@ -970,7 +970,7 @@ async def test_memory_router_supports_layered_memory_endpoints() -> None:
         group_graph_resp = await client.get(
             "/group-graph?tenant_id=demo&channel=wechat&source_key=wxbot&session_id=group-1@chatroom"
             "&from=2026-05-01T00:00:00&to=2026-05-15T00:00:00&node_type=person&relation_type=knows"
-            "&acceptance_status=accepted,needs_review&min_confidence=0.45&limit=25",
+            "&acceptance_status=accepted,needs_review&min_confidence=0.45&limit=25&cursor=500",
             headers=admin_headers,
         )
         history_dates_resp = await client.get(
@@ -1164,6 +1164,7 @@ async def test_memory_router_supports_layered_memory_endpoints() -> None:
     assert store.group_graph_calls[0]["acceptance_status"] == "accepted,needs_review"
     assert store.group_graph_calls[0]["min_confidence"] == 0.45
     assert store.group_graph_calls[0]["limit"] == 25
+    assert store.group_graph_calls[0]["cursor"] == "500"
     assert history_dates_resp.status_code == 200
     assert history_dates_resp.json()["user_id_scope"] == "__group__"
     assert history_dates_resp.json()["items"][0] == {
@@ -1181,6 +1182,7 @@ async def test_memory_router_supports_layered_memory_endpoints() -> None:
     }
     assert history_dates_resp.json()["user_id_auto"] is True
     assert store.history_date_calls[0]["user_id"] is None
+    assert store.history_date_calls[0]["connection_id"] == "legacy-wechat-default"
     assert "private user text" not in str(history_dates_resp.json())
     assert list_items_resp.status_code == 200
     assert list_items_resp.json()["items"][0]["content"] == "重点客户"

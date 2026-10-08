@@ -247,4 +247,6 @@ def _acceptance_status_for_review_action(action: str) -> str:
         return "expired"
     if action == "supersede":
         return "superseded"
+    if action == "candidate":
+        return "candidate"
     return "needs_review"

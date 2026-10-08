@@ -87,16 +87,25 @@ def _normalize_command_args(args: list[str], *, mentioned_me: bool) -> list[str]
     return normalized
 
 
+def _admin_identity_candidates(ctx: PipelineContext) -> set[str]:
+    metadata = ctx.event.metadata or {}
+    values = [
+        ctx.event.user_id,
+        metadata.get("sender_id"),
+        metadata.get("sender_wxid"),
+    ]
+    return {str(item).strip() for item in values if str(item or "").strip()}
+
+
 def _is_admin(ctx: PipelineContext, cfg: dict) -> bool:
-    sender_id = str(
-        ctx.event.user_id
-        or ctx.event.metadata.get("sender_id")
-        or ctx.event.metadata.get("sender_wxid")
-        or ""
-    ).strip()
-    if not sender_id:
+    admin_ids = {
+        str(item).strip()
+        for item in (cfg.get("admin_user_ids") or [])
+        if str(item or "").strip()
+    }
+    if not admin_ids:
         return False
-    return sender_id in set(cfg.get("admin_user_ids") or [])
+    return bool(_admin_identity_candidates(ctx) & admin_ids)
 
 
 def _enabled_command_scopes(

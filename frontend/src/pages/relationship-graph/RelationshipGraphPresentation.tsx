@@ -47,6 +47,7 @@ export type RelationshipGraphPresentationProps = Pick<
   | "graphNodes"
   | "graphSummaryText"
   | "loading"
+  | "loadNextGraphPage"
   | "visibleGraphEdges"
   | "layout"
   | "selectedEdge"
@@ -170,6 +171,7 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
     graphNodes,
     graphSummaryText,
     loading,
+    loadNextGraphPage,
     visibleGraphEdges,
     layout,
     selectedEdge,
@@ -291,10 +293,24 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
               </button>
             </div>
           )}
+          {serverTruncated && (
+            <p className="relationship-sync-hint is-warning" role="status">
+              服务端匹配到 {pageInfo?.total} 条关系，但本次只返回 {graph?.edges?.length || 0} 条{pageInfo?.limit ? `（上限 ${pageInfo.limit}）` : ""}。画布还会按当前视图预算继续筛选；如需查看其余关系，请缩小时间范围或关系类型。
+              {pageInfo?.next_cursor && (
+                <button
+                  className="button button-secondary button-compact"
+                  type="button"
+                  onClick={() => void loadNextGraphPage()}
+                  disabled={loading}
+                >
+                  {loading ? "正在加载下一页" : "加载下一页关系"}
+                </button>
+              )}
+            </p>
+          )}
           {!!graphNodes.length && (
             <p className="relationship-graph-summary">
               {graphSummaryText}
-              {serverTruncated && ` 服务端共 ${pageInfo?.total} 条匹配关系，按互动强度只返回了前 ${graph?.edges?.length}，收窄时间范围或关系类型可以看到其余部分。`}
               {" "}可在画布上点选、拖动画布平移、滚轮缩放；待审关系用虚线，线宽表示证据消息数（对数），透明度表示最近一次证据的新旧。
             </p>
           )}
@@ -448,7 +464,7 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                 <p className="section-kicker">审核</p>
                 <h3 id="relationship-review-queue-title">待审核队列</h3>
                 <p className="muted-copy">
-                  引用、@ 这类直接互动即时通过；模型推断的关系在跨天复现、同窗有 3 条以上消息支撑，或与已通过的关系相互印证（同一主题已有人在聊、两人已有直接互动）后由系统自动通过，14 天内都没印证的自动过期。这里是还在等印证的候选，人工点不点都不影响自动流程；最多显示 100 条。
+                  引用、@ 即时通过。参与、报障、给资源、协作、问答这类关键关系进本队列。闲聊「提到」和空泛兴趣先挂起，不占待审；跨天复现、同窗 3 条以上证据、或与已通过关系印证后自动通过。人工点不点都不影响自动流程；最多显示 100 条。
                 </p>
               </div>
               <span className="relationship-queue-count" title={pendingTotal !== null ? `共 ${pendingTotal} 条待印证，显示前 ${pendingShown} 条` : undefined}>

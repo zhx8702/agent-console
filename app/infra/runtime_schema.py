@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-RUNTIME_SCHEMA_REVISION = "0052_wxbot_group_webhooks"
+RUNTIME_SCHEMA_REVISION = "0055_jev_revisions"
 RUNTIME_SCHEMA_CONTRACT_NAME = "agent-console-runtime"
 # 0046 adds durable memory-event provenance, evidence, and physical expiry.
 RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
@@ -17,6 +17,11 @@ RUNTIME_SCHEMA_COMPATIBILITY_LEVEL = 9
 RUNTIME_SCHEMA_TABLES = frozenset(
     {
         "app_schema_contract",
+        "jev_policy",
+        "jev_evaluation",
+        "jev_knowledge_job",
+        "jev_knowledge_candidate",
+        "jev_quality_finding",
         "channel_connection",
         "plugin_agent_session_policy",
         "plugin_agent_tool_audit",
@@ -103,6 +108,8 @@ RUNTIME_SCHEMA_TABLES = frozenset(
 
 RUNTIME_SCHEMA_INDEXES = frozenset(
     {
+        "ix_jev_due",
+        "ix_jev_tenant_created",
         "ux_plugin_wxbot_group_webhook_active_group",
         "idx_draw_task_status_heartbeat",
         "ix_channel_connection_tenant_adapter",

@@ -1,0 +1,84 @@
+{
+  "verified_at": "2026-09-20T16:42:44.346078+00:00",
+  "application_commit": "6e152337fc4285ee9e0a7faafd41b29181a1459d",
+  "migration": "0055_jev_revisions",
+  "group": "Codex降智交流群",
+  "archive_day": "2026-09-20",
+  "coverage": {
+    "status": "completed",
+    "scanned": 420,
+    "archive_count": 420,
+    "covered_count": 420,
+    "attempts": 0,
+    "error_type": "",
+    "candidate_statuses": [
+      {
+        "status": "needs_review",
+        "count": 38
+      },
+      {
+        "status": "unresolved",
+        "count": 9
+      }
+    ]
+  },
+  "quality_summary": [
+    {
+      "kind": "missed_help",
+      "status": "needs_review",
+      "count": 3
+    },
+    {
+      "kind": "unhelpful_answer",
+      "status": "needs_review",
+      "count": 1
+    }
+  ],
+  "jev_evaluations": [
+    {
+      "model": "jev-1.13.0",
+      "status": "completed",
+      "count": 52
+    }
+  ],
+  "health": {
+    "/healthz": 200,
+    "/readyz": 200
+  },
+  "console_smoke": {
+    "pagination_disjoint": true,
+    "cursor_group_bound": true,
+    "status_filters": true,
+    "finding_evidence_hash": true,
+    "frontend_http": 200,
+    "no_chat_messages_sent": true
+  },
+  "complete_source_fingerprint_verified": true,
+  "runtime_source_files_verified": 19,
+  "tests": {
+    "backend_passed": 3454,
+    "backend_skipped": 3,
+    "postgres_passed": 34,
+    "frontend_passed": 12,
+    "frontend_build": "passed",
+    "ruff": "passed",
+    "mypy": "passed",
+    "plugin_manifest": "passed"
+  },
+  "daily_hour": 3,
+  "timezone": "Asia/Shanghai",
+  "knowledge_min_confidence": 0.9,
+  "publication": "manual_review_only",
+  "models": {
+    "extractor": "grok-4.6",
+    "reviewer": "jev-1.13.0"
+  },
+  "grok_stream_timeouts": {
+    "first_event": 45,
+    "idle": 120,
+    "total": 300,
+    "offline_outer_wait": 330
+  },
+  "application_branch": "fix/group-relationship-graph-full",
+  "backup": "/opt/agent-console-backups/jev-evidence-20260921"
+}

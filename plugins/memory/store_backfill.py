@@ -846,6 +846,54 @@ class MemoryBackfillStoreMixin:
         session_id: str,
         user_id: str | None,
         recent_days: int = 14,
+        connection_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return daily extraction status for a group history scope.
+
+        The legacy wxbot SDK exposes account-wide history and requires the
+        connection identity on every read.  API callers provide that identity
+        here; keep the context scoped to this request so concurrent history
+        reads cannot inherit one another's connection.
+        """
+
+        connection = str(connection_id or "").strip()
+        if not connection:
+            # Preserve direct/internal callers that do not need an SDK read
+            # (for example, callers supplying a pre-resolved history adapter).
+            return await self._get_group_graph_history_dates(
+                tenant_id=tenant_id,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                user_id=user_id,
+                recent_days=recent_days,
+            )
+        tenant, connection = self._require_legacy_wxbot_history_connection(
+            tenant_id=tenant_id,
+            connection_id=connection,
+        )
+        token = _ACTIVE_LEGACY_WXBOT_HISTORY_SCOPE.set((tenant, connection))
+        try:
+            return await self._get_group_graph_history_dates(
+                tenant_id=tenant,
+                channel=channel,
+                source_key=source_key,
+                session_id=session_id,
+                user_id=user_id,
+                recent_days=recent_days,
+            )
+        finally:
+            _ACTIVE_LEGACY_WXBOT_HISTORY_SCOPE.reset(token)
+
+    async def _get_group_graph_history_dates(
+        self,
+        *,
+        tenant_id: str,
+        channel: str,
+        source_key: str,
+        session_id: str,
+        user_id: str | None,
+        recent_days: int = 14,
     ) -> dict[str, Any]:
         if str(channel or "").strip().lower() != "wechat":
             raise RuntimeError("memory history dates only supports wechat channel")

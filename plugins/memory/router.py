@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.admin.auth_router import authenticate_admin_request, is_admin_request
 from app.admin.mutation_ledger import MutationIdempotencyConflictError
-from app.channel.identity import require_legacy_wxbot_history_scope
+from app.channel.identity import LEGACY_WXBOT_CONNECTION_ID, require_legacy_wxbot_history_scope
 from app.common.request_models import StrictRequestModel
 from plugins.memory.store import (
     GROUP_GRAPH_EDGE_TYPES,
@@ -1489,6 +1489,7 @@ def build_memory_router(
         acceptance_status: str | None = Query(default=None),
         min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
         limit: int = Query(default=500, ge=1, le=500),
+        cursor: str | None = Query(default=None, max_length=64),
     ):
         await _require_group_read_access(
             request,
@@ -1511,6 +1512,7 @@ def build_memory_router(
             acceptance_status=acceptance_status,
             min_confidence=min_confidence,
             limit=limit,
+            cursor=cursor,
         )
         safe_payload = _scrub_group_graph_payload(payload)
         if not isinstance(safe_payload, dict):
@@ -1715,6 +1717,7 @@ def build_memory_router(
         channel: str = Query(default="wechat"),
         source_key: str = Query(default="wxbot"),
         session_id: str = Query(...),
+        connection_id: str = Query(default=LEGACY_WXBOT_CONNECTION_ID, max_length=64),
         user_id: str | None = Query(default=None),
         recent_days: int = Query(default=14, ge=1, le=90),
     ):
@@ -1733,8 +1736,9 @@ def build_memory_router(
                 session_id=session_id,
                 user_id=user_id,
                 recent_days=recent_days,
+                connection_id=connection_id,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
     @router.get("/graph/entities")

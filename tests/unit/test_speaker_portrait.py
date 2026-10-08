@@ -212,6 +212,7 @@ def test_compile_reply_style_uses_first_person_and_examples() -> None:
     assert "带带我" in prompt
     assert "烤鱼" in prompt
     assert "按自己平时怎么过、最近在忙什么来答" in prompt
+    assert "短的就写一行" in prompt
 
 
 class _FakePersonaStore:

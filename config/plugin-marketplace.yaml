@@ -2,7 +2,7 @@ items:
   - name: amap
     display_name: 高德地图
     version: 0.1.0
-    description: AMap personal map, POI search, and route planning agent tools
+    description: "高德个人地图、地点搜索与路线规划工具"
     author: builtin
     source: builtin
     package:
@@ -50,7 +50,7 @@ items:
   - name: commands
     display_name: 命令中心
     version: 0.1.0
-    description: Tenant-wide command center for intercepted slash commands
+    description: "租户级命令中心，统一接管斜杠命令"
     author: builtin
     source: builtin
     package:
@@ -80,7 +80,7 @@ items:
   - name: credits
     display_name: 积分插件
     version: 0.1.0
-    description: Credit balance, check-in rewards, and per-chat cost deduction
+    description: "群积分余额、签到奖励与按次扣费"
     author: builtin
     source: builtin
     package:
@@ -132,13 +132,13 @@ items:
   - name: draw
     display_name: 画图插件
     version: 0.1.0
-    description: Slash-command image generation for wxbot chats
+    description: "群聊里用斜杠命令生成图片"
     author: builtin
     source: builtin
     package:
       type: builtin
       uri: plugins/draw
-    capability_digest: sha256:189cde457cac43b070146fa11642d5a3bec1ec5767d171e44a0979654461e8a7
+    capability_digest: sha256:bfd2bc2c5d5bfec6ca6b97d9b0107c71fb8c69771f541850f277c94e2c285a23
     compatibility:
       core_api: ">=0.1.0 <0.2.0"
       python: ">=3.11"
@@ -175,7 +175,7 @@ items:
   - name: local_agent
     display_name: 本机 CLI Agent
     version: 0.1.0
-    description: Probe host grok / Codex CLIs, run /grok /codex, and overflow long prompts locally
+    description: "探测宿主机 grok / Codex CLI，执行 /grok /codex，并把超长提示词转到本地处理"
     author: builtin
     source: builtin
     package:
@@ -234,7 +234,7 @@ items:
   - name: video
     display_name: 视频生成插件
     version: 0.1.0
-    description: Slash-command and Agent video generation for wxbot chats
+    description: "群聊里用斜杠命令或智能体生成视频"
     author: builtin
     source: builtin
     package:
@@ -271,7 +271,7 @@ items:
   - name: memory
     display_name: 用户记忆
     version: 0.1.0
-    description: Per-user short-term and long-term memory keyed by channel/source/wxid
+    description: "按渠道 / 来源 / 微信号维护成员的短期与长期记忆"
     author: builtin
     source: builtin
     package:
@@ -304,7 +304,7 @@ items:
   - name: moderation
     display_name: 审核插件
     version: 0.1.0
-    description: Per-session keyword moderation, audit logging, and webhook alerts
+    description: "按群关键词审核、审计记录与 webhook 告警"
     author: builtin
     source: builtin
     package:
@@ -337,7 +337,7 @@ items:
   - name: persona_extract
     display_name: 回复风格
     version: 0.2.0
-    description: Extract and synthesize reply-style profiles from user message history
+    description: "从成员历史消息中提炼并合成回复风格"
     author: builtin
     source: builtin
     package:
@@ -374,7 +374,7 @@ items:
   - name: speaker_portrait
     display_name: 人物画像
     version: 0.1.0
-    description: Build speaker portraits from chat history via local CLI
+    description: "通过本地 CLI 从聊天记录生成成员画像"
     author: builtin
     source: builtin
     package:
@@ -414,7 +414,7 @@ items:
   - name: repeater
     display_name: 复读机
     version: 0.1.0
-    description: Per-session repeater with cooldown dedupe for group chats
+    description: "群聊复读，带冷却去重"
     author: builtin
     source: builtin
     package:
@@ -444,7 +444,7 @@ items:
   - name: group_activity
     display_name: 群聊主动参与
     version: 0.1.0
-    description: Group idle activity starter using group Agent skill and wxbot outbound queue
+    description: "群聊冷场时由群智能体主动发起话题，经微信发送队列投递"
     author: builtin
     source: builtin
     package:
@@ -481,7 +481,7 @@ items:
   - name: tibo_reset
     display_name: Codex Tibo 重置提醒
     version: 0.2.3
-    description: Persist confirmed Codex reset history, answer group queries, and forward new posts
+    description: "记录已确认的 Codex 重置历史，回答群内查询并转发新动态"
     author: builtin
     source: builtin
     package:
@@ -526,13 +526,13 @@ items:
   - name: wxbot
     display_name: 微信机器人
     version: 0.2.0
-    description: WeChat bot SDK bridge — polls inbound messages, dispatches replies
+    description: "微信机器人 SDK 桥接：拉取入站消息并投递回复"
     author: builtin
     source: builtin
     package:
       type: builtin
       uri: plugins/wxbot
-    capability_digest: sha256:8efb0fdbe5fa309d9cd14c72a3154a40deabc25a0a3edbeed93f9c48de0c11e1
+    capability_digest: sha256:caae6a76acf7f15b812d9c02aacc6a4e22cd59a5928eb887281e7c1ef4d32feb
     compatibility:
       core_api: ">=0.1.0 <0.2.0"
       python: ">=3.11"

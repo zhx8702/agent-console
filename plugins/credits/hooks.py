@@ -131,16 +131,100 @@ def _estimate_amap_agent_cost(ctx: PipelineContext, costs: dict[str, int]) -> in
         return int(costs.get("map") or 0)
     return int(costs.get("search") or 0)
 
+_ACCOUNT_ID_RE = re.compile(
+    r"^(?:wxid_[A-Za-z0-9_-]+|cx1:p:[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
+
+
+def _credit_bot_wxids(ctx: PipelineContext) -> set[str]:
+    metadata = ctx.event.metadata or {}
+    values = {
+        str(metadata.get(key) or "").strip()
+        for key in ("bot_wxid", "self_wxid", "robot_wxid", "wxbot_self_wxid")
+    }
+    session = ctx.session
+    if session is not None:
+        session_vars = getattr(session, "variables", {}) or {}
+        values.add(str(session_vars.get("bot_wxid") or "").strip())
+        values.add(str(session_vars.get("self_wxid") or "").strip())
+    return {item for item in values if item}
+
+
+def _mentioned_member_wxids(ctx: PipelineContext) -> list[str]:
+    from app.orchestrator.simple_capabilities import parse_at_wxids
+
+    raw = parse_at_wxids(ctx.event.metadata.get("at_wxids"))
+    sender = _credit_user_id(ctx)
+    bots = _credit_bot_wxids(ctx)
+    targets = [wxid for wxid in raw if wxid and wxid != sender and wxid not in bots]
+    if (
+        not targets
+        and not bots
+        and bool(ctx.event.metadata.get("mentioned_me"))
+        and len(raw) > 1
+    ):
+        targets = [wxid for wxid in raw[1:] if wxid and wxid != sender]
+    return targets
+
+
 def _mentioned_credit_target_user_id(ctx: PipelineContext) -> str:
-    at_wxids = ctx.event.metadata.get("at_wxids") or []
-    if not isinstance(at_wxids, list):
+    targets = _mentioned_member_wxids(ctx)
+    if not targets:
         return ""
-    values = [str(item or "").strip() for item in at_wxids if str(item or "").strip()]
-    if not values:
-        return ""
+    if len(targets) == 1:
+        return targets[0]
     if bool(ctx.event.metadata.get("mentioned_me")):
-        return values[-1] if len(values) >= 2 else ""
-    return values[0]
+        return targets[-1]
+    return targets[0]
+
+
+def _looks_like_account_id(value: str) -> bool:
+    return bool(_ACCOUNT_ID_RE.fullmatch(str(value or "").strip()))
+
+
+def _mention_display_name(args: list[str]) -> str:
+    for token in args:
+        text = str(token or "").strip()
+        if not text.startswith("@"):
+            continue
+        name = text[1:].strip()
+        if name and not _looks_like_account_id(name):
+            return name
+    return ""
+
+
+def _drop_target_tokens(args: list[str], target_user_id: str) -> list[str]:
+    remaining: list[str] = []
+    for token in args:
+        text = str(token or "").strip()
+        if not text:
+            continue
+        bare = text.lstrip("@").strip()
+        if bare == target_user_id:
+            continue
+        if text.startswith("@") and bare and not _looks_like_account_id(bare):
+            continue
+        remaining.append(text)
+    return remaining
+
+
+def _resolve_command_target_user(
+    ctx: PipelineContext,
+    args: list[str],
+) -> tuple[str, str, list[str]]:
+    mentioned = _mentioned_member_wxids(ctx)
+    if len(mentioned) > 1:
+        raise ValueError("一次只能指定一个成员，请只 @ 一个人")
+    if mentioned:
+        target = mentioned[0]
+        return target, _mention_display_name(args), _drop_target_tokens(args, target)
+    if not args:
+        raise ValueError("请 @ 对方，并写上数量")
+    first = _parse_target_user(args[0])
+    if _looks_like_account_id(first):
+        return first, "", [str(item).strip() for item in args[1:] if str(item).strip()]
+    raise ValueError("请 @ 对方，或填写对方的 wxid")
 
 
 def _member_matches_target(item: dict, target: str) -> bool:
@@ -405,10 +489,10 @@ def _parse_target_user(arg: str) -> str:
 async def _cmd_transfer(store: CreditStore, ctx: PipelineContext, cfg: dict, args: list[str]) -> str:
     if not cfg.get("enabled"):
         return "当前会话未开启积分系统"
-    if len(args) < 2:
-        return "用法：/转账 <user_id> <数量>"
-    target_user_id = _parse_target_user(args[0])
-    amount = _parse_amount(args[1])
+    target_user_id, display_name, remaining = _resolve_command_target_user(ctx, args)
+    if not remaining:
+        return "用法：/转账 @成员 <数量>"
+    amount = _parse_amount(remaining[0])
     balances = await store.transfer(
         ctx.event.tenant_id,
         _credit_session_id(ctx),
@@ -419,8 +503,9 @@ async def _cmd_transfer(store: CreditStore, ctx: PipelineContext, cfg: dict, arg
         reference=ctx.event.trace_id,
     )
     credit_name = str(cfg.get("credit_name") or "积分")
+    target_label = display_name or target_user_id
     return (
-        f"转账成功：→ {target_user_id} +{amount} {credit_name}\n"
+        f"转账成功：→ {target_label} +{amount} {credit_name}\n"
         f"你的余额：{balances['from_balance']} {credit_name}\n"
         f"对方余额：{balances['to_balance']} {credit_name}"
     )
@@ -429,10 +514,10 @@ async def _cmd_transfer(store: CreditStore, ctx: PipelineContext, cfg: dict, arg
 async def _cmd_grant(store: CreditStore, ctx: PipelineContext, cfg: dict, args: list[str]) -> str:
     if not cfg.get("enabled"):
         return "当前会话未开启积分系统"
-    if len(args) < 2:
-        return "用法：/赠送 <user_id> <数量>"
-    target_user_id = _parse_target_user(args[0])
-    amount = _parse_amount(args[1])
+    target_user_id, display_name, remaining = _resolve_command_target_user(ctx, args)
+    if not remaining:
+        return "用法：/赠送 @成员 <数量>"
+    amount = _parse_amount(remaining[0])
     balance = await store.adjust(
         ctx.event.tenant_id,
         _credit_session_id(ctx),
@@ -441,10 +526,11 @@ async def _cmd_grant(store: CreditStore, ctx: PipelineContext, cfg: dict, args: 
         "admin_grant",
         actor=_credit_user_id(ctx),
         reference=ctx.event.trace_id,
-        display_name="",
+        display_name=display_name,
     )
     credit_name = str(cfg.get("credit_name") or "积分")
-    return f"[管理员] 赠送 {target_user_id} {amount} {credit_name}\n对方余额：{balance}"
+    target_label = display_name or target_user_id
+    return f"[管理员] 赠送 {target_label} {amount} {credit_name}\n对方余额：{balance}"
 
 
 def _checkin_mode_usage() -> str:
@@ -536,7 +622,7 @@ def build_credit_command_definitions(store: CreditStore) -> list[CommandDefiniti
             command="/转账",
             aliases=("/transfer",),
             description="给当前会话里的其他成员转账积分",
-            usage="/转账 <user_id> <数量>",
+            usage="/转账 @成员 <数量>",
             handler=_handle_transfer,
         ),
         CommandDefinition(
@@ -545,7 +631,7 @@ def build_credit_command_definitions(store: CreditStore) -> list[CommandDefiniti
             aliases=("/grant",),
             description="管理员给成员补发积分",
             admin_only=True,
-            usage="/赠送 <user_id> <数量>",
+            usage="/赠送 @成员 <数量>",
             handler=_handle_grant,
         ),
         CommandDefinition(

@@ -243,6 +243,39 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
 
+    # TypeSafe is an optional, independent evaluator used for shadow review
+    # of extracted relations.  It is deliberately separate from ``llm_*`` so
+    # enabling it can never change the application's primary chat provider.
+    # The names map directly to TYPESAFE_* environment variables.
+    typesafe_api_key: str | None = None
+    typesafe_base_url: str = "https://api.typesafe.ai"
+    typesafe_model: str = "jev-latest"
+    typesafe_timeout: float = Field(default=30.0, gt=0.0, le=600.0)
+    typesafe_max_retries: int = Field(default=2, ge=0, le=10)
+    typesafe_enabled: bool = False
+    typesafe_relationship_enabled: bool = True
+    typesafe_memory_enabled: bool = True
+    typesafe_intent_enabled: bool = True
+    typesafe_moderation_enabled: bool = True
+    typesafe_participation_enabled: bool = True
+    typesafe_online_timeout: float = Field(default=10.0, gt=0, le=20)
+    typesafe_worker_concurrency: int = Field(default=4, ge=1, le=8)
+    typesafe_job_max_attempts: int = Field(default=3, ge=1, le=10)
+    typesafe_shadow_only: bool = True
+    typesafe_min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+    @property
+    def typesafe_group_graph_shadow_enabled(self) -> bool:
+        """Compatibility name used by the group-graph shadow hook."""
+
+        return self.typesafe_enabled
+
+    @property
+    def typesafe_group_graph_shadow_timeout_seconds(self) -> float:
+        """Compatibility timeout name used by the group-graph shadow hook."""
+
+        return self.typesafe_timeout
+
     llm_provider: str = "fake"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"

@@ -149,6 +149,23 @@ const tenantMemberControlDocument: TenantMemberControlDocument = {
   updated_at: "2026-07-17T08:30:00Z",
 };
 
+const jevDesk = {
+  session_id: "room@chatroom",
+  in_help_sessions: true,
+  participation_enabled: true,
+  participation_shadow_only: false,
+  min_confidence: 0.8,
+  channel: {
+    reply_mode: "contains",
+    configured_reply_mode: "contains",
+    inherits_global_keywords: false,
+    keyword_count: 46,
+    mention_sender: false,
+    has_session_row: true,
+  },
+  conflicts: [] as string[],
+};
+
 const runtimeEvent: ParticipationEventDocument = {
   event_id: "event-1",
   tenant_id: "default",
@@ -361,6 +378,9 @@ describe("GroupBehaviorPage", () => {
       if (path.endsWith("/memory-items")) {
         return { items: [], next_cursor: null };
       }
+      if (path === "/v1/admin/jev/desk") {
+        return { desk: jevDesk };
+      }
       return {};
     });
   });
@@ -470,6 +490,47 @@ describe("GroupBehaviorPage", () => {
     );
     expect(await screen.findByText(/群参与策略已保存/)).toBeInTheDocument();
     expect(screen.getAllByText("v4").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shows this group's Jev help-desk status and links to the evaluation page", async () => {
+    renderPage();
+
+    expect(await screen.findByRole("heading", { name: "Jev 答疑状态" })).toBeInTheDocument();
+    expect(screen.getByText(/已在主动答疑白名单/)).toBeInTheDocument();
+    expect(screen.getByText(/关键词 46 个/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "打开 Jev 评估" })).toHaveAttribute("href", "/memory?tab=jev");
+    expect(apiRequestMock.mock.calls.some(([, path, options]) => (
+      path === "/v1/admin/jev/desk"
+      && options?.query?.session_id === "room@chatroom"
+    ))).toBe(true);
+  });
+
+  it("flags Jev observe mode on the participation page", async () => {
+    apiRequestMock.mockImplementation(async (_config, path) => {
+      if (path === "/v1/admin/jev/desk") {
+        return {
+          desk: {
+            ...jevDesk,
+            participation_shadow_only: true,
+            conflicts: ["jev_observe_only"],
+          },
+        };
+      }
+      if (path.endsWith("/participation-events")) {
+        return { items: [runtimeEvent], next_cursor: null };
+      }
+      if (path.endsWith("/history")) {
+        return versionHistoryPage;
+      }
+      if (path.endsWith("/memory-items")) {
+        return { items: [], next_cursor: null };
+      }
+      return {};
+    });
+    renderPage();
+
+    expect(await screen.findByText("求助判断仍是观察模式，只记录建议，不会主动开口")).toBeInTheDocument();
+    expect(screen.getByText("观察模式")).toBeInTheDocument();
   });
 
   it("renders the group behavior menu as a unified control deck", async () => {
