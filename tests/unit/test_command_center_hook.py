@@ -1205,6 +1205,40 @@ async def test_command_center_hook_silently_denies_group_admin_command_for_norma
 
 
 @pytest.mark.asyncio
+async def test_admin_command_accepts_wxid_when_event_user_id_is_canonical_hash() -> None:
+    hook = CommandCenterHook(_FakeCommandStore(), _build_service())
+
+    with pytest.raises(HookAbort) as exc:
+        await hook.run(
+            _ctx(
+                "/sign-in mode 2",
+                user_id="cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b",
+                metadata={"sender_wxid": "admin-user"},
+            )
+        )
+
+    assert exc.value.reply_text == "已切换到 2"
+    assert exc.value.reason != "command_denied"
+
+
+@pytest.mark.asyncio
+async def test_admin_command_denies_canonical_hash_when_wxid_is_not_admin() -> None:
+    hook = CommandCenterHook(_FakeCommandStore(), _build_service())
+
+    with pytest.raises(HookAbort) as exc:
+        await hook.run(
+            _ctx(
+                "/sign-in mode 2",
+                user_id="cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b",
+                metadata={"sender_wxid": "wxid_other"},
+            )
+        )
+
+    assert exc.value.reply_text == ""
+    assert exc.value.reason == "command_denied"
+
+
+@pytest.mark.asyncio
 async def test_command_center_hook_silently_stops_disabled_group_command() -> None:
     store = _FakeCommandStore()
     store.config["user_commands"] = []
