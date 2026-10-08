@@ -219,8 +219,20 @@
   display: none;
 }
 
+.plugins-flow-shell {
+  position: relative;
+}
+
+.plugins-flow-refresh {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 1;
+}
+
 .plugins-flow-details > summary.panel-header {
   margin-bottom: 0;
+  padding-right: 7.5rem;
 }
 
 .plugins-flow-details[open] > summary.panel-header {
