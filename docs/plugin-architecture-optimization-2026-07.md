@@ -99,3 +99,7 @@ flowchart LR
 - 升级 `0034` 前必须排空或终结旧版 `prepared/running/retryable failed` effect intent；迁移发现仍可执行的旧 intent 会主动失败，避免伪造 producer provenance。
 - 生产继续保持 dynamic plugin mutation 关闭；这同时覆盖 install/upgrade/uninstall/enable/disable。插件升级和全局启停通过签名/attestation 完整的 digest-pinned 镜像与部署配置发布；tenant/session scope 仍由控制面安全变更。
 - 群机器人自然参与的产品与策略约束见 `docs/humanization-rollout.md`；自然参与必须建立在上述插件 execution gate、source-bound revalidation 和统一发言预算之上。
+
+## 2026-10-06 增量复核
+
+实际生产配置、前端状态与请求隔离修复，以及贡献集合、资源清理和职责拆分的边界见 [插件优化发布记录](plugin-optimization-release-2026-10.md)。旧文中的数据库 head 与生产环境描述是历史审计记录，当前发布应以该增量复核和实际容器配置为准。

@@ -185,6 +185,60 @@ def test_video_command_parser_rejects_invalid_duration() -> None:
         _parse_video_command_args(["--duration", "16", "海边日落"])
 
 
+def test_video_bind_prefers_current_turn_message_id_over_stale_contract(
+    tmp_path: Path,
+) -> None:
+    session = _ctx("/video 女警花审查犯人").session
+    assert session is not None
+    session.turns.append(
+        Turn(
+            session_id=session.session_id,
+            role=Role.USER,
+            content="/video 女警花审查犯人",
+            metadata={"message_id": "cx1:m:current-video"},
+        )
+    )
+    session.metadata["_wxbot_delivery_contract"] = {
+        "participation_status": "must_reply",
+        "source_message_id": "cx1:m:stale-source",
+        "participation_policy_version": 9,
+        "send_revalidation_enabled": True,
+    }
+    service = VideoAgentToolService(
+        store=_FakeVideoStore(tmp_path),  # type: ignore[arg-type]
+        channel_registry=None,
+    )
+    target = service._target(session)
+    assert service._current_source_message_id(session, target) == "cx1:m:current-video"
+
+
+def test_video_bind_prefers_current_turn_message_id_over_stale_contract(
+    tmp_path: Path,
+) -> None:
+    session = _ctx("/video 女警花审查犯人").session
+    assert session is not None
+    session.turns.append(
+        Turn(
+            session_id=session.session_id,
+            role=Role.USER,
+            content="/video 女警花审查犯人",
+            metadata={"message_id": "cx1:m:current-video"},
+        )
+    )
+    session.metadata["_wxbot_delivery_contract"] = {
+        "participation_status": "must_reply",
+        "source_message_id": "cx1:m:stale-source",
+        "participation_policy_version": 9,
+        "send_revalidation_enabled": True,
+    }
+    service = VideoAgentToolService(
+        store=_FakeVideoStore(tmp_path),  # type: ignore[arg-type]
+        channel_registry=None,
+    )
+    target = service._target(session)
+    assert service._current_source_message_id(session, target) == "cx1:m:current-video"
+
+
 @pytest.mark.asyncio
 async def test_video_command_passes_parameters_to_service_and_reserves_credits() -> None:
     service = _FakeVideoService()
@@ -309,6 +363,8 @@ async def test_video_command_job_captures_reserved_credits_after_generation(
     assert accepted["suppress_final_reply"] is True
     assert outbound.texts == [VIDEO_ACCEPTED_TEXT]
     assert outbound.text_options[0].idempotency_key.endswith("-accepted")
+    assert outbound.text_options[0].delivery_metadata["force_send"] is True
+    assert outbound.text_options[0].delivery_metadata["send_revalidation_enabled"] is False
     assert len(spawned) == 1
     await spawned[0]
 

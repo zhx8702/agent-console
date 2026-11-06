@@ -8,6 +8,8 @@ from app.common.intent_classify import (
     LlmIntentClassifier,
     NullIntentClassifier,
     StaticIntentClassifier,
+    _CLASSIFY_SYSTEM,
+    classify_context_from_event,
     semantic_classify_skip_reason,
 )
 from app.common.types import ChatResponse, ChatUsage
@@ -70,6 +72,10 @@ async def test_llm_classifier_parses_json_and_strips_fences() -> None:
     assert decision.confidence == 0.91
     assert llm.last_request.metadata["route"] == "intent_classify"
     assert llm.last_request.metadata["openai_web_search"] is False
+    assert "搜下x 目前grok bot 有多少额度" in (llm.last_request.system or "")
+    assert "搜下x 一般是怎么说别人胖的" in (llm.last_request.system or "")
+    assert "explicit request to search X" in (llm.last_request.system or "")
+    assert "credits is ONLY this group's" in (llm.last_request.system or "")
 
 
 @pytest.mark.asyncio
@@ -161,3 +167,86 @@ async def test_llm_classifier_does_not_call_model_for_group_chatter() -> None:
     )
     assert decision == IntentDecision()
     assert llm.last_request is None
+
+
+def test_classify_context_marks_quoted_image() -> None:
+    event = type(
+        "Event",
+        (),
+        {
+            "metadata": {
+                "mentioned_me": True,
+                "session_kind": "group",
+                "quote_image_path": "/data/images/601.png",
+            },
+            "session_id": "room@chatroom",
+            "tenant_id": "default",
+            "trace_id": "tr-quote",
+            "message": type("Message", (), {"content": "请帮我旁边增加海总"})(),
+        },
+    )()
+    context = classify_context_from_event(event, has_attachment=False)
+    assert context["quoted_image"] is True
+    assert context["has_attachment"] is False
+    assert context["mentioned_me"] is True
+
+
+def test_classify_context_treats_at_wxid_as_mention() -> None:
+    event = type(
+        "Event",
+        (),
+        {
+            "metadata": {
+                "mentioned_me": False,
+                "session_kind": "group",
+                "at_wxids": ["wxid_other", "wxid_bot"],
+                "bot_wxid": "wxid_bot",
+            },
+            "session_id": "room@chatroom",
+            "tenant_id": "default",
+            "trace_id": "tr-at",
+            "message": type("Message", (), {"content": "@zzz 帮我在旁边增加吴彦祖"})(),
+        },
+    )()
+    context = classify_context_from_event(event)
+    assert context["mentioned_me"] is True
+    assert semantic_classify_skip_reason(event.message.content, context) == ""
+
+
+def test_classify_context_quoted_image_with_leading_at_is_addressed() -> None:
+    event = type(
+        "Event",
+        (),
+        {
+            "metadata": {
+                "mentioned_me": False,
+                "session_kind": "group",
+                "quote_image_path": "/data/images/601.png",
+            },
+            "session_id": "room@chatroom",
+            "tenant_id": "default",
+            "trace_id": "tr-quote-at",
+            "message": type("Message", (), {"content": "@zzz 帮我在旁边增加吴彦祖"})(),
+        },
+    )()
+    context = classify_context_from_event(event)
+    assert context["quoted_image"] is True
+    assert context["leading_mention"] is True
+    assert context["mentioned_me"] is True
+    assert semantic_classify_skip_reason("帮我在旁边增加吴彦祖", context) == ""
+
+
+@pytest.mark.asyncio
+async def test_llm_classifier_tells_model_about_quoted_image() -> None:
+    llm = _FakeLLM(
+        '{"domain":"draw","action":"edit","operation":"update","source":"user_attachment",'
+        '"artifact":"image","confidence":0.9,"needs_tool":true,"tool_name":"edit_group_image"}'
+    )
+    decision = await LlmIntentClassifier(llm).classify(
+        "请帮我旁边增加海总",
+        context={"mentioned_me": True, "quoted_image": True, "is_group": True},
+    )
+    assert decision.domain is IntentDomain.DRAW
+    assert decision.action == "edit"
+    assert decision.tool_name == "edit_group_image"
+    assert "quotes or replies to an image" in llm.last_request.messages[0].content

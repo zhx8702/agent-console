@@ -19,6 +19,7 @@ const HARDCODED_RUNTIME = new Set([
 type InstalledPluginsSectionProps = {
   pluginCards: InstalledPlugin[];
   runtime: PluginRuntime;
+  runtimeErrors?: Record<string, string>;
   selectedPluginName?: string;
   restartRequired?: boolean;
   canManage: boolean;
@@ -28,6 +29,7 @@ type InstalledPluginsSectionProps = {
 export function InstalledPluginsSection({
   pluginCards,
   runtime,
+  runtimeErrors = {},
   selectedPluginName = "",
   restartRequired = false,
   canManage,
@@ -66,7 +68,7 @@ export function InstalledPluginsSection({
               </div>
               <p className="plugin-card-copy">{plugin.description || "无描述"}</p>
               <dl className="plugin-meta-list">
-                <div><dt>全局状态</dt><dd>{plugin.enabled ? "已启用" : "已停用"}</dd></div>
+                <div><dt>全局状态</dt><dd>{plugin.enabled == null ? "状态未知" : plugin.enabled ? "已启用" : "已停用"}</dd></div>
                 <div><dt>类型</dt><dd>{plugin.system ? "系统插件" : "普通插件"}</dd></div>
                 <div><dt>权限</dt><dd>{plugin.permissions?.length ?? 0}</dd></div>
                 <div><dt>重启</dt><dd>{plugin.restart_required ? "需要" : "不需要"}</dd></div>
@@ -78,7 +80,9 @@ export function InstalledPluginsSection({
                 </details>
               )}
 
-              {plugin.name === "amap" && (
+              {runtimeErrors[plugin.name] && <Alert variant="warning" title="运行状态不可用">{runtimeErrors[plugin.name]}</Alert>}
+              {!runtimeErrors[plugin.name] && !runtime[plugin.name as keyof PluginRuntime] && <p className="muted-copy">运行状态待查询</p>}
+              {plugin.name === "amap" && runtime.amap && (
                 <dl className="plugin-meta-list">
                   <div><dt>接口密钥</dt><dd>{runtime.amap?.api_key_configured ? "已配置" : "缺失"}</dd></div>
                   <div><dt>作用范围</dt><dd>{runtime.amap?.agent_scope || "群个人地图"}</dd></div>
@@ -87,7 +91,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "commands" && (
+              {plugin.name === "commands" && runtime.commands && (
                 <dl className="plugin-meta-list">
                   <div><dt>管理员</dt><dd>{runtime.commands?.admins ?? 0}</dd></div>
                   <div><dt>普通命令</dt><dd>{runtime.commands?.user_commands ?? 0}</dd></div>
@@ -95,7 +99,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "credits" && (
+              {plugin.name === "credits" && runtime.credits && (
                 <dl className="plugin-meta-list">
                   <div><dt>启用</dt><dd>{runtime.credits?.enabled ? "是" : "否"}</dd></div>
                   <div><dt>积分名</dt><dd>{runtime.credits?.credit_name || "-"}</dd></div>
@@ -103,7 +107,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "moderation" && (
+              {plugin.name === "moderation" && runtime.moderation && (
                 <dl className="plugin-meta-list">
                   <div><dt>启用</dt><dd>{runtime.moderation?.enabled ? "是" : "否"}</dd></div>
                   <div><dt>提醒模式</dt><dd>{runtime.moderation?.reminder_mode || "-"}</dd></div>
@@ -111,7 +115,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "memory" && (
+              {plugin.name === "memory" && runtime.memory && (
                 <dl className="plugin-meta-list">
                   <div><dt>画像</dt><dd>{runtime.memory?.profiles ?? 0}</dd></div>
                   <div><dt>事件</dt><dd>{runtime.memory?.events ?? 0}</dd></div>
@@ -119,7 +123,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "persona_extract" && (
+              {plugin.name === "persona_extract" && runtime.persona_extract && (
                 <dl className="plugin-meta-list">
                   <div><dt>人物画像</dt><dd>{runtime.persona_extract?.profiles ?? 0}</dd></div>
                   <div><dt>任务</dt><dd>{runtime.persona_extract?.jobs ?? 0}</dd></div>
@@ -127,7 +131,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "wxbot" && (
+              {plugin.name === "wxbot" && runtime.wxbot && (
                 <dl className="plugin-meta-list">
                   <div><dt>桥接</dt><dd>{runtime.wxbot?.running ? "运行中" : "未运行"}</dd></div>
                   <div><dt>微信连接</dt><dd>{runtime.wxbot?.sdk_online ? "在线" : "离线"}</dd></div>
@@ -136,7 +140,7 @@ export function InstalledPluginsSection({
                 </dl>
               )}
 
-              {plugin.name === "repeater" && (
+              {plugin.name === "repeater" && runtime.repeater && (
                 <dl className="plugin-meta-list">
                   <div><dt>启用</dt><dd>{runtime.repeater?.enabled ? "是" : "否"}</dd></div>
                   <div><dt>冷却时间</dt><dd>{runtime.repeater?.cooldown_seconds ?? 300} 秒</dd></div>
@@ -166,7 +170,7 @@ export function InstalledPluginsSection({
                     </p>
                   )}
                   confirmLabel={plugin.enabled ? "确认停用" : "确认启用"}
-                  disabled={plugin.system || !canManage}
+                  disabled={plugin.enabled == null || plugin.system || !canManage}
                   onConfirm={() => setPluginEnabled(plugin.name, !plugin.enabled)}
                 />
               </div>

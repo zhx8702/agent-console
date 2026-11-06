@@ -93,10 +93,10 @@ export const RELATION_LABELS: Record<string, string> = {
 };
 
 const ACCEPTANCE_LABELS: Record<string, string> = {
-  [DISPLAY_ACCEPTANCE_STATUS]: "已接受和待审核",
+  [DISPLAY_ACCEPTANCE_STATUS]: "已接受和观察中",
   accepted: "已接受",
   candidate: "候选关系",
-  needs_review: "待审核",
+  needs_review: "观察中",
   rejected: "已拒绝",
   superseded: "已被替代",
   expired: "已过期",
@@ -1183,15 +1183,26 @@ const SIGNAL_LABELS: Record<string, string> = {
 
 const POLICY_LABELS: Record<string, string> = {
   group_window_direct_signal: "有引用 / @ 这类直接互动，立即通过",
-  group_window_llm_multi_day: "模型关系在不止一天里出现，自动通过",
-  group_window_llm_repeated_evidence: "同一窗口内有 3 条以上消息支撑，自动通过",
+  group_window_llm_multi_day: "旧版策略：跨日重复后自动通过，未证明事实成立",
+  group_window_llm_repeated_evidence: "旧版策略：按消息条数自动通过，未证明事实成立",
+  group_window_semantic_review_required: "等待自动语义评估，消息条数和讨论天数不能代替核实",
   group_window_repeated_weak_signal: "弱信号跨天重复出现，自动通过",
   group_window_weak_signal: "只有单日弱信号，等待印证",
   group_window_low_value_hold: "闲聊提到或空泛兴趣，先挂起不占待审",
-  group_window_term_corroborated: "同一主题已有其他已通过的关系，系统印证通过",
-  group_window_pair_corroborated: "两人之间已有其他已通过的互动，系统印证通过",
+  group_window_term_corroborated: "旧版策略：因主题出现在其他关系中而通过，未核实当前关系",
+  group_window_pair_corroborated: "旧版策略：因两人有其他互动而通过，未核实当前关系",
   group_window_auto_accept: "旧版策略：全部自动通过",
-  group_window_relation: "自动通过已关闭，等待人工",
+  group_window_direct_batch: "批处理：仅接受尚未审核的直接互动记录",
+  group_window_relation: "等待自动评估或后续证据",
+};
+
+const EVIDENCE_REASON_LABELS: Record<string, string> = {
+  missing_evidence: "缺少原始证据",
+  evidence_truncated: "证据超过单次审核范围，需要完整复核",
+  non_text_or_missing_evidence: "含非文本占位或缺失记录",
+  ambiguous_evidence: "证据标识重复或来源不明",
+  no_subject_statement: "没有当事人本人的有效发言",
+  object_not_grounded: "关系对象无法在相关原文中核对",
 };
 
 /** Human-readable breakdown of why an edge exists; empty when the payload has nothing to say. */
@@ -1218,6 +1229,16 @@ export function judgementSummary(judgement?: GroupGraphEdgeJudgement | null) {
     reviewerText,
     modelReason: String(judgement.model_reason || "").trim(),
     dayCount: Number(judgement.day_count || 0),
+    evidenceText: judgement.evidence_quality?.version
+      ? `可用文本 ${judgement.evidence_quality.usable_count ?? 0} / 引用 ${judgement.evidence_quality.cited_count ?? 0} 条；当事人不同发言 ${judgement.evidence_quality.subject_statement_count ?? 0} 条。${
+          judgement.evidence_quality.status === "grounded"
+            ? "已核对发言归属和对象；这一步不能单独证明关系成立。"
+            : (judgement.evidence_quality.reasons || []).map((reason) => EVIDENCE_REASON_LABELS[reason] || reason).join("；")
+        }`
+      : "旧记录未保存证据核对结果。",
+    recallText: judgement.recall_block_reason
+      ? "未进入回复召回：关系或长期偏好尚未完成有效审核。"
+      : "",
   };
 }
 

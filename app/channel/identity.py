@@ -112,6 +112,22 @@ def _required(value: str, field_name: str) -> str:
     return normalized
 
 
+def is_hashed_channel_user_id(user_id: object) -> bool:
+    """Return True when the ID is a namespaced channel hash, not a provider ID."""
+
+    return str(user_id or "").strip().startswith("cx1:")
+
+
+def preferred_external_user_id(*candidates: object) -> str:
+    """Prefer a provider-native user ID over a hashed channel identity."""
+
+    values = [str(item or "").strip() for item in candidates if str(item or "").strip()]
+    for value in values:
+        if not is_hashed_channel_user_id(value):
+            return value
+    return values[0] if values else ""
+
+
 __all__ = [
     "LEGACY_WXBOT_CONNECTION_ID",
     "canonical_conversation_id",
@@ -119,5 +135,7 @@ __all__ = [
     "canonical_message_id",
     "canonical_participant_id",
     "canonical_session_namespace",
+    "is_hashed_channel_user_id",
+    "preferred_external_user_id",
     "require_legacy_wxbot_history_scope",
 ]

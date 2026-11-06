@@ -8,6 +8,7 @@ import { StatusTile } from "../components/StatusTile";
 import { TechnicalDetails, friendlyErrorMessage } from "../components/TechnicalDetails";
 import { apiRequest, formatJson } from "../lib/api";
 import { useStableIdempotencyKeys } from "../lib/idempotency";
+import { useRequestEpoch } from "./plugins/useRequestEpoch";
 import { useConsoleConfig } from "../state/console-config";
 
 type MarketplacePermission = {
@@ -83,9 +84,17 @@ function marketplaceStateLabel(item: MarketplaceItem) {
 
 export function PluginMarketplacePage() {
   const { config } = useConsoleConfig();
+  const keys = useStableIdempotencyKeys();
+  const scope = JSON.stringify([config.apiBaseUrl, config.adminToken, config.tenantId, config.sessionId]);
+  return <ScopedMarketplacePage key={scope} keys={keys} />;
+}
+
+function ScopedMarketplacePage({ keys }: { keys: ReturnType<typeof useStableIdempotencyKeys> }) {
+  const { config } = useConsoleConfig();
   const [searchParams] = useSearchParams();
   const selectedPluginName = searchParams.get("plugin")?.trim() || "";
-  const { keyFor, clear } = useStableIdempotencyKeys();
+  const { keyFor, clear } = keys;
+  const beginRequest = useRequestEpoch();
   const [data, setData] = useState<MarketplaceResponse | null>(null);
   const [restart, setRestart] = useState<RestartInstructions | null>(null);
   const [loading, setLoading] = useState(false);
@@ -110,34 +119,43 @@ export function PluginMarketplacePage() {
   }, [data]);
 
   const loadMarketplace = async () => {
+    const current = beginRequest("marketplace");
     setLoading(true);
     setError("");
     try {
       const result = await apiRequest<MarketplaceResponse>(config, "/v1/admin/plugins/marketplace", {
         auth: true,
       });
+      if (!current()) return;
       setData(result);
       setOutput(formatJson(result));
       if (result.restart_required) {
         await loadRestartInstructions();
+      if (!current()) return;
       }
     } catch (err) {
+      if (!current()) return;
+      setData(null);
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
+      if (!current()) return;
       setLoading(false);
     }
   };
 
   const loadRestartInstructions = async () => {
+    const current = beginRequest("restart");
     const result = await apiRequest<RestartInstructions>(config, "/v1/admin/runtime/restart-instructions", {
       auth: true,
       init: { method: "POST" },
     });
+      if (!current()) return;
     setRestart(result);
     return result;
   };
 
   const previewPluginChange = async (kind: PendingPluginChange["kind"], item: MarketplaceItem) => {
+    const current = beginRequest("mutation");
     setWorkingPlugin(item.name);
     setError("");
     try {
@@ -152,11 +170,14 @@ export function PluginMarketplacePage() {
           body: JSON.stringify(kind === "install" ? { name: item.name } : {}),
         },
       });
+      if (!current()) return;
       setOutput(formatJson(preview));
       setPendingChange({ kind, pluginName: item.name, preview });
     } catch (err) {
+      if (!current()) return;
       setError(err instanceof Error ? err.message : `${kind === "install" ? "安装" : "升级"}预检失败`);
     } finally {
+      if (!current()) return;
       setWorkingPlugin("");
     }
   };
@@ -166,8 +187,9 @@ export function PluginMarketplacePage() {
     item: MarketplaceItem,
     preview: PreviewResponse,
   ) => {
+    const current = beginRequest("mutation");
     const permissionIds = preview.permissions.map((permission) => permission.id);
-    const intent = `plugin:${kind}:${item.name}:${preview.version}:${permissionIds.slice().sort().join(",")}:${preview.restart_required}`;
+    const intent = `plugin:${config.apiBaseUrl}:${config.tenantId}:${kind}:${item.name}:${preview.version}:${permissionIds.slice().sort().join(",")}:${preview.restart_required}`;
     setWorkingPlugin(item.name);
     setError("");
     try {
@@ -189,21 +211,27 @@ export function PluginMarketplacePage() {
           }),
         },
       });
+      if (!current()) return;
       setOutput(formatJson(result));
       await loadMarketplace();
+      if (!current()) return;
       await loadRestartInstructions();
+      if (!current()) return;
       setPendingChange(null);
       clear(intent);
     } catch (err) {
+      if (!current()) return;
       setError(err instanceof Error ? err.message : `${kind === "install" ? "安装" : "升级"}失败`);
       throw err;
     } finally {
+      if (!current()) return;
       setWorkingPlugin("");
     }
   };
 
   const uninstallPlugin = async (item: MarketplaceItem) => {
-    const intent = `plugin:uninstall:${item.name}:${item.installed_version || item.version}`;
+    const current = beginRequest("mutation");
+    const intent = `plugin:${config.apiBaseUrl}:${config.tenantId}:uninstall:${item.name}:${item.installed_version || item.version}`;
     setWorkingPlugin(item.name);
     setError("");
     try {
@@ -214,14 +242,19 @@ export function PluginMarketplacePage() {
           headers: { "Idempotency-Key": keyFor(intent) },
         },
       });
+      if (!current()) return;
       setOutput(formatJson(result));
       await loadMarketplace();
+      if (!current()) return;
       await loadRestartInstructions();
+      if (!current()) return;
       clear(intent);
     } catch (err) {
+      if (!current()) return;
       setError(err instanceof Error ? err.message : "卸载失败");
       throw err;
     } finally {
+      if (!current()) return;
       setWorkingPlugin("");
     }
   };

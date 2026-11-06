@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from plugins.memory import store as _store_runtime
+from plugins.memory.group_evidence import group_recall_block_reason
 from plugins.memory.store import (
     HYBRID_GRAPH_CANDIDATE_MULTIPLIER,
     HYBRID_GRAPH_EPISODE_BUDGET,
@@ -1357,7 +1358,8 @@ class MemoryRetrievalStoreMixin:
             item_params["memory_item_ids"] = list(episode_item_ids)
             item_rows = await _exec(
                 "SELECT id, user_id, session_id, sensitivity, audience_scope, origin_session_kind, "
-                "allowed_session_ids, sensitivity_category, expires_at FROM plugin_memory_item "
+                "allowed_session_ids, sensitivity_category, expires_at, source_type, value_json "
+                "FROM plugin_memory_item "
                 "WHERE tenant_id = :tid AND channel = :channel AND user_id = :uid "
                 "AND id = ANY(:memory_item_ids) "
                 "AND deleted_at IS NULL AND status = 'active' "
@@ -1378,7 +1380,7 @@ class MemoryRetrievalStoreMixin:
             visible_episode_item_ids = _coerce_int_set(
                 row.get("id")
                 for row in item_rows
-                if _memory_item_visible_for_audience(
+                if not group_recall_block_reason(row) and _memory_item_visible_for_audience(
                     row,
                     session_id=session_id,
                     user_id=user_id,
@@ -1388,6 +1390,10 @@ class MemoryRetrievalStoreMixin:
 
         facts: list[dict[str, Any]] = []
         for index, row in enumerate(fact_rows):
+            if group_recall_block_reason({
+                "source_type": row.get("item_source_type"), "value_json": row.get("item_value_json"),
+            }):
+                continue
             if str(row.get("status") or "") != "active":
                 continue
             if row.get("invalid_at") is not None:

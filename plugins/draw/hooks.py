@@ -57,6 +57,7 @@ DRAW_ACCEPTED_TEXT = "收到, 正在画。"
 REDRAW_ACCEPTED_TEXT = "收到, 正在重绘。"
 DRAW_CONFIG_ERROR_TEXT = "画图失败：未配置画图服务。"
 DRAW_API_ERROR_TEXT = "画图失败：上游请求失败。"
+DRAW_NO_ACCOUNT_ERROR_TEXT = "画图失败：上游没有可用的画图账号。"
 DRAW_TIMEOUT_ERROR_TEXT = "画图失败：上游超时。"
 DRAW_EMPTY_RESPONSE_ERROR_TEXT = "画图失败：上游返回无图片。"
 DRAW_IMAGE_ID_ERROR_TEXT = "画图失败：图片ID无效/找不到。"
@@ -284,6 +285,17 @@ def _draw_failure_from_exception(exc: BaseException) -> DrawFailure:
             return DrawFailure("invalid_params", DRAW_PARAM_ERROR_TEXT)
         if "timeout" in message or "timed out" in message or "超时" in message or "timeout" in class_names:
             return DrawFailure("upstream_timeout", DRAW_TIMEOUT_ERROR_TEXT)
+        if any(
+            marker in message
+            for marker in (
+                "no eligible",
+                "grok_media_no_eligible",
+                "no_available_channel",
+                "无可用渠道",
+                "没有可用的画图账号",
+            )
+        ):
+            return DrawFailure("upstream_no_account", DRAW_NO_ACCOUNT_ERROR_TEXT)
         if "httpstatuserror" in class_names or "接口返回 " in message:
             return DrawFailure("upstream_http_status", DRAW_API_ERROR_TEXT)
         if (

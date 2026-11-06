@@ -231,6 +231,8 @@ def build_wxbot_group_agent_tools(service: WxbotAgentToolService) -> list[AgentT
                 parameters={
                     "type": "object",
                     "properties": {
+                        "sender_scope": {"type": "string", "enum": ["self", "group"], "description": "self 查询当前提问者本人；身份由服务端确定。"},
+                        "period": {"type": "string", "enum": ["today", "yesterday", "recent"], "description": "今天/昨天按群时区计算；recent 使用 hours。"},
                         "query": {
                             "type": "string",
                             "description": "要搜索的关键词，可留空表示只看最近消息。",

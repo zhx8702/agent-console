@@ -17,6 +17,7 @@ class JevPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = True
     shadow_only: bool = True
+    memory_mode: Literal["inherit", "auto", "shadow"] = "inherit"
     min_confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     relationship: bool = True
     memory: bool = True
@@ -31,6 +32,14 @@ class JevPolicy(BaseModel):
     knowledge_daily_hour: int = Field(default=3, ge=0, le=23)
     knowledge_timezone: str = "Asia/Shanghai"
     knowledge_min_confidence: float = Field(default=0.9, ge=0.8, le=1.0)
+
+    def memory_shadow_only(self) -> bool:
+        return self.shadow_only if self.memory_mode == "inherit" else self.memory_mode == "shadow"
+
+    def memory_review_key(self, model: str) -> str:
+        # Version the application policy as well as the input, so shadow audits
+        # do not suppress a later automatic review of the same evidence.
+        return fingerprint(["memory-automation-v1", model, self.memory_shadow_only(), self.min_confidence])
 
     @field_validator("knowledge_timezone")
     @classmethod
@@ -136,18 +145,26 @@ def questions(domain: str) -> dict:
         return {
             "decision": {"type": "choice", "instructions": untrusted + (
                 "Review whether the cited messages explicitly support this relationship. "
-                "Co-occurrence alone is not a relationship; account for quotation, negation, jokes and speaker attribution."
+                "Co-occurrence alone is not a relationship; account for quotation, negation, jokes and speaker attribution. "
+                "For interested_in, require the SUBJECT's own explicit enduring preference. Questions, comparisons, "
+                "complaints, purchase requests and temporary use are not enduring preferences. Other speakers and "
+                "image placeholders do not confirm the subject's claim. A familiar term elsewhere in the group is not evidence."
                 if domain == "relationship" else
                 "Review whether this memory is a durable, explicitly supported fact about the speaker. "
                 "Distinguish jokes, temporary requests, speculation and sensitive information."
             ), "criteria": {"accepted": "Clear supporting evidence; safe and useful to retain",
                              "needs_review": "Ambiguous, sensitive, insufficient evidence or uncertain attribution",
                              "rejected": "Contradicted, unsupported, joke or not a durable fact"}},
+            **({"durable_preference": {"type": "noul", "instructions": untrusted +
+                "Does the subject explicitly state an enduring interest or preference for this object in their own words? "
+                "Questions, negation, jokes, hearsay, criticism and temporary use are insufficient. "
+                "Return low probability when ambiguous or not a preference candidate."}}
+               if domain == "relationship" else {}),
             "supported": {"type": "noul", "instructions": untrusted + "Does the cited evidence explicitly support the candidate?"},
             "sensitive": {"type": "noul", "instructions": untrusted + "Does the candidate contain sensitive personal information?"},
             "quality": {"type": "score", "instructions": untrusted + "Rate the strength of the cited evidence.",
                         "criteria": ["none", "weak", "moderate", "strong"]},
-            "priority": {"type": "score", "instructions": untrusted + "How urgently should a human review this candidate?",
+            "priority": {"type": "score", "instructions": untrusted + "How severe would an incorrect acceptance of this candidate be?",
                          "criteria": ["routine", "ambiguous", "potentially harmful", "urgent"]},
         }
     if domain == "participation":

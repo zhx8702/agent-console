@@ -92,7 +92,8 @@ def build_jev_router(service, settings) -> APIRouter:
                                    {"v": version, "policy": body.policy.model_dump_json(), "tid": tenant_id})
                 return MutationChange(response={"version": version, "policy": body.policy.model_dump()},
                     before_state={"version": body.version}, after_state={"version": version,
-                        "enabled": body.policy.enabled, "shadow_only": body.policy.shadow_only}, resource_version=str(version))
+                        "enabled": body.policy.enabled, "shadow_only": body.policy.shadow_only,
+                        "memory_auto_apply": not body.policy.memory_shadow_only()}, resource_version=str(version))
             try:
                 outcome = await run_idempotent_mutation(conn,
                     identity=MutationIdentity(tenant_id=tenant_id, plugin_name="jev", operation="policy.update",

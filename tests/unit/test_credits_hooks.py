@@ -366,27 +366,30 @@ def _make_ctx(
     *,
     channel: Channel = Channel.WEB,
     session_id: str = "s1",
+    user_id: str = "u1",
     external_conversation_id: str = "",
     content: str = "hello",
     metadata: dict[str, object] | None = None,
     credit_action: str | None = None,
     credit_slots: dict[str, object] | None = None,
 ) -> PipelineContext:
+    event_metadata = dict(metadata or {})
     event = InboundEvent(
         message_id="m-1",
         tenant_id="demo",
         channel=channel,
-        user_id="u1",
+        user_id=user_id,
         session_id=session_id,
         external_conversation_id=external_conversation_id,
+        external_participant_id=str(event_metadata.get("external_participant_id") or ""),
         message=Message(content=content),
         trace_id="trace-1",
-        metadata=metadata or {},
+        metadata=event_metadata,
     )
     session = Session(
         session_id=session_id,
         tenant_id="demo",
-        user_id="u1",
+        user_id=user_id,
         channel=channel,
         external_conversation_id=external_conversation_id,
     )
@@ -668,6 +671,31 @@ async def test_credit_reserve_step_stops_when_balance_is_insufficient() -> None:
 
 
 @pytest.mark.asyncio
+async def test_credit_reserve_step_does_not_canned_automatic_participation() -> None:
+    store = _FakeCreditStore(cost=2, balance=0)
+    step = CreditReserveStep(store)
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="g1@chatroom",
+        content="房子也是我租的",
+        metadata={
+            "sender_name": "张三",
+            "mentioned_me": False,
+            "session_kind": "group",
+        },
+    )
+    ctx.extras["wxbot_participation"] = {"status": "may_reply"}
+
+    result = await step.run(ctx)
+
+    assert result.action != "stop"
+    assert result.result is None
+    assert result.reason == "no_cost"
+    assert store.reserve_calls == []
+    assert ctx.signals["billing"]["reservation"]["reason"] == "no_cost"
+
+
+@pytest.mark.asyncio
 async def test_credit_settle_step_captures_successful_llm_result() -> None:
     store = _FakeCreditStore(cost=4, balance=12)
     reserve = CreditReserveStep(store)
@@ -881,6 +909,53 @@ async def test_credit_deduction_blocks_zero_balance_before_llm() -> None:
     store = _FakeCreditStore(cost=2, balance=0)
     hook = CreditDeductionHook(store)
     ctx = _make_ctx()
+
+    with pytest.raises(HookAbort) as exc_info:
+        await hook.run(ctx)
+
+    assert exc_info.value.reason == "insufficient_credits"
+    assert exc_info.value.reply_text == "积分不足，请先签到。"
+    assert ctx.extras.get("_credits_cost") is None
+
+
+@pytest.mark.asyncio
+async def test_credit_deduction_skips_automatic_group_participation() -> None:
+    store = _FakeCreditStore(cost=2, balance=0)
+    hook = CreditDeductionHook(store)
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="g1@chatroom",
+        content="普通住宅可以注册公司吗",
+        metadata={
+            "sender_name": "张三",
+            "mentioned_me": False,
+            "session_kind": "group",
+        },
+    )
+    ctx.extras["wxbot_participation"] = {"status": "may_reply"}
+
+    await hook.run(ctx)
+
+    assert ctx.extras.get("_credits_cost") is None
+    assert ctx.extras.get("_credits_skip_reason") == "automatic_participation"
+    assert store.reserve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_credit_deduction_still_blocks_mentioned_must_reply_when_broke() -> None:
+    store = _FakeCreditStore(cost=2, balance=0)
+    hook = CreditDeductionHook(store)
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="g1@chatroom",
+        content="@zzz 帮我查一下",
+        metadata={
+            "sender_name": "张三",
+            "mentioned_me": True,
+            "session_kind": "group",
+        },
+    )
+    ctx.extras["wxbot_participation"] = {"status": "must_reply"}
 
     with pytest.raises(HookAbort) as exc_info:
         await hook.run(ctx)
@@ -1152,6 +1227,28 @@ async def test_credit_auto_checkin_uses_sender_wxid_for_wechat_identity() -> Non
 
 
 @pytest.mark.asyncio
+async def test_credit_auto_checkin_prefers_external_participant_over_hashed_sender() -> None:
+    store = _FakeCreditStore(cost=0, balance=0, checkin_reward=3, checkin_mode=2)
+    hook = CreditAutoCheckinHook(store)
+    hashed = "cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b"
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="g1@chatroom",
+        user_id=hashed,
+        metadata={
+            "sender_name": "Z",
+            "sender_wxid": hashed,
+            "external_participant_id": "zhx870255124",
+        },
+    )
+
+    await hook.run(ctx)
+
+    assert len(store.checkin_calls) == 1
+    assert store.checkin_calls[0]["user_id"] == "zhx870255124"
+
+
+@pytest.mark.asyncio
 async def test_credit_auto_checkin_skips_command_mode() -> None:
     store = _FakeCreditStore(cost=0, balance=0, checkin_reward=3, checkin_mode=1)
     hook = CreditAutoCheckinHook(store)
@@ -1208,6 +1305,40 @@ async def test_credit_natural_language_balance_query_runs_silent_checkin_first()
     assert ctx.extras["_credits_auto_checkin_result"]["checked_in"] is True
     assert "你当前有 3 积分。" in exc_info.value.reply_text
     assert "今日已签到，获得 3 积分。" in exc_info.value.reply_text
+
+
+@pytest.mark.asyncio
+async def test_credit_natural_language_ignores_x_search_for_third_party_quota() -> None:
+    store = _FakeCreditStore(cost=0, balance=9545)
+    hook = CreditNaturalLanguageHook(store)
+    ctx = _make_ctx(
+        channel=Channel.WECHAT,
+        session_id="g1@chatroom",
+        content="@zzz 搜下x 目前grok bot 有多少额度",
+        metadata={
+            "sender_name": "张三",
+            "mentioned_me": True,
+            "wxbot_normalized_content": "搜下x 目前grok bot 有多少额度",
+        },
+    )
+    persist_decision(
+        IntentDecision(
+            domain=IntentDomain.WEB_SEARCH,
+            action="retrieve",
+            source="x",
+            confidence=0.94,
+            needs_tool=True,
+            tool_name="x_search",
+        ),
+        pre=ctx.pre,
+    )
+    ctx.route = RouteDecision(type=RouteType.LLM)
+
+    await hook.run(ctx)
+
+    assert store.checkin_calls == []
+    assert ctx.signals["credits"]["intent"]["should_handle"] is False
+    assert ctx.signals["credits"]["intent"]["reason"] == "not_matched"
 
 
 @pytest.mark.asyncio

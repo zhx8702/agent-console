@@ -13,6 +13,7 @@ class EmbedRequest:
     trace_id: str
     model: str
     texts: list[str]
+    priority: str = "query"
 
 
 @dataclass

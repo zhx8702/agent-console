@@ -14,7 +14,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
-from app.common.intent import IntentDecision, IntentDomain
+from app.channel.models import configuration_session_id
+from app.common.intent import IntentDecision, IntentDomain, is_local_history_lookup
 from app.common.intent_runtime import decision_from_pre, is_confident, slot_int, slot_text
 from app.common.logging import get_logger
 from app.common.types import (
@@ -31,6 +32,7 @@ from app.plugin.hooks import HookAbort, HookPoint
 from app.preprocessing.pii import detect_and_mask
 from app.social.contracts import MemberPrivacyValues
 from plugins.memory.observability import build_safe_memory_profile_signal
+from plugins.memory.runtime_legacy import retrieve_legacy_group_memory
 from plugins.memory.store import (
     GROUP_HISTORY_USER_ID_SCOPE,
     MemoryItemConflictError,
@@ -1024,6 +1026,9 @@ async def handle_memory_control_intent(store: MemoryStore, ctx: PipelineContext)
         return None
     scope = _memory_control_scope(ctx)
     decision = decision_from_pre(ctx.pre)
+    if is_local_history_lookup(decision):
+        ctx.signals["memory_control"] = {"matched": False, "reason": "history_lookup"}
+        return None
 
     remember_content = _parse_remember_intent(text, decision=decision)
     if remember_content:
@@ -1680,6 +1685,47 @@ class MemoryContextHook:
             user_id=user_id,
             load_scope=load_scope,
         )
+        if load_scope == "group" and _settings_bool(self.store.settings, "memory_retrieval_enabled", True):
+            metadata = dict(ctx.event.metadata or {})
+            try:
+                legacy = await retrieve_legacy_group_memory(
+                    self.store,
+                    tenant_id=tenant_id,
+                    connection_id=str(ctx.event.connection_id or metadata.get("connection_id") or ""),
+                    session_id=ctx.event.session_id,
+                    external_session_id=configuration_session_id(ctx.event, ctx.session),
+                    source_key=source_key,
+                    query=_current_user_text(ctx),
+                    limit=_settings_int(self.store.settings, "memory_retrieval_top_k", 6, minimum=1, maximum=20),
+                )
+                if not legacy["items"] and not legacy["facts"]:
+                    return profile
+                previous = dict(_memory_runtime_signal(ctx)["load"]["scopes"].get(load_scope) or {})
+                added_items = 0
+                truncated = bool(previous.get("truncated"))
+                for key, incoming, limit in (
+                    ("relevant_memory_items", "items", _settings_int(self.store.settings, "memory_retrieval_top_k", 6, minimum=1, maximum=20)),
+                    ("relevant_graph_facts", "facts", _settings_int(self.store.settings, "memory_graph_retrieval_fact_top_k", 3, minimum=1, maximum=10)),
+                ):
+                    current = list(profile.get(key) or [])
+                    seen = {row.get("id") for row in current}
+                    added = [row for row in legacy[incoming] if row.get("id") not in seen]
+                    if incoming == "items":
+                        added_items = len(added)
+                    current.extend(added)
+                    truncated = truncated or len(current) > limit
+                    profile[key] = current[:limit]
+                profile["retrieval_truncated"] = truncated
+                _record_memory_load_scope(
+                    ctx, scope=load_scope, profile=profile,
+                    retrieval_mode=str(profile.get("retrieval_mode") or "sql"),
+                    candidate_count=int(previous.get("candidate_count") or 0) + added_items,
+                    budget_chars=int(profile.get("memory_graph_budget_chars") or 0),
+                    truncated=truncated,
+                )
+            except Exception as exc:
+                # Keep current canonical results when legacy provenance is unavailable.
+                logger.warning("memory.legacy_group_read_failed", error_type=type(exc).__name__)
         return profile
 
     async def _load_context(self, ctx: PipelineContext) -> None:
@@ -1702,8 +1748,23 @@ class MemoryContextHook:
             member_privacy,
             session_id=ctx.event.session_id,
         )
+        should_load_group = _should_load_group_memory(ctx, user_id)
+        public_recall_allowed = False
+        public_loader = getattr(self.store, "group_public_memory_enabled", None)
+        if should_load_group and callable(public_loader):
+            try:
+                public_recall_allowed = await public_loader(
+                    tenant_id=tenant_id,
+                    session_id=configuration_session_id(ctx.event, ctx.session),
+                ) is True
+            except Exception:
+                public_recall_allowed = False
         if not recall_allowed:
             ctx.signals.setdefault("memory", {})["member_recall_blocked"] = True
+            _memory_runtime_signal(ctx)["load"]["scopes"]["member"] = {
+                "status": "blocked", "reason": "member_privacy_blocked",
+            }
+        if not recall_allowed and not public_recall_allowed:
             _set_memory_runtime_stage(
                 ctx,
                 "load",
@@ -1712,15 +1773,10 @@ class MemoryContextHook:
             )
             return
 
-        should_load_group = _should_load_group_memory(ctx, user_id)
-        load_specs = [
-            (
-                "member",
-                user_id,
-                "group" if _is_group_session(ctx) else "private",
-            )
-        ]
-        if should_load_group:
+        load_specs = []
+        if recall_allowed:
+            load_specs.append(("member", user_id, "group" if _is_group_session(ctx) else "private"))
+        if should_load_group and (recall_allowed or public_recall_allowed):
             load_specs.append(("group", GROUP_HISTORY_USER_ID_SCOPE, "group"))
         tasks = [
             asyncio.create_task(
@@ -2168,8 +2224,11 @@ class MemoryLoadStep:
 
     async def run(self, ctx: PipelineContext) -> StepResult:
         await MemoryContextHook(self.store).run(ctx)
-        profile = _sync_memory_signal(ctx)
-        return StepResult(reason="loaded" if profile else "no_session")
+        _sync_memory_signal(ctx)
+        load = _memory_runtime_signal(ctx).get("load", {})
+        status = str(load.get("status") or "")
+        reason = str(load.get("reason") or "not_loaded")
+        return StepResult(reason="loaded" if status == "loaded" else reason)
 
 
 @dataclass

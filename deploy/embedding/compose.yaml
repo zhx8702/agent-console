@@ -1,0 +1,41 @@
+services:
+  model:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    gpus: all
+    mem_limit: 4g
+    cpus: 2
+    environment:
+      OLLAMA_KEEP_ALIVE: -1
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_MAX_LOADED_MODELS: 1
+      GGML_CUDA_DISABLE_GRAPHS: 1
+    volumes:
+      - ${EMBEDDING_MODELS_DIR:?Set the existing Ollama models directory}:/root/.ollama/models:ro
+    networks: [embedding]
+  worker:
+    image: ${PYTHON_IMAGE:-python:3.11-slim}
+    restart: unless-stopped
+    command: [python, -u, /service/worker.py]
+    mem_limit: 256m
+    cpus: 1
+    environment:
+      OLLAMA_URL: http://model:11434
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3:latest}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      EMBEDDING_TOKEN_FILE: /run/secrets/embedding_token
+    volumes:
+      - ${EMBEDDING_WORKER_PATH:-./worker.py}:/service/worker.py:ro
+      - ${EMBEDDING_TOKEN_PATH:?Set the private token file}:/run/secrets/embedding_token:ro
+    ports:
+      - "127.0.0.1:${EMBEDDING_PORT:-11435}:8080"
+    networks: [embedding]
+    depends_on: [model]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 300s
+networks:
+  embedding: {}

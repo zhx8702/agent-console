@@ -817,6 +817,7 @@ _MEMORY_RUNTIME_SETTING_KEYS = (
     "memory_llm_extraction_job_drain_enabled",
     "memory_retrieval_enabled",
     "memory_group_identity_memory_enabled",
+    "llm_embed_provider",
     "memory_hybrid_retrieval_enabled",
     "memory_vector_index_enabled",
     "memory_graph_retrieval_enabled",
@@ -865,6 +866,11 @@ def _memory_management_diagnostics(
     session_id: str,
 ) -> list[dict[str, str]]:
     diagnostics: list[dict[str, str]] = []
+    if config.get("llm_embed_provider") == "fake" and config.get("memory_vector_index_enabled"):
+        diagnostics.append({
+            "area": "recall", "status": "warning", "code": "non_semantic_embedding",
+            "message": "当前使用测试向量，无法按语义召回。请配置真实 embedding 并重建索引；模型名称不代表实际供应商。",
+        })
     if config.get("memory_retrieval_enabled") is False:
         diagnostics.append(
             {
@@ -1397,6 +1403,24 @@ def build_memory_router(
             items=items,
             session_id=session_id,
         )
+        member_policy: dict[str, Any] = {}
+        if session_id.endswith("@chatroom") and user_id:
+            reader = getattr(store, "get_group_member_privacy_policy", None)
+            if callable(reader):
+                try:
+                    policy = await reader(tenant_id=tenant_id, session_id=session_id, user_id=user_id)
+                    member_policy = {
+                        "memory_enabled": policy.memory_enabled,
+                        "allow_group_recall": policy.allow_group_recall,
+                        "audience_scope": policy.audience_scope,
+                    }
+                    if not policy.memory_enabled or not policy.allow_group_recall:
+                        diagnostics.append({
+                            "area": "member_memory", "status": "blocked", "code": "member_privacy_blocked",
+                            "message": "该成员的群内记忆未获授权，个人记忆不会进入本群回复。群公共记忆由独立的群设置控制。",
+                        })
+                except Exception:
+                    source_errors.append("member_policy_unavailable")
         diagnostics.extend(
             {
                 "area": "observability",
@@ -1420,6 +1444,7 @@ def build_memory_router(
                 "note": "这些值是当前服务进程的生效配置；租户/会话开关以 runtime_scope 为准。",
             },
             "runtime_scope": runtime_scope,
+            "member_policy": member_policy,
             "jobs": {
                 "stats": job_stats,
                 "recent": [_safe_extraction_job_row(row) for row in recent_jobs],

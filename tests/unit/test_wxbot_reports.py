@@ -316,6 +316,8 @@ class _CaptureBridge:
         self.outbound_error = ""
         self.detail_error_status = 0
         self.list_reply_text = "日报正文"
+        self.next_outbound_id = 1
+        self.outbound_rows: dict[int, dict[str, object]] = {}
 
     async def sdk_request(
         self,
@@ -339,33 +341,68 @@ class _CaptureBridge:
                 ]
             }
         if path == "/send":
-            return {"queued": True, "id": 1}
-        if path == "/queue/messages/1":
+            row_id = self.next_outbound_id
+            self.next_outbound_id += 1
+            command_id = str((request_headers or {}).get("Idempotency-Key") or f"wxbot-report:{row_id}")
+            text = str((json_body or {}).get("text") or "")
+            self.outbound_rows[row_id] = {
+                "id": row_id,
+                "session_id": "room@chatroom",
+                "session_name": "测试群",
+                "command_id": command_id,
+                "reply_text": text,
+                "status": self.outbound_status,
+                "error": self.outbound_error,
+            }
+            return {"queued": True, "id": row_id}
+        if path.startswith("/queue/messages/"):
+            row_id = int(path.rsplit("/", 1)[-1])
             if self.detail_error_status:
                 from fastapi import HTTPException
 
                 raise HTTPException(self.detail_error_status, "detail unavailable")
+            row = self.outbound_rows.get(row_id)
+            if row is None and row_id == 1:
+                return {
+                    "id": 1,
+                    "session_id": "room@chatroom",
+                    "session_name": "测试群",
+                    "command_id": "wxbot-report:1",
+                    "status": self.outbound_status,
+                    "error": self.outbound_error,
+                }
+            if row is None:
+                from fastapi import HTTPException
+
+                raise HTTPException(404, "missing outbound row")
             return {
-                "id": 1,
-                "session_id": "room@chatroom",
-                "session_name": "测试群",
-                "command_id": "wxbot-report:1",
+                **row,
                 "status": self.outbound_status,
                 "error": self.outbound_error,
             }
         if path == "/queue/messages":
+            items = list(self.outbound_rows.values()) or [
+                {
+                    "id": 1,
+                    "session_id": "room@chatroom",
+                    "session_name": "测试群",
+                    "idempotency_key": "",
+                    "reply_text": self.list_reply_text,
+                    "status": self.outbound_status,
+                    "error": self.outbound_error,
+                }
+            ]
             return {
-                "count": 1,
+                "count": len(items),
                 "items": [
                     {
-                        "id": 1,
-                        "session_id": "room@chatroom",
-                        "session_name": "测试群",
+                        **item,
                         "idempotency_key": "",
                         "reply_text": self.list_reply_text,
                         "status": self.outbound_status,
                         "error": self.outbound_error,
                     }
+                    for item in items
                 ],
             }
         return {"ok": True}
@@ -1357,3 +1394,82 @@ async def test_send_report_job_marks_failed_sdk_row_indeterminate() -> None:
     assert sent is False
     assert store.jobs[1]["delivery_status"] == "indeterminate"
     assert "group transition not confirmed" in store.jobs[1]["delivery_error"]
+
+
+def test_split_report_send_text_keeps_short_body() -> None:
+    assert reports.split_report_send_text("短正文", max_chars=20) == ["短正文"]
+
+
+def test_split_report_send_text_breaks_on_paragraphs_and_marks_parts() -> None:
+    text = "标题\n\n" + ("一段话。" * 40) + "\n\n" + ("另一段。" * 40)
+    parts = reports.split_report_send_text(text, max_chars=80)
+    assert len(parts) >= 2
+    assert all(len(part) <= 80 for part in parts)
+    assert any("（1/" in part for part in parts)
+
+
+async def test_send_report_job_splits_long_monthly_text() -> None:
+    store = _ReportStore()
+    store.settings.wxbot_report_send_max_chars = 80
+    long_body = "\n\n".join(f"段落{index} " + ("月报内容" * 8) for index in range(1, 6))
+    store.jobs[1].update(
+        {
+            "report_type": "monthly",
+            "period_key": "2026-10",
+            "period_label": "2026-10",
+            "status": "completed",
+            "result_text": f"[测试群] 月报 · 2026-10\n\n{long_body}",
+            "delivery_status": "pending",
+        }
+    )
+    bridge = _CaptureBridge()
+    service = reports.WxbotReportService(
+        store,
+        SimpleNamespace(llm_service=None),
+        bridge=bridge,
+        scope_execution_allowed=_allow_scope,
+    )
+
+    sent = await service.send_report_job(1)
+
+    send_calls = [call for call in bridge.calls if call[1] == "/send"]
+    assert sent is True
+    assert len(send_calls) >= 2
+    assert all(len(str(call[3]["text"])) <= 80 for call in send_calls)
+    assert bridge.request_headers[0] == {"Idempotency-Key": "wxbot-report:1:p1"}
+    assert store.jobs[1]["report_payload"]["send_part_count"] == len(send_calls)
+
+
+async def test_monthly_rollup_prompt_asks_for_short_body() -> None:
+    store = _ReportStore()
+    store.jobs[1].update(
+        {
+            "report_type": "monthly",
+            "period_key": "2026-04",
+            "period_label": "2026-04",
+        }
+    )
+    store.jobs[2] = {
+        "id": 2,
+        "tenant_id": "default",
+        "session_id": "room@chatroom",
+        "session_name": "测试群",
+        "report_type": "weekly",
+        "period_key": "2026-03-30..2026-04-05",
+        "period_label": "2026-03-30..2026-04-05",
+        "status": "completed",
+        "current_stage": "completed",
+        "msg_count": 1,
+        "result_text": "周报 2026-03-30..2026-04-05",
+        "report_payload": {},
+        "delivery_status": "pending",
+        "error": "",
+    }
+    llm = _CaptureLlm()
+    service = _ReportService(store, SimpleNamespace(llm_service=llm))
+
+    await service.run_report_job(1)
+
+    user = str(llm.requests[0].messages[0].content)
+    assert "1500 字以内" in user
+    assert llm.requests[0].max_tokens == 700

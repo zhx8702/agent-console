@@ -2112,7 +2112,7 @@ async def test_target_flow_matches_legacy_memory_load_and_save(
     assert flow.last_flow_runtime_result is not None
     assert flow.last_flow_runtime_result.status == "completed"
     traces = {step.kind: step for step in flow.last_flow_runtime_result.steps}
-    assert traces["plugin.memory.load"].reason == "no_session"
+    assert traces["plugin.memory.load"].reason == "member_privacy_blocked"
     assert traces["plugin.memory.save"].reason == "member_privacy_blocked"
 
 

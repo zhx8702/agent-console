@@ -75,6 +75,13 @@ def test_pii_no_hit_passes_through():
     assert pii_map == {}
 
 
+def test_pii_does_not_treat_tweet_ids_as_bank_cards():
+    text = "https://x.com/thsottiaux/status/2077607697487188198 解释一下"
+    masked, pii_map = detect_and_mask(text)
+    assert masked == text
+    assert pii_map == {}
+
+
 # ---- intent ----------------------------------------------------------------
 
 def test_intent_without_decision_is_unknown():

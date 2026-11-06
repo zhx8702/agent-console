@@ -588,6 +588,37 @@ async def test_budgeted_queue_output_kinds_reserve_before_enqueue_and_commit(
 
 
 @pytest.mark.asyncio
+async def test_store_masks_sensitive_terms_before_queue_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inserts: list[dict] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if sql.startswith("INSERT INTO plugin_wxbot_reply_queue"):
+            inserts.append(dict(params or {}))
+            return [{"id": 88}]
+        return []
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fake_exec)
+    store = WxbotStore(SimpleNamespace())
+    reply_id = await store.enqueue_reply(
+        tenant_id="demo",
+        session_id="desensitize-room@chatroom",
+        session_name="测试群",
+        sender_name="",
+        reply_text="别拿习近平和做爱开玩笑，操作按文档走。",
+        session_kind="group",
+        command_id="desensitize-88",
+    )
+
+    assert reply_id == 88
+    assert inserts[0]["reply"] == "别拿***和**开玩笑，操作按文档走。"
+    delivery = wxbot_store_module.json.loads(inserts[0]["delivery_json"])
+    assert "习近平" in delivery["outbound_desensitize"]["matched"]
+    assert "做爱" in delivery["outbound_desensitize"]["matched"]
+
+
+@pytest.mark.asyncio
 async def test_store_duplicate_guard_cancels_soft_but_preserves_obligation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -653,6 +684,68 @@ async def test_store_duplicate_guard_cancels_soft_but_preserves_obligation(
     delivery = wxbot_store_module.json.loads(inserts[0]["delivery_json"])
     assert delivery["near_duplicate_guard"]["action"] == "rewritten"
     assert delivery["near_duplicate_guard"]["complete_answer_preserved"] is True
+
+
+@pytest.mark.asyncio
+async def test_store_agree_echo_cancels_soft_but_keeps_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = InMemoryGroupSpeechLedger(now=lambda: _NOW)
+    inserts: list[dict] = []
+
+    async def fake_exec(sql: str, params: dict | None = None) -> list[dict]:
+        if sql.startswith("INSERT INTO plugin_wxbot_reply_queue"):
+            inserts.append(dict(params or {}))
+            return [{"id": len(inserts)}]
+        return []
+
+    monkeypatch.setattr(wxbot_store_module, "_exec", fake_exec)
+    store = WxbotStore(SimpleNamespace(), speech_ledger=ledger)
+    source_message = {
+        "message": {"content": "还是错怪了codex了，他的computer use真的是独一档的"},
+    }
+
+    with pytest.raises(GroupSpeechBudgetExceeded) as caught:
+        await store.enqueue_reply(
+            tenant_id="demo",
+            session_id="echo-room@chatroom",
+            session_name="测试群",
+            sender_name="",
+            reply_text="是啊，computer use这块确实独一档，错怪了就对了 hhh",
+            session_kind="group",
+            source_message=source_message,
+            delivery={"speech_class": "soft"},
+            command_id="soft-echo",
+        )
+    assert caught.value.reason == "agree_echo"
+    assert inserts == []
+
+    reply_id = await store.enqueue_reply(
+        tenant_id="demo",
+        session_id="echo-room@chatroom",
+        session_name="测试群",
+        sender_name="",
+        reply_text="computer use确实猛，不过这次炸的是容量，歇一会再试",
+        session_kind="group",
+        source_message=source_message,
+        delivery={"speech_class": "soft", "speech_budget_enabled": False},
+        command_id="soft-context",
+    )
+    assert reply_id == 1
+    assert "歇一会再试" in inserts[0]["reply"]
+
+    obligation_id = await store.enqueue_reply(
+        tenant_id="demo",
+        session_id="echo-room@chatroom",
+        session_name="测试群",
+        sender_name="",
+        reply_text="是啊，computer use这块确实独一档，错怪了就对了",
+        session_kind="group",
+        source_message=source_message,
+        delivery={"speech_class": "obligation", "speech_budget_enabled": False},
+        command_id="obligation-echo",
+    )
+    assert obligation_id == 2
 
 
 @pytest.mark.asyncio

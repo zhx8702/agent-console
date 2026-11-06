@@ -40,7 +40,12 @@ from app.channel.identity import (
 from app.common.logging import get_logger
 from app.infra.db import get_engine
 from app.infra.runtime_schema import verify_runtime_schema
-from app.social.reply_style import NaturalReplyStyleGuard
+from app.postprocessing.outbound_desensitize import desensitize_outbound_text
+from app.social.reply_style import (
+    NaturalReplyStyleGuard,
+    is_agree_echo,
+    soften_repeated_trailing_tics,
+)
 from app.social.revalidation import evaluate_group_reply_revalidation
 from app.social.speech_ledger import (
     GroupSpeechBudgetExceeded,
@@ -406,8 +411,15 @@ def _source_message_text(source_message: dict[str, Any] | None) -> str:
     payload = source_message if isinstance(source_message, dict) else {}
     message = payload.get("message")
     if isinstance(message, dict):
-        return str(message.get("content") or "")
-    return str(payload.get("content") or payload.get("text") or "")
+        content = str(message.get("content") or "").strip()
+        if content:
+            return content
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        normalized = str(metadata.get("wxbot_normalized_content") or "").strip()
+        if normalized:
+            return normalized
+    return str(payload.get("content") or payload.get("text") or "").strip()
 
 
 async def _exec(sql: str, params: dict | None = None) -> list[dict]:
@@ -1015,12 +1027,13 @@ class WxbotStore(WxbotReportStoreMixin):
                 text=file_idempotency_material or reply_text or image_url or image_path,
             )
             style_result = None
+            style_history = None
             if (
                 msg_type == "text"
                 and output_kind in {"ordinary", "proactive"}
                 and bool(initial_delivery.get("style_eligible"))
             ):
-                history = await self._speech_ledger.recent_style_history(
+                style_history = await self._speech_ledger.recent_style_history(
                     tenant_id,
                     session_id,
                 )
@@ -1034,7 +1047,7 @@ class WxbotStore(WxbotReportStoreMixin):
                         if "explicitly_detailed" in initial_delivery
                         else None
                     ),
-                    history=history,
+                    history=style_history,
                     voice_profile=(
                         initial_delivery.get("voice_profile")
                         if isinstance(initial_delivery.get("voice_profile"), dict)
@@ -1052,6 +1065,42 @@ class WxbotStore(WxbotReportStoreMixin):
                     "emoji": style_result.emoji,
                     "catchphrase": style_result.catchphrase,
                 }
+            if msg_type == "text" and output_kind != "repeater":
+                if style_history is None:
+                    style_history = await self._speech_ledger.recent_style_history(
+                        tenant_id,
+                        session_id,
+                    )
+                reply_text, mood_tic, mood_stripped = soften_repeated_trailing_tics(
+                    reply_text,
+                    recent_catchphrases=style_history.catchphrases_last_30,
+                )
+                if mood_stripped:
+                    initial_delivery["trailing_tic_guard"] = {
+                        "tic": mood_tic,
+                        "suppressed": True,
+                    }
+                elif mood_tic:
+                    initial_delivery["trailing_tic_guard"] = {
+                        "tic": mood_tic,
+                        "suppressed": False,
+                    }
+                    if style_result is not None and not style_result.catchphrase:
+                        initial_delivery["style_guard"]["catchphrase"] = mood_tic
+            if (
+                msg_type == "text"
+                and speech_class in {"soft", "scheduled"}
+                and is_agree_echo(reply_text, _source_message_text(source_message))
+            ):
+                observe_duplicate_guard(
+                    speech_class=speech_class,
+                    action="cancelled",
+                )
+                raise GroupSpeechBudgetExceeded(
+                    "agree_echo",
+                    output_kind=output_kind,
+                    idempotency_key=clean_command_id,
+                )
             if msg_type == "text" and output_kind == "ordinary" and duplicate_guard_enabled:
                 near_duplicate = await self._speech_ledger.has_near_duplicate(
                     tenant_id=tenant_id,
@@ -1087,6 +1136,16 @@ class WxbotStore(WxbotReportStoreMixin):
                         action="allowed",
                     )
             if speech_budget_enabled and not deferred_candidate:
+                trailing_guard = (
+                    initial_delivery.get("trailing_tic_guard")
+                    if isinstance(initial_delivery.get("trailing_tic_guard"), dict)
+                    else {}
+                )
+                ledger_catchphrase = (
+                    style_result.catchphrase if style_result is not None else ""
+                )
+                if not ledger_catchphrase and trailing_guard.get("tic") and not trailing_guard.get("suppressed"):
+                    ledger_catchphrase = str(trailing_guard.get("tic") or "")
                 reservation = await reserve_or_raise(
                     self._speech_ledger,
                     tenant_id=tenant_id,
@@ -1096,7 +1155,7 @@ class WxbotStore(WxbotReportStoreMixin):
                     speech_class=speech_class,
                     text=file_idempotency_material or reply_text or image_url or image_path,
                     emoji=style_result.emoji if style_result is not None else "",
-                    catchphrase=(style_result.catchphrase if style_result is not None else ""),
+                    catchphrase=ledger_catchphrase,
                     metadata={
                         "msg_type": msg_type,
                         "trace_id": trace_id,
@@ -1113,6 +1172,12 @@ class WxbotStore(WxbotReportStoreMixin):
         if clean_command_id:
             initial_delivery["command_id"] = clean_command_id
             initial_delivery["idempotency_key"] = clean_command_id
+        if msg_type == "text" and reply_text:
+            reply_text, desensitize_hits = desensitize_outbound_text(reply_text)
+            if desensitize_hits:
+                initial_delivery["outbound_desensitize"] = {
+                    "matched": list(desensitize_hits),
+                }
         try:
             rows = await _exec(
                 "INSERT INTO plugin_wxbot_reply_queue "
@@ -2549,6 +2614,41 @@ class WxbotStore(WxbotReportStoreMixin):
             params,
         )
         return [self._hydrate_group_observation(row) for row in rows]
+
+    async def search_recorded_group_messages(
+        self, *, tenant_id: str, session_id: str, start_ts: int, end_ts: int,
+        sender_wxid: str = "", sender_name: str = "", query: str = "",
+        exclude_message_id: str = "", limit: int = 20,
+    ) -> dict[str, Any]:
+        if not tenant_id or not session_id.endswith("@chatroom") or end_ts <= start_ts:
+            raise ValueError("invalid_history_scope")
+        if end_ts - start_ts > 14 * 86400:
+            raise ValueError("history_window_exceeds_limit")
+        rows = await _exec(
+            "SELECT id, sender_name, left(content, 1200) AS text, length(content) > 1200 AS text_truncated, "
+            "occurred_ts, received_at, COUNT(*) OVER() AS matched_count "
+            "FROM plugin_wxbot_group_observations "
+            "WHERE tenant_id = :tid AND session_id = :sid AND is_self_sent = FALSE "
+            "AND msg_type = 'text' AND message_id <> :exclude_mid "
+            "AND COALESCE(NULLIF(occurred_ts, 0), EXTRACT(EPOCH FROM received_at AT TIME ZONE 'UTC')) >= :start_ts "
+            "AND COALESCE(NULLIF(occurred_ts, 0), EXTRACT(EPOCH FROM received_at AT TIME ZONE 'UTC')) < :end_ts "
+            "AND (:sender = '' OR sender_wxid = :sender) "
+            "AND (:sender_name = '' OR strpos(lower(sender_name), lower(:sender_name)) > 0) "
+            "AND (:query = '' OR strpos(lower(content), lower(:query)) > 0) "
+            "ORDER BY COALESCE(NULLIF(occurred_ts, 0), EXTRACT(EPOCH FROM received_at AT TIME ZONE 'UTC')) DESC, id DESC LIMIT :lim",
+            {"tid": tenant_id, "sid": session_id, "start_ts": start_ts, "end_ts": end_ts,
+             "sender": sender_wxid, "sender_name": sender_name, "query": query,
+             "exclude_mid": exclude_message_id, "lim": max(1, min(int(limit), 20))},
+        )
+        total = int(rows[0]["matched_count"]) if rows else 0
+        messages = [
+            {"observation_id": row["id"], "sender_name": row.get("sender_name") or "成员",
+             "text": row.get("text") or "", "text_truncated": row.get("text_truncated") is True,
+             "occurred_ts": row.get("occurred_ts"),
+             "received_at": str(row.get("received_at") or "")}
+            for row in rows
+        ]
+        return {"total": total, "truncated": total > len(messages), "messages": messages}
 
     async def list_recent_group_observations(
         self,

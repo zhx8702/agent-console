@@ -76,6 +76,17 @@ class IntentDomain(str, Enum):
     UNKNOWN = "unknown"
 
 
+def is_local_history_lookup(decision: IntentDecision | None) -> bool:
+    return bool(
+        decision is not None
+        and decision.confidence >= 0.6
+        and decision.operation is IntentOperation.RETRIEVE
+        and decision.source is IntentSource.LOCAL_HISTORY
+        and decision.domain in {IntentDomain.MEMORY, IntentDomain.GROUP_INFO}
+        and decision.action in {"search", "list", "query"}
+    )
+
+
 _EnumT = TypeVar("_EnumT", bound=Enum)
 _DEFAULT_OPERATION = IntentOperation.UNKNOWN
 _DEFAULT_SOURCE = IntentSource.NONE

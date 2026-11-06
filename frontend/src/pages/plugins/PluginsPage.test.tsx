@@ -228,6 +228,8 @@ describe("PluginsPage composition", () => {
             },
           ],
         };
+      } else if (url.includes("/v1/admin/plugins/scopes")) {
+        body = { items: [] };
       } else if (url.includes("/plugins/wxbot/admin/roster/groups")) {
         body = {
           sessions: [{ session_id: "group-1@chatroom", session_name: "测试群" }],
@@ -275,7 +277,8 @@ describe("PluginsPage composition", () => {
       expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/v1/admin/plugins/scopes"))).toBe(true);
     });
 
-    fireEvent.click(within(scopePanel as HTMLElement).getByRole("button", { name: "关闭" }));
+    const selectedScopePanel = screen.getByRole("heading", { name: "群级插件开关" }).closest("section");
+    fireEvent.click(await within(selectedScopePanel as HTMLElement).findByRole("button", { name: "关闭" }));
     fireEvent.click(await screen.findByRole("button", { name: "确认关闭" }));
     await waitFor(() => {
       expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes("/v1/admin/plugins/credits/scopes"))).toBe(true);

@@ -89,6 +89,7 @@ class ParticipationPolicyValues(StrictContract):
     # implied by participation being enabled and cannot be bypassed by a group
     # administrator or an Agent tool allowlist.
     file_send_enabled: bool = False
+    group_public_memory_enabled: bool = False
     rollout_stage: RolloutStage = "contextual"
     rollout_opt_in: bool = False
     proactive_rollout_percent: Annotated[int, Field(ge=0, le=100)] = 5
@@ -100,6 +101,7 @@ class ParticipationPolicyValues(StrictContract):
                 "rollout_opt_in",
                 "proactive_rollout_percent",
                 "file_send_enabled",
+                "group_public_memory_enabled",
             }
         )
         return ParticipationPolicy(enabled=enabled, **values)

@@ -98,7 +98,7 @@ class AirgateClient:
         payload = self._extra_body()
         payload.update(
             {
-                "model": self.model or "grok-imagine-video-1.5-preview",
+                "model": self.model or "grok-imagine-video",
                 "prompt": prompt,
                 "duration": int(duration),
                 "resolution": str(resolution or "720p").strip(),
@@ -145,7 +145,10 @@ class AirgateClient:
             response = await safe_get(
                 client,
                 source_url,
-                headers={"Accept": "video/*,application/octet-stream"},
+                headers={
+                    **self._headers(),
+                    "Accept": "video/*,application/octet-stream",
+                },
                 max_response_bytes=AIRGATE_MAX_VIDEO_BYTES,
                 allowed_content_types=AIRGATE_VIDEO_CONTENT_TYPES,
                 policy=self._policy(source_url, response_kind="video"),
@@ -232,11 +235,11 @@ class AirgateClient:
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as exc:
-            raise AirgateError(f"AirGate 接口返回 {exc.response.status_code}") from exc
+            raise AirgateError(self._http_status_error(exc)) from exc
         except httpx.TimeoutException as exc:
-            raise AirgateError("AirGate 请求超时") from exc
+            raise AirgateError("视频接口请求超时") from exc
         except httpx.HTTPError as exc:
-            raise AirgateError("AirGate 请求失败") from exc
+            raise AirgateError("视频接口请求失败") from exc
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -273,6 +276,20 @@ class AirgateClient:
                 else AIRGATE_JSON_CONTENT_TYPES
             ),
         )
+
+    @staticmethod
+    def _http_status_error(exc: httpx.HTTPStatusError) -> str:
+        status = exc.response.status_code
+        body = ""
+        try:
+            body = exc.response.text.strip()
+        except Exception:
+            body = ""
+        if len(body) > 300:
+            body = body[:300].rstrip() + "..."
+        if body:
+            return f"视频接口返回 {status}: {body}"
+        return f"视频接口返回 {status}"
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json, video/*"}

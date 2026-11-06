@@ -3,6 +3,7 @@ import type { GroupPluginState, InstalledPlugin, PluginRuntime, WxbotSession } f
 
 type GroupPluginScopeSectionProps = {
   groups: WxbotSession[];
+  scopeReady: boolean;
   groupPlugins: InstalledPlugin[];
   managedGroupSessionId: string;
   groupPluginState: GroupPluginState;
@@ -16,6 +17,7 @@ type GroupPluginScopeSectionProps = {
 
 export function GroupPluginScopeSection({
   groups,
+  scopeReady,
   groupPlugins,
   managedGroupSessionId,
   groupPluginState,
@@ -43,7 +45,7 @@ export function GroupPluginScopeSection({
         </p>
       )}
       confirmLabel={enabled ? "确认关闭" : "确认开启"}
-      disabled={!groupSelected}
+      disabled={!groupSelected || !scopeReady}
       onConfirm={() => setGroupPluginEnabled(pluginName, !enabled)}
     />
   );
@@ -87,7 +89,7 @@ export function GroupPluginScopeSection({
                   <strong>{plugin.name}</strong>
                   <span>{label}</span>
                 </div>
-                <span className={`plugin-badge ${enabled ? "" : "is-muted"}`}>{enabled ? "已开启" : "已关闭"}</span>
+                <span className={`plugin-badge ${enabled ? "" : "is-muted"}`}>{!scopeReady ? "状态未知" : enabled ? "已开启" : "已关闭"}</span>
               </div>
               <p className="muted-copy">{summary}</p>
               {plugin.name === "tibo_reset" && tiboStats && (

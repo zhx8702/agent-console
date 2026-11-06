@@ -35,6 +35,7 @@ class JevService:
         self._failures = 0
         self._online_slots = asyncio.Semaphore(4)
         self._maintenance_at = 0.0
+        self._memory_review_cursor = 0
         self._reconcile_cursor = (datetime.now(UTC).replace(tzinfo=None) - timedelta(days=1), 0)
 
     @property
@@ -108,10 +109,19 @@ class JevService:
         policy = await self.policy(item["tenant_id"])
         if not policy.enabled or not getattr(policy, domain):
             return False
-        digest = memory_fingerprint(item)
-        if (value.get("jev") or {}).get("content_hash") == digest:
+        actor = str((value.get("acceptance") or {}).get("reviewed_by") or "")
+        if item.get("pinned") or (actor and not actor.startswith("system/")):
             return False
-        key = fingerprint([item["id"], digest, getattr(self.settings, "typesafe_model", "jev-latest"), "jev-v1"])
+        if item.get("deleted_at") or item.get("status") in {"deleted", "invalidated", "expired", "archived"}:
+            return False
+        if not await self.allowed(item["tenant_id"], item.get("session_id") or "", domain):
+            return False
+        digest = memory_fingerprint(item)
+        policy_key = policy.memory_review_key(getattr(self.settings, "typesafe_model", "jev-latest"))
+        audit = value.get("jev") or {}
+        if audit.get("content_hash") == digest and audit.get("policy_key") == policy_key:
+            return False
+        key = fingerprint([item["id"], digest, policy_key, audit.get("evaluation_id")])
         if int(key[:8], 16) / 0x100000000 >= policy.sample_rate:
             return False
         return bool(await self.store.enqueue(
@@ -268,6 +278,17 @@ class JevService:
                     from app.jev.store import execute
                     await self.enqueue_memory(item, run=execute)
                 self._reconcile_cursor = (row["updated_at"], row["id"])
+            # An independent ID sweep also reaches old shadow-only records when
+            # their source has not changed. Both scans are bounded and deduped.
+            historical = await self.store.memory_review_page(self._memory_review_cursor)
+            for row in historical:
+                item = await self.memory_store.get_memory_item(row["id"])
+                if item is not None:
+                    from app.jev.store import execute
+                    await self.enqueue_memory(item, run=execute)
+                self._memory_review_cursor = row["id"]
+            if len(historical) < 100:
+                self._memory_review_cursor = 0
         jobs = await self.store.claim(limit=self.settings.typesafe_worker_concurrency,
                                       lease_seconds=max(60, int(self.settings.typesafe_timeout) + 30),
                                       max_attempts=self.settings.typesafe_job_max_attempts)

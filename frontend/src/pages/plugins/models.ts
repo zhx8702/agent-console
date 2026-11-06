@@ -19,7 +19,7 @@ export type InstalledPlugin = {
   plugin_name?: string;
   version: string;
   description?: string;
-  enabled: boolean;
+  enabled: boolean | null;
   system: boolean;
   status: string;
   restart_required: boolean;
@@ -45,6 +45,7 @@ export type InstalledPluginsResponse = {
 
 export type PluginRuntimeEnvelope = {
   plugin_name: string;
+  runtime_query?: { status: "ready" | "blocked" | "error" | "timeout"; error?: string };
   runtime_status?: Record<string, unknown>;
   runtime?: Record<string, unknown>;
 };
@@ -162,7 +163,20 @@ export type FlowRuntimeConfig = {
   log_failure_policy?: string;
 };
 
+export type MemoryDecisionTrace = {
+  load_status?: string;
+  load_reason?: string;
+  save_status?: string;
+  save_reason?: string;
+  member_recall_blocked?: boolean;
+  candidate_count?: number;
+  selected_count?: number;
+  selected_fact_count?: number;
+  selected_episode_count?: number;
+};
+
 export type FlowRunResult = {
+  decision_trace?: { memory?: MemoryDecisionTrace };
   flow_name?: string;
   trace_id?: string;
   tenant_id?: string;
@@ -541,6 +555,8 @@ export function pluginEnablementLabel(
   runtime?: PluginRuntime,
 ): string {
   if (!plugin) return "未加载";
+  if (plugin.enabled == null || plugin.status === "unknown") return "状态未知";
+  if (plugin.last_error || plugin.status === "failed") return "异常";
   if (plugin.restart_required) return "待重启";
   if (!plugin.enabled) return "已停用";
   if (pluginRuntimeUnconfigured(plugin.name, runtime)) {

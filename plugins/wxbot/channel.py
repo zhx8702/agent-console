@@ -500,10 +500,17 @@ class WxbotChannelOutbound:
             if queued_version != int(current["participation_policy_version"]):
                 raise WxbotGroupDeliverySuppressed("participation_policy_version_changed")
         captured_revalidation = prepared.get("send_revalidation_enabled")
-        if not isinstance(captured_revalidation, bool):
-            raise RuntimeError("wxbot_group_delivery_send_revalidation_enabled_invalid")
-        if captured_revalidation != bool(current["send_revalidation_enabled"]):
-            raise RuntimeError("wxbot_group_delivery_send_revalidation_policy_mismatch")
+        force_send = bool(prepared.get("force_send"))
+        if force_send:
+            # Slash-command / tool results must still deliver after the group
+            # keeps talking. Keep the captured policy version, but skip the
+            # send-time supersede check.
+            prepared["send_revalidation_enabled"] = False
+        else:
+            if not isinstance(captured_revalidation, bool):
+                raise RuntimeError("wxbot_group_delivery_send_revalidation_enabled_invalid")
+            if captured_revalidation != bool(current["send_revalidation_enabled"]):
+                raise RuntimeError("wxbot_group_delivery_send_revalidation_policy_mismatch")
         for key, value in current.items():
             prepared.setdefault(key, value)
         if not _has_complete_group_delivery_contract(prepared):

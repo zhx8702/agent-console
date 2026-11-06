@@ -144,6 +144,35 @@ async def test_managed_channel_policy_fences_use_external_conversation_scope() -
 
 
 @pytest.mark.asyncio
+async def test_channel_outbound_force_send_skips_group_send_revalidation() -> None:
+    store = _QueueStore()
+    channel = WxbotChannelOutbound(
+        store,  # type: ignore[arg-type]
+        social_policy_store=_PolicyStore(_document()),
+    )
+    contract = await channel.capture_group_delivery_contract(
+        _target(),
+        source_message_id="question-1",
+    )
+    contract.update({"force_send": True, "send_revalidation_enabled": False})
+
+    await channel.send_text(
+        _target(),
+        "收到，正在生成视频。",
+        ChannelSendOptions(
+            source_message={"message_id": "question-1"},
+            delivery_metadata=contract,
+        ),
+    )
+
+    delivery = store.calls[0]["delivery"]
+    assert delivery["force_send"] is True
+    assert delivery["send_revalidation_enabled"] is False
+    assert delivery["participation_policy_version"] == 7
+    assert delivery["source_message_id"] == "question-1"
+
+
+@pytest.mark.asyncio
 async def test_channel_outbound_distinguishes_soft_group_output_from_task_obligation() -> None:
     store = _QueueStore()
     channel = WxbotChannelOutbound(

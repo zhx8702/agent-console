@@ -14,6 +14,12 @@ from typing import Any
 
 from app.common.types import ChatMessage, ChatRequest, Role
 from plugins.memory import store as _store_runtime
+from plugins.memory.group_evidence import (
+    EVIDENCE_POLICY_VERSION,
+    assess_group_evidence,
+    group_recall_block_reason,
+    human_reviewed,
+)
 from plugins.memory.store import (
     DETERMINISTIC_GROUP_WINDOW_SOURCE_TYPE,
     GROUP_GRAPH_EDGE_TYPES,
@@ -169,6 +175,8 @@ def _group_relation_judgement(item: dict[str, Any] | None) -> dict[str, Any]:
     model_reason = _normalize_line(str(relation.get("reason") or ""))[:240]
     return {
         "extraction_method": method,
+        "evidence_quality": relation.get("evidence_quality") or {},
+        "recall_block_reason": group_recall_block_reason(item or {}),
         "signals": signals,
         "policy": str(acceptance.get("policy") or acceptance.get("reason") or "").strip()[:80],
         "acceptance_status": str(acceptance.get("status") or "").strip(),
@@ -341,10 +349,6 @@ MENTION_METADATA_CONFIDENCE = 0.85
 MENTION_TEXT_CONFIDENCE = 0.72
 PREFIX_REPLY_CONFIDENCE = 0.62
 CO_PARTICIPATION_CONFIDENCE = 0.45
-GROUP_RELATION_MIN_LLM_DAYS = 2
-# A model-only relation is also accepted without a second day once this many
-# distinct messages in the window support it; one-off claims stay in review.
-GROUP_RELATION_MIN_LLM_EVIDENCE = 3
 # Below this many supporting messages an LLM candidate is not stored at all:
 # on the production data single-message claims were the bulk of the noise.
 GROUP_RELATION_MIN_LLM_WINDOW_EVIDENCE = 2
@@ -373,9 +377,6 @@ GROUP_RELATION_REVIEW_PREDICATES = frozenset(
         "asked",
         "answered",
     }
-)
-GROUP_RELATION_REVIEW_OBJECT_TYPES = frozenset(
-    {"tool", "project", "artifact", "task"}
 )
 # Objects for the pseudo-entity "the group" ("asked the group") are dropped.
 LLM_GROUP_PSEUDO_OBJECTS = frozenset({"group", "the group", "群", "群聊", "大家", "everyone", "all"})
@@ -904,15 +905,14 @@ def _group_relation_needs_human_review(
 ) -> bool:
     """Key work/help claims stay in the review queue; gossip does not.
 
-    ``interested_in`` a concrete tool/project is often the first sighting of a
-    real ask (proxy, model, service). A vague topic mention is not.
+    An inferred interest always needs a source-based review, regardless of
+    whether its object is classified as a product or a broad topic.
     """
 
     predicate = str(predicate or "").strip().lower()
     if predicate in GROUP_RELATION_REVIEW_PREDICATES:
         return True
-    object_type = str(object_type or "").strip().lower()
-    return predicate == "interested_in" and object_type in GROUP_RELATION_REVIEW_OBJECT_TYPES
+    return predicate == "interested_in"
 
 
 def _group_relation_acceptance_decision(
@@ -927,13 +927,10 @@ def _group_relation_acceptance_decision(
 
     if not auto_accept:
         return "needs_review", "group_window_relation"
+    if signals.get(SIGNAL_LLM, 0) > 0:
+        return "needs_review", "group_window_semantic_review_required"
     if any(signals.get(key, 0) > 0 for key in DIRECT_GROUP_SIGNALS):
         return "accepted", "group_window_direct_signal"
-    llm_count = int(signals.get(SIGNAL_LLM, 0) or 0)
-    if llm_count > 0 and int(day_count) >= GROUP_RELATION_MIN_LLM_DAYS:
-        return "accepted", "group_window_llm_multi_day"
-    if llm_count >= GROUP_RELATION_MIN_LLM_EVIDENCE:
-        return "accepted", "group_window_llm_repeated_evidence"
     if (
         signals.get(SIGNAL_CO_PARTICIPATION, 0) >= GROUP_RELATION_MIN_WEAK_COUNT
         and int(day_count) >= GROUP_RELATION_MIN_WEAK_DAYS
@@ -2893,8 +2890,13 @@ class MemoryGroupGraphStoreMixin:
             "tracked: do not emit mentioned, replied_to, addressed or co_participated. Prefer "
             "asked/answered/requested/provided_resource/collaborated_with between people and "
             "reported_issue/works_on/maintains/tested/fixed_issue/asked between a person and a term. "
-            "(5) interested_in means the person wants, likes, uses or asks how to get a concrete "
-            "tool, product or service. Mocking it, criticizing it, gossiping about it, chatting "
+            "(5) interested_in requires the subject's explicit enduring preference or interest. "
+            "A question, purchase request, temporary use, comparison or complaint is not a preference; "
+            "use asked/requested/tested/reported_issue when supported, or omit it. "
+            "Only the subject's own statements establish their preference; another speaker's question "
+            "or an image placeholder is context, never independent confirmation. "
+            "The object must be identifiable in the cited text; do not invent product names. "
+            "Mocking it, criticizing it, gossiping about it, chatting "
             "about a game or celebrity, or discussing whether this system labelled it correctly "
             "is not a relation; skip it. "
             "(6) reason is one short sentence in the group's language that names the concrete "
@@ -3236,10 +3238,28 @@ class MemoryGroupGraphStoreMixin:
         relation_payload["signals"] = signals
         relation_payload["signal_evidence"] = signal_evidence
         relation_payload["strength"] = strength
+        if relation_source_type == LLM_GROUP_WINDOW_SOURCE_TYPE:
+            # Assess the actual rows, never a quality claim supplied by the model.
+            cited = set(candidate.get("evidence_event_ids") or []) | set(candidate.get("evidence_observation_ids") or [])
+            evidence = []
+            found = set()
+            for row in window.get("rows") or []:
+                if row.get("id") not in cited:
+                    continue
+                sender, body = _split_group_event_text(row.get("user_text"))
+                found.add(row["id"])
+                evidence.append({"id": row["id"], "source": row.get("_graph_source") or "memory_event",
+                                 "member": row.get("source_member_id") or (
+                                     row.get("user_id") if row.get("user_id") != GROUP_HISTORY_USER_ID_SCOPE else ""
+                                 ) or sender,
+                                 "text": body, "type": row.get("msg_type") or "text",
+                                 "is_self_sent": row.get("is_self_sent", False)})
+            evidence.extend({"id": missing, "source": "missing"} for missing in cited - found)
+            relation_payload["evidence_quality"] = assess_group_evidence(candidate, evidence)
 
         # Human accept/reject decisions stick. Everything else follows the
-        # deterministic policy, which may promote a needs_review relation to
-        # accepted once it has repeated across days.
+        # current policy. Repetition may increase strength, never establish an
+        # LLM inference as fact without semantic review.
         prior_acceptance_status = str(
             existing_acceptance.get("status")
             or (existing_item or {}).get("acceptance_status")
@@ -3257,7 +3277,11 @@ class MemoryGroupGraphStoreMixin:
                 candidate.get("object_type") or relation_payload.get("object_type") or ""
             ),
         )
-        if prior_acceptance_status in {"accepted", "rejected"} or existing_acceptance.get("reviewed_by") == "system/jev":
+        if relation_source_type == LLM_GROUP_WINDOW_SOURCE_TYPE:
+            policy_status = "needs_review"
+            policy_reason = "group_window_semantic_review_required"
+        if (human_reviewed(existing_acceptance) or prior_acceptance_status == "rejected"
+                or existing_acceptance.get("reviewed_by") == "system/jev"):
             acceptance_status = prior_acceptance_status
             acceptance_reason = str(
                 existing_acceptance.get("reason") or relation_payload.get("reason") or policy_reason
@@ -3281,6 +3305,7 @@ class MemoryGroupGraphStoreMixin:
             "signals": signals,
             "day_count": day_count,
             "policy": policy_reason,
+            "policy_version": EVIDENCE_POLICY_VERSION,
         }
         if acceptance_status == "accepted" and prior_acceptance_status != "accepted":
             acceptance_payload.setdefault("reviewed_by", "system/auto")
@@ -4112,16 +4137,11 @@ class MemoryGroupGraphStoreMixin:
         limit: int | None = None,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """Accept pending model relations that the accepted graph already corroborates.
+        """Park low-value candidates without treating graph overlap as proof.
 
-        Single-window model claims wait. Instead of a human clicking through
-        them, this pass promotes the ones the rest of the group's graph
-        supports: a term that some member already has an accepted relation
-        with, or two people who already have an accepted direct edge.
-        Uncorroborated gossip (mentioned / vague interested_in) is parked as
-        candidate so it leaves the human queue without being discarded.
-        Key work/help claims stay in needs_review until they repeat, get
-        corroborated, or governance expires them.
+        A familiar product does not prove this member likes or maintains it;
+        a direct reply does not prove collaboration. Acceptance belongs to the
+        source-based semantic reviewer or an operator, including across days.
         """
 
         settings = getattr(self, "settings", None)
@@ -4157,15 +4177,7 @@ class MemoryGroupGraphStoreMixin:
         for candidate in candidates:
             object_type = str(candidate.get("object_type") or "person").strip().lower()
             predicate = str(candidate.get("predicate") or "")
-            if object_type != "person" and candidate.get("term_corroborated"):
-                action = "accept"
-                reason = "group_window_term_corroborated"
-                bucket = "accepted_term"
-            elif object_type == "person" and candidate.get("pair_corroborated"):
-                action = "accept"
-                reason = "group_window_pair_corroborated"
-                bucket = "accepted_pair"
-            elif (
+            if (
                 not _group_relation_needs_human_review(predicate, object_type)
                 and str(candidate.get("acceptance_status") or "") == "needs_review"
             ):
@@ -4873,6 +4885,16 @@ class MemoryGroupGraphStoreMixin:
         conditions = [
             "pending.tenant_id = :tid",
             "pending.deleted_at IS NULL",
+            "pending.status = 'pending'",
+            "pending.source_type = 'deterministic_group_window'",
+            "pending.pinned = FALSE",
+            "pending.sensitivity = 'normal'",
+            "(pending.expires_at IS NULL OR pending.expires_at > NOW())",
+            "COALESCE(pending.value_json::jsonb #>> '{acceptance,reviewed_by}', '') IN ('', 'system/auto')",
+            "pending.value_json::jsonb #>> '{relation,predicate}' IN ('replied_to', 'addressed')",
+            "(COALESCE(pending.value_json::jsonb #>> '{relation,signals,quote}', '0') ~ '^[1-9][0-9]*$' "
+            "OR COALESCE(pending.value_json::jsonb #>> '{relation,signals,mention}', '0') ~ '^[1-9][0-9]*$' "
+            "OR COALESCE(pending.value_json::jsonb #>> '{relation,signals,prefix_reply}', '0') ~ '^[1-9][0-9]*$')",
             "pending.value_json::jsonb->>'kind' = 'group_window_relation'",
             "COALESCE(pending.value_json::jsonb->'acceptance'->>'status', '') "
             "IN ('needs_review', 'candidate', '')",
@@ -4894,7 +4916,7 @@ class MemoryGroupGraphStoreMixin:
             "jsonb_set("
             "COALESCE(item.value_json::jsonb, '{}'::jsonb), "
             "'{acceptance,status}', '\"accepted\"'), "
-            "'{acceptance,reason}', '\"group_window_auto_accept\"'), "
+            "'{acceptance,reason}', '\"group_window_direct_batch\"'), "
             "'{acceptance,reviewed_by}', '\"system/auto\"'"
             ")::text, "
             "updated_at = NOW() "
@@ -5222,7 +5244,7 @@ class MemoryGroupGraphStoreMixin:
             params["lim"] = int(limit)
         rows = await _exec(
             "SELECT id, tenant_id, session_id, sender_wxid, sender_name, content, "
-            "occurred_ts, is_self_sent, metadata_json "
+            "occurred_ts, is_self_sent, msg_type, metadata_json "
             "FROM plugin_wxbot_group_observations "
             "WHERE tenant_id = :tid AND session_id = ANY(:sids) "
             "AND occurred_ts >= :start_ts AND occurred_ts < :end_ts "
@@ -5259,6 +5281,7 @@ class MemoryGroupGraphStoreMixin:
                     "assistant_text": "",
                     "trace_id": "",
                     "event_key": f"observation:{row.get('id')}",
+                    "msg_type": row.get("msg_type") or "text",
                     "created_at": created_at,
                     "_graph_source": EVIDENCE_SOURCE_OBSERVATION,
                     "_observation": _observation_interaction_metadata(

@@ -25,6 +25,8 @@ from app.channel.identity import (
     canonical_message_id,
     canonical_participant_id,
     canonical_session_namespace,
+    is_hashed_channel_user_id,
+    preferred_external_user_id,
 )
 from app.channel.models import (
     ChannelFile,
@@ -72,6 +74,8 @@ __all__ = [
     "canonical_participant_id",
     "canonical_session_namespace",
     "get_reply_policy_override",
+    "is_hashed_channel_user_id",
+    "preferred_external_user_id",
     "legacy_wxbot_connection_from_settings",
     "normalize_secret_ref",
     "set_reply_policy_override",

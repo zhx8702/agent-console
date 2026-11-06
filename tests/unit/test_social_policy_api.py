@@ -12,6 +12,7 @@ from app.admin.authorization import AdminRole, Principal
 from app.admin.route_permissions import RoutePermissionRegistry
 from app.models.base import Base
 from app.models.reliability import MessageEffectIntentRow
+from app.models.session import SessionRow
 from app.models.social import (
     AuditEventRow,
     SocialGroupPolicyHistoryRow,
@@ -55,6 +56,7 @@ async def social_api() -> AsyncIterator[tuple[httpx.AsyncClient, async_sessionma
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         social_tables = [
+            SessionRow.__table__,
             SocialGroupPolicyRow.__table__,
             SocialGroupPolicyHistoryRow.__table__,
             SocialMemberPolicyRow.__table__,
@@ -102,6 +104,7 @@ def _group_payload(
     mention_sender_strategy: str = "never",
     prompt_context_retention_seconds: int = 3600,
     file_send_enabled: bool = False,
+    group_public_memory_enabled: bool = False,
 ) -> dict:
     return {
         "kill_switches": {
@@ -115,6 +118,7 @@ def _group_payload(
             "mention_sender_strategy": mention_sender_strategy,
             "prompt_context_retention_seconds": prompt_context_retention_seconds,
             "file_send_enabled": file_send_enabled,
+            "group_public_memory_enabled": group_public_memory_enabled,
         },
         "voice_profile": {
             "profile_id": "natural-v1",
@@ -152,6 +156,7 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
             mention_sender_strategy="reply_or_ambiguous",
             prompt_context_retention_seconds=7200,
             file_send_enabled=True,
+            group_public_memory_enabled=True,
         ),
     )
 
@@ -164,6 +169,7 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
     assert initial.json()["policy"]["proactive_enabled"] is False
     assert initial.json()["policy"]["mention_sender_strategy"] == "never"
     assert initial.json()["policy"]["prompt_context_retention_seconds"] == 3600
+    assert initial.json()["policy"]["group_public_memory_enabled"] is False
     assert initial.json()["policy"]["file_send_enabled"] is False
     assert missing_precondition.status_code == 428
     assert missing_precondition.json()["detail"] == "if_match_required"
@@ -173,6 +179,9 @@ async def test_group_policy_requires_precondition_and_round_trips_etag(
     assert updated.json()["policy"]["threshold"] == 72
     assert updated.json()["policy"]["mention_sender_strategy"] == "reply_or_ambiguous"
     assert updated.json()["policy"]["prompt_context_retention_seconds"] == 7200
+    assert updated.json()["policy"]["group_public_memory_enabled"] is True
+    persisted = await client.get(path)
+    assert persisted.json()["policy"]["group_public_memory_enabled"] is True
     assert updated.json()["policy"]["file_send_enabled"] is True
     assert updated.json()["voice_profile"]["version"] == 1
     assert updated.json()["voice_profile"]["enabled"] is True

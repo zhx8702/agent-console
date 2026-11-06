@@ -223,6 +223,35 @@ async def test_rag_engine_prefers_session_scope_before_global() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retriever_also_searches_external_session_id() -> None:
+    kb = InMemoryKBStore()
+    vec = InMemoryVectorStore()
+    llm = CannedChatProvider(reply="实践 [1]")
+    ingest = IngestionService(kb, vec, llm, max_tokens_per_chunk=200)
+    svc = KnowledgeBaseService(kb, vec, ingest)
+    await svc.add_text(
+        "demo",
+        "实践论",
+        "实践论：认识从实践发生，经过实践得到理论。",
+        session_id="53876528317@chatroom",
+    )
+
+    async def chunk_source(tenant_id: str, session_id: str | None):
+        return await kb.list_chunks(tenant_id, session_id)
+
+    hits = await HybridRetriever(vec, chunk_source, llm).retrieve(
+        "demo",
+        "实践论",
+        top_k=3,
+        session_id="cx1:c:hashed@chatroom",
+        extra_session_ids=["53876528317@chatroom"],
+    )
+    assert hits
+    assert hits[0].session_id == "53876528317@chatroom"
+    assert "实践论" in hits[0].content
+
+
+@pytest.mark.asyncio
 async def test_rag_engine_falls_back_to_global_scope_when_session_scope_not_relevant() -> None:
     kb = InMemoryKBStore()
     vec = InMemoryVectorStore()
@@ -391,8 +420,9 @@ async def test_rag_search_query_excludes_unrelated_group_observation_tail() -> N
             query: str,
             top_k: int = 5,
             session_id: str | None = None,
+            extra_session_ids: list[str] | None = None,
         ):
-            _ = tenant_id, top_k, session_id
+            _ = tenant_id, top_k, session_id, extra_session_ids
             self.query = query
             return [
                 RetrievalHit(
@@ -463,6 +493,31 @@ async def test_rag_engine_includes_quote_and_recent_group_context() -> None:
     assert "群友A" in prompt
     assert "活动订单退款规则" in prompt
     assert "quoted_message" in prompt
+    assert "不要标注编号、出处或参考资料" in prompt
+    assert "标注 [编号]" not in prompt
+    assert "标注 [1] [2]" not in (llm.last_request.system or "")
+
+
+@pytest.mark.asyncio
+async def test_rag_engine_skips_citation_validation_for_group_chat() -> None:
+    kb = InMemoryKBStore()
+    vec = InMemoryVectorStore()
+    llm = _CapturingChatProvider(reply="认识从实践发生，再上升到理论。")
+    ingest = IngestionService(kb, vec, llm, max_tokens_per_chunk=200)
+    svc = KnowledgeBaseService(kb, vec, ingest)
+    await svc.add_text("demo", "实践论", "认识从实践发生，经过实践得到理论。")
+
+    async def chunk_source(tenant_id: str, session_id: str | None):
+        return await kb.list_chunks(tenant_id, session_id)
+
+    session = make_session("demo", session_id="53876528317@chatroom")
+    session.channel = Channel.WECHAT
+    engine = RAGEngine(HybridRetriever(vec, chunk_source, llm), llm)
+    res = await engine.answer(make_preprocessed("实践和理论哪个重要"), session)
+
+    assert res.reply_text == "认识从实践发生，再上升到理论。"
+    assert res.citations
+    assert "[1]" not in res.reply_text
 
 
 @pytest.mark.asyncio

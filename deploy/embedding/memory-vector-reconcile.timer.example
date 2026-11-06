@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly memory vector repair
+
+[Timer]
+# Adjust the time and IANA time zone for this deployment.
+OnCalendar=*-*-* 02:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=60
+Unit=memory-vector-reconcile.service
+
+[Install]
+WantedBy=timers.target

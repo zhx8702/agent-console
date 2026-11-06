@@ -262,3 +262,56 @@ async def test_postprocessor_appends_citations_to_first_text_segment_for_structu
     assert "参考资料" in reply.segments[0].content
     assert "https://example.com/help" in reply.segments[0].content
     assert reply.segments[1].metadata["wxbot_msg_type"] == "image"
+
+
+@pytest.mark.asyncio
+async def test_postprocessor_hides_citations_in_group_chat() -> None:
+    post = build_postprocessor()
+    session = Session(
+        session_id="53876528317@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+        state=SessionState.CHATTING,
+    )
+    result = CapabilityResult(
+        route=RouteType.RAG,
+        reply_text="认识从实践发生。[1]\n\n参考资料：\n[1] 毛泽东选集第一卷 · 实践论",
+        citations=[
+            Citation(
+                id="c1",
+                title="毛泽东选集第一卷 · 实践论",
+                source="kb:1",
+            )
+        ],
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.type == ReplyType.TEXT
+    assert reply.primary_text == "认识从实践发生。"
+    assert "参考资料" not in reply.primary_text
+    assert "[1]" not in reply.primary_text
+    assert reply.citations[0].title == "毛泽东选集第一卷 · 实践论"
+
+
+@pytest.mark.asyncio
+async def test_postprocessor_strips_leaked_planning_from_group_chat() -> None:
+    post = build_postprocessor()
+    session = Session(
+        session_id="53876528317@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+        state=SessionState.CHATTING,
+    )
+    result = CapabilityResult(
+        route=RouteType.LLM,
+        reply_text="先查一下这条白宫锐评到底在说啥，再按群里口气接\n这就是在甩锅，别当真当政策看。",
+    )
+
+    reply = await post.run(result, session)
+
+    assert reply.primary_text == "这就是在甩锅，别当真当政策看。"
+    assert "先查一下" not in reply.primary_text
+    assert "口气接" not in reply.primary_text

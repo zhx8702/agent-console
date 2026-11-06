@@ -31,7 +31,10 @@ class JevStore:
         rows = await run(
             "INSERT INTO jev_evaluation (id,tenant_id,session_id,domain,fingerprint,input_hash,target_id,state) "
             "VALUES (:id,:tid,:sid,:domain,:fingerprint,:input_hash,:target_id,CAST(:state AS JSON)) "
-            "ON CONFLICT (tenant_id,domain,fingerprint) DO NOTHING RETURNING id",
+            "ON CONFLICT (tenant_id,domain,fingerprint) DO UPDATE SET "
+            "status='pending',attempts=0,error_type='',next_run_at=NOW(),updated_at=NOW() "
+            "WHERE jev_evaluation.target_id IS NOT NULL AND jev_evaluation.status='skipped' "
+            "AND jev_evaluation.error_type='disabled' RETURNING id",
             {"id": str(uuid4()), "tid": tenant_id, "sid": session_id, "domain": domain,
              "fingerprint": fingerprint, "input_hash": input_hash, "target_id": target_id,
              "state": json.dumps(state or {}, ensure_ascii=False)},
@@ -229,6 +232,14 @@ class JevStore:
             "SELECT id,updated_at FROM plugin_memory_item WHERE deleted_at IS NULL "
             "AND source_type NOT IN ('manual','explicit_user') AND (updated_at,id)>(:since,:id) "
             "ORDER BY updated_at,id LIMIT 100", {"since": since, "id": item_id})
+
+    async def memory_review_page(self, after_id: int) -> list[dict]:
+        return await execute(
+            "SELECT id FROM plugin_memory_item WHERE id>:id AND deleted_at IS NULL "
+            "AND NOT pinned AND source_type NOT IN ('manual','explicit_user') "
+            "AND status NOT IN ('deleted','expired','invalidated','archived') "
+            "AND (expires_at IS NULL OR expires_at>NOW()) ORDER BY id LIMIT 100",
+            {"id": after_id})
 
     async def maintain(self) -> None:
         # Pending source text is short-lived; terminal audits retain no message text.

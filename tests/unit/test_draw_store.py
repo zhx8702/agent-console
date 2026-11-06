@@ -1116,6 +1116,70 @@ async def test_draw_store_builds_airgate_grok_image_payload(tmp_path) -> None:
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_empty_runtime_provider_falls_through_to_env_airgate(tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["post_body"] = json.loads(request.content.decode("utf-8"))
+        captured["url"] = str(request.url)
+        return httpx.Response(
+            200,
+            content=b"\xff\xd8\xff\xe0fake-jpeg",
+            headers={"content-type": "image/jpeg"},
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://airgate.example/v1",
+        draw_api_key="sk-env",
+        draw_api_provider="airgate",
+        draw_api_model="grok-imagine-image",
+        draw_api_extra_body='{"stream":true,"size":"1024x1024","n":1}',
+    )
+    store = DrawStore(settings)
+    store._runtime_overrides = {"draw_api_provider": "", "draw_api_key": ""}
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+
+    await store.generate_image("火盆", trace_id="trace-empty-provider")
+
+    assert captured["url"] == "https://airgate.example/v1/images/generations"
+    assert captured["post_body"] == {
+        "n": 1,
+        "prompt": "火盆",
+        "input": "火盆",
+        "model": "grok-imagine-image",
+    }
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_http_error_includes_upstream_message(tmp_path) -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={
+                "error": {
+                    "message": "No eligible Grok media accounts",
+                    "type": "grok_media_no_eligible_account",
+                }
+            },
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://sub2api.example/v1",
+        draw_api_key="sk-test",
+        draw_api_model="grok-imagine-image",
+    )
+    store = DrawStore(settings)
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+
+    with pytest.raises(DrawApiError, match="No eligible Grok media accounts"):
+        await store.generate_image("火盆", trace_id="trace-no-account")
+    await store.close()
+
+
 def test_draw_store_stages_image_for_wxbot_delivery(tmp_path) -> None:
     source = tmp_path / "draw-cache" / "generated.jpg"
     outbound = tmp_path / "wxbot-outbound"
@@ -1527,6 +1591,145 @@ async def test_draw_store_edits_image_by_id_with_multipart_payload(tmp_path) -> 
     assert tmp_path.joinpath(edited.file_name).read_bytes() == edited_bytes
     assert store.resolve_image_id(edited.image_id).source_image_id == source.image_id
 
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_edit_stays_on_generate_host_when_env_edit_url_differs(tmp_path) -> None:
+    captured: dict[str, object] = {}
+    source_bytes = b"\x89PNG\r\n\x1a\nsource-png"
+    edited_bytes = b"\x89PNG\r\n\x1a\nedited-png"
+    edited_b64 = base64.b64encode(edited_bytes).decode("ascii")
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/v1/images/edits"):
+            captured["edit_url"] = str(request.url)
+            captured["authorization"] = request.headers.get("authorization", "")
+            return httpx.Response(
+                200,
+                json={"created": 2, "data": [{"b64_json": edited_b64}]},
+            )
+        return httpx.Response(401, json={"error": {"message": "无效的 API Key"}})
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://sub2api.example/v1",
+        draw_api_key="sk-sub2api",
+        draw_api_model="grok-imagine-image",
+        draw_api_edit_url="https://claude1.example/v1/images/edits",
+    )
+    store = DrawStore(settings)
+    store._runtime_overrides = {
+        "draw_api_url": "https://sub2api.example/v1",
+        "draw_api_key": "sk-sub2api",
+        "draw_api_model": "grok-imagine-image",
+    }
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+    source_path = tmp_path / "quoted.png"
+    source_path.write_bytes(source_bytes)
+
+    edited = await store.edit_reference_image(
+        image_path=str(source_path),
+        prompt="换一下背景",
+        trace_id="trace-edit-host",
+        source_label="quote:photo",
+    )
+
+    assert captured["edit_url"] == "https://sub2api.example/v1/images/edits"
+    assert captured["authorization"] == "Bearer sk-sub2api"
+    assert edited.source_image_id == "quote:photo"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_xai_edits_send_json_image_url(tmp_path) -> None:
+    captured: dict[str, object] = {}
+    source_bytes = b"\x89PNG\r\n\x1a\nsource-png"
+    edited_bytes = b"\x89PNG\r\n\x1a\nedited-png"
+    edited_b64 = base64.b64encode(edited_bytes).decode("ascii")
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["edit_url"] = str(request.url)
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={"created": 2, "data": [{"b64_json": edited_b64}]},
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://api.x.ai/v1",
+        draw_api_key="sk-xai",
+        draw_api_model="grok-imagine-image",
+    )
+    store = DrawStore(settings)
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+    source_path = tmp_path / "quoted.png"
+    source_path.write_bytes(source_bytes)
+
+    edited = await store.edit_reference_image(
+        image_path=str(source_path),
+        prompt="去一下壳",
+        trace_id="trace-json-edit",
+        source_label="quote:bottle",
+    )
+
+    assert captured["edit_url"] == "https://api.x.ai/v1/images/edits"
+    assert "application/json" in captured["content_type"]
+    assert captured["body"]["model"] == "grok-imagine-image-2.0"
+    assert captured["body"]["prompt"] == "去一下壳"
+    assert "image_url" not in captured["body"]
+    assert captured["body"]["image"]["type"] == "image_url"
+    assert captured["body"]["image"]["url"].startswith("data:image/png;base64,")
+    assert base64.b64decode(captured["body"]["image"]["url"].split(",", 1)[1]) == source_bytes
+    assert edited.source_image_id == "quote:bottle"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sub2api_grok_edits_send_json_image_url(tmp_path) -> None:
+    captured: dict[str, object] = {}
+    source_bytes = b"\x89PNG\r\n\x1a\nsource-png"
+    edited_bytes = b"\x89PNG\r\n\x1a\nedited-png"
+    edited_b64 = base64.b64encode(edited_bytes).decode("ascii")
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["edit_url"] = str(request.url)
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={"created": 2, "data": [{"b64_json": edited_b64}]},
+        )
+
+    settings = _draw_settings(
+        tmp_path,
+        draw_api_url="https://sub2api.example/v1",
+        draw_api_key="sk-sub2api",
+        draw_api_model="grok-imagine-image",
+    )
+    store = DrawStore(settings)
+    store._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+    source_path = tmp_path / "quoted.png"
+    source_path.write_bytes(source_bytes)
+
+    edited = await store.edit_reference_image(
+        image_path=str(source_path),
+        prompt="去一下壳",
+        trace_id="trace-json-edit",
+        source_label="quote:bottle",
+    )
+
+    assert captured["edit_url"] == "https://sub2api.example/v1/images/edits"
+    assert "application/json" in captured["content_type"]
+    assert captured["body"]["model"] == "grok-imagine-image-2.0"
+    assert captured["body"]["prompt"] == "去一下壳"
+    assert "image_url" not in captured["body"]
+    assert captured["body"]["image"]["type"] == "image_url"
+    assert captured["body"]["image"]["url"].startswith("data:image/png;base64,")
+    assert base64.b64decode(captured["body"]["image"]["url"].split(",", 1)[1]) == source_bytes
+    assert edited.source_image_id == "quote:bottle"
     await store.close()
 
 

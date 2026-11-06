@@ -50,6 +50,7 @@ from plugins.draw.hooks import (
     DRAW_EMPTY_RESPONSE_ERROR_TEXT,
     DRAW_HELP_TEXT,
     DRAW_IMAGE_ID_ERROR_TEXT,
+    DRAW_NO_ACCOUNT_ERROR_TEXT,
     DRAW_SUCCESS_TEXT,
     DRAW_TIMEOUT_ERROR_TEXT,
     REDRAW_HELP_TEXT,
@@ -1750,6 +1751,24 @@ async def test_draw_command_center_hook_hides_verbose_api_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_draw_command_center_hook_reports_no_account_error() -> None:
+    store = _FailingDrawStore(
+        DrawApiError("绘图接口返回 503: No eligible Grok media accounts")
+    )
+    registry = CommandRegistryService()
+    registry.register(build_draw_command_definitions(store))
+    hook = CommandCenterHook(_FakeCommandStore(), registry)
+    ctx = _ctx("/draw 一只柴犬")
+
+    with pytest.raises(HookAbort) as excinfo:
+        await hook.run(ctx)
+
+    assert excinfo.value.reason == "draw_command"
+    assert excinfo.value.reply_text == DRAW_NO_ACCOUNT_ERROR_TEXT
+    assert store.calls == [{"prompt": "一只柴犬", "trace_id": "trace-1"}]
+
+
+@pytest.mark.asyncio
 async def test_draw_command_center_hook_reports_config_error() -> None:
     store = _FailingDrawStore(DrawConfigError("未配置 DRAW_API_URL"))
     registry = CommandRegistryService()
@@ -3333,6 +3352,34 @@ async def test_draw_agent_tool_accepts_quality_and_bills_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_draw_agent_bills_wechat_sender_not_hashed_user() -> None:
+    draw_store = _FakeDrawStore()
+    billing, provider = _fake_billing()
+    spawned: list[asyncio.Task[None]] = []
+    service = DrawAgentToolService(
+        store=draw_store,
+        channel_registry=_fake_channel_registry(_FakeChannelOutbound()),
+        billing=billing,
+        register_background_task=spawned.append,
+        scope_execution_allowed=_allow_draw_scope,
+    )
+    session = _agent_session()
+    session.user_id = "cx1:p:hashedperson"
+    session.session_id = "cx1:c:hashedroom@chatroom"
+    session.external_conversation_id = "53876528317@chatroom"
+    session.turns[0].metadata["sender_id"] = "cx1:p:hashedperson"
+    session.turns[0].metadata["sender_wxid"] = "zhx870255124"
+
+    result = await service.generate_group_image(
+        session,
+        {"prompt": "一只戴墨镜的橘猫"},
+    )
+    assert result["accepted"] is True
+    assert provider.reservations[0].subject.user_id == "zhx870255124"
+    assert provider.reservations[0].subject.session_id == "53876528317@chatroom"
+
+
+@pytest.mark.asyncio
 async def test_draw_agent_tool_rejects_invalid_quality() -> None:
     draw_store = _FakeDrawStore()
     outbound = _FakeChannelOutbound()
@@ -3604,3 +3651,80 @@ async def test_draw_agent_tool_sends_original_file_when_image_is_transcoded() ->
     assert [call["msg_type"] for call in outbound.calls] == ["text", "file"]
     assert outbound.calls[1]["file_path"] == "/data/wxbot-outbound/pic2d27.zip"
     assert outbound.calls[1]["file_name"] == "pic2d27.zip"
+
+
+def _quoted_agent_session() -> Session:
+    session = _agent_session()
+    session.turns[0].content = "@zzz 请帮我旁边增加海总"
+    session.turns[0].metadata.update(
+        {
+            "quote_image_path": r"C:\wx-bot\images\hash-601\601.png",
+            "quote_image_url": "http://127.0.0.1:5080/images/hash-601/601.png",
+            "quote_image_preview_url": "http://127.0.0.1:5080/images/hash-601/601_preview.jpg",
+        }
+    )
+    return session
+
+
+@pytest.mark.asyncio
+async def test_draw_agent_edit_tool_uses_quoted_image() -> None:
+    draw_store = _FakeDrawStore()
+    outbound = _FakeChannelOutbound()
+    spawned: list[asyncio.Task[None]] = []
+    service = DrawAgentToolService(
+        store=draw_store,
+        channel_registry=_fake_channel_registry(outbound),
+        register_background_task=spawned.append,
+        scope_execution_allowed=_allow_draw_scope,
+    )
+
+    result = await service.edit_group_image(
+        _quoted_agent_session(),
+        {"prompt": "旁边增加海总"},
+    )
+
+    assert result["accepted"] is True
+    assert result["command"] == "/redraw"
+    await spawned[0]
+    assert draw_store.calls[0]["prompt"] == "旁边增加海总"
+    assert draw_store.calls[0]["image_path"].endswith("601.png")
+    assert "hash-601" in draw_store.calls[0]["image_url"]
+    assert draw_store.calls[0]["source_label"].startswith("quote:") or draw_store.calls[0][
+        "image_path"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_draw_agent_edit_tool_requires_quoted_image() -> None:
+    service = DrawAgentToolService(
+        store=_FakeDrawStore(),
+        channel_registry=_fake_channel_registry(_FakeChannelOutbound()),
+        scope_execution_allowed=_allow_draw_scope,
+    )
+
+    with pytest.raises(ValueError, match="没有引用图片"):
+        await service.edit_group_image(
+            _agent_session(),
+            {"prompt": "旁边增加海总"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_draw_agent_generate_uses_redraw_when_message_quotes_image() -> None:
+    draw_store = _FakeDrawStore()
+    spawned: list[asyncio.Task[None]] = []
+    service = DrawAgentToolService(
+        store=draw_store,
+        channel_registry=_fake_channel_registry(_FakeChannelOutbound()),
+        register_background_task=spawned.append,
+        scope_execution_allowed=_allow_draw_scope,
+    )
+
+    result = await service.generate_group_image(
+        _quoted_agent_session(),
+        {"prompt": "旁边增加海总"},
+    )
+    assert result["command"] == "/redraw"
+    await spawned[0]
+    assert "image_path" in draw_store.calls[0]
+    assert draw_store.calls[0]["prompt"] == "旁边增加海总"

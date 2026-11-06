@@ -10,8 +10,10 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from app.admin.audit import set_admin_audit_context
 from plugins.wxbot.reports import (
     normalize_report_send_text,
+    report_send_max_chars,
     resolve_preview_period,
     should_defer_report_job_retry,
+    split_report_send_text,
 )
 from plugins.wxbot.router import (
     WxbotReportSendRequest,
@@ -443,21 +445,18 @@ def register_report_routes(
                 )
                 raise HTTPException(409, "scope_execution_denied")
             try:
-                sdk_result = await report_service.sdk_request(
-                    "POST",
-                    "/send",
-                    json_body={
-                        "session_id": session_id,
-                        "session_name": session_name,
-                        "sender_name": "",
-                        "text": text,
-                        "msg_type": "text",
-                    },
-                    request_headers={
-                        "Idempotency-Key": f"wxbot-report:{int(job['id'])}"
-                    },
+                parts = split_report_send_text(
+                    text,
+                    report_send_max_chars(store.settings),
                 )
-                sdk_outbound_id = report_service.sdk_outbound_id(sdk_result)
+                queued_parts = await report_service.queue_report_sdk_sends(
+                    job_id=int(job["id"]),
+                    session_id=session_id,
+                    session_name=session_name,
+                    parts=parts,
+                )
+                await report_service._persist_delivery_parts(job, queued_parts)
+                sdk_outbound_id = int(queued_parts[-1]["sdk_outbound_id"])
             except Exception as exc:
                 mark_indeterminate = getattr(
                     store,
@@ -479,10 +478,10 @@ def register_report_routes(
             return _AdminEffectOutcome(
                 {
                     **response_payload,
-                    "queued_count": 1 if sdk_result else 0,
+                    "queued_count": len(queued_parts),
                     "delivery_status": "queued",
                     "sdk_outbound_id": sdk_outbound_id,
-                    "send_result": sdk_result,
+                    "send_result": queued_parts,
                 }
             )
 

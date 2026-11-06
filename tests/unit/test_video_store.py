@@ -30,7 +30,7 @@ async def test_video_store_stages_result_in_shared_file_outbox(tmp_path: Path) -
         wxbot_outbound_file_max_bytes=1024,
         video_api_url="https://airgate.example/v1",
         video_api_key="test-key",
-        video_api_model="grok-imagine-video-1.5-preview",
+        video_api_model="grok-imagine-video",
         video_api_timeout_seconds=30,
         video_api_poll_interval_seconds=1,
         video_api_poll_timeout_seconds=30,
@@ -46,3 +46,28 @@ async def test_video_store_stages_result_in_shared_file_outbox(tmp_path: Path) -
     assert Path(result.local_path).parent == outbound_dir.resolve()
     assert Path(result.local_path).read_bytes() == b"fake-video"
     assert list(storage_dir.glob("*.mp4"))
+
+
+def test_video_store_falls_back_to_llm_sub2api_base(tmp_path: Path) -> None:
+    settings = SimpleNamespace(
+        video_storage_dir=str(tmp_path / "video-cache"),
+        wxbot_outbound_file_dir=str(tmp_path / "wxbot-outbound"),
+        video_api_url="",
+        draw_api_url="",
+        grok_models_base_url="https://sub2api.example/v1",
+        openai_base_url="https://unused.example/v1",
+        video_api_key="",
+        draw_api_key="",
+        openai_api_key="sk-llm",
+        video_api_model="grok-imagine-video",
+        video_api_timeout_seconds=30,
+        video_api_poll_interval_seconds=1,
+        video_api_poll_timeout_seconds=30,
+        video_api_key_header="Authorization",
+        video_api_key_prefix="Bearer",
+        video_api_extra_body="",
+    )
+    store = VideoStore(settings)
+    client = store._get_client()
+    assert client.base_url == "https://sub2api.example/v1"
+    assert client.api_key == "sk-llm"

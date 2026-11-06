@@ -433,6 +433,40 @@ async def test_insufficient_reserve_does_not_leave_a_reservation(
 
 
 @pytest.mark.asyncio
+async def test_reserve_charge_uses_wxid_sibling_for_hashed_user(
+    credits_engine: AsyncEngine,
+) -> None:
+    hashed = "cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b"
+    wxid = "zhx870255124"
+    async with credits_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO plugin_credits_balance "
+                "(tenant_id, session_id, user_id, display_name, credits) VALUES "
+                "('tenant', 'room', :hashed, 'Z', 0), "
+                "('tenant', 'room', :wxid, 'Z', 9490)"
+            ),
+            {"hashed": hashed, "wxid": wxid},
+        )
+
+    store = CreditStore(settings=None)
+    reservation = await store.reserve_charge(
+        "tenant",
+        "room",
+        hashed,
+        5,
+        reason="draw_cost",
+        display_name="Z",
+        idempotency_key="redraw-hashed-identity",
+    )
+
+    assert reservation["balance"] == 9485
+    assert await _balance(credits_engine, wxid) == 9485
+    assert await _balance(credits_engine, hashed) == 0
+    assert await store.peek_balance("tenant", "room", hashed, display_name="Z") == 9485
+
+
+@pytest.mark.asyncio
 async def test_concurrent_capture_refunds_and_records_ledger_once(
     credits_engine: AsyncEngine,
 ) -> None:

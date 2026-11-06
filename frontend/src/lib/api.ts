@@ -187,6 +187,7 @@ export type ParticipationPolicyValues = {
   proactive_min_silence_seconds: number;
   mention_sender_strategy: "never" | "reply_or_ambiguous";
   prompt_context_retention_seconds: number;
+  group_public_memory_enabled?: boolean;
   file_send_enabled: boolean;
 };
 
@@ -629,6 +630,16 @@ export type GroupGraphEdgeEvidenceResponse = {
 };
 
 export type GroupGraphEdgeJudgement = {
+  recall_block_reason?: string;
+  evidence_quality?: {
+    version?: string;
+    status?: string;
+    reasons?: string[];
+    cited_count?: number;
+    usable_count?: number;
+    subject_statement_count?: number;
+    object_grounded?: boolean;
+  };
   extraction_method?: string;
   signals?: Record<string, number>;
   policy?: string;

@@ -51,6 +51,8 @@ def test_group_relation_judgement_explains_model_edges_without_chat_text() -> No
 
     assert judgement == {
         "extraction_method": "llm",
+        "evidence_quality": {},
+        "recall_block_reason": "",
         "signals": {"llm": 10},
         "policy": "group_window_weak_signal",
         "acceptance_status": "accepted",
@@ -624,11 +626,11 @@ async def test_window_candidate_direct_signal_is_accepted_on_first_sight(
 
 
 @pytest.mark.asyncio
-async def test_window_candidate_weak_signal_waits_for_repetition(
+async def test_window_candidate_repetition_does_not_replace_semantic_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """co_participated is held as candidate; a key single-day LLM edge stays
-    needs_review; a second day with evidence promotes it to accepted."""
+    needs_review; repeating on a second day does not establish semantic truth."""
 
     store = MemoryStore(SimpleNamespace(memory_group_graph_auto_accept=True))
     inserted: list[dict[str, Any]] = []
@@ -698,10 +700,10 @@ async def test_window_candidate_weak_signal_waits_for_repetition(
     value = day_two["value_json"]
     assert value["evidence_dates"] == ["2026-08-31", "2026-09-01"]
     assert value["relation"]["signals"]["llm"] == 2
-    assert value["acceptance"]["status"] == "accepted"
-    assert value["acceptance"]["reason"] == "group_window_llm_multi_day"
+    assert value["acceptance"]["status"] == "needs_review"
+    assert value["acceptance"]["reason"] == "group_window_semantic_review_required"
     assert value["acceptance"]["day_count"] == 2
-    assert day_two["status"] == "active"
+    assert day_two["status"] == "pending"
     assert value["relation"]["strength"] > day_one["value_json"]["relation"]["strength"]
 
 
@@ -710,23 +712,23 @@ def test_group_relation_review_keeps_key_claims_and_holds_gossip() -> None:
     assert _group_relation_needs_human_review("asked", "person") is True
     assert _group_relation_needs_human_review("provided_resource", "artifact") is True
     assert _group_relation_needs_human_review("interested_in", "tool") is True
-    assert _group_relation_needs_human_review("interested_in", "topic") is False
+    assert _group_relation_needs_human_review("interested_in", "topic") is True
     assert _group_relation_needs_human_review("mentioned", "topic") is False
     assert _group_relation_needs_human_review("co_participated", "person") is False
 
     weak = {"quote": 0, "mention": 0, "prefix_reply": 0, "co_participation": 0, "llm": 1}
     assert _group_relation_acceptance_decision(
         weak, day_count=1, auto_accept=True, predicate="works_on", object_type="topic",
-    ) == ("needs_review", "group_window_weak_signal")
+    ) == ("needs_review", "group_window_semantic_review_required")
     assert _group_relation_acceptance_decision(
         weak, day_count=1, auto_accept=True, predicate="interested_in", object_type="tool",
-    ) == ("needs_review", "group_window_weak_signal")
+    ) == ("needs_review", "group_window_semantic_review_required")
     assert _group_relation_acceptance_decision(
         weak, day_count=1, auto_accept=True, predicate="interested_in", object_type="topic",
-    ) == ("candidate", "group_window_low_value_hold")
+    ) == ("needs_review", "group_window_semantic_review_required")
     assert _group_relation_acceptance_decision(
         weak, day_count=1, auto_accept=True, predicate="mentioned", object_type="topic",
-    ) == ("candidate", "group_window_low_value_hold")
+    ) == ("needs_review", "group_window_semantic_review_required")
     assert _group_relation_acceptance_decision(
         {**weak, "mention": 1, "llm": 0},
         day_count=1,
@@ -1668,7 +1670,7 @@ async def test_auto_extract_tick_runs_queued_llm_jobs_after_catchup(
 
 
 @pytest.mark.asyncio
-async def test_group_relation_auto_review_accepts_only_corroborated_candidates(
+async def test_group_relation_auto_review_does_not_accept_by_graph_overlap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = MemoryStore(SimpleNamespace(memory_group_graph_auto_review_batch=200))
@@ -1708,16 +1710,14 @@ async def test_group_relation_auto_review_accepts_only_corroborated_candidates(
     summary = await store.run_group_relation_auto_review()
 
     assert reviews == [
-        (1, "accept", "group_window_term_corroborated", "system/auto-review"),
-        (3, "accept", "group_window_pair_corroborated", "system/auto-review"),
         (5, "candidate", "group_window_low_value_hold", "system/auto-review"),
     ]
     assert summary["scanned"] == 6
-    assert summary["accepted"] == 2
-    assert summary["accepted_term"] == 1
-    assert summary["accepted_pair"] == 1
+    assert summary["accepted"] == 0
+    assert summary["accepted_term"] == 0
+    assert summary["accepted_pair"] == 0
     assert summary["held"] == 1
-    assert summary["remaining"] == 3
+    assert summary["remaining"] == 5
     assert summary["stop_reason"] == "completed"
 
     assert (await store.run_group_relation_auto_review(limit=0))["stop_reason"] == "disabled"
@@ -1779,7 +1779,7 @@ async def test_auto_accept_pending_group_window_relations(
         if sql.strip().startswith("UPDATE plugin_memory_item"):
             assert params is not None
             assert params["sids"] == ["room-a@chatroom"]
-            assert "group_window_auto_accept" in sql
+            assert "group_window_direct_batch" in sql
             return [{"id": 21}, {"id": 22}]
         if sql.strip().startswith("UPDATE plugin_memory_fact"):
             return [{"id": 201}, {"id": 202}]

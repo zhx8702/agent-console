@@ -694,6 +694,7 @@ async def test_outside_canary_preserves_exact_channel_baseline_without_new_budge
     ).run(ctx)
 
     assert ctx.extras["wxbot_participation"]["status"] == "may_reply"
+    assert ctx.session.variables["participation_status"] == "may_reply"
     assert ctx.extras["wxbot_participation"]["not_before"] == ""
     assert ctx.extras["wxbot_humanization_counterfactual_decision"]["status"] == "observe_only"
     features = ctx.extras["wxbot_humanization_features"]

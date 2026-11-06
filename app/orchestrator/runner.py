@@ -999,6 +999,25 @@ def _decision_trace(ctx: PipelineContext) -> dict[str, object]:
     if safe_signals:
         trace["router_signals"] = safe_signals
 
+    memory = ctx.signals.get("memory")
+    runtime = memory.get("runtime") if isinstance(memory, dict) else None
+    if isinstance(runtime, dict):
+        summary: dict[str, object] = {"member_recall_blocked": memory.get("member_recall_blocked") is True}
+        for stage in ("load", "save"):
+            payload = runtime.get(stage)
+            if not isinstance(payload, dict):
+                continue
+            for field in ("status", "reason"):
+                if payload.get(field):
+                    summary[f"{stage}_{field}"] = _bounded_trace_text(payload[field])
+        load = runtime.get("load")
+        if isinstance(load, dict):
+            for field in ("candidate_count", "selected_count", "selected_fact_count", "selected_episode_count"):
+                if isinstance(load.get(field), int) and not isinstance(load[field], bool):
+                    summary[field] = max(0, load[field])
+        if summary:
+            trace["memory"] = summary
+
     scope = ""
     agent_signals = ctx.signals.get("agent")
     if isinstance(agent_signals, dict):

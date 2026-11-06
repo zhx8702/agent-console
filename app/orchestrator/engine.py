@@ -644,6 +644,7 @@ class DialogOrchestrator:
             #    does not retain raw group @mentions or duplicated current input.
             if not bool(event.metadata.get("is_self_sent")):
                 turn_metadata = dict(event.metadata or {})
+                turn_metadata.setdefault("message_id", event.message_id)
                 turn_metadata.setdefault("original_content", pre.original_text)
                 turn_metadata["cleaned_content"] = pre.cleaned_text
                 already_recorded = any(

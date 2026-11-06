@@ -161,6 +161,10 @@ _DECISION_TRACE_FIELDS: dict[str, frozenset[str]] = {
             "consecutive_fallbacks",
         }
     ),
+    "memory": frozenset({
+        "load_status", "load_reason", "save_status", "save_reason", "member_recall_blocked",
+        "candidate_count", "selected_count", "selected_fact_count", "selected_episode_count",
+    }),
     "agent": frozenset({"tool_scope"}),
     "result": frozenset(
         {

@@ -724,3 +724,19 @@ def test_registration_rejects_reserved_kernel_owner() -> None:
 
     with pytest.raises(PluginRegistrationError, match="reserved kernel owner"):
         PluginRegistry()._register(ReservedPlugin())
+
+
+@pytest.mark.asyncio
+async def test_startup_graph_must_not_drop_uninitialized_dependent_owner() -> None:
+    registry = PluginRegistry(allow_offline_execution=True)
+    registry._register(_FoundationPlugin())
+    registry._register(_DependentPlugin())
+    registry._active_plugins = {"foundation"}
+    registry._initialized_plugins = {"foundation"}
+    registry._dependency_graph = resolve_plugin_dependency_graph(
+        registry.loaded_plugins, {"foundation"}
+    )
+    assert set(registry._execution_owner_closure("dependent")) == {"foundation", "dependent"}
+    assert await registry.global_execution_allowed("dependent") is False
+    assert await registry.scope_execution_allowed("dependent", tenant_id="tenant", session_id="room") is False
+    assert await registry.owners_scope_execution_allowed(["dependent"], tenant_id="tenant", session_id="room") is False

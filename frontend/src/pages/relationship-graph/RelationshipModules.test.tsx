@@ -145,6 +145,22 @@ describe("relationship graph evidence labels", () => {
     expect(evidenceObservedRange(null)).toBe("");
   });
 
+  it("separates grounded evidence from an accepted claim and shows recall blocks", () => {
+    const summary = judgementSummary({
+      policy: "group_window_semantic_review_required",
+      recall_block_reason: "group_preference_requires_review",
+      evidence_quality: {
+        version: "group-evidence-v2", status: "grounded", cited_count: 3,
+        usable_count: 3, subject_statement_count: 1, object_grounded: true,
+      },
+    });
+    expect(summary?.policyText).toContain("消息条数和讨论天数不能代替核实");
+    expect(summary?.evidenceText).toContain("当事人不同发言 1 条");
+    expect(summary?.evidenceText).toContain("不能单独证明关系成立");
+    expect(summary?.recallText).toContain("未进入回复召回");
+    expect(judgementSummary({})?.evidenceText).toContain("旧记录未保存");
+  });
+
   it("explains how an edge was decided from the judgement block", () => {
     const summary = judgementSummary({
       extraction_method: "llm",
@@ -161,7 +177,7 @@ describe("relationship graph evidence labels", () => {
     expect(summary?.method).toBe("语义抽取");
     expect(summary?.signals).toEqual(["模型判定的支撑消息 10 条"]);
     // The review reason (why it was finally accepted) wins over the initial policy.
-    expect(summary?.policyText).toBe("同一主题已有其他已通过的关系，系统印证通过");
+    expect(summary?.policyText).toBe("旧版策略：因主题出现在其他关系中而通过，未核实当前关系");
     expect(summary?.reviewerText).toBe("系统印证扫描");
     expect(summary?.modelReason).toBe("多次比较三位成员并评价其外貌");
     expect(judgementSummary(undefined)).toBeNull();
@@ -309,9 +325,9 @@ describe("relationship graph modules", () => {
     const { rerender } = render(<RelationshipGraphPresentation {...controller} />);
     const nodeList = screen.getByRole("region", { name: "这些人" });
     const edgeList = screen.getByRole("region", { name: "这些互动" });
-    const queue = screen.getByRole("region", { name: "待审核队列" });
-     expect(within(queue).getByText(/关键关系进本队列/)).toBeInTheDocument();
-     expect(within(queue).getByText(/闲聊「提到」和空泛兴趣先挂起/)).toBeInTheDocument();
+    const queue = screen.getByRole("region", { name: "观察中的关系" });
+     expect(within(queue).getByText(/无需逐条审核/)).toBeInTheDocument();
+     expect(within(queue).getByText(/下方操作仅用于纠错/)).toBeInTheDocument();
     // The list is capped; the badge tells how many are really waiting.
     expect(within(queue).getByText("1 / 637")).toBeInTheDocument();
     const nodeRow = within(nodeList).getByRole("button", { name: /成员甲/ });
@@ -422,7 +438,7 @@ describe("relationship graph modules", () => {
 
     const dialog = screen.getByRole("dialog", { name: "确认接受该关系" });
     expect(within(dialog).getByText(/回复/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/待审核/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/观察中/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "确认接受" }));
 
     expect(reviewEdge).toHaveBeenCalledWith("accept");
