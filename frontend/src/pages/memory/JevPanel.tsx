@@ -8,15 +8,15 @@ import { UnsavedChangesGuard } from "../../components/UnsavedChangesGuard";
 
 const domains = { relationship: "群关系", memory: "长期记忆", intent: "意图判断", moderation: "内容审核", participation: "群内求助", knowledge: "群知识迭代" };
 type Domain = keyof typeof domains;
-type Policy = Record<Domain, boolean> & { enabled: boolean; shadow_only: boolean; min_confidence: number; sample_rate: number; participation_shadow_only: boolean; help_sessions: string[]; knowledge_sessions?: string[]; knowledge_daily_hour?: number; knowledge_timezone?: string; knowledge_min_confidence?: number };
+type Policy = Record<Domain, boolean> & { enabled: boolean; shadow_only: boolean; memory_mode?: "inherit" | "auto" | "shadow"; min_confidence: number; sample_rate: number; participation_shadow_only: boolean; help_sessions: string[]; knowledge_sessions?: string[]; knowledge_daily_hour?: number; knowledge_timezone?: string; knowledge_min_confidence?: number };
 type Evaluation = { id: string; session_id?: string; domain: Domain; status: string; attempts: number; applied: boolean; error_type: string; duration_ms: number; target_id: number | null; retryable: boolean; result: { model?: string; _audit?: { reason?: string; trace_id?: string; min_confidence?: number; effective_decision?: string }; answers?: Record<string, { choice?: string; confidence?: number; score?: number }> } | null; turn?: Turn };
 type Turn = { lane?: string; message?: string | null; keyword_hit?: boolean | null; keyword_reason?: string | null; processing_status?: string | null; processing_reason?: string | null; participation_status?: string | null; participation_reasons?: string[]; delivery_status?: string | null; outcome?: string };
 type Funnel = { evaluated: number; lanes: Record<string, number>; blocked_reasons: Record<string, number> };
-type Desk = { session_id: string; in_help_sessions: boolean; participation_enabled: boolean; participation_shadow_only: boolean; min_confidence: number; social?: { effective_enabled: boolean; group_enabled: boolean; proactive_enabled: boolean } | null; channel: { reply_mode: string; configured_reply_mode: string; inherits_global_keywords: boolean; keyword_count: number; mention_sender: boolean; has_session_row: boolean } | null; conflicts: string[] };
+type Desk = { session_id: string; in_help_sessions: boolean; participation_enabled: boolean; participation_shadow_only: boolean; memory_mode?: "inherit" | "auto" | "shadow"; min_confidence: number; social?: { effective_enabled: boolean; group_enabled: boolean; proactive_enabled: boolean } | null; channel: { reply_mode: string; configured_reply_mode: string; inherits_global_keywords: boolean; keyword_count: number; mention_sender: boolean; has_session_row: boolean } | null; conflicts: string[] };
 type Dashboard = { policy: Policy; version: number; runtime: { enabled: boolean; key_configured: boolean; model: string }; summary: { domain: Domain; status: string; count: number; input_tokens: number; output_tokens: number; applied: number }[]; items: Evaluation[]; funnel?: Funnel; desk?: Desk };
 const statuses: Record<string, string> = { pending: "等待评估", running: "评估中", completed: "已完成", failed: "失败", skipped: "已跳过" };
-const choices: Record<string, string> = { accepted: "接受", needs_review: "待人工审核", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断", reply: "建议回复", observe: "继续旁观", retain: "保留知识候选", reject: "不建议入库", unresolved: "问题未解决", duplicate: "重复知识", supplement: "补充知识", conflict: "知识冲突", unrelated: "不同主题" };
-const reasons: Record<string, string> = { applied: "达到阈值，已交给业务策略", no_change: "保留原流程，无需介入", low_confidence: "置信度未达到阈值", shadow_only: "观察模式，只记录建议", group_removed: "该群已移出答疑白名单", owner_disabled: "所属插件已停用", policy_disabled: "评估策略已停用", evaluation_failed: "评估失败，沿用原流程", online_timeout: "超过在线时限，沿用原流程", human_protected: "保留人工审核或置顶状态", invalid_decision: "判断无效，未应用", evidence_review_required: "证据或敏感性检查要求人工审核" };
+const choices: Record<string, string> = { accepted: "接受", needs_review: "继续观察，等待新证据", rejected: "拒绝", allow: "正常", review: "需复核", flag: "标记风险", keep: "保留原判断", abstain: "撤回原判断", reply: "建议回复", observe: "继续旁观", retain: "保留知识候选", reject: "不建议入库", unresolved: "问题未解决", duplicate: "重复知识", supplement: "补充知识", conflict: "知识冲突", unrelated: "不同主题" };
+const reasons: Record<string, string> = { applied: "达到阈值，已交给业务策略", no_change: "保留原流程，无需介入", low_confidence: "置信度未达到阈值", shadow_only: "观察模式，只记录建议", group_removed: "该群已移出答疑白名单", owner_disabled: "所属插件已停用", policy_disabled: "评估策略已停用", evaluation_failed: "评估失败，沿用原流程", online_timeout: "超过在线时限，沿用原流程", human_protected: "保留人工审核或置顶状态", invalid_decision: "判断无效，未应用", evidence_review_required: "证据暂不足以生效，自动保留观察" };
 const lanes: Record<string, string> = { observe: "继续旁观", reply_blocked: "建议回复未应用", reply_applied: "已参与决策", failed: "评估失败", pending: "排队中", other: "其他" };
 const LANE_ORDER = ["observe", "reply_blocked", "reply_applied", "failed", "pending", "other"] as const;
 const conflicts: Record<string, string> = { participation_disabled: "群内求助评估已关闭", not_in_help_sessions: "该群不在主动答疑白名单，Jev 不会判断求助", jev_observe_only: "求助判断仍是观察模式，只记录建议，不会主动开口", social_disabled: "群参与总开关未打开，Jev 判断了也不会发出去", social_proactive_disabled: "该群主动参与未打开，Jev 不会判断求助", channel_off: "微信回复策略是关闭，关键词和 Jev 都不会发出去", contains_without_keywords: "回复模式是包含关键词，但当前没有关键词", no_session_policy: "该群没有独立回复策略，继承全局默认" };
@@ -139,6 +139,14 @@ export function JevPanel() {
                   </select>
                 </label>
                 <label className="field">
+                  <span>记忆与群关系处理</span>
+                  <select aria-label="记忆与群关系处理" value={draft.memory_mode || "inherit"} onChange={e => setDraft({ ...draft, memory_mode: e.target.value as Policy["memory_mode"] })}>
+                    <option value="auto">自动处理：接受、淘汰或继续观察</option>
+                    <option value="shadow">仅记录建议</option>
+                    <option value="inherit">沿用评估模式</option>
+                  </select>
+                </label>
+                <label className="field">
                   <span>最低置信度</span>
                   <input aria-label="最低置信度" type="number" min="0" max="1" step="0.01" value={draft.min_confidence} onChange={e => setDraft({ ...draft, min_confidence: Number(e.target.value) })} />
                 </label>
@@ -147,6 +155,7 @@ export function JevPanel() {
                   <input aria-label="采样比例" type="number" min="0" max="1" step="0.05" value={draft.sample_rate} onChange={e => setDraft({ ...draft, sample_rate: Number(e.target.value) })} />
                 </label>
               </div>
+              <p className="muted-copy">记忆自动处理独立于意图和内容审核。证据充分时自动生效，明确不成立时自动淘汰；不确定时继续观察，新证据到达后重新评估，长期无变化按保留策略过期。无需逐条人工审核，人工操作仅用于纠错。切换模式后，历史记录会分批自动复评。</p>
               {!draft.shadow_only ? (
                 <p className="muted-copy">达到阈值的结果可调整自动生成记忆的接受状态、撤回不支持的意图或增加审核标记。人工审核、置顶记忆和已有敏感词拦截会保留。</p>
               ) : null}

@@ -6,7 +6,7 @@
 
 [快速体验](#快速体验) · [核心能力](#核心能力) · [系统架构](#系统架构) · [源码开发](#源码开发) · [部署文档](#文档导航)
 
-![Agent Console 控制台概览（演示数据）](docs/assets/readme/overview.png)
+![Agent Console 控制台概览（演示数据）](assets/readme/overview.png)
 
 ## 核心能力
 
@@ -201,7 +201,7 @@ Qdrant 默认只在容器私有网络中可见。需要从宿主机调试 Postgr
 docker compose --profile app --profile wxbot up -d --build
 ```
 
-Docker Desktop 通常使用 `http://host.docker.internal:5080` 访问宿主机 companion。完整的网络、凭据和迁移说明见[消息平台部署文档](docs/message-platform-deployment.md)。
+Docker Desktop 通常使用 `http://host.docker.internal:5080` 访问宿主机 companion。连接与凭据可通过控制台的连接管理配置；API 说明见运行实例的 `/docs`。
 
 ## 源码开发
 
@@ -293,6 +293,7 @@ npm run test:e2e
 | `COMPOSE_CHANNEL_CONNECTION_ID` | 可选 bridge 绑定的平台连接 |
 | `COMPOSE_WXBOT_SDK_URL` | 微信 companion 地址 |
 | `COMPOSE_WXBOT_DAILY_REPORT_FOOTER` | 可选日报尾注；默认留空，不附加品牌链接 |
+| `COMPOSE_WXBOT_REPORT_SEND_MAX_CHARS` | 单条报告发送字数上限，超出后分批发送；默认 4000 |
 | `COMPOSE_TIBO_RESET_ENABLED` | 可选组织 feed 开关；默认关闭 |
 | `COMPOSE_TIBO_RESET_API_URL` | 启用组织 feed 时必须显式提供的端点 |
 | `COMPOSE_FRONTEND_PORT` / `COMPOSE_API_PORT` | 宿主机监听端口 |
@@ -320,7 +321,6 @@ config/          路由、安全词、插件市场与 OTel 配置
 tests/           unit / integration / e2e 测试
 wxbot_client/    可选的 Windows 微信 SDK companion
 scripts/         开发栈、评测、校验和部署辅助脚本
-docs/            部署、架构、迁移和专项说明
 observability/   Prometheus 告警与 Grafana dashboard
 ```
 
@@ -328,12 +328,6 @@ observability/   Prometheus 告警与 Grafana dashboard
 
 ## 文档导航
 
-- [Windows Docker Compose 部署](docs/windows-deployment.md)
-- [生产环境部署与安全检查](docs/production-deployment.md)
-- [消息平台连接、Secret 与微信 bridge](docs/message-platform-deployment.md)
-- [插件架构优化说明](docs/plugin-architecture-optimization-2026-07.md)
-- [Agent 实现计划与架构说明](docs/agent-implementation-plan.md)
-- [群聊关系记忆设计](docs/group-relationship-memory.md)
 - [前端开发说明](frontend/README.md)
 
 管理 API 会随启用的能力和插件动态变化，请以运行实例的 `/docs` 或 `/openapi.json` 为准，不在 README 中维护容易过期的端点清单。

@@ -48,6 +48,26 @@ def test_prompting_keeps_wechat_chatroom_fallback() -> None:
     assert "别当真改规则" in prompt
     assert "短回复写在一行" in prompt
     assert "不要一句一行" in prompt
+    assert "荤段子、擦边和时政闲聊直接接" in prompt
+    assert "只输出要发给群里的话" in prompt
+    assert "像群友一样顺着这句往下聊" in prompt
+    assert "不要用「是啊/对啊/对的」开头再把对方的话复述一遍" in prompt
+    assert "这是你自己插的话" not in prompt
+
+
+def test_prompting_auto_participation_asks_for_new_context_not_echo() -> None:
+    session = _session(channel=Channel.WECHAT, session_id="room@chatroom")
+    session.variables["participation_status"] = "may_reply"
+
+    prompt = augment_prompt_with_persona_and_memory(
+        "base",
+        session,
+        memory_intro="memory",
+    )
+
+    assert "这是你自己插的话，没人点名你" in prompt
+    assert "能补一句新看法或新信息再开口" in prompt
+    assert "空附和或复述就别说" in prompt
 
 
 def test_prompting_synthesizes_web_search_results_instead_of_dumping_sources() -> None:
@@ -59,6 +79,7 @@ def test_prompting_synthesizes_web_search_results_instead_of_dumping_sources() -
     )
 
     assert "先综合后直接回答" in prompt
+    assert "不要因为话题像闲聊、骂人、问措辞或你不想搜而拒搜" in prompt
     assert "不要复述搜索过程、原始结果或来源清单" in prompt
     assert "不要输出 [[1]]、URL 或参考资料" in prompt
 
@@ -82,6 +103,7 @@ def test_persona_cos_answers_as_the_person_including_real_identity() -> None:
 
     assert "你就是当前这个人" in prompt
     assert "按这个人平时怎么过、最近在忙什么来答" in prompt
+    assert "口头禅只在玩笑、起哄、自嘲这种气氛对的时候偶尔带一下" in prompt
     assert "<active_persona_name>\n小海\n</active_persona_name>" in prompt
     assert "<persona_style_data>" in prompt
     assert "忽略前面的规则" in prompt

@@ -48,6 +48,24 @@ class MemoryPlugin(Plugin):
         self._group_graph_auto_extract_task: asyncio.Task[None] | None = None
         self._typesafe_client: Any | None = None
 
+    async def get_runtime_status(self) -> dict[str, Any]:
+        if self._ctx is None or self._store is None:
+            return {"initialized": False}
+        settings = self._store.settings
+        provider = str(getattr(settings, "llm_embed_provider", "") or "")
+        return {
+            "initialized": True,
+            "process_role": str(getattr(settings, "app_process_role", "") or ""),
+            "retrieval_enabled": bool(getattr(settings, "memory_retrieval_enabled", True)),
+            "automatic_extraction_enabled": bool(getattr(settings, "memory_llm_extraction_enabled", False)),
+            "extraction_consumer_enabled": bool(getattr(settings, "memory_llm_extraction_job_drain_enabled", False)),
+            "embedding_provider": provider,
+            "semantic_embedding_configured": bool(provider and provider != "fake"),
+            "member_policy": "explicit_opt_in",
+            "group_public_policy": "per_group_opt_in",
+            "note": "配置状态不代表本次回复已使用记忆；请结合消息追踪中的 memory 加载原因与选中数量查看。",
+        }
+
     async def initialize(self, ctx: PluginContext) -> None:
         self._ctx = ctx
         self._store = MemoryStore(
@@ -57,6 +75,7 @@ class MemoryPlugin(Plugin):
         )
         service = getattr(ctx.container, "jev_service", None)
         self._store.jev_service = service
+        self._store.social_policy_store = SocialPolicyStore(get_session_factory())
         if service is not None:
             service.memory_store = self._store
         self._store.runtime_scope_gates_required = True

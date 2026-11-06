@@ -93,7 +93,7 @@ export function RelationshipMutationActions({
                 <dl>
                   <div><dt>目标群</dt><dd>{selectedGroupId ? "当前已验证群聊" : "未选择"}</dd></div>
                   <div><dt>范围</dt><dd>最近 7 天历史导入，并按日追平窗口抽取。</dd></div>
-                  <div><dt>影响</dt><dd>会调用历史同步和语义抽取；新关系进入待审核，不展示聊天原文。</dd></div>
+                  <div><dt>影响</dt><dd>会调用历史同步和语义抽取；新关系进入自动评估流程，不展示聊天原文。</dd></div>
                 </dl>
               )}
               onConfirm={runRecentCoverage}
@@ -397,8 +397,10 @@ export function RelationshipDetailPanel(controller: RelationshipGraphController)
                             <div><dt>信号</dt><dd>{judgement.signals.join("，")}</dd></div>
                           )}
                           {judgement.policyText && (
-                            <div><dt>通过依据</dt><dd>{judgement.policyText}</dd></div>
+                            <div><dt>判定依据</dt><dd>{judgement.policyText}</dd></div>
                           )}
+                          <div><dt>证据核对</dt><dd>{judgement.evidenceText}</dd></div>
+                          {judgement.recallText && <div><dt>回复使用</dt><dd>{judgement.recallText}</dd></div>}
                           {judgement.reviewerText && (
                             <div><dt>判定者</dt><dd>{judgement.reviewerText}</dd></div>
                           )}

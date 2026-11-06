@@ -511,6 +511,7 @@ def _ctx(
         channel=channel,
         user_id=user_id,
         session_id=session_id,
+        external_participant_id=str(event_metadata.get("external_participant_id") or ""),
         message=Message(content=content),
         trace_id="trace-1",
         metadata=event_metadata,
@@ -933,6 +934,43 @@ async def test_command_dispatch_step_routes_credit_rank_aliases_from_saved_confi
 
 
 @pytest.mark.asyncio
+async def test_command_billing_charges_wechat_sender_wxid_not_hashed_user_id() -> None:
+    billing, provider = _fake_billing()
+    step = CommandDispatchStep(_FakeCommandStore(), _build_service(), billing)
+    ctx = _ctx(
+        "/签到",
+        user_id="cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b",
+        metadata={"sender_wxid": "zhx870255124"},
+    )
+
+    result = await step.run(ctx)
+
+    assert result.action == "stop"
+    assert provider.reservations[0].subject.user_id == "zhx870255124"
+
+
+@pytest.mark.asyncio
+async def test_command_billing_prefers_external_participant_over_hashed_sender() -> None:
+    billing, provider = _fake_billing()
+    step = CommandDispatchStep(_FakeCommandStore(), _build_service(), billing)
+    hashed = "cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b"
+    ctx = _ctx(
+        "/签到",
+        user_id=hashed,
+        metadata={
+            "sender_wxid": hashed,
+            "sender_id": hashed,
+            "external_participant_id": "zhx870255124",
+        },
+    )
+
+    result = await step.run(ctx)
+
+    assert result.action == "stop"
+    assert provider.reservations[0].subject.user_id == "zhx870255124"
+
+
+@pytest.mark.asyncio
 async def test_command_dispatch_step_returns_billing_effects() -> None:
     billing, provider = _fake_billing()
     step = CommandDispatchStep(_FakeCommandStore(), _build_service(), billing)
@@ -952,6 +990,50 @@ async def test_command_dispatch_step_returns_billing_effects() -> None:
     assert result.effects[0].idempotency_key == ("commands:reserve_credits:reservation-1")
     assert result.effects[1].payload["settlement"] == "captured"
     assert result.effects[1].idempotency_key == ("commands:capture_credits:reservation-1")
+
+
+@pytest.mark.asyncio
+async def test_command_dispatch_skips_billing_when_credits_scope_is_denied() -> None:
+    async def deny_scope(tenant_id: str, session_id: str) -> bool:
+        _ = (tenant_id, session_id)
+        return False
+
+    billing = BillingCoordinator()
+    provider = _FakeBillingProvider()
+    billing.register_provider(
+        provider,
+        owner="credits",
+        scope_execution_allowed=deny_scope,
+    )
+    store = _FakeCommandStore()
+    store.config["user_commands"] = ["/draw"]
+
+    async def handler(ctx: PipelineContext, args: list[str]) -> str:
+        _ = (ctx, args)
+        return "收到, 正在画。"
+
+    service = CommandRegistryService()
+    service.register(
+        [
+            CommandDefinition(
+                plugin_name="draw",
+                command="/draw",
+                handler=handler,
+            )
+        ]
+    )
+    result = await CommandDispatchStep(store, service, billing).run(
+        _ctx("/draw 旺仔牛奶 芒果 火龙果")
+    )
+
+    assert result.action == "stop"
+    assert result.result is not None
+    assert result.result.reply_text == "收到, 正在画。"
+    assert result.reason == "draw_command"
+    assert provider.reservations == []
+    assert provider.captures == []
+    assert provider.releases == []
+    assert result.effects == []
 
 
 @pytest.mark.asyncio

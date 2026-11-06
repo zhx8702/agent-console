@@ -19,6 +19,7 @@ import importlib.util
 import json
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -38,6 +39,7 @@ from app.plugin.base import (
     plugin_capability_digest,
 )
 from app.plugin.config_schema import validate_config_schema
+from app.plugin.contributions import PluginContributionSet
 from app.plugin.dependencies import (
     PluginDependencyBlockedError,
     PluginDependencyGraph,
@@ -47,8 +49,10 @@ from app.plugin.dependencies import (
     resolve_plugin_dependency_graph,
 )
 from app.plugin.hooks import HookRunner
+from app.plugin.resources import PluginResources, revoke_contributions
 from app.plugin.runtime import GatedCapabilityEngine
 from app.plugin.state import PluginStateStore
+from app.plugin.validation import assert_descriptor_values, validate_runtime_descriptor
 
 if TYPE_CHECKING:
     from fastapi import APIRouter
@@ -214,6 +218,8 @@ class PluginRegistry:
         self._initialization_order: list[str] = []
         self._initialization_failures: dict[str, str] = {}
         self._dependency_graph: PluginDependencyGraph | None = None
+        self._contributions: dict[str, PluginContributionSet] = {}
+        self._resources: dict[str, PluginResources] = {}
         self._descriptors: dict[str, PluginDescriptor] = {}
         self._config_schemas: dict[str, dict[str, Any]] = {}
         self._admin_ui_documents: dict[str, dict[str, Any]] = {}
@@ -401,6 +407,13 @@ class PluginRegistry:
         was_initialized = name in self._initialized_plugins
         try:
             if not was_initialized:
+                if name in self._resources:
+                    await self._close_resources(name)
+                    if name in self._resources:
+                        raise RuntimeError("plugin_previous_resource_cleanup_incomplete")
+                resources = PluginResources(name)
+                self._resources[name] = resources
+                ctx = replace(ctx, resources=resources)
                 await asyncio.wait_for(
                     plugin.initialize(ctx),
                     timeout=_PLUGIN_INITIALIZE_TIMEOUT_SECONDS,
@@ -411,8 +424,9 @@ class PluginRegistry:
                 validate_plugin_admin_ui(admin_ui)
                 self._config_schemas[name] = copy.deepcopy(config_schema)
                 self._admin_ui_documents[name] = copy.deepcopy(admin_ui)
-                descriptor = plugin.build_descriptor(
-                    command_tokens=self._command_tokens_by_owner(name)
+                contributions = PluginContributionSet.collect(plugin)
+                descriptor = PluginDescriptor.from_plugin(
+                    contributions, command_tokens=self._command_tokens_by_owner(name)
                 )
                 if descriptor.name != name:
                     raise ValueError(
@@ -420,10 +434,11 @@ class PluginRegistry:
                     )
                 await self._validate_durable_package_contract(name, descriptor)
                 self._descriptors[name] = descriptor
+                self._contributions[name] = contributions
                 self._initialized_plugins.add(name)
                 self._initialization_order.append(name)
-            self._register_plugin_hooks(name, plugin)
-            self._register_plugin_agent_tools(name, plugin, ctx.container)
+            self._register_plugin_hooks(name, self._contributions[name])
+            self._register_plugin_agent_tools(name, self._contributions[name], ctx.container)
             self._validate_runtime_descriptor(name, container=ctx.container)
             self._active_plugins.add(name)
             self._initialization_failures.pop(name, None)
@@ -445,19 +460,8 @@ class PluginRegistry:
             raise
 
     async def deactivate_plugin(self, name: str, container: Any) -> dict[str, int]:
-        removed_hooks = self._hook_runner.unregister_owner(name)
-        self._hooks_registered.discard(name)
-        removed_tools = 0
-        registry = getattr(container, "agent_tool_registry", None)
-        if isinstance(registry, AgentToolRegistry):
-            removed_tools = registry.unregister_owner(name)
-        self._agent_tools_registered.discard(name)
-        removed_commands = 0
-        commands_plugin = self._plugins.get("commands")
-        unregister = getattr(commands_plugin, "unregister_owner", None)
-        if callable(unregister):
-            removed_commands = int(unregister(name))
         self._active_plugins.discard(name)
+        counts = self._revoke_contributions(name, container)
         plugin = self._plugins.get(name)
         if plugin is not None:
             try:
@@ -471,18 +475,16 @@ class PluginRegistry:
                 # The execution gate is already closed.  Keep the plugin
                 # inactive even when its best-effort resource cleanup fails.
                 logger.exception("plugin.disable_cleanup_failed", name=name)
-                return {
-                    "hooks": removed_hooks,
-                    "agent_tools": removed_tools,
-                    "commands": removed_commands,
-                    "cleanup_errors": 1,
-                }
-        return {
-            "hooks": removed_hooks,
-            "agent_tools": removed_tools,
-            "commands": removed_commands,
-            "cleanup_errors": 0,
-        }
+                counts["cleanup_errors"] += 1
+        return counts
+
+    def _revoke_contributions(self, name: str, container: Any) -> dict[str, int]:
+        counts = revoke_contributions(
+            name, self._hook_runner, container, self._plugins.get("commands")
+        )
+        self._hooks_registered.discard(name)
+        self._agent_tools_registered.discard(name)
+        return counts
 
     async def reactivate_plugin(self, name: str, ctx: PluginContext) -> bool:
         self._runtime_container = ctx.container
@@ -500,8 +502,9 @@ class PluginRegistry:
                 plugin.on_enable(),
                 timeout=_PLUGIN_LIFECYCLE_TIMEOUT_SECONDS,
             )
-            self._register_plugin_hooks(name, plugin)
-            self._register_plugin_agent_tools(name, plugin, ctx.container)
+            self._contributions[name] = PluginContributionSet.collect(plugin)
+            self._register_plugin_hooks(name, self._contributions[name])
+            self._register_plugin_agent_tools(name, self._contributions[name], ctx.container)
             self._validate_runtime_descriptor(name, container=ctx.container)
             self._active_plugins.add(name)
             return False
@@ -517,6 +520,8 @@ class PluginRegistry:
 
     async def shutdown_all(self) -> None:
         for name in reversed(self._initialization_order):
+            self._active_plugins.discard(name)
+            self._revoke_contributions(name, self._runtime_container)
             try:
                 await asyncio.wait_for(
                     self._plugins[name].shutdown(),
@@ -525,6 +530,19 @@ class PluginRegistry:
                 logger.info("plugin.shutdown", name=name)
             except Exception as exc:
                 logger.error("plugin.shutdown_failed", name=name, error=str(exc))
+            finally:
+                await self._close_resources(name)
+
+    async def _close_resources(self, name: str) -> None:
+        resources = self._resources.get(name)
+        if resources is None:
+            return
+        try:
+            await asyncio.wait_for(resources.close(), _PLUGIN_SHUTDOWN_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.error("plugin.resource_cleanup_failed", name=name, error=type(exc).__name__)
+        else:
+            self._resources.pop(name, None)
 
     # -- accessors -----------------------------------------------------------
 
@@ -537,7 +555,7 @@ class PluginRegistry:
         owners: dict[RouteType, str] = {}
         for name, plugin in self._plugins.items():
             if name in self._active_plugins:
-                engines = plugin.get_capability_engines()
+                engines = self._published_contributions(name, plugin).get_capability_engines()
                 self._assert_descriptor_values(
                     name,
                     "capability_engines",
@@ -566,7 +584,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins:
                 continue
-            router = plugin.get_api_router()
+            router = self._published_contributions(name, plugin).get_api_router()
             routes: set[str] = set()
             if router is not None:
                 for route in getattr(router, "routes", ()):
@@ -584,7 +602,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins:
                 continue
-            steps = plugin.get_flow_steps()
+            steps = self._published_contributions(name, plugin).get_flow_steps()
             self._assert_descriptor_values(
                 name,
                 "flow_steps",
@@ -614,7 +632,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins:
                 continue
-            executors = plugin.get_flow_executors()
+            executors = self._published_contributions(name, plugin).get_flow_executors()
             self._assert_descriptor_values(
                 name,
                 "flow_steps",
@@ -641,7 +659,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins:
                 continue
-            handlers = plugin.get_effect_handlers()
+            handlers = self._published_contributions(name, plugin).get_effect_handlers()
             invalid_owners = sorted(
                 {
                     str(item[1])
@@ -667,7 +685,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins:
                 continue
-            provider = plugin.get_admin_media_event_provider()
+            provider = self._published_contributions(name, plugin).get_admin_media_event_provider()
             self._assert_descriptor_values(
                 name,
                 "admin_media_providers",
@@ -689,7 +707,7 @@ class PluginRegistry:
         for name, plugin in self._plugins.items():
             if name not in self._active_plugins or name not in self._initialized_plugins:
                 continue
-            registrations = list(plugin.get_channel_adapters())
+            registrations = list(self._published_contributions(name, plugin).get_channel_adapters())
             actual_ids = {
                 str(getattr(getattr(item, "descriptor", None), "adapter_id", "") or "")
                 for item in registrations
@@ -715,6 +733,12 @@ class PluginRegistry:
                     _GatedChannelAdapterRegistration(self, name, registration)
                 )
         return result
+
+    def _published_contributions(self, name: str, plugin: Plugin) -> PluginContributionSet | Plugin:
+        if name not in self._contributions:
+            return plugin  # Explicit offline diagnostic/test registries.
+        self._validate_runtime_descriptor(name)
+        return self._contributions[name]
 
     def all_permissions(self) -> dict[str, set[str]]:
         for name in sorted(self._active_plugins & self._initialized_plugins):
@@ -1161,140 +1185,18 @@ class PluginRegistry:
         logger.info("plugin.agent_tools_registered", plugin=name, count=count)
         self._agent_tools_registered.add(name)
 
-    def _validate_runtime_descriptor(
-        self,
-        name: str,
-        *,
-        container: Any | None = None,
-    ) -> None:
+    def _validate_runtime_descriptor(self, name: str, *, container: Any | None = None) -> None:
         plugin = self._plugins.get(name)
         if plugin is None:
             raise RuntimeError(f"plugin missing for descriptor validation: {name}")
         descriptor = self._descriptors.get(name)
         if descriptor is None:
             raise RuntimeError(f"plugin descriptor missing after initialization: {name}")
-
-        if (
-            plugin.meta.name != descriptor.name
-            or plugin.meta.version != descriptor.version
-            or plugin.meta.description != descriptor.description
-            or tuple(plugin.meta.dependencies) != descriptor.dependencies
-        ):
-            raise RuntimeError(f"plugin descriptor drift: {name}.metadata")
-
-        permissions = {
-            str(item).strip()
-            for item in plugin.get_permissions()
-            if str(item).strip()
-        }
-        self._assert_descriptor_values(name, "permissions", permissions)
-        self._assert_descriptor_values(
-            name,
-            "storage_permissions",
-            {item for item in permissions if item.startswith("storage:")},
-        )
-        self._assert_descriptor_values(
-            name,
-            "network_permissions",
-            {item for item in permissions if item.startswith("network:")},
-        )
-
-        hooks = plugin.get_pipeline_hooks()
-        self._assert_descriptor_values(
-            name,
-            "hooks",
-            {
-                (
-                    f"{getattr(getattr(item, 'point', ''), 'value', getattr(item, 'point', ''))}:"
-                    f"{getattr(item, 'name', '')}"
-                )
-                for item in hooks
-            },
-        )
-        tools = plugin.get_agent_tools()
-        self._assert_descriptor_values(
-            name,
-            "agent_tools",
-            {
-                f"{getattr(item, 'scope', '')}:{getattr(item, 'name', '')}"
-                for item in tools
-            },
+        validate_runtime_descriptor(
+            plugin, descriptor, command_tokens=self._command_tokens_by_owner(name)
         )
         self._assert_registered_agent_tools(
-            name,
-            container=container if container is not None else self._runtime_container,
-        )
-
-        router = plugin.get_api_router()
-        routes: set[str] = set()
-        if router is not None:
-            for route in getattr(router, "routes", ()):
-                path = str(getattr(route, "path", "") or "")
-                for method in sorted(getattr(route, "methods", ()) or ()):
-                    routes.add(f"{str(method).upper()} {path}")
-        self._assert_descriptor_values(name, "admin_routes", routes)
-
-        steps = {str(item.kind) for item in plugin.get_flow_steps()}
-        self._assert_descriptor_values(name, "flow_steps", steps)
-        self._assert_descriptor_values(
-            name,
-            "flow_steps",
-            {str(kind) for kind in plugin.get_flow_executors()},
-        )
-
-        handlers = plugin.get_effect_handlers()
-        invalid_owners = sorted(
-            {
-                str(item[1])
-                for item in handlers
-                if str(item[1]).strip() != name
-            }
-        )
-        if invalid_owners:
-            raise RuntimeError(
-                f"plugin descriptor drift: {name}.effects owners: "
-                f"expected={name!r} actual={invalid_owners!r}"
-            )
-        self._assert_descriptor_values(
-            name,
-            "effects",
-            {str(item[0]) for item in handlers},
-        )
-        self._assert_descriptor_values(
-            name,
-            "commands",
-            set(self._command_tokens_by_owner(name)),
-        )
-        self._assert_descriptor_values(
-            name,
-            "channel_adapters",
-            {
-                str(getattr(getattr(item, "descriptor", None), "adapter_id", "") or "")
-                for item in plugin.get_channel_adapters()
-            },
-        )
-        self._assert_descriptor_values(
-            name,
-            "capability_engines",
-            {
-                str(getattr(route_type, "value", route_type))
-                for route_type in plugin.get_capability_engines()
-            },
-        )
-        admin_media_provider = plugin.get_admin_media_event_provider()
-        self._assert_descriptor_values(
-            name,
-            "admin_media_providers",
-            (
-                {
-                    str(
-                        getattr(admin_media_provider, "name", "")
-                        or name
-                    )
-                }
-                if admin_media_provider is not None
-                else set()
-            ),
+            name, container=container if container is not None else self._runtime_container
         )
 
     async def _validate_durable_package_contract(
@@ -1432,12 +1334,7 @@ class PluginRegistry:
         descriptor = self._descriptors.get(name)
         if descriptor is None:
             raise RuntimeError(f"plugin descriptor missing after initialization: {name}")
-        expected = set(getattr(descriptor, field_name))
-        if actual != expected:
-            raise RuntimeError(
-                f"plugin descriptor drift: {name}.{field_name}: "
-                f"expected={sorted(expected)!r} actual={sorted(actual)!r}"
-            )
+        assert_descriptor_values(descriptor, field_name, actual)
 
     async def _selected_plugin_names(self) -> set[str]:
         if self._state_store is None:
@@ -1786,7 +1683,10 @@ class PluginRegistry:
             return (name,)
         selected = plugin_dependency_closure(self._plugins, (name,))
         ordered = tuple(owner for owner in graph.order if owner in selected)
-        return ordered if ordered else (name,)
+        # The startup graph contains selected (enabled) plugins only. A
+        # disabled owner can still have dependencies in that graph; filtering
+        # must never erase the owner or any required dependency from a gate.
+        return (*ordered, *sorted(selected.difference(ordered)))
 
     async def _rollback_failed_activation(
         self,
@@ -1799,18 +1699,12 @@ class PluginRegistry:
         """Remove every owner-indexed contribution after a failed publish."""
 
         self._active_plugins.discard(name)
-        self._hook_runner.unregister_owner(name)
-        self._hooks_registered.discard(name)
-        registry = getattr(container, "agent_tool_registry", None)
-        if isinstance(registry, AgentToolRegistry):
-            registry.unregister_owner(name)
-        self._agent_tools_registered.discard(name)
-        commands_plugin = self._plugins.get("commands")
-        unregister = getattr(commands_plugin, "unregister_owner", None)
-        if callable(unregister):
-            unregister(name)
+        counts = self._revoke_contributions(name, container)
+        if counts["cleanup_errors"]:
+            logger.error("plugin.activation_revoke_failed", name=name)
         if not discard_initialization:
             return
+        self._contributions.pop(name, None)
         self._descriptors.pop(name, None)
         self._config_schemas.pop(name, None)
         self._admin_ui_documents.pop(name, None)
@@ -1840,6 +1734,8 @@ class PluginRegistry:
                 name=name,
                 error=str(exc),
             )
+        finally:
+            await self._close_resources(name)
 
     async def _record_initialization_failure(self, name: str, reason: str) -> None:
         self._active_plugins.discard(name)

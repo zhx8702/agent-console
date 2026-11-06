@@ -1,0 +1,14 @@
+[Unit]
+Description=Private embedding reverse SSH tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Install the edited tunnel.env.example here, or change this configuration path.
+EnvironmentFile=/etc/agent-console/embedding-tunnel.env
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE} -i ${SSH_IDENTITY_FILE} -p ${SSH_PORT} -R ${SSH_REMOTE_BIND}:${SSH_REMOTE_PORT}:${EMBEDDING_LOCAL_HOST}:${EMBEDDING_LOCAL_PORT} ${SSH_USER}@${SSH_HOST}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

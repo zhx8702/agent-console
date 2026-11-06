@@ -198,6 +198,61 @@ async def test_llm_capability_uses_native_tool_choice_instead_of_keyword_search_
 
 
 @pytest.mark.asyncio
+async def test_llm_capability_requires_hosted_search_for_x_quota_intent() -> None:
+    llm = _CapturingLLMService()
+    settings = Settings(openai_web_search_enabled=True)
+    engine = LLMCapabilityEngine(llm, settings=settings)
+    session = Session(session_id="s1", tenant_id="demo", user_id="u1", channel=Channel.WEB)
+    pre = make_preprocessed("搜下x 目前grok bot 有多少额度")
+    persist_decision(
+        IntentDecision(
+            domain=IntentDomain.WEB_SEARCH,
+            action="retrieve",
+            source="x",
+            confidence=0.94,
+            needs_tool=True,
+            tool_name="x_search",
+        ),
+        pre=pre,
+    )
+
+    await engine.answer(pre, session)
+
+    assert llm.last_request is not None
+    assert llm.last_request.metadata["openai_web_search"] is True
+    assert llm.last_request.metadata["openai_web_search_required"] is True
+    assert llm.last_request.metadata["semantic_intent_mode"] == "required_hosted_tool"
+    assert llm.last_request.metadata["openai_web_search_tools"] == ["x_search"]
+
+
+@pytest.mark.asyncio
+async def test_llm_capability_requires_x_search_for_slang_query() -> None:
+    llm = _CapturingLLMService()
+    settings = Settings(openai_web_search_enabled=True)
+    engine = LLMCapabilityEngine(llm, settings=settings)
+    session = Session(session_id="s1", tenant_id="demo", user_id="u1", channel=Channel.WEB)
+    pre = make_preprocessed("搜下x 一般是怎么说别人胖的")
+    persist_decision(
+        IntentDecision(
+            domain=IntentDomain.WEB_SEARCH,
+            action="retrieve",
+            source="x",
+            confidence=0.93,
+            needs_tool=True,
+            tool_name="x_search",
+        ),
+        pre=pre,
+    )
+
+    await engine.answer(pre, session)
+
+    assert llm.last_request is not None
+    assert llm.last_request.metadata["openai_web_search_required"] is True
+    assert llm.last_request.metadata["openai_web_search_tools"] == ["x_search"]
+    assert "不要因为话题像闲聊" in (llm.last_request.system or "")
+
+
+@pytest.mark.asyncio
 async def test_llm_capability_formats_group_history_with_speaker_and_skips_duplicate_current_turn() -> None:
     llm = _CapturingLLMService()
     engine = LLMCapabilityEngine(llm)
@@ -1482,22 +1537,77 @@ async def test_llm_capability_adds_group_concise_rules_ahead_of_persona_style() 
 
 
 @pytest.mark.asyncio
-async def test_problem_solving_group_retrieves_only_current_scope():
+async def test_llm_retrieves_knowledge_without_jev():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
-    from app.jev.models import JevPolicy
     from app.rag.retriever import RetrievalHit
+
     llm = _CapturingLLMService()
-    retriever = SimpleNamespace(retrieve=AsyncMock(return_value=[RetrievalHit(chunk_id=1,doc_id=1,content='Gemini 总结：292 的含义未经验证',score=.9,title='codex-state-kit',source='user_gemini_summary',metadata={'verification':'unverified'})]))
-    service = SimpleNamespace(policy=AsyncMock(return_value=JevPolicy(help_sessions=['room@chatroom'])))
-    engine = LLMCapabilityEngine(llm, help_retriever=retriever, jev_service=service)
-    session = Session(session_id='room@chatroom',tenant_id='demo',user_id='u1',channel=Channel.WECHAT)
-    await engine.answer(make_preprocessed('codex-state-kit 能解决 429 吗'), session)
-    retriever.retrieve.assert_awaited_once_with('demo','codex-state-kit 能解决 429 吗',top_k=3,session_id='room@chatroom')
-    assert '区分资料中已核实的事实' in llm.last_request.system
-    assert any('292 的含义未经验证' in str(m.content) for m in llm.last_request.messages)
-    retriever.retrieve.reset_mock()
-    session.session_id='other@chatroom'
-    await engine.answer(make_preprocessed('codex-state-kit'),session)
+    retriever = SimpleNamespace(
+        retrieve=AsyncMock(
+            return_value=[
+                RetrievalHit(
+                    chunk_id=1,
+                    doc_id=1,
+                    content="实践论：认识从实践发生。",
+                    score=0.9,
+                    title="毛泽东选集第一卷 · 实践论",
+                    source="maoxuan-official",
+                    metadata={"article_id": "vol1/17_实践论.txt"},
+                )
+            ]
+        )
+    )
+    jev = SimpleNamespace(policy=AsyncMock())
+    engine = LLMCapabilityEngine(
+        llm,
+        help_retriever=retriever,
+        jev_service=jev,
+        settings=Settings(knowledge_features_enabled=True),
+    )
+    session = Session(
+        session_id="cx1:c:hashed@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+        external_conversation_id="53876528317@chatroom",
+    )
+    await engine.answer(make_preprocessed("实践论讲了什么"), session)
+    retriever.retrieve.assert_awaited_once_with(
+        "demo",
+        "实践论讲了什么",
+        top_k=5,
+        session_id="cx1:c:hashed@chatroom",
+        extra_session_ids=["53876528317@chatroom"],
+    )
+    jev.policy.assert_not_awaited()
+    system = llm.last_request.system or ""
+    assert "资料不够就说不够" in system
+    assert "不要写出处、编号或参考资料" in system
+    assert "注明来源" not in system
+    assert any("认识从实践发生" in str(message.content) for message in llm.last_request.messages)
+
+
+@pytest.mark.asyncio
+async def test_llm_skips_knowledge_for_automatic_participation():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    llm = _CapturingLLMService()
+    retriever = SimpleNamespace(retrieve=AsyncMock(return_value=[]))
+    engine = LLMCapabilityEngine(
+        llm,
+        help_retriever=retriever,
+        settings=Settings(knowledge_features_enabled=True),
+    )
+    session = Session(
+        session_id="cx1:c:hashed@chatroom",
+        tenant_id="demo",
+        user_id="u1",
+        channel=Channel.WECHAT,
+        external_conversation_id="53876528317@chatroom",
+    )
+    session.variables["participation_status"] = "may_reply"
+    await engine.answer(make_preprocessed("哈哈"), session)
     retriever.retrieve.assert_not_awaited()

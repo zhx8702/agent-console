@@ -1,0 +1,19 @@
+# Replace only the reverse_proxy directive inside the EXISTING authenticated route.
+# Preserve the public listener and its authentication. Do not publish this by itself.
+# Set these environment variables for the Caddy process, or substitute your addresses.
+reverse_proxy {$MODERATION_GPU_UPSTREAM:127.0.0.1:17436} {
+    lb_try_duration 2s
+    lb_try_interval 100ms
+    # Only retry read-only discovery and inference endpoints, not model mutations.
+    lb_retry_match {
+        path /api/chat /api/generate /api/show /api/tags /api/ps /api/version /v1/chat/completions /v1/completions /v1/models
+    }
+    health_uri /api/version
+    health_interval 5s
+    health_timeout 1s
+    fail_duration 10s
+    max_fails 1
+    transport http {
+        dial_timeout 1s
+    }
+}

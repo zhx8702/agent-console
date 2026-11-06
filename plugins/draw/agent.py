@@ -8,11 +8,13 @@ from app.agent.registry import AgentToolDefinition
 from app.agent.scopes import GROUP_DRAW_GENERATION_SCOPE
 from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
 from app.channel import ChannelRegistry, ChannelSendOptions, ChannelTarget
+from app.channel.identity import preferred_external_user_id
 from app.common.context import get_trace_id
 from app.common.ids import new_trace_id
 from app.common.intent_runtime import decision_from_session
 from app.common.logging import get_logger
 from app.common.prompting import persona_response_language
+from app.common.quote_images import QuoteImageSource, quote_image_source_from_metadata
 from app.common.types import Role, Session
 from plugins.draw.avatar import resolve_prompt_avatar_reference
 from plugins.draw.hooks import (
@@ -20,6 +22,7 @@ from plugins.draw.hooks import (
     DRAW_API_ERROR_TEXT,
     DRAW_CONFIG_ERROR_TEXT,
     DRAW_CRASH_ERROR_TEXT,
+    REDRAW_ACCEPTED_TEXT,
     _draw_success_text,
     _ensure_draw_storage_ready,
     _finish_persistent_operation,
@@ -70,7 +73,30 @@ def build_draw_agent_tools(service: DrawAgentToolService) -> list[AgentToolDefin
             },
             handler=service.generate_group_image,
             metadata={"session_kinds": ["group", "private"]},
-        )
+        ),
+        AgentToolDefinition(
+            scope=GROUP_DRAW_GENERATION_SCOPE,
+            name="edit_group_image",
+            description="按当前消息引用或回复的图片重绘；适合在原图旁边加人物、换背景或改风格。不要用它凭空生成一张新图。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "重绘提示词，直接描述要在原图上改什么。",
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "图片质量。可选 low、medium、high；省略时使用 low。",
+                    },
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+            handler=service.edit_group_image,
+            metadata={"session_kinds": ["group", "private"]},
+        ),
     ]
 
 
@@ -94,10 +120,36 @@ class DrawAgentToolService:
     async def generate_group_image(
         self, session: Session, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        return await self._accept_image_job(
+            session,
+            arguments,
+            command="/draw" if not self._quoted_image_source(session).found else "/redraw",
+            require_quote=False,
+        )
+
+    async def edit_group_image(
+        self, session: Session, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._accept_image_job(
+            session,
+            arguments,
+            command="/redraw",
+            require_quote=True,
+        )
+
+    async def _accept_image_job(
+        self,
+        session: Session,
+        arguments: dict[str, Any],
+        *,
+        command: str,
+        require_quote: bool,
+    ) -> dict[str, Any]:
         target = self._target(session)
         session_id = target.session_id
+        tool_name = "edit_group_image" if command == "/redraw" else "generate_group_image"
         if not target.channel:
-            raise ValueError("generate_group_image 缺少渠道信息")
+            raise ValueError(f"{tool_name} 缺少渠道信息")
         if (
             self._channel_registry is None
             or self._channel_registry.outbound_for(target.channel) is None
@@ -105,6 +157,9 @@ class DrawAgentToolService:
             raise ValueError("当前渠道还没有注册出站发送能力")
         if not await self._scope_allowed(session):
             raise ValueError("draw plugin is disabled for this session")
+        quote = self._quoted_image_source(session)
+        if require_quote and not quote.found:
+            raise ValueError("当前消息没有引用图片，无法重绘")
         await self._bind_group_delivery_contract(session, target)
 
         prompt = str(arguments.get("prompt") or "").strip()
@@ -120,7 +175,6 @@ class DrawAgentToolService:
             raise ValueError(DRAW_CONFIG_ERROR_TEXT) from exc
 
         tenant_id = str(getattr(session, "tenant_id", "") or "default")
-        user_id = str(getattr(session, "user_id", "") or "")
         sender_name = self._sender_name(session)
         trace_id = f"{get_trace_id() or new_trace_id()}:draw-agent"
         reservation: BillingReservation | None = None
@@ -129,16 +183,16 @@ class DrawAgentToolService:
                 self._billing.reserve(
                     BillingSubject(
                         tenant_id=tenant_id,
-                        session_id=target.external_conversation_id or session_id,
-                        user_id=user_id,
+                        session_id=self._billing_session_id(session, target),
+                        user_id=self._billing_user_id(session),
                         display_name=sender_name,
                     ),
                     BillingResource(
                         kind="command",
-                        operation="/draw",
+                        operation=command,
                         reference=trace_id,
                         metadata={
-                            "command": "/draw",
+                            "command": command,
                             "quality": quality,
                             "source": "agent_tool",
                         },
@@ -175,15 +229,16 @@ class DrawAgentToolService:
             trace_id=trace_id,
             prompt_length=len(prompt),
             quality=quality,
+            command=command,
         )
         return {
             "accepted": True,
             "async": True,
             "prompt": prompt,
             "quality": quality,
-            "command": "/draw",
+            "command": command,
             "trace_id": trace_id,
-            "message": DRAW_ACCEPTED_TEXT,
+            "message": REDRAW_ACCEPTED_TEXT if command == "/redraw" else DRAW_ACCEPTED_TEXT,
         }
 
     async def _run_async_job(
@@ -200,16 +255,28 @@ class DrawAgentToolService:
         success_committed = False
         try:
             await self._require_scope(session)
-            avatar_ref = await resolve_prompt_avatar_reference(
-                self._store,
-                session_id=session_id,
-                prompt=prompt,
-                trace_id=trace_id,
-                decision=decision_from_session(session),
-            )
-            if avatar_ref is not None and (avatar_ref.image_path or avatar_ref.avatar_url):
+            quote = self._quoted_image_source(session)
+            avatar_ref = None
+            if not quote.found:
+                avatar_ref = await resolve_prompt_avatar_reference(
+                    self._store,
+                    session_id=session_id,
+                    prompt=prompt,
+                    trace_id=trace_id,
+                    decision=decision_from_session(session),
+                )
+            if quote.found:
                 result = await self._store.edit_reference_image(
-                    image_url="" if avatar_ref.image_path else avatar_ref.avatar_url,
+                    image_url=quote.image_url,
+                    image_path=quote.image_path,
+                    prompt=prompt,
+                    trace_id=trace_id,
+                    quality=quality,
+                    source_label=quote.label or "quote",
+                )
+            elif avatar_ref is not None and (avatar_ref.image_path or avatar_ref.avatar_url):
+                result = await self._store.edit_reference_image(
+                    image_url=avatar_ref.avatar_url,
                     image_path=avatar_ref.image_path,
                     prompt=prompt,
                     trace_id=trace_id,
@@ -488,6 +555,12 @@ class DrawAgentToolService:
                 return dict(turn.metadata or {})
         return {}
 
+    def _quoted_image_source(self, session: Session) -> QuoteImageSource:
+        return quote_image_source_from_metadata(
+            self._latest_user_metadata(session),
+            session=session,
+        )
+
     def _session_name(self, session: Session) -> str:
         metadata = self._latest_user_metadata(session)
         return str(
@@ -502,22 +575,59 @@ class DrawAgentToolService:
         return str(metadata.get("sender_name") or "").strip()
 
     def _sender_wxid(self, session: Session) -> str:
+        return self._billing_user_id(session)
+
+    def _billing_user_id(self, session: Session) -> str:
         metadata = self._latest_user_metadata(session)
-        return str(
-            metadata.get("sender_id")
-            or metadata.get("sender_wxid")
-            or getattr(session, "user_id", "")
-            or ""
-        ).strip()
+        return preferred_external_user_id(
+            metadata.get("sender_wxid"),
+            metadata.get("sender_id"),
+            metadata.get("external_participant_id"),
+            getattr(session, "external_participant_id", ""),
+            getattr(session, "user_id", ""),
+        )
+
+    def _billing_session_id(self, session: Session, target: ChannelTarget) -> str:
+        candidates = (
+            target.external_conversation_id,
+            getattr(session, "external_conversation_id", ""),
+            (getattr(session, "metadata", {}) or {}).get("external_conversation_id"),
+            (getattr(session, "metadata", {}) or {}).get("external_session_id"),
+            self._latest_user_metadata(session).get("external_conversation_id"),
+            self._latest_user_metadata(session).get("external_session_id"),
+            getattr(session, "session_id", ""),
+        )
+        fallback = ""
+        for value in candidates:
+            session_id = str(value or "").strip()
+            if not session_id:
+                continue
+            if not fallback:
+                fallback = session_id
+            if not session_id.startswith("cx1:"):
+                return session_id
+        return fallback
 
     def _reply_to_msg_svr_id(self, session: Session) -> str:
         metadata = self._latest_user_metadata(session)
-        return str(
-            metadata.get("reply_to_message_id")
-            or metadata.get("msg_svr_id")
-            or metadata.get("message_id")
-            or ""
+        for key in ("reply_to_message_id", "msg_svr_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value.isdigit():
+                return value
+        return ""
+
+    def _current_source_message_id(self, session: Session, target: ChannelTarget) -> str:
+        metadata = self._latest_user_metadata(session)
+        for key in ("message_id", "source_message_id", "canonical_message_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value[:128]
+        captured = str(
+            self._captured_delivery_contract(target).get("source_message_id") or ""
         ).strip()
+        if captured:
+            return captured[:128]
+        return str(target.reply_to_message_id or "").strip()[:128]
 
     def _target(self, session: Session) -> ChannelTarget:
         metadata = self._latest_user_metadata(session)
@@ -577,8 +687,14 @@ class DrawAgentToolService:
     ) -> None:
         if target.channel != "wechat" or not target.session_id.endswith("@chatroom"):
             return
+        current_id = self._current_source_message_id(session, target)
         captured = self._captured_delivery_contract(target)
-        if self._complete_delivery_contract(captured):
+        if (
+            self._complete_delivery_contract(captured)
+            and str(captured.get("source_message_id") or "").strip() == current_id
+            and current_id
+        ):
+            session.metadata[_DELIVERY_CONTRACT_METADATA_KEY] = dict(captured)
             return
         if self._channel_registry is None:
             raise RuntimeError("channel registry is not configured")
@@ -588,7 +704,7 @@ class DrawAgentToolService:
             return
         contract = await capture(
             target,
-            source_message_id=target.reply_to_message_id,
+            source_message_id=current_id or target.reply_to_message_id,
             response_kind="tool_result",
         )
         if not isinstance(contract, dict) or not self._complete_delivery_contract(

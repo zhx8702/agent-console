@@ -22,6 +22,12 @@ export function ParticipationBudgetSection({
           <h2 id="participation-policy-heading">阈值、预算与安静时段</h2>
         </div>
       </div>
+      <ToggleCard
+        label="召回本群公共记忆"
+        description="允许回复引用本群已接受且可见的知识与关系记录。成员个人记忆仍遵循各自的隐私设置。"
+        checked={policy.group_public_memory_enabled === true}
+        onChange={(checked) => onUpdate("group_public_memory_enabled", checked)}
+      />
       <div className="form-grid">
         <label className="field">
           <span>群内 @发送者策略</span>

@@ -34,6 +34,7 @@ from app.infra.metrics import MEMORY_ACCEPTANCE_DECISIONS, MEMORY_GOVERNANCE_EVE
 from app.infra.runtime_schema import verify_runtime_schema
 from app.social.contracts import MemberMemoryCorrectionResolution, MemberPrivacyValues
 from plugins.memory.graph_extractor import MemoryGraphLLMExtractor
+from plugins.memory.group_evidence import current_jev_review_accepts, group_recall_block_reason
 from plugins.memory.store_acceptance import (
     MEMORY_ACCEPTANCE_AUTO_ACCEPT_MIN,
     MEMORY_ACCEPTANCE_REJECT_BELOW,
@@ -1614,6 +1615,8 @@ def _memory_sensitivity_bucket(value: Any) -> str:
 
 
 def _is_prompt_eligible_memory_item(item: dict[str, Any]) -> bool:
+    if group_recall_block_reason(item):
+        return False
     if str(item.get("source_type") or "") == PROFILE_ENRICHMENT_SOURCE_TYPE:
         return False
     if str(item.get("memory_type") or "") == PROFILE_ENRICHMENT_MEMORY_TYPE:
@@ -3915,6 +3918,13 @@ class MemoryStore(
     async def ensure_tables(self) -> None:
         await verify_runtime_schema(get_engine(), component="memory store")
         logger.info("memory.schema_verified")
+
+    async def group_public_memory_enabled(self, *, tenant_id: str, session_id: str) -> bool:
+        policy_store = getattr(self, "social_policy_store", None)
+        if policy_store is None:
+            return False
+        document = await policy_store.get_group_policy(tenant_id, session_id)
+        return document.policy.group_public_memory_enabled is True
 
     async def get_group_member_privacy_policy(
         self,
@@ -6948,6 +6958,12 @@ class MemoryStore(
             reason = "joking_or_hyperbole"
         reviewed_at = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
         actor = _normalize_line(str(reviewed_by or "admin/api"))[:120] or "admin/api"
+        if (current.get("source_type") == "llm_group_window" and next_status == "accepted"
+                and actor.startswith("system/")
+                and not (actor == "system/jev" and current_jev_review_accepts(next_value))):
+            next_status = "needs_review"
+            normalized_action = "needs_review"
+            reason = "group_window_semantic_review_required"
 
         history = acceptance.get("history") if isinstance(acceptance.get("history"), list) else []
         history_entry = {

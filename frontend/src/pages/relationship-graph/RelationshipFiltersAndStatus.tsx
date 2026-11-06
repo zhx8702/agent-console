@@ -280,7 +280,7 @@ export function RelationshipFiltersAndStatus(controller: RelationshipGraphContro
           <div><span>关系项</span><strong>{windowStatsTotals.items ?? 0}</strong></div>
           <div><span>窗口</span><strong>{windowStatsTotals.windows ?? 0}</strong></div>
           <div><span>证据事件</span><strong>{windowStatsTotals.events ?? 0}</strong></div>
-          <div><span>待审核</span><strong>{windowStatsAcceptance.needs_review ?? 0}</strong></div>
+          <div><span>观察中</span><strong>{windowStatsAcceptance.needs_review ?? 0}</strong></div>
           <div><span>已接受</span><strong>{windowStatsAcceptance.accepted ?? 0}</strong></div>
           <div><span>已拒绝</span><strong>{windowStatsAcceptance.rejected ?? 0}</strong></div>
         </div>

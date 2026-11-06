@@ -226,6 +226,16 @@ def test_group_scope_conflicts_use_specific_primary_intent(
     assert _resolve_group_agent_scope(text, decision=decision) == expected_scope
 
 
+def test_draw_edit_intent_opens_draw_scope() -> None:
+    assert (
+        _resolve_group_agent_scope(
+            "请帮我旁边增加海总",
+            decision=_decision(IntentDomain.DRAW, "edit"),
+        )
+        == GROUP_DRAW_GENERATION_SCOPE
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [

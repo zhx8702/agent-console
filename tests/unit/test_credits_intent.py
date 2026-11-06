@@ -47,6 +47,24 @@ def test_classify_discussion_does_not_handle() -> None:
     assert intent.should_handle is False
 
 
+def test_classify_live_x_quota_search_is_not_credits() -> None:
+    intent = classify_credit_intent(
+        text="搜下x 目前grok bot 有多少额度",
+        balance_text="搜下x 目前grok bot 有多少额度",
+        credit_name="积分",
+        decision=IntentDecision(
+            domain=IntentDomain.WEB_SEARCH,
+            action="retrieve",
+            source="x",
+            confidence=0.95,
+            needs_tool=True,
+            tool_name="x_search",
+        ),
+    )
+    assert intent.type == CreditIntentType.UNKNOWN
+    assert intent.should_handle is False
+
+
 def test_classify_without_decision_unknown() -> None:
     intent = classify_credit_intent(
         text="我的积分多少",

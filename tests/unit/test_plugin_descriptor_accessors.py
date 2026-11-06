@@ -93,3 +93,19 @@ async def test_admin_media_collector_rejects_post_init_descriptor_drift() -> Non
         match=r"plugin descriptor drift: mutable_media\.admin_media_providers",
     ):
         registry.all_admin_media_event_providers()
+
+
+@pytest.mark.asyncio
+async def test_published_capability_identity_stays_in_generation_until_reactivation() -> None:
+    registry = PluginRegistry(allow_offline_execution=True)
+    plugin = _MutableCapabilityPlugin()
+    registry._register(plugin)
+    context = _context()
+    await registry.initialize_all(context)
+    original = registry.all_capability_engines()[RouteType.FAQ].delegate
+    plugin.engine = _CapabilityEngine()
+    assert registry.all_capability_engines()[RouteType.FAQ].delegate is original
+    await registry.deactivate_plugin(plugin.meta.name, context.container)
+    assert registry.all_capability_engines() == {}
+    await registry.reactivate_plugin(plugin.meta.name, context)
+    assert registry.all_capability_engines()[RouteType.FAQ].delegate is plugin.engine

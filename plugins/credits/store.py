@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from app.billing.catalog import DRAW_QUALITY_COSTS
+from app.channel.identity import is_hashed_channel_user_id
 from app.common.logging import get_logger
 from app.infra.db import get_engine
 from app.infra.runtime_schema import verify_runtime_schema
@@ -683,6 +684,38 @@ class CreditStore:
             display_name=display_name,
         )
 
+    async def resolve_ledger_user_id(
+        self,
+        tenant_id: str,
+        session_id: str,
+        user_id: str,
+        *,
+        display_name: str = "",
+    ) -> str:
+        user_id = _require_user_id(user_id)
+        if not is_hashed_channel_user_id(user_id):
+            return user_id
+        display_name = str(display_name or "").strip()
+        if not display_name:
+            return user_id
+        rows = await _exec(
+            "SELECT user_id FROM plugin_credits_balance "
+            "WHERE tenant_id = :tid AND session_id = :sid "
+            "AND display_name = :display_name "
+            "AND user_id NOT LIKE 'cx1:%' "
+            "AND TRIM(user_id) <> '' "
+            "ORDER BY credits DESC, updated_at DESC",
+            {
+                "tid": tenant_id,
+                "sid": session_id,
+                "display_name": display_name,
+            },
+        )
+        if len(rows) != 1:
+            return user_id
+        resolved = str(rows[0].get("user_id") or "").strip()
+        return resolved or user_id
+
     async def get_balance_record(
         self, tenant_id: str, session_id: str, user_id: str
     ) -> dict[str, Any] | None:
@@ -724,7 +757,12 @@ class CreditStore:
         *,
         display_name: str = "",
     ) -> int:
-        user_id = _require_user_id(user_id)
+        user_id = await self.resolve_ledger_user_id(
+            tenant_id,
+            session_id,
+            user_id,
+            display_name=display_name,
+        )
         row = await self.get_balance_record(tenant_id, session_id, user_id)
         if row:
             await self._update_display_name(tenant_id, session_id, user_id, display_name)
@@ -755,7 +793,12 @@ class CreditStore:
         *,
         display_name: str = "",
     ) -> int:
-        user_id = _require_user_id(user_id)
+        user_id = await self.resolve_ledger_user_id(
+            tenant_id,
+            session_id,
+            user_id,
+            display_name=display_name,
+        )
         row = await self.get_balance_record(tenant_id, session_id, user_id)
         if row:
             await self._update_display_name(tenant_id, session_id, user_id, display_name)
@@ -775,7 +818,12 @@ class CreditStore:
         metadata: dict[str, Any] | None = None,
         idempotency_key: str = "",
     ) -> dict[str, Any]:
-        user_id = _require_user_id(user_id)
+        user_id = await self.resolve_ledger_user_id(
+            tenant_id,
+            session_id,
+            user_id,
+            display_name=display_name,
+        )
         amount = int(amount or 0)
         if amount <= 0:
             raise ValueError("reservation amount must be positive")

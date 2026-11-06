@@ -460,6 +460,9 @@ describe("GroupBehaviorPage", () => {
 
     await user.click(groupSwitch);
     await user.click(groupFileSwitch);
+    const publicMemory = screen.getByRole("checkbox", { name: /^召回本群公共记忆/ });
+    expect(publicMemory).not.toBeChecked();
+    await user.click(publicMemory);
     await user.selectOptions(
       screen.getByRole("combobox", { name: "群内 @发送者策略" }),
       "reply_or_ambiguous",
@@ -483,6 +486,7 @@ describe("GroupBehaviorPage", () => {
               mention_sender_strategy: "reply_or_ambiguous",
               prompt_context_retention_seconds: 7200,
               file_send_enabled: true,
+              group_public_memory_enabled: true,
             }),
           }),
         }),

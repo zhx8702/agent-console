@@ -27,6 +27,7 @@ from app.plugin.config_schema import (
     validate_plugin_config,
 )
 from app.plugin.dependencies import PluginDependencyError, parse_plugin_dependency
+from app.plugin.diagnostics import query_runtime
 from app.plugin.marketplace import (
     MarketplaceItem,
     MarketplaceManifestError,
@@ -639,24 +640,7 @@ class PluginManager:
 
     async def runtime(self, name: str) -> dict[str, Any]:
         plugin = self._plugin_or_404(name)
-        state = await self.state_store.get(name)
-        allowed_lookup = getattr(self.registry, "global_execution_allowed", None)
-        allowed = bool(
-            await allowed_lookup(name)
-            if callable(allowed_lookup)
-            else state is not None and state.installed and state.enabled
-        )
-        runtime = (
-            await plugin.get_runtime_status()
-            if allowed
-            else {"running": False, "execution_allowed": False}
-        )
-        return {
-            "plugin_name": name,
-            "state": state.as_dict() if state is not None else None,
-            "runtime_status": runtime,
-            "runtime": runtime,
-        }
+        return await query_runtime(plugin, self.registry, self.state_store, name)
 
     async def events(
         self,

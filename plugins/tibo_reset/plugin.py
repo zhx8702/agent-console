@@ -122,6 +122,8 @@ class TiboResetPlugin(Plugin):
                 getattr(ctx.settings, "tibo_reset_request_timeout_seconds", 15.0)
             ),
         )
+        if ctx.resources is not None:
+            ctx.resources.add_cleanup(self._client.close)
         plugin_registry = getattr(ctx.container, "plugin_registry", None)
         scope_execution_allowed = getattr(
             plugin_registry,
@@ -149,7 +151,7 @@ class TiboResetPlugin(Plugin):
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
             await self._stop_scheduler()
-            if self._client is not None:
+            if self._client is not None and (self._ctx is None or self._ctx.resources is None):
                 await self._client.close()
             self._service = None
             self._client = None

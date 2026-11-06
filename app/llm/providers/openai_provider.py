@@ -61,6 +61,15 @@ _TIER_ATTR = {
 _SUPPORTED_API_MODES = {"chat", "responses"}
 _MAX_WEB_SEARCH_SOURCE_CITATIONS = 20
 _SUPPORTED_WEB_SEARCH_TOOLS = {"web_search", "web_search_preview", "x_search"}
+_HIDDEN_OUTPUT_TYPES = frozenset(
+    {
+        "reasoning",
+        "reasoning_text",
+        "thinking",
+        "thought",
+        "summary_text",
+    }
+)
 _RESPONSES_FIRST_EVENT_TIMEOUT_SECONDS = 45.0
 _RESPONSES_IDLE_TIMEOUT_SECONDS = 120.0
 _RESPONSES_TOTAL_TIMEOUT_SECONDS = 3600.0
@@ -307,8 +316,21 @@ def is_grok_compatible_settings(settings: Settings, *, base_url: str | None = No
     )
 
 
+def _item_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("type") or "").strip().lower()
+    return str(getattr(value, "type", "") or "").strip().lower()
+
+
+def _is_hidden_output(value: Any) -> bool:
+    item_type = _item_type(value)
+    return item_type in _HIDDEN_OUTPUT_TYPES or item_type.startswith("reasoning")
+
+
 def _extract_text_content(value: Any) -> str:
     if value is None:
+        return ""
+    if _is_hidden_output(value):
         return ""
     if isinstance(value, str):
         return value
@@ -555,6 +577,8 @@ def _extract_responses_payload(
                     arguments=_serialise_args(_field(item, "arguments", "") or ""),
                 )
             )
+            continue
+        if item_type in _HIDDEN_OUTPUT_TYPES or item_type.startswith("reasoning"):
             continue
         content = _field(item, "content", None)
         text = _extract_text_content(content)
@@ -830,14 +854,17 @@ class OpenAIProvider:
             # the model's optional tool choice.
             kwargs["tool_choice"] = "required"
             include_sources = (req.metadata or {}).get("openai_web_search_include_sources")
+            search_tool = tools[0].get("type")
             if include_sources is None:
-                include_sources = (
+                # Grok accepts required x_search, but
+                # include=x_search_call.action.sources is a 400 on sub2api
+                # and the whole turn then falls back to chat without search.
+                include_sources = search_tool != "x_search" and (
                     self._grok_compatible
                     or (urlparse(self._responses_base_url).hostname or "").lower()
                     == "api.openai.com"
                 )
             if bool(include_sources):
-                search_tool = tools[0].get("type")
                 call_type = "x_search_call" if search_tool == "x_search" else "web_search_call"
                 kwargs["include"] = [f"{call_type}.action.sources"]
         return kwargs
@@ -1280,6 +1307,9 @@ async def _openai_responses_stream(
     try:
         stream = await provider._responses_client.responses.create(**kwargs)
         async for event in stream:
+            event_type = str(getattr(event, "type", "") or "").strip().lower()
+            if "reasoning" in event_type or event_type.startswith("response.thinking"):
+                continue
             text = _extract_text_content(getattr(event, "delta", None))
             if not text:
                 text = _extract_text_content(getattr(event, "output_text", None))

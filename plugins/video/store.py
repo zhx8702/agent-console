@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from app.common.airgate import AirgateClient, AirgateError
 
-VIDEO_DEFAULT_MODEL = "grok-imagine-video-1.5-preview"
+VIDEO_DEFAULT_MODEL = "grok-imagine-video"
 VIDEO_DEFAULT_DURATION = 6
 VIDEO_DEFAULT_RESOLUTION = "720p"
 VIDEO_RESOLUTIONS = ("480p", "720p", "1080p")
@@ -130,10 +130,18 @@ class VideoStore:
                 str(getattr(self.settings, "draw_api_url", "") or "").strip()
             )
         if not api_url:
+            api_url = str(
+                getattr(self.settings, "grok_models_base_url", "") or ""
+            ).strip()
+        if not api_url:
+            api_url = str(getattr(self.settings, "openai_base_url", "") or "").strip()
+        if not api_url:
             raise VideoConfigError("未配置 VIDEO_API_URL")
         api_key = str(getattr(self.settings, "video_api_key", "") or "").strip()
         if not api_key:
             api_key = str(getattr(self.settings, "draw_api_key", "") or "").strip()
+        if not api_key:
+            api_key = str(getattr(self.settings, "openai_api_key", "") or "").strip()
         self._client = AirgateClient(
             base_url=api_url,
             api_key=api_key,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
-
 import pytest
 from pydantic import ValidationError
 
@@ -9,7 +7,9 @@ from app.social.contracts import VoiceProfile
 from app.social.reply_style import (
     NaturalReplyStyleGuard,
     ReplyStyleHistory,
+    is_agree_echo,
     requests_detailed_answer,
+    soften_repeated_trailing_tics,
 )
 
 
@@ -37,79 +37,38 @@ def test_ineligible_factual_tool_safety_and_high_risk_text_is_unchanged(
     assert result.mode == "preserved"
 
 
-def test_length_modes_are_deterministic_and_follow_65_25_10_split() -> None:
+def test_non_persona_replies_keep_full_model_text() -> None:
     guard = NaturalReplyStyleGuard()
     text = "第一句内容比较完整。第二句继续补充说明。第三句只在明确要求详细时保留。"
-    modes = Counter(
-        guard.apply(
-            text,
-            deterministic_key=f"distribution-{index}",
-            eligible=True,
-            source_text="请详细展开说明",
-        ).mode
-        for index in range(2_000)
-    )
 
-    assert 1_200 <= modes["one_sentence"] <= 1_400
-    assert 430 <= modes["two_sentences"] <= 570
-    assert 150 <= modes["expanded_requested"] <= 250
-
-
-def test_expanded_mode_requires_an_explicit_detail_request() -> None:
-    guard = NaturalReplyStyleGuard()
-    text = "第一句。第二句。第三句需要详细回答才保留。"
-    key = next(
-        f"detail-{index}"
-        for index in range(1_000)
-        if guard.apply(
-            text,
-            deterministic_key=f"detail-{index}",
-            eligible=True,
-            source_text="请详细展开",
-        ).mode
-        == "expanded_requested"
-    )
-
-    detailed = guard.apply(
-        text,
-        deterministic_key=key,
-        eligible=True,
-        source_text="请详细展开",
-    )
     ordinary = guard.apply(
         text,
-        deterministic_key=key,
+        deterministic_key="no-persona-long",
         eligible=True,
         source_text="随便聊聊",
     )
+    detailed = guard.apply(
+        text,
+        deterministic_key="no-persona-detail",
+        eligible=True,
+        source_text="请详细展开",
+    )
+    long_text = "很长的一句话内容" * 20 + "。第二句话也很长" * 10
 
+    long_result = guard.apply(
+        long_text,
+        deterministic_key="no-persona-very-long",
+        eligible=True,
+    )
+
+    assert ordinary.mode == "natural"
+    assert ordinary.text == text
+    assert "length_shaped" not in ordinary.reason_codes
     assert detailed.text == text
-    assert ordinary.mode == "two_sentences"
-    assert len(ordinary.text) <= 70
-    assert "第三句" not in ordinary.text
+    assert long_result.text == long_text
+    assert len(long_result.text) > 70
     assert requests_detailed_answer("麻烦一步步完整说明") is True
     assert requests_detailed_answer("随便说说") is False
-
-
-def test_one_and_two_sentence_modes_enforce_exact_character_budgets() -> None:
-    guard = NaturalReplyStyleGuard()
-    text = "很长的一句话内容" * 20 + "。第二句话也很长" * 10 + "🙂🙂"
-
-    for index in range(500):
-        result = guard.apply(
-            text,
-            deterministic_key=f"length-{index}",
-            eligible=True,
-        )
-        if result.mode == "one_sentence":
-            assert len(result.text) <= 35
-            assert "第二句话" not in result.text
-        else:
-            assert result.mode == "two_sentences"
-            assert len(result.text) <= 70
-            assert result.text.startswith("很长的一句话内容")
-        assert result.text.rstrip("🙂").endswith("…")
-        assert result.text.count("🙂") <= 1
 
 
 def test_emoji_is_deterministic_capped_and_not_reused_within_twenty_messages() -> None:
@@ -228,6 +187,65 @@ def test_custom_phrase_history_and_identity_disclosure_use_the_real_guard() -> N
     assert always.identity_disclosed is True
     assert "identity_prefix_added" in always.reason_codes
     assert len(always.text) <= 70
+
+
+def test_agree_echo_catches_restatement_but_keeps_new_context() -> None:
+    source = "还是错怪了codex了，他的computer use真的是独一档的"
+
+    assert is_agree_echo("是啊，computer use这块确实独一档，错怪了就对了 hhh", source)
+    assert is_agree_echo("对啊 hhh", source)
+    assert is_agree_echo("是啊，还是错怪了codex了，他的computer use真的是独一档的", source)
+    assert not is_agree_echo(
+        "是啊，computer use确实猛，不过这次炸的是容量，歇一会再试",
+        source,
+    )
+    assert not is_agree_echo(
+        "computer use确实猛，不过这次炸的是容量，歇一会再试",
+        source,
+    )
+    assert not is_agree_echo(
+        "淦，连鹈鹕都画不明白，跟luna有啥区别",
+        "画个鹈鹕都翻车了",
+    )
+
+
+def test_trailing_hhh_stays_once_then_is_stripped_when_recent() -> None:
+    first = soften_repeated_trailing_tics("是啊，wg就是香 hhh")
+    repeated = soften_repeated_trailing_tics(
+        "是啊，反射通了就完了 hhh",
+        recent_catchphrases=("hhh",),
+    )
+    middle = soften_repeated_trailing_tics(
+        "hhh 这种气氛才带",
+        recent_catchphrases=("hhh",),
+    )
+
+    assert first == ("是啊，wg就是香 hhh", "hhh", False)
+    assert repeated == ("是啊，反射通了就完了", "hhh", True)
+    assert middle == ("hhh 这种气氛才带", "", False)
+
+
+def test_style_guard_records_and_strips_repeated_trailing_tics() -> None:
+    guard = NaturalReplyStyleGuard()
+    kept = guard.apply(
+        "是啊，mt6000可以 hhh",
+        deterministic_key="tic-keep",
+        eligible=True,
+        preserve_persona_style=True,
+    )
+    stripped = guard.apply(
+        "是啊，手搓就是香 hhh",
+        deterministic_key="tic-strip",
+        eligible=True,
+        preserve_persona_style=True,
+        history=ReplyStyleHistory(catchphrases_last_30=("hhh",)),
+    )
+
+    assert kept.text.endswith("hhh")
+    assert kept.catchphrase == "hhh"
+    assert "trailing_tic_suppressed" not in kept.reason_codes
+    assert stripped.text == "是啊，手搓就是香"
+    assert "trailing_tic_suppressed" in stripped.reason_codes
 
 
 def test_short_replies_inline_newlines_with_punctuation() -> None:

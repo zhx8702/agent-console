@@ -1,0 +1,27 @@
+services:
+  model:
+    image: ${OLLAMA_IMAGE:?Set a tested Ollama image tag or digest}
+    restart: unless-stopped
+    gpus: all
+    mem_limit: ${MODERATION_MEMORY_LIMIT:-4g}
+    cpus: ${MODERATION_CPUS:-2}
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${MODERATION_KEEP_ALIVE:--1}
+      OLLAMA_NUM_PARALLEL: ${MODERATION_PARALLEL:-1}
+      OLLAMA_MAX_LOADED_MODELS: ${MODERATION_MAX_LOADED_MODELS:-2}
+      OLLAMA_MAX_QUEUE: ${MODERATION_MAX_QUEUE:-16}
+      # Ollama 0.32's llama-server defaults to an 8 GiB host prompt cache.
+      # Bound it separately from GPU KV memory to avoid container OOM under varied traffic.
+      LLAMA_ARG_CACHE_RAM: ${MODERATION_PROMPT_CACHE_MB:-256}
+    volumes:
+      - ${MODERATION_MODELS_DIR:?Set the independent model snapshot directory}:/root/.ollama/models:ro
+    ports:
+      - "127.0.0.1:${MODERATION_PORT:-11436}:11434"
+    healthcheck:
+      # Server readiness. Run an actual inference before switching production traffic.
+      test: [CMD, env, "OLLAMA_HOST=127.0.0.1:11434", ollama, list]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s

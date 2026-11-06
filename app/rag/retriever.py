@@ -22,7 +22,7 @@ from rank_bm25 import BM25Okapi
 from app.common.config import Settings, get_settings
 from app.common.ids import new_trace_id
 from app.kb.ingest import kb_collection_for
-from app.kb.scope import normalize_scope_session_id, scope_kind
+from app.kb.scope import knowledge_scope_session_ids, normalize_scope_session_id, scope_kind
 from app.kb.vector.base import VectorStore
 from app.llm.base import EmbedRequest, LLMProvider
 
@@ -377,28 +377,33 @@ class HybridRetriever:
         return self.rerank(query, deduped), bool(deduped)
 
     async def retrieve(
-        self, tenant_id: str, query: str, top_k: int = 5, session_id: str | None = None
+        self,
+        tenant_id: str,
+        query: str,
+        top_k: int = 5,
+        session_id: str | None = None,
+        extra_session_ids: list[str] | None = None,
     ) -> list[RetrievalHit]:
         query = (query or "").strip()
         if not query:
             return []
 
-        normalized_session_id = normalize_scope_session_id(session_id)
+        scoped_ids = knowledge_scope_session_ids(session_id, *(extra_session_ids or []))
         try:
             query_vector = await self._embed_query(tenant_id, query)
         except Exception:
             query_vector = []
         scoped_hits: list[RetrievalHit] = []
-        if normalized_session_id:
-            scoped_hits, scoped_ok = await self._retrieve_scope(
+        for scoped_id in scoped_ids:
+            hits, scoped_ok = await self._retrieve_scope(
                 tenant_id,
-                normalized_session_id,
+                scoped_id,
                 query,
                 max(top_k * 2, top_k),
                 query_vector=query_vector,
             )
-            if not scoped_ok:
-                scoped_hits = []
+            if scoped_ok:
+                scoped_hits.extend(hits)
 
         global_hits, global_ok = await self._retrieve_scope(
             tenant_id,

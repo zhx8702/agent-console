@@ -29,7 +29,6 @@ _PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     ("phone", re.compile(r"1[3-9]\d{9}")),
-    ("bank_card", re.compile(r"\b\d{13,19}\b")),
     ("ip", re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")),
 ]
 

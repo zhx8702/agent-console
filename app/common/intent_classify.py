@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from app.common.exceptions import UpstreamRejected
 from app.common.intent import IntentDecision
 from app.common.logging import get_logger
+from app.common.quote_images import quote_image_source_from_metadata
 from app.common.types import ChatMessage, ChatRequest, Role
 from app.llm.activity import wait_for_llm_activity
 
@@ -29,8 +30,10 @@ _CLASSIFY_USER_SUFFIX = "\n\n(Classify the message above. Return only the JSON o
 
 _CLASSIFY_SYSTEM = """Classify the latest user message into one JSON object.
 Do not treat quoted text, mentioned examples, or cancelled requests as an instruction.
-If the user is asking what a phrase means, or is not making a request, use domain none.
-If unsure, use domain none, operation unknown, and confidence 0.
+If the user is asking what a phrase means and did not ask to search the web or X/Twitter,
+or is not making a request, use domain none.
+If unsure and there is no explicit live-search request, use domain none,
+operation unknown, and confidence 0.
 Handoff means an explicit request to transfer to a real human or customer service agent.
 Asking the current assistant to help, answer questions, or act as an assistant is ordinary
 conversation (chitchat/greet, operation converse), not a human handoff.
@@ -62,7 +65,7 @@ Domain/action:
 - credits/balance_self|balance_other|rank|checkin_status|checkin_action|transfer_self_to_other_unsupported|transfer_reverse_unauthorized|redeem_or_discussion
 - file/inspect_incoming|generate|send_existing|convert|export_history
 - map/search|generate
-- draw/generate
+- draw/generate|edit
 - video/generate|question
 - memory/remember|forget|forget_all|list|search
 - tibo_reset/week_count|today_status|latest|retention|summary
@@ -72,12 +75,49 @@ Domain/action:
 - web_search/retrieve
 - none/""
 
+Credits versus live search:
+- credits is ONLY this group's 积分 system: 余额, 签到, 榜单, 转账.
+- Third-party / product / API quota is not credits. Words like 额度, quota,
+  remaining calls, grok bot, X, Twitter do not make it credits.
+- An explicit request to search X / Twitter / the web is web_search, even if
+  the query looks like chitchat, slang, insults, phrasing, or "what does this
+  mean". Do not use domain none or chitchat in that case.
+- 搜X / 搜下x / 搜推特 / search X / search Twitter is web_search/retrieve,
+  source x, operation retrieve, needs_tool true, tool_name x_search.
+- Examples: "搜下x 目前grok bot 有多少额度" -> web_search/retrieve, source x;
+  "搜下x 一般是怎么说别人胖的" -> web_search/retrieve, source x;
+  "搜下x 总结一下 都是怎么说的" -> web_search/retrieve, source x;
+  "一般是怎么说别人胖的" (no search request) -> none;
+  "我还有多少积分" -> credits/balance_self;
+  "@张三 他积分多少" -> credits/balance_other.
+
+History versus durable memory:
+- Questions about past messages ("我今天问过你哪些问题", "我昨天在这个群发言了吗",
+  "上周群里谁提过部署方案") are group_info/query, operation retrieve, source local_history,
+  needs_tool true, tool_name search_group_messages. Preserve the requested person and time.
+- "我/我的" means the current requester, not the bot or all group members.
+- memory/list|search is ONLY about saved facts/preferences ("你保存了哪些关于我的偏好");
+  its source is none. Remember/forget requests remain memory mutations, never history searches.
+- Exporting a transcript remains file/export_history, not a plain history lookup.
+
 Slots:
 - credits: target, amount
 - file: format, delivery_required, recent_minutes
 - memory: content, query
+- group_info history query: sender_scope (self|group), period (today|yesterday|recent),
+  hours (1..336 for recent), sender_name (only if explicitly named), keywords (literal search keywords or empty; never the whole question).
+  Use sender_scope=self for "我/我的", group only when the user asks about the group.
 - avatar: name
 - map: city, keywords
+- draw: prompt
+
+Draw:
+- draw/generate is a new picture from text only.
+- draw/edit is modifying a quoted, attached, or already-generated image
+  (add a person beside someone, change the background, restyle, redraw).
+- If the message quotes or replies to an image and the user asks to change
+  that picture, use draw/edit, operation update, source user_attachment,
+  artifact image, needs_tool true, tool_name edit_group_image.
 """
 
 
@@ -123,6 +163,30 @@ class StaticIntentClassifier:
         return self.decision
 
 
+def _leading_at_token(text: str) -> str:
+    raw = str(text or "").lstrip()
+    if not raw.startswith("@"):
+        return ""
+    token = raw.split(None, 1)[0]
+    return token[1:].strip()
+
+
+def _metadata_mentions_bot(metadata: Mapping[str, Any]) -> bool:
+    if metadata.get("mentioned_me") or metadata.get("bot_mentioned"):
+        return True
+    at_wxids = {
+        str(value or "").strip()
+        for value in (metadata.get("at_wxids") or [])
+        if str(value or "").strip()
+    }
+    bot_wxids = {
+        str(metadata.get(key) or "").strip()
+        for key in ("bot_wxid", "self_wxid", "wxbot_self_wxid")
+        if str(metadata.get(key) or "").strip()
+    }
+    return bool(at_wxids & bot_wxids)
+
+
 def classify_context_from_event(
     event: Any,
     *,
@@ -136,12 +200,21 @@ def classify_context_from_event(
     is_group = session_kind in {"group", "chatroom", "channel", "guild"} or session_id.endswith(
         "@chatroom"
     )
+    quoted_image = quote_image_source_from_metadata(dict(metadata)).found
+    message = getattr(event, "message", None)
+    content = str(getattr(message, "content", "") or "")
+    leading_mention = bool(_leading_at_token(content))
+    mentioned_me = _metadata_mentions_bot(metadata) or (
+        quoted_image and leading_mention
+    )
     return {
         "has_attachment": bool(has_attachment),
+        "quoted_image": quoted_image,
+        "leading_mention": leading_mention,
         "tenant_id": str(getattr(event, "tenant_id", "") or ""),
         "session_id": session_id,
         "trace_id": str(getattr(event, "trace_id", "") or ""),
-        "mentioned_me": bool(metadata.get("mentioned_me") or metadata.get("bot_mentioned")),
+        "mentioned_me": mentioned_me,
         "replied_to_bot": bool(
             metadata.get("replied_to_bot")
             or metadata.get("reply_to_bot")
@@ -209,6 +282,8 @@ class LlmIntentClassifier:
         hints: list[str] = []
         if extra.get("has_attachment"):
             hints.append("The message includes a file attachment.")
+        if extra.get("quoted_image"):
+            hints.append("The message quotes or replies to an image.")
         if extra.get("mentioned_me"):
             hints.append("The bot was explicitly mentioned.")
         previous = extra.get("previous_intent")

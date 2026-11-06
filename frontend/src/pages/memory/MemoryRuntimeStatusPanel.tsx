@@ -86,6 +86,7 @@ type MemoryRuntimeStatusPanelProps = {
 };
 
 const CONFIG_LABELS: Record<string, string> = {
+  llm_embed_provider: "实际向量供应商",
   memory_llm_extraction_enabled: "LLM 自动抽取",
   memory_llm_extraction_job_enabled: "抽取任务入队",
   memory_llm_extraction_job_drain_enabled: "抽取任务消费",

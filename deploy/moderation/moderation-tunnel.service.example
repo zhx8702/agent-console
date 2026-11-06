@@ -1,0 +1,19 @@
+[Unit]
+Description=Private moderation reverse SSH tunnel
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=/etc/agent-console/moderation-tunnel.env
+ExecStart=/usr/bin/python3 ${MODERATION_SUPERVISOR_PATH}
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

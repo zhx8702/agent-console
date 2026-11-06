@@ -77,9 +77,12 @@ def validate_llm_settings(settings: Settings) -> list[str]:
 
     if settings.llm_embed_provider not in _SUPPORTED_EMBED_PROVIDERS:
         errors.append(f"unsupported LLM_EMBED_PROVIDER={settings.llm_embed_provider}")
-    elif settings.llm_embed_provider == "openai" and not settings.openai_api_key:
-        errors.append("OPENAI_API_KEY is required when LLM_EMBED_PROVIDER=openai")
-    elif (
+    elif settings.llm_embed_provider == "openai":
+        if settings.llm_embed_base_url and not settings.llm_embed_api_key:
+            errors.append("LLM_EMBED_API_KEY is required for a separate embedding endpoint")
+        elif not settings.llm_embed_base_url and not settings.openai_api_key:
+            errors.append("OPENAI_API_KEY is required when LLM_EMBED_PROVIDER=openai")
+    if (
         settings.is_prod
         and settings.knowledge_features_enabled
         and settings.llm_embed_provider == "fake"
@@ -377,6 +380,7 @@ class LLMService:
                     trace_id=request.trace_id,
                     model=model,
                     texts=list(request.texts),
+                    priority=request.priority,
                 )
             )
             resp = await self._embed.embed(effective_req)
@@ -456,6 +460,10 @@ def _build_chat_provider(settings: Settings) -> LLMProvider:
 
 
 def _build_embed_provider(settings: Settings) -> LLMProvider:
+    if settings.llm_embed_provider == "openai" and settings.llm_embed_base_url:
+        from app.llm.providers.embedding_provider import EmbeddingProvider
+
+        return EmbeddingProvider(settings)
     if settings.llm_embed_provider == "openai":
         if not settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required when LLM_EMBED_PROVIDER=openai")

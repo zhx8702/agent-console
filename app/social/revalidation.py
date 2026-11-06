@@ -117,14 +117,20 @@ def evaluate_group_reply_revalidation(
         relevant_flags.append(related)
 
         bot_addressed = bool(item.get("bot_addressed") or item.get("mentioned_me"))
-        if (
-            source_is_question
-            and not same_sender
-            and not bot_addressed
-            and related
-            and _looks_like_answer(text)
-        ):
-            valid_answer = True
+        if source_is_question and not same_sender and not bot_addressed:
+            tied_to_question = quotes_source or mentions_source_sender
+            # A direct @ stays live through same-topic chatter. Only a reply that
+            # quotes the question or @s the asker can retire that obligation.
+            if tied_to_question and (
+                quotes_source or _looks_like_answer(text)
+            ):
+                valid_answer = True
+            elif (
+                status != "must_reply"
+                and related
+                and _looks_like_answer(text)
+            ):
+                valid_answer = True
 
         if same_sender:
             if status == "must_reply":
@@ -203,10 +209,9 @@ def _looks_like_answer(text: str) -> bool:
     cleaned = re.sub(r"@[\w\-\u3400-\u9fff]+", "", str(text or "")).strip()
     if len(cleaned) < 2 or not _MEANINGFUL_RE.search(cleaned):
         return False
-    if _ANSWER_PREFIX_RE.search(cleaned):
-        return True
-    # A short follow-up question is not accepted as somebody else's answer.
-    return not bool(re.search(r"[?？]\s*$", cleaned)) and len(cleaned) >= 4
+    if re.search(r"[?？]\s*$", cleaned):
+        return False
+    return bool(_ANSWER_PREFIX_RE.search(cleaned))
 
 
 def _quotes_message(item: dict[str, Any], source_message_id: str) -> bool:

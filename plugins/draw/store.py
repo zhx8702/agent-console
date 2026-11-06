@@ -260,6 +260,35 @@ class DrawApiError(DrawError):
     """Raised when the remote draw API cannot produce an image."""
 
 
+def _upstream_http_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        text = " ".join(str(response.text or "").split())
+        return text[:160]
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    message = ""
+    code = ""
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        code = str(error.get("type") or error.get("code") or "").strip()
+    elif isinstance(error, str):
+        message = error.strip()
+    else:
+        message = str(payload.get("message") or "").strip()
+        code = str(payload.get("type") or payload.get("code") or "").strip()
+    detail = ": ".join(part for part in (message, code) if part)
+    return " ".join(detail.split())[:160]
+
+
+def _http_status_draw_error(action: str, response: httpx.Response) -> DrawApiError:
+    detail = _upstream_http_error_detail(response)
+    suffix = f": {detail}" if detail else ""
+    return DrawApiError(f"{action}返回 {response.status_code}{suffix}")
+
+
 @dataclass
 class DrawImageRecord:
     image_id: str
@@ -443,6 +472,7 @@ class DrawEndpoint:
     model_field: str
     response_format: str
     extra_body_raw: str
+    edit_url: str = ""
 
 
 def _draw_endpoint_policy(url: str, *, timeout: float) -> OutboundURLPolicy:
@@ -1875,7 +1905,11 @@ class DrawStore:
 
     def _overlay_setting(self, field: str, overrides: dict[str, str]) -> str:
         if field in overrides:
-            return str(overrides.get(field) or "").strip()
+            value = str(overrides.get(field) or "").strip()
+            # Blank URL overlays stay blank so the console can disable drawing.
+            # Other blank overlays fall through to environment values.
+            if value or field in _DRAW_RUNTIME_URL_FIELDS:
+                return value
         return str(getattr(self.settings, field, "") or "").strip()
 
     def _build_endpoint(
@@ -1907,6 +1941,10 @@ class DrawStore:
             model_field=str(getattr(self.settings, f"{prefix}_model_field", "model") or "model").strip(),
             response_format=str(getattr(self.settings, f"{prefix}_response_format", "") or "").strip(),
             extra_body_raw=str(getattr(self.settings, f"{prefix}_extra_body", "") or "").strip(),
+            edit_url=self._compatible_edit_api_url(
+                api_url,
+                self._overlay_setting(f"{prefix}_edit_url", overlay),
+            ),
         )
 
     def _normalize_generation_api_url(self, api_url: str) -> str:
@@ -1951,9 +1989,7 @@ class DrawStore:
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise DrawApiError(
-                f"绘图接口返回 {exc.response.status_code}"
-            ) from exc
+            raise _http_status_draw_error("绘图接口", exc.response) from exc
         except httpx.TimeoutException as exc:
             raise DrawApiError("绘图接口请求超时") from exc
         except httpx.HTTPError as exc:
@@ -2032,9 +2068,7 @@ class DrawStore:
         quality: str,
     ) -> DrawResult:
         edit_url = self._resolve_edit_api_url(endpoint)
-        data = self._build_payload(prompt, endpoint, quality=quality)
         headers = self._build_headers(endpoint)
-        headers.pop("Content-Type", None)
         client = await self._get_client(endpoint.client_name, endpoint.timeout)
         configure_http_client(
             client,
@@ -2044,37 +2078,53 @@ class DrawStore:
                 edit_url: headers,
             },
         )
-
-        files = {
-            "image": (
-                source.file_name or "reference.png",
-                source.content,
-                source.media_type or "image/png",
+        if self._uses_json_image_url_edits(endpoint):
+            payload = self._build_json_edit_payload(
+                endpoint,
+                source,
+                prompt,
+                quality=quality,
             )
-        }
-        multipart_body, multipart_content_type = _encode_multipart(data, files)
-        request_headers = {
-            **headers,
-            "Content-Type": multipart_content_type,
-        }
+            logger.info(
+                "draw.edit_json_payload",
+                model=str(payload.get("model") or ""),
+                keys=sorted(str(key) for key in payload.keys()),
+                media_type=str(source.media_type or ""),
+                image_bytes=len(source.content or b""),
+            )
+            request_kwargs: dict[str, Any] = {"json": payload}
+        else:
+            headers = dict(headers)
+            headers.pop("Content-Type", None)
+            data = self._build_payload(prompt, endpoint, quality=quality)
+            files = {
+                "image": (
+                    source.file_name or "reference.png",
+                    source.content,
+                    source.media_type or "image/png",
+                )
+            }
+            multipart_body, multipart_content_type = _encode_multipart(data, files)
+            headers["Content-Type"] = multipart_content_type
+            request_kwargs = {"content": multipart_body}
         try:
             response = await safe_http_request(
                 client,
                 "POST",
                 edit_url,
-                content=multipart_body,
-                headers=request_headers,
+                headers=headers,
                 policy=_draw_endpoint_policy(edit_url, timeout=endpoint.timeout),
+                **request_kwargs,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise DrawApiError(
-                f"重绘接口返回 {exc.response.status_code}"
-            ) from exc
+            raise _http_status_draw_error("重绘接口", exc.response) from exc
         except httpx.TimeoutException as exc:
             raise DrawApiError("重绘接口请求超时") from exc
         except httpx.HTTPError as exc:
-            raise DrawApiError("重绘接口请求失败") from exc
+            detail = str(exc or "").strip()
+            suffix = f"：{detail}" if detail else ""
+            raise DrawApiError(f"重绘接口请求失败{suffix}") from exc
 
         file_bytes, media_type, source_url = await self._extract_image_payload(
             response,
@@ -2475,18 +2525,74 @@ class DrawStore:
             payload.setdefault("response_format", response_format)
         return payload
 
+    def _uses_json_image_url_edits(self, endpoint: DrawEndpoint) -> bool:
+        model = str(endpoint.model or "").strip().lower()
+        if model.startswith("grok-imagine"):
+            return True
+        host = str(urlparse(self._resolve_edit_api_url(endpoint)).hostname or "").lower()
+        return host.endswith("x.ai") or "sub2api" in host
+
+    def _build_json_edit_payload(
+        self,
+        endpoint: DrawEndpoint,
+        source: DrawInputImage,
+        prompt: str,
+        *,
+        quality: str,
+    ) -> dict[str, Any]:
+        media_type = str(source.media_type or "").strip() or "image/png"
+        if not media_type.startswith("image/"):
+            media_type = "image/png"
+        model = str(endpoint.model or "").strip()
+        if not model:
+            model = (
+                "grok-imagine-image-quality"
+                if quality in {"medium", "high"}
+                else "grok-imagine-image"
+            )
+        encoded = base64.b64encode(source.content).decode("ascii")
+        data_url = f"data:{media_type};base64,{encoded}"
+        # v1 grok-imagine-image + top-level image_url is accepted by
+        # sub2api/xAI (HTTP 200) but the reference is ignored and the
+        # prompt is treated as text-to-image. Real edits need the 2.0
+        # image object contract.
+        if model.startswith("grok-imagine") and "image-2" not in model and not model.endswith("-2.0"):
+            model = "grok-imagine-image-2.0"
+        if "image-2" in model or model.endswith("-2.0") or model.startswith("grok-imagine"):
+            return {
+                "model": model,
+                "prompt": prompt,
+                "image": {"url": data_url, "type": "image_url"},
+            }
+        return {
+            "model": model,
+            "prompt": prompt,
+            "image_url": data_url,
+        }
+
     def _resolve_edit_api_url(self, endpoint: DrawEndpoint) -> str:
-        setting_name = "draw_api_edit_url"
-        if endpoint.name == "fallback":
-            setting_name = "draw_fallback_api_edit_url"
-        configured = str(getattr(self.settings, setting_name, "") or "").strip()
-        if configured:
-            return self._normalize_edit_api_url(configured)
-        api_url = endpoint.api_url.rstrip("/")
+        if endpoint.edit_url:
+            return endpoint.edit_url
+        return self._derived_edit_api_url(endpoint.api_url)
+
+    def _compatible_edit_api_url(self, generate_url: str, edit_url: str) -> str:
+        normalized = self._normalize_edit_api_url(edit_url)
+        generate_host = str(urlparse(generate_url).hostname or "").strip().lower()
+        edit_host = str(urlparse(normalized).hostname or "").strip().lower()
+        if normalized and generate_host and edit_host and generate_host != edit_host:
+            # Env leftovers like DRAW_API_EDIT_URL=claude1 must not override a
+            # runtime generate host such as sub2api; keep edits on the same key.
+            return self._derived_edit_api_url(generate_url)
+        if normalized:
+            return normalized
+        return self._derived_edit_api_url(generate_url)
+
+    def _derived_edit_api_url(self, api_url: str) -> str:
+        api_url = str(api_url or "").rstrip("/")
         for suffix in ("/images/generations", "/image/generations"):
             if api_url.endswith(suffix):
                 return f"{api_url[: -len(suffix)]}/images/edits"
-        return api_url
+        return self._normalize_edit_api_url(api_url)
 
     def _normalize_edit_api_url(self, api_url: str) -> str:
         api_url = str(api_url or "").strip()

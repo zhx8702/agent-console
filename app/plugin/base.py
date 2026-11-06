@@ -235,6 +235,7 @@ class PluginContext:
     settings: Any
     db_ok: bool = False
     redis_ok: bool = False
+    resources: Any | None = None
 
 
 class Plugin(ABC):

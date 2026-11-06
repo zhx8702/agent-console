@@ -1,0 +1,172 @@
+{
+  "items": [
+    {
+      "title": "湖南农民运动考察报告",
+      "period": "civil_war_1",
+      "genre": "survey",
+      "source": "official",
+      "year": "1927"
+    },
+    {
+      "title": "《农村调查》的序言和跋",
+      "period": "resistance",
+      "genre": "survey",
+      "source": "official",
+      "year": "1941"
+    },
+    {
+      "title": "党的布尔什维克化（十二条）——毛主席在西北高干会议上的报告",
+      "period": "resistance",
+      "genre": "directive",
+      "source": "supplement",
+      "year": "1942"
+    },
+    {
+      "title": "在中华苏维埃共和国第二次全国苏维埃代表大会上的讲话",
+      "period": "civil_war_1",
+      "genre": "directive",
+      "source": "supplement",
+      "year": "1934"
+    },
+    {
+      "title": "基础战术",
+      "period": "late",
+      "genre": "directive",
+      "source": "supplement",
+      "year": ""
+    },
+    {
+      "title": "在中央会议上的谈话——陈毅同志传达",
+      "period": "liberation",
+      "genre": "relay",
+      "source": "relay",
+      "year": "1947"
+    },
+    {
+      "title": "对目前时局的基本分析――康生同志传达",
+      "period": "liberation",
+      "genre": "relay",
+      "source": "relay",
+      "year": "1946"
+    },
+    {
+      "title": "毛主席视察华北、中南和华东地区时谈话的主要精神的传达",
+      "period": "late",
+      "genre": "relay",
+      "source": "relay",
+      "year": ""
+    },
+    {
+      "title": "和美国记者斯诺的谈话",
+      "period": "late",
+      "genre": "talk",
+      "source": "supplement",
+      "year": "1965"
+    },
+    {
+      "title": "同蒙哥马利的谈话",
+      "period": "late",
+      "genre": "talk",
+      "source": "supplement",
+      "year": "1960"
+    },
+    {
+      "title": "与延安新中华报记者谈话",
+      "period": "resistance",
+      "genre": "talk",
+      "source": "supplement",
+      "year": "1938"
+    },
+    {
+      "title": "论持久战",
+      "period": "resistance",
+      "genre": "treatise",
+      "source": "official",
+      "year": "1938"
+    },
+    {
+      "title": "论联合政府",
+      "period": "liberation",
+      "genre": "treatise",
+      "source": "official",
+      "year": "1945"
+    },
+    {
+      "title": "新民主主义论",
+      "period": "resistance",
+      "genre": "treatise",
+      "source": "official",
+      "year": "1940"
+    },
+    {
+      "title": "中共中央关于西藏工作方针的指示",
+      "period": "construction",
+      "genre": "directive",
+      "source": "official",
+      "year": "1952"
+    },
+    {
+      "title": "反对官僚主义、命令主义和违法乱纪",
+      "period": "construction",
+      "genre": "directive",
+      "source": "official",
+      "year": "1953"
+    },
+    {
+      "title": "向全国进军的命令",
+      "period": "construction",
+      "genre": "directive",
+      "source": "official",
+      "year": "1949"
+    },
+    {
+      "title": "在省市自治区党委书记会议上的讲话",
+      "period": "construction",
+      "genre": "essay",
+      "source": "official",
+      "year": "1957"
+    },
+    {
+      "title": "在延安文艺座谈会上的讲话",
+      "period": "resistance",
+      "genre": "essay",
+      "source": "official",
+      "year": "1942"
+    },
+    {
+      "title": "《中国农村的社会主义高潮》的按语",
+      "period": "construction",
+      "genre": "essay",
+      "source": "official",
+      "year": "1955"
+    },
+    {
+      "title": "反对党八股",
+      "period": "resistance",
+      "genre": "short",
+      "source": "official",
+      "year": "1942"
+    },
+    {
+      "title": "愚公移山",
+      "period": "liberation",
+      "genre": "short",
+      "source": "official",
+      "year": "1945"
+    },
+    {
+      "title": "反对自由主义",
+      "period": "resistance",
+      "genre": "short",
+      "source": "official",
+      "year": "1937"
+    },
+    {
+      "title": "和英国记者贝特兰的谈话",
+      "period": "resistance",
+      "genre": "talk",
+      "source": "official",
+      "year": "1937"
+    }
+  ]
+}

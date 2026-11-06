@@ -388,6 +388,7 @@ class AppendUserTurnStep(_BaseCoreStep):
                 ],
             )
         turn_metadata = dict(event.metadata or {})
+        turn_metadata.setdefault("message_id", event.message_id)
         turn_metadata.setdefault("user_id", event.user_id)
         turn_metadata.setdefault(
             "external_participant_id",
@@ -499,10 +500,13 @@ class RouteStep(_BaseCoreStep):
             and hasattr(faq_engine, "preview_match")
         ):
             try:
-                preview = await faq_engine.preview_match(
-                    ctx.pre,
-                    ctx.session,
-                    {"trace_id": ctx.event.trace_id},
+                preview = await asyncio.wait_for(
+                    faq_engine.preview_match(
+                        ctx.pre,
+                        ctx.session,
+                        {"trace_id": ctx.event.trace_id},
+                    ),
+                    2.0,
                 )
                 faq_preview = dict(preview)
                 _merge_faq_preview_signals(router_signals, faq_preview)

@@ -4,7 +4,17 @@ from datetime import date
 
 import pytest
 
+from app.channel.identity import preferred_external_user_id
 from plugins.credits.store import CreditStore, draw_quality_cost_for_config
+
+
+def test_preferred_external_user_id_skips_hashed_channel_identity() -> None:
+    hashed = "cx1:p:5591a89ab37df0027016fefee052ae7503b0cd937df6170b"
+
+    assert preferred_external_user_id(hashed, "zhx870255124") == "zhx870255124"
+    assert preferred_external_user_id(hashed, hashed, hashed) == hashed
+    assert preferred_external_user_id("", None, "wxid_real") == "wxid_real"
+    assert preferred_external_user_id() == ""
 
 
 def test_draw_quality_cost_for_config_defaults_by_quality() -> None:

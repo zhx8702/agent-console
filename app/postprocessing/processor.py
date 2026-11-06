@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from app.common.context import get_trace_id
+from app.common.conversation import is_group_session
 from app.common.logging import get_logger
 from app.common.types import (
     CapabilityResult,
@@ -47,6 +48,13 @@ _WEB_SEARCH_TOOL_LABEL_RE = re.compile(
     r"web_search_call|x_search)(?:\*\*)?\s*[:：]?\s*$",
     re.IGNORECASE,
 )
+_PLANNING_LINE_RE = re.compile(
+    r"^\s*(?:让我|我)?先(?:查|搜|看|核)一下[^\n]{0,80}"
+    r"(?:再按(?:群里)?口气(?:接|回)|再按这个人口气接)\s*[。.!！]?\s*$"
+)
+_PLANNING_PREFIX_RE = re.compile(
+    r"^(?:让我|我)?先(?:查|搜)一下[^\n。.!！]{0,80}再按(?:群里)?口气接[，,。.!！]?\s*"
+)
 
 
 def _restore_pii(text: str, pii_map: dict[str, str]) -> str:
@@ -69,6 +77,19 @@ def _is_web_search_citation(citation: object) -> bool:
         str(getattr(citation, "source", "") or "").strip().lower()
         in _WEB_SEARCH_CITATION_SOURCES_LOWER
     )
+
+
+def _strip_reply_planning_artifacts(text: str) -> str:
+    """Drop leaked internal plans such as '先查一下…再按群里口气接'."""
+
+    kept_lines: list[str] = []
+    for line in str(text or "").splitlines():
+        if _PLANNING_LINE_RE.match(line):
+            continue
+        kept_lines.append(line)
+    compact = "\n".join(kept_lines)
+    compact = _PLANNING_PREFIX_RE.sub("", compact, count=1)
+    return re.sub(r"\n{3,}", "\n\n", compact).strip()
 
 
 def _strip_web_search_artifacts(text: str) -> str:
@@ -115,12 +136,15 @@ def _build_segments(
     citations: list,
     *,
     hide_web_search_artifacts: bool = False,
+    strip_planning_artifacts: bool = False,
 ) -> tuple[list[ReplySegment], ReplyType]:
     raw_segments = result.metadata.get("reply_segments")
     if not isinstance(raw_segments, list) or not raw_segments:
         raw_text = result.reply_text or ""
         if hide_web_search_artifacts:
             raw_text = _strip_web_search_artifacts(raw_text)
+        if strip_planning_artifacts:
+            raw_text = _strip_reply_planning_artifacts(raw_text)
         text = _normalize_text(raw_text, session.pii_map or {})
         footer = _format_citations(citations)
         if footer:
@@ -148,6 +172,8 @@ def _build_segments(
         if wxbot_msg_type != "image":
             if hide_web_search_artifacts:
                 content = _strip_web_search_artifacts(content)
+            if strip_planning_artifacts:
+                content = _strip_reply_planning_artifacts(content)
             content = _normalize_text(content, session.pii_map or {})
             if first_text_idx is None:
                 first_text_idx = len(segments)
@@ -164,6 +190,8 @@ def _build_segments(
         raw_text = result.reply_text or ""
         if hide_web_search_artifacts:
             raw_text = _strip_web_search_artifacts(raw_text)
+        if strip_planning_artifacts:
+            raw_text = _strip_reply_planning_artifacts(raw_text)
         text = _normalize_text(raw_text, session.pii_map or {})
         reply_type = ReplyType.MARKDOWN if citations else ReplyType.TEXT
         return [ReplySegment(type=reply_type, content=text)], reply_type
@@ -189,15 +217,25 @@ def _build_segments(
 class Postprocessor:
     async def run(self, result: CapabilityResult, session: Session) -> OutboundReply:
         citations = list(result.citations or [])
-        hide_web_search_artifacts = any(_is_web_search_citation(citation) for citation in citations)
-        display_citations = [
-            citation for citation in citations if not _is_web_search_citation(citation)
-        ]
+        hide_web_search_artifacts = any(
+            _is_web_search_citation(citation) for citation in citations
+        )
+        hide_group_citations = is_group_session(session)
+        display_citations = (
+            []
+            if hide_group_citations
+            else [
+                citation
+                for citation in citations
+                if not _is_web_search_citation(citation)
+            ]
+        )
         segments, reply_type = _build_segments(
             result,
             session,
             display_citations,
-            hide_web_search_artifacts=hide_web_search_artifacts,
+            hide_web_search_artifacts=hide_web_search_artifacts or hide_group_citations,
+            strip_planning_artifacts=hide_group_citations,
         )
 
         metadata: dict = {

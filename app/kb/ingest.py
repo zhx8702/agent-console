@@ -413,6 +413,7 @@ class IngestionService:
                     trace_id=trace_id,
                     model=self._settings.llm_embed_model,
                     texts=batch,
+                    priority="background",
                 )
             )
             vectors.extend(resp.vectors)

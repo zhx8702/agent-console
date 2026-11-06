@@ -6,7 +6,6 @@ import re
 from app.common.config import Settings, get_settings
 from app.common.logging import get_logger
 from app.common.types import PreprocessedMessage
-from app.preprocessing.pii import detect_and_mask
 from app.safety.keywords import load_keywords
 
 log = get_logger(__name__)
@@ -19,7 +18,7 @@ _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 class SafetyService:
-    def __init__(self, keywords: list[str], *, block_pii_output: bool = True):
+    def __init__(self, keywords: list[str], *, block_pii_output: bool = False):
         # store lowercased for case-insensitive matching
         self._keywords_lower = tuple(kw.lower() for kw in keywords if kw)
         self._block_pii_output = block_pii_output
@@ -69,20 +68,8 @@ class SafetyService:
             log.info("safety.output.blocked", reason="keyword", match=kw)
             return True, f"keyword:{kw}"
 
-        if self._block_pii_output:
-            _masked, pii_map = detect_and_mask(text)
-            if pii_map:
-                pii_types = sorted(
-                    {
-                        placeholder.split(":", 2)[1]
-                        for placeholder in pii_map
-                        if placeholder.startswith("<PII:")
-                    }
-                )
-                reason = f"pii_output:{','.join(pii_types)}"
-                log.info("safety.output.blocked", reason="pii", pii_types=pii_types)
-                return True, reason
-
+        # Output PII must not replace a finished answer. Tweet IDs, timestamps
+        # and citation URLs look like card numbers and were being canned.
         return False, None
 
 

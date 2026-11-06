@@ -12,7 +12,7 @@ from app.agent.scopes import (
     GROUP_VIDEO_GENERATION_SCOPE,
     MESSAGE_EXPORT_SCOPE,
 )
-from app.common.intent import IntentDecision, IntentDomain
+from app.common.intent import IntentDecision, IntentDomain, is_local_history_lookup
 from app.common.intent_runtime import is_confident
 from app.orchestrator.pipeline import PipelineContext
 from app.social import (
@@ -348,6 +348,8 @@ def _record_participation_decision(
 ) -> dict[str, object]:
     payload = _participation_payload(decision)
     ctx.extras["wxbot_participation"] = payload
+    if ctx.session is not None:
+        ctx.session.variables["participation_status"] = payload["status"]
     policy_state = ctx.extras.get("wxbot_reply_policy")
     if isinstance(policy_state, dict):
         policy_state.update(
@@ -498,6 +500,8 @@ def _resolve_group_agent_scope(
         return None
     if decision.domain is IntentDomain.FILE and decision.action == "export_history":
         return MESSAGE_EXPORT_SCOPE
+    if is_local_history_lookup(decision):
+        return DEFAULT_AGENT_SCOPE
     return _SCOPE_BY_DOMAIN.get(decision.domain)
 
 

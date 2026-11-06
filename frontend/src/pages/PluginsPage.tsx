@@ -1,3 +1,6 @@
+import { useStableIdempotencyKeys } from "../lib/idempotency";
+import { Alert } from "../components/Alert";
+import { useConsoleConfig } from "../state/console-config";
 import { DrawConfigSection } from "./plugins/DrawConfigSection";
 import { FlowRuntimeSection } from "./plugins/FlowRuntimeSection";
 import { GroupPluginScopeSection } from "./plugins/GroupPluginScopeSection";
@@ -7,7 +10,16 @@ import { PluginOverviewSection } from "./plugins/PluginOverviewSection";
 import { usePluginsPageController } from "./plugins/usePluginsPageController";
 
 export function PluginsPage() {
-  const page = usePluginsPageController();
+  const { config } = useConsoleConfig();
+  const idempotencyKeys = useStableIdempotencyKeys();
+  // A new authority/scope gets a fresh state tree, including open confirmation
+  // dialogs and unsaved secrets. Old promises cannot target the new page.
+  const scope = JSON.stringify([config.apiBaseUrl, config.adminToken, config.tenantId, config.sessionId]);
+  return <ScopedPluginsPage key={scope} idempotencyKeys={idempotencyKeys} />;
+}
+
+function ScopedPluginsPage({ idempotencyKeys }: { idempotencyKeys: ReturnType<typeof useStableIdempotencyKeys> }) {
+  const page = usePluginsPageController(idempotencyKeys);
 
   return (
     <div className="page-grid plugins-page">
@@ -19,6 +31,8 @@ export function PluginsPage() {
         canRefresh={page.canManage}
         onRefresh={() => void page.refreshSummary()}
       />
+
+      {page.error && <Alert variant="danger" title="插件状态">{page.error}</Alert>}
 
       <FlowRuntimeSection
         flowStatus={page.flowStatus}
@@ -60,6 +74,7 @@ export function PluginsPage() {
       />
 
       <InstalledPluginsSection
+        runtimeErrors={page.runtimeErrors}
         pluginCards={page.pluginCards}
         runtime={page.runtime}
         selectedPluginName={page.selectedPluginName}
@@ -69,6 +84,7 @@ export function PluginsPage() {
       />
 
       <GroupPluginScopeSection
+        scopeReady={page.scopeReady}
         groups={page.groups}
         groupPlugins={page.groupScopedPlugins}
         managedGroupSessionId={page.managedGroupSessionId}

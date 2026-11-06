@@ -3,7 +3,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.billing import BillingCoordinator, BillingReservation, BillingResource, BillingSubject
+from app.billing import (
+    BillingCoordinator,
+    BillingExecutionDenied,
+    BillingReservation,
+    BillingResource,
+    BillingSubject,
+)
+from app.channel.identity import preferred_external_user_id
 from app.channel.models import configuration_session_id
 from app.commands import CommandDefinition, CommandRegistryService, CommandSkip
 from app.common.canned import degradation_text
@@ -91,10 +98,25 @@ def _admin_identity_candidates(ctx: PipelineContext) -> set[str]:
     metadata = ctx.event.metadata or {}
     values = [
         ctx.event.user_id,
+        ctx.event.external_participant_id,
         metadata.get("sender_id"),
         metadata.get("sender_wxid"),
+        metadata.get("external_participant_id"),
     ]
     return {str(item).strip() for item in values if str(item or "").strip()}
+
+
+def _billing_user_id(ctx: PipelineContext) -> str:
+    metadata = ctx.event.metadata or {}
+    session = ctx.session
+    return preferred_external_user_id(
+        metadata.get("sender_wxid"),
+        metadata.get("sender_id"),
+        metadata.get("external_participant_id"),
+        ctx.event.external_participant_id,
+        getattr(session, "external_participant_id", "") if session is not None else "",
+        ctx.event.user_id,
+    )
 
 
 def _is_admin(ctx: PipelineContext, cfg: dict) -> bool:
@@ -136,7 +158,7 @@ async def _reserve_command_charge(
     subject = BillingSubject(
         tenant_id=ctx.event.tenant_id,
         session_id=configuration_session_id(ctx.event, ctx.session),
-        user_id=ctx.event.user_id,
+        user_id=_billing_user_id(ctx),
         display_name=str(ctx.event.metadata.get("sender_name") or ""),
     )
     resource = BillingResource(
@@ -145,7 +167,18 @@ async def _reserve_command_charge(
         reference=ctx.event.trace_id,
         metadata={"command": command, **dict(metadata or {})},
     )
-    reservation = await billing.reserve(subject, resource)
+    try:
+        reservation = await billing.reserve(subject, resource)
+    except BillingExecutionDenied:
+        # Credits can be installed globally but disabled for this group.
+        # Skip charging instead of failing the command as if the dispatcher died.
+        logger.info(
+            "commands.billing_skipped_scope_denied",
+            tenant_id=ctx.event.tenant_id,
+            session_id=subject.session_id,
+            command=command,
+        )
+        return None
     if reservation.amount <= 0:
         return reservation
     ctx.extras["_billing_command_reservation"] = reservation

@@ -7,9 +7,9 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*")
 _LIST_PREFIX_RE = re.compile(r"(?m)^\s*(?:[-*•·]|\d{1,2}[.)、]|[一二三四五六七八九十]+[、.])\s*")
 _EMOJI_RE = re.compile(
     "["
@@ -30,6 +30,19 @@ _IDENTITY_DISCLOSURE_PREFIX = "我是 AI 助手。"
 _MAX_EMOJI_FREQUENCY = 0.15
 _SHORT_REPLY_INLINE_CHARS = 80
 _TERMINAL_PUNCT = "，,。.!！?？；;：:…~～"
+_TRAILING_TIC_RE = re.compile(
+    r"(?P<pad>[\s，,。.!！?？~～]*)(?P<tic>hhh|干就完了)(?P<tail>[。.!！?？~～]*)\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_TIC_WINDOW = 3
+_AGREE_OPENER_RE = re.compile(r"^(是啊|对啊|对的|对，|可以啊|有啊|行啊)[，,。.!！?？\s]*")
+_NEW_INFO_RE = re.compile(
+    r"(不过|但是|可是|问题是|下次|要不|其实|另外|建议|试试|先|然后|因为|所以|区别|为啥|怎么|但)"
+)
+_ECHO_TOKEN_MIN = 2
+_ECHO_TOKEN_RATIO = 0.28
+_ECHO_SEQUENCE = 0.42
+_CJK_STOP = set("的了是在就都也还真这那把被和与他她你我")
 _CATCHPHRASES = (
     "哈哈",
     "确实",
@@ -95,42 +108,12 @@ class NaturalReplyStyleGuard:
             )
 
         active_history = history or ReplyStyleHistory()
-        detail_requested = (
-            bool(explicitly_detailed)
-            if explicitly_detailed is not None
-            else bool(_DETAIL_REQUEST_RE.search(str(source_text or "")))
-        )
         list_requested = bool(_LIST_REQUEST_RE.search(str(source_text or "")))
         profile = dict(voice_profile or {})
         profile_phrases = _profile_phrase_preferences(profile)
-        verbosity = str(profile.get("verbosity") or "concise").strip().lower()
-        bucket = _bucket(deterministic_key, "length", 100)
-        if preserve_persona_style:
-            # Portraits own length and catchphrases. They must not keep a
-            # 3-line couplet; short bursts are still inlined below.
-            mode = "persona"
-            sentence_limit = 0
-            char_limit = 0
-        elif (
-            verbosity == "terse"
-            or (verbosity == "concise" and bucket < 65)
-            or (verbosity == "balanced" and bucket < 35)
-        ):
-            mode = "one_sentence"
-            sentence_limit = 1
-            char_limit = 35
-        elif (
-            (verbosity == "concise" and bucket < 90)
-            or (verbosity == "balanced" and bucket < 75)
-            or not detail_requested
-        ):
-            mode = "two_sentences"
-            sentence_limit = 2
-            char_limit = 70
-        else:
-            mode = "expanded_requested"
-            sentence_limit = 0
-            char_limit = 0
+        # Persona and generic chat keep the model text. Length clipping used
+        # to make no-persona replies look refused or truncated.
+        mode = "persona" if preserve_persona_style else "natural"
 
         value = original.strip()
         reasons: list[str] = []
@@ -174,15 +157,15 @@ class NaturalReplyStyleGuard:
             reasons.append("catchphrase_suppressed")
             candidate_catchphrase = ""
 
-        if sentence_limit:
-            text_budget = max(
-                1,
-                char_limit - len(allowed_emoji) - len(identity_prefix),
-            )
-            shortened = _limit_sentences(value, sentence_limit, text_budget)
-            if shortened != value:
-                reasons.append("length_shaped")
-            value = shortened
+        value, trailing_tic, trailing_stripped = soften_repeated_trailing_tics(
+            value,
+            recent_catchphrases=active_history.catchphrases_last_30,
+        )
+        if trailing_stripped:
+            reasons.append("trailing_tic_suppressed")
+        elif trailing_tic and not candidate_catchphrase:
+            candidate_catchphrase = trailing_tic
+
         inlined = _inline_short_newlines(value)
         if inlined != value:
             reasons.append("short_lines_inlined")
@@ -201,6 +184,89 @@ class NaturalReplyStyleGuard:
             identity_disclosed=identity_disclosed,
             reason_codes=tuple(reasons),
         )
+
+
+def soften_repeated_trailing_tics(
+    text: str,
+    *,
+    recent_catchphrases: tuple[str, ...] = (),
+    window: int = _TRAILING_TIC_WINDOW,
+) -> tuple[str, str, bool]:
+    """Keep a trailing tic only when the last few bot lines did not already use it."""
+
+    value = str(text or "")
+    match = _TRAILING_TIC_RE.search(value)
+    if match is None:
+        return value, "", False
+    tic = match.group("tic")
+    recent = [
+        phrase
+        for phrase in recent_catchphrases[: max(1, window)]
+        if _phrase_key(phrase) == _phrase_key(tic)
+    ]
+    if not recent:
+        return value, tic, False
+    prefix = value[: match.start()].rstrip("，,。.!！?？~～ ")
+    if not prefix:
+        return value, tic, False
+    return prefix, tic, True
+
+
+def is_agree_echo(reply: str, source: str) -> bool:
+    """True when a soft reply is just agreeing and restating the last line."""
+
+    reply_raw = str(reply or "").strip()
+    source_raw = str(source or "").strip()
+    if not reply_raw or not source_raw:
+        return False
+    compact_reply = _compact_chat_text(reply_raw)
+    if _AGREE_OPENER_RE.match(reply_raw) and len(compact_reply) < 4:
+        return True
+    compact_source = _compact_chat_text(source_raw)
+    if not compact_reply or not compact_source:
+        return False
+    if compact_reply == compact_source:
+        return True
+    shorter, longer = (
+        (compact_reply, compact_source)
+        if len(compact_reply) <= len(compact_source)
+        else (compact_source, compact_reply)
+    )
+    if len(shorter) >= 6 and shorter in longer and len(shorter) / len(longer) >= 0.7:
+        return True
+    if not _AGREE_OPENER_RE.match(reply_raw):
+        return False
+    if _NEW_INFO_RE.search(_AGREE_OPENER_RE.sub("", reply_raw, count=1)):
+        return False
+    source_tokens = _distinctive_tokens(compact_source)
+    shared = source_tokens & _distinctive_tokens(compact_reply)
+    if len(shared) >= _ECHO_TOKEN_MIN and (
+        len(shared) / max(1, len(source_tokens)) >= _ECHO_TOKEN_RATIO
+    ):
+        return True
+    return SequenceMatcher(None, compact_reply, compact_source).ratio() >= _ECHO_SEQUENCE
+
+
+def _compact_chat_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", str(text or "")).lower()
+    value = _AGREE_OPENER_RE.sub("", value)
+    value = re.sub(r"\bhhh+\b", "", value, flags=re.IGNORECASE)
+    value = value.replace("干就完了", "")
+    return re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+
+
+def _distinctive_tokens(text: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]{3,}", text))
+    for index, char in enumerate(text):
+        if index + 1 >= len(text):
+            break
+        if not ("\u4e00" <= char <= "\u9fff"):
+            continue
+        gram = text[index : index + 2]
+        if any(item in _CJK_STOP for item in gram):
+            continue
+        tokens.add(gram)
+    return tokens
 
 
 def requests_detailed_answer(source_text: str) -> bool:
@@ -288,18 +354,6 @@ def _flatten_list(text: str) -> str:
     return "；".join(parts) + ("。" if parts else "")
 
 
-def _split_sentences(text: str) -> list[str]:
-    value = _normalize_spacing(text)
-    parts: list[str] = []
-    for block in value.split("\n"):
-        block = block.strip()
-        if not block:
-            continue
-        sentences = [part.strip() for part in _SENTENCE_SPLIT_RE.split(block) if part.strip()]
-        parts.extend(sentences or [block])
-    return parts
-
-
 def _join_inline(parts: list[str]) -> str:
     joined: list[str] = []
     for part in parts:
@@ -331,25 +385,6 @@ def _inline_short_newlines(text: str) -> str:
     if sum(len(line) for line in lines) > _SHORT_REPLY_INLINE_CHARS:
         return value
     return _join_inline(lines)
-
-
-def _limit_sentences(text: str, count: int, char_limit: int) -> str:
-    sentences = _split_sentences(text)
-    selected = _join_inline(sentences[:count]) if sentences else _normalize_spacing(text)
-    if len(selected) <= char_limit:
-        return selected
-    # Only soft, non-factual replies reach this guard. Prefer a nearby natural
-    # clause boundary, then add an ellipsis inside the exact character budget.
-    # Tool, safety, factual and obligation replies are preserved earlier.
-    prefix = selected[: max(1, char_limit - 1)]
-    minimum_boundary = max(1, int(char_limit * 0.6))
-    boundary = max(
-        (prefix.rfind(marker) for marker in "\n，、；;：:,. "),
-        default=-1,
-    )
-    if boundary >= minimum_boundary:
-        prefix = prefix[:boundary]
-    return f"{prefix.rstrip('，、；;：:,. ')}…"
 
 
 def _bounded_float(value: Any, *, default: float, maximum: float = 1.0) -> float:

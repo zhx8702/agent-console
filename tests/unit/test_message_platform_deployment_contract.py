@@ -50,6 +50,7 @@ def test_core_compose_profile_has_no_wxbot_worker_or_secret_injection() -> None:
         "WXBOT_DAILY_REPORT_FOOTER",
         "WXBOT_REPORT_LLM_BACKEND",
         "WXBOT_REPORT_MAX_CHARS_PER_CHUNK",
+        "WXBOT_REPORT_SEND_MAX_CHARS",
         "WXBOT_SELF_REVIEW_LLM_BACKEND",
         "WXBOT_FILE_DOWNLOAD_MAX_BYTES",
         "WXBOT_OUTBOUND_FILE_CLEANUP_GRACE_SECONDS",
@@ -190,3 +191,9 @@ def test_message_platform_documentation_covers_secret_and_network_boundaries() -
     assert "adapter ID: `wechat-sdk`" in source
     assert "does **not** mean" in source
     assert "never copied into the connection row" in source
+
+
+def test_server_overlay_keeps_global_plugin_mutations_closed() -> None:
+    services = _compose("docker-compose.server.yml")["services"]
+    for name in ("migrate", "api", "inbound-worker", "outbound-worker", "scheduler", "wxbot-bridge-worker"):
+        assert services[name]["environment"]["PLUGIN_DYNAMIC_MUTATIONS_ENABLED"] == "false"

@@ -2300,12 +2300,11 @@ async def test_group_relationship_window_extraction_merges_same_relation_across_
     value = json.loads(item["value_json"])
     assert value["relation"]["evidence_event_ids"] == [501, 502, 503, 504]
     assert value["source_event_ids"] == [501, 502, 503, 504]
-    # Four supporting messages on one day: accepted without waiting for a second day.
-    assert value["acceptance"]["status"] == "accepted"
-    assert value["acceptance"]["reason"] == "group_window_llm_repeated_evidence"
-    # The synthetic "wxid_a asked wxid_b" line must not be read as PII: an
-    # accepted relation is stored active, otherwise its fact never reaches the graph.
-    assert item["status"] == "active"
+    # Four cited messages remain an unverified model claim until semantic review.
+    assert value["acceptance"]["status"] == "needs_review"
+    assert value["acceptance"]["reason"] == "group_window_semantic_review_required"
+    # Pending semantic review must not be confused with a PII restriction.
+    assert item["status"] == "pending"
     assert item["sensitivity"] == "normal"
     assert item["sensitivity_category"] == "normal"
 

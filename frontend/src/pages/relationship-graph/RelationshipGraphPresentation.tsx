@@ -461,10 +461,10 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
           <section className="panel relationship-list-panel" aria-labelledby="relationship-review-queue-title">
             <div className="panel-header">
               <div>
-                <p className="section-kicker">审核</p>
-                <h3 id="relationship-review-queue-title">待审核队列</h3>
+                <p className="section-kicker">自动处理</p>
+                <h3 id="relationship-review-queue-title">观察中的关系</h3>
                 <p className="muted-copy">
-                  引用、@ 即时通过。参与、报障、给资源、协作、问答这类关键关系进本队列。闲聊「提到」和空泛兴趣先挂起，不占待审；跨天复现、同窗 3 条以上证据、或与已通过关系印证后自动通过。人工点不点都不影响自动流程；最多显示 100 条。
+                  这里展示证据尚不充分的关系，无需逐条审核。开启记忆自动处理后，系统核对原始发言，自动接受或淘汰；不确定的继续观察，新证据到达后复评，长期无变化按保留策略过期。消息多、跨天出现不会直接证明关系成立。下方操作仅用于纠错，最多显示 100 条。
                 </p>
               </div>
               <span className="relationship-queue-count" title={pendingTotal !== null ? `共 ${pendingTotal} 条待印证，显示前 ${pendingShown} 条` : undefined}>
@@ -529,7 +529,7 @@ export function RelationshipGraphPresentation(controller: RelationshipGraphPrese
                 </div>
               ))}
               {!pendingReviewError && !pendingEdges.length && (
-                <p className="muted-copy">{pendingReviewLoading ? "正在加载待审核关系..." : "当前范围内没有待审核关系。看图不需要先审核。"}</p>
+                <p className="muted-copy">{pendingReviewLoading ? "正在加载观察中的关系..." : "当前范围内没有观察中的关系。无需人工审核后再看图。"}</p>
               )}
             </div>
           </section>

@@ -7,11 +7,12 @@ import re
 from dataclasses import dataclass, field
 
 from app.agent.scopes import GROUP_PERSONAL_MAP_SCOPE, normalize_agent_scope
+from app.channel.identity import preferred_external_user_id
 from app.channel.models import configuration_session_id
 from app.commands import CommandDefinition
 from app.common.intent_runtime import decision_from_pre
 from app.common.logging import get_logger
-from app.common.types import CapabilityResult, Channel, RouteType
+from app.common.types import CapabilityResult, RouteType
 from app.orchestrator.effect_handlers import effect_handler_opt_in_enabled
 from app.orchestrator.effects import (
     EFFECT_COMMIT_SEMANTICS_AUDIT_AFTER_SIDE_EFFECT,
@@ -100,6 +101,23 @@ def _is_amap_agent_context(ctx: PipelineContext) -> bool:
     return normalize_agent_scope(scope) == GROUP_PERSONAL_MAP_SCOPE
 
 
+_FREE_GROUP_PARTICIPATION_STATUSES = frozenset({"may_reply", "defer"})
+
+
+def _is_automatic_group_participation(ctx: PipelineContext) -> bool:
+    """Soft group chatter is the bot joining in, not a user-paid request."""
+
+    if not _is_group_context(ctx):
+        return False
+    if ctx.extras.get("_command_token"):
+        return False
+    participation = ctx.extras.get("wxbot_participation")
+    if not isinstance(participation, dict):
+        return False
+    status = str(participation.get("status") or "").strip().lower()
+    return status in _FREE_GROUP_PARTICIPATION_STATUSES
+
+
 def _is_group_context(ctx: PipelineContext) -> bool:
     session_kind = str(ctx.event.metadata.get("session_kind") or "").strip().lower()
     if session_kind in {"group", "chatroom", "channel", "guild"}:
@@ -110,11 +128,16 @@ def _is_group_context(ctx: PipelineContext) -> bool:
 
 
 def _credit_user_id(ctx: PipelineContext) -> str:
-    if ctx.event.channel == Channel.WECHAT:
-        sender_wxid = str(ctx.event.metadata.get("sender_wxid") or "").strip()
-        if sender_wxid:
-            return sender_wxid
-    return str(ctx.event.user_id or "").strip()
+    metadata = ctx.event.metadata or {}
+    session = ctx.session
+    return preferred_external_user_id(
+        metadata.get("sender_wxid"),
+        metadata.get("sender_id"),
+        metadata.get("external_participant_id"),
+        ctx.event.external_participant_id,
+        getattr(session, "external_participant_id", "") if session is not None else "",
+        ctx.event.user_id,
+    )
 
 
 def _credit_session_id(ctx: PipelineContext) -> str:
@@ -715,6 +738,14 @@ class CreditDeductionHook:
 
         if _should_auto_checkin(ctx, cfg) and not ctx.extras.get("_credits_auto_checkin_done"):
             auto_result = await _maybe_auto_checkin(self.store, ctx, cfg)
+
+        if _is_automatic_group_participation(ctx):
+            ctx.extras["_credits_skip_reason"] = "automatic_participation"
+            ctx.signals.setdefault("credits", {})["deduction"] = {
+                "skipped": True,
+                "reason": "automatic_participation",
+            }
+            return
 
         amap_estimated_cost = _estimate_amap_agent_cost(ctx, _amap_costs(self.store, cfg))
         cost = amap_estimated_cost or int(cfg.get("cost_per_chat", 0) or 0)

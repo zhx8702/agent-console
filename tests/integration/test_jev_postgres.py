@@ -150,7 +150,8 @@ async def test_delayed_human_review_is_not_overwritten(env):
     assert (await memory.get_memory_item(item['id']))['value']['acceptance']['reviewed_by'] == 'admin/reviewer'
 
 
-async def test_admin_policy_idempotency_version_and_tenant_scope(env, monkeypatch):
+@pytest.mark.parametrize("memory_mode", ["inherit", "auto", "shadow"])
+async def test_admin_policy_idempotency_version_and_tenant_scope(env, monkeypatch, memory_mode):
     import httpx
     from fastapi import FastAPI
 
@@ -166,10 +167,12 @@ async def test_admin_policy_idempotency_version_and_tenant_scope(env, monkeypatc
     app.include_router(router_module.build_jev_router(svc, svc.settings))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
         path = f'/v1/admin/jev/policy?tenant_id={tid}'
-        payload = {'version':0, 'policy':JevPolicy(shadow_only=False).model_dump()}
+        payload = {'version':0, 'policy':JevPolicy(shadow_only=True, memory_mode=memory_mode).model_dump()}
         headers = {'Idempotency-Key':'one'}
         first = await client.put(path, json=payload, headers=headers)
         assert first.status_code == 200, first.text
+        assert first.json()["policy"]["memory_mode"] == memory_mode
+        assert first.json()["policy"]["shadow_only"] is True
         replay = await client.put(path, json=payload, headers=headers)
         assert replay.json() == first.json()
         conflict = await client.put(path, json=payload, headers={'Idempotency-Key':'two'})

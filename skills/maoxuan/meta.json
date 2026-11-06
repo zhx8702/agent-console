@@ -1,0 +1,45 @@
+{
+  "name": "毛选人格",
+  "slug": "maoxuan",
+  "generated_at": "2026-10-28T03:26:56+00:00",
+  "article_count": 1237,
+  "by_source": {
+    "supplement": 964,
+    "relay": 31,
+    "official": 229,
+    "variant": 13
+  },
+  "by_period": {
+    "civil_war_1": {
+      "articles": 111,
+      "chars": 352826
+    },
+    "late": {
+      "articles": 619,
+      "chars": 906960
+    },
+    "resistance": {
+      "articles": 177,
+      "chars": 711944
+    },
+    "liberation": {
+      "articles": 105,
+      "chars": 333122
+    },
+    "construction": {
+      "articles": 225,
+      "chars": 688767
+    }
+  },
+  "by_genre": {
+    "directive": 773,
+    "treatise": 103,
+    "survey": 12,
+    "decree": 14,
+    "talk": 125,
+    "short": 21,
+    "relay": 13,
+    "essay": 176
+  },
+  "skill_prompt_max_chars": 12000
+}

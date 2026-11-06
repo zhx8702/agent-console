@@ -2429,6 +2429,13 @@ class WxbotAgentToolService:
         if not session_id.endswith("@chatroom"):
             raise ValueError("search_group_messages only supports group chats")
 
+        from app.common.intent import is_local_history_lookup
+        from plugins.wxbot.history_query import search_recorded_history
+
+        connection = str(getattr(session, "connection_id", "") or "")
+        if (connection and connection != LEGACY_WXBOT_CONNECTION_ID) or is_local_history_lookup(decision_from_session(session)):
+            return await search_recorded_history(self, session, arguments)
+
         query = str(arguments.get("query") or "").strip()
         sender_name_query = str(arguments.get("sender_name") or "").strip().lower()
         sender_wxid_query = str(arguments.get("sender_wxid") or "").strip().lower()

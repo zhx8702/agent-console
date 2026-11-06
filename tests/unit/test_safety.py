@@ -82,21 +82,19 @@ def test_safety_output_keyword():
 
 
 @pytest.mark.parametrize(
-    ("text", "expected_type"),
+    "text",
     [
-        ("可以联系 13800138000", "phone"),
-        ("邮箱是 member@example.com", "email"),
-        ("api_key=sk-abcdefghijklmnop", "secret"),
+        "可以联系 13800138000",
+        "邮箱是 member@example.com",
+        "api_key=sk-abcdefghijklmnop",
+        "tibo 最新帖 https://x.com/thsottiaux/status/2077607697487188198",
+        "推特状态 2077607697487188198",
     ],
 )
-def test_safety_output_pii_or_secret_is_blocked(
-    text: str,
-    expected_type: str,
-) -> None:
+def test_safety_output_does_not_block_pii_or_tweet_ids(text: str) -> None:
     svc = SafetyService([])
 
     blocked, reason = svc.check_output(text)
 
-    assert blocked is True
-    assert reason is not None
-    assert expected_type in reason
+    assert blocked is False
+    assert reason is None

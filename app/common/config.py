@@ -304,6 +304,13 @@ class Settings(BaseSettings):
     openai_web_search_tool: str = "web_search"
     openai_web_search_live_enabled: bool = True
     llm_embed_provider: str = "fake"
+    # A separate endpoint never inherits the chat provider's credentials.
+    llm_embed_base_url: str | None = None
+    llm_embed_api_key: str | None = None
+    llm_embed_timeout_seconds: float = Field(default=2.5, gt=0, le=30)
+    llm_embed_background_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    llm_embed_cache_entries: int = Field(default=128, ge=0, le=4096)
+    llm_embed_cache_ttl_seconds: float = Field(default=60.0, ge=0, le=3600)
     knowledge_features_enabled: bool = True
     customer_service_prompt_enabled: bool = True
     response_guard_bot_aliases: str = "zzz"
@@ -369,6 +376,7 @@ class Settings(BaseSettings):
     wxbot_self_review_llm_backend: str = ""
     wxbot_report_stage_timeout_seconds: float = 240.0
     wxbot_report_max_chars_per_chunk: int = Field(default=12_000, ge=1000)
+    wxbot_report_send_max_chars: int = Field(default=4_000, ge=200, le=8_000)
     wxbot_report_transient_backoff_seconds: float = Field(default=900.0, gt=0)
     wxbot_daily_report_footer: str = ""
     orchestrator_handle_timeout_seconds: float = Field(default=150.0, gt=0)
@@ -705,7 +713,7 @@ class Settings(BaseSettings):
     draw_storage_dir: str = "/mnt/c/Users/Public/agent-console-draw"
     video_api_url: str = ""
     video_api_key: str = ""
-    video_api_model: str = "grok-imagine-video-1.5-preview"
+    video_api_model: str = "grok-imagine-video"
     video_api_timeout_seconds: float = 600.0
     video_api_poll_interval_seconds: float = Field(default=5.0, gt=0)
     video_api_poll_timeout_seconds: float = Field(default=1800.0, gt=0)
@@ -779,7 +787,7 @@ class Settings(BaseSettings):
     # tenant/session policy remains independently mutable.
     plugin_dynamic_mutations_enabled: bool = True
     safety_keywords_path: str = "config/safety_keywords.txt"
-    safety_block_pii_output: bool = True
+    safety_block_pii_output: bool = False
 
     otel_exporter_otlp_endpoint: str | None = None
     otel_exporter_otlp_insecure: bool = True

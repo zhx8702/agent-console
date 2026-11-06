@@ -44,6 +44,7 @@ from app.infra.metrics import (
     RAG_RETRIEVAL_LATENCY,
     RAG_RETRIEVAL_RESULTS,
 )
+from app.kb.scope import knowledge_scope_session_ids
 from app.llm.base import LLMProvider
 from app.rag.citations import validate_cited_answer
 from app.rag.retriever import HybridRetriever, RetrievalHit
@@ -56,7 +57,10 @@ def _compose_rag_system_prompt(
     web_search_enabled: bool = False,
     prompt_trace: dict[str, Any] | None = None,
 ) -> str:
-    base_system = rag_system_prompt(settings.customer_service_prompt_enabled)
+    base_system = rag_system_prompt(
+        settings.customer_service_prompt_enabled,
+        cite_inline=not is_group_session(session),
+    )
     return augment_prompt_with_persona_and_memory(
         base_system,
         session,
@@ -98,6 +102,7 @@ class RAGEngine:
         *,
         context: str = "",
         request_metadata: dict[str, Any] | None = None,
+        hide_citations: bool = False,
     ) -> str:
         refs = "\n\n".join(
             f"<reference id=\"{i + 1}\">{escape(h.content)}</reference>"
@@ -111,7 +116,10 @@ class RAGEngine:
         current_message = with_quote_context(query, request_metadata)
         parts.append(with_bot_interaction_context(current_message, request_metadata))
         parts.append(f"参考资料：\n{refs}")
-        parts.append("仅根据相关参考资料回答；使用资料时在对应结论后标注 [编号]。")
+        if hide_citations:
+            parts.append("仅根据相关参考资料回答；用自己的话讲，不要标注编号、出处或参考资料。")
+        else:
+            parts.append("仅根据相关参考资料回答；使用资料时在对应结论后标注 [编号]。")
         return "\n\n".join(parts)
 
     def _build_citations(self, hits: list[RetrievalHit]) -> list[Citation]:
@@ -189,11 +197,17 @@ class RAGEngine:
             request_metadata = dict((hints or {}).get("request_metadata") or {})
             web_search_requested = live_web_search_requested(query, request_metadata)
             search_query = retrieval_query(query, request_metadata)
+            scope_ids = knowledge_scope_session_ids(
+                session.session_id,
+                session.external_conversation_id,
+                session.canonical_conversation_id,
+            )
             hits = await self._retriever.retrieve(
                 tenant_id,
                 search_query,
                 top_k=self._top_k,
-                session_id=session.session_id,
+                session_id=scope_ids[0] if scope_ids else None,
+                extra_session_ids=scope_ids[1:],
             )
         finally:
             RAG_RETRIEVAL_LATENCY.labels(tenant=tenant_id).observe(time.monotonic() - start)
@@ -212,11 +226,13 @@ class RAGEngine:
             current_trace_id=str(trace_id or ""),
             limit=12 if is_group_session(session) else 6,
         )
+        hide_citations = is_group_session(session)
         user_content = self._build_user_prompt(
             query,
             hits,
             context=conversation,
             request_metadata=request_metadata,
+            hide_citations=hide_citations,
         )
         prompt_trace: dict[str, Any] = {}
         request_metadata.update(
@@ -258,7 +274,7 @@ class RAGEngine:
             cache_write_tokens=int(resp.usage.cache_write_tokens or 0),
             cost_usd=float(resp.usage.cost_usd or 0.0),
         )
-        if bool(self._settings.rag_citation_validation_enabled):
+        if (not hide_citations) and bool(self._settings.rag_citation_validation_enabled):
             validation = validate_cited_answer(
                 answer,
                 hits,

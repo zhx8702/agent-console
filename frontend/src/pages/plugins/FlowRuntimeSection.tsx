@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Link } from "react-router-dom";
 
+import { MemoryTraceSummary } from "./MemoryTraceSummary";
 import { messageStoryPath } from "../message-story/path";
 import type {
   EffectAuditFilters,
@@ -687,6 +688,7 @@ export function FlowRuntimeSection({
               {traceAggregateError && <p className="muted-copy">{traceAggregateError}</p>}
               {activeTraceAggregate ? (
                 <>
+                  <MemoryTraceSummary memory={selectedTraceRuntime?.decision_trace?.memory} />
                   <div className="flow-trace-dossier">
                     <section className="flow-trace-runtime-card">
                       <div>

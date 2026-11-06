@@ -44,3 +44,8 @@ wxbot_client/data/
 
 # Deployment scratch archives and screenshots are local operator artifacts.
 /.tmp-*
+
+# Local operator documentation and production audit artifacts.
+/doc/
+/docs/
+/artifacts/

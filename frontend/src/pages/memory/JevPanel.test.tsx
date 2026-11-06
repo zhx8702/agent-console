@@ -74,7 +74,19 @@ describe("Jev tenant policy", () => {
   it("shows the effective memory disposition separately from the recommendation", async () => {
     mocks.request.mockResolvedValueOnce({ ...dashboard, items: [{ id: "memory", domain: "memory", status: "completed", applied: true, duration_ms: 10, attempts: 1, result: { answers: { decision: { choice: "accepted", confidence: .95 } }, _audit: { reason: "evidence_review_required", effective_decision: "needs_review" } } }] });
     render(<JevPanel />);
-    expect(await screen.findByText("实际处理：待人工审核")).toBeInTheDocument();
-    expect(screen.getByText("证据或敏感性检查要求人工审核")).toBeInTheDocument();
+    expect(await screen.findByText("实际处理：继续观察，等待新证据")).toBeInTheDocument();
+    expect(screen.getByText("证据暂不足以生效，自动保留观察")).toBeInTheDocument();
   });
+});
+
+it("enables memory automation without activating intent or moderation", async () => {
+  const updated = { ...policy, memory_mode: "auto" };
+  mocks.request.mockResolvedValueOnce(dashboard).mockResolvedValueOnce({ policy: updated, version: 2 });
+  render(<JevPanel />);
+  fireEvent.change(await screen.findByLabelText("记忆与群关系处理"), { target: { value: "auto" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存策略" }));
+  await screen.findByRole("status");
+  expect(JSON.parse(mocks.request.mock.calls[1][2].init.body)).toEqual({ version: 1, policy: updated });
+  expect(screen.getByLabelText("评估模式")).toHaveValue("shadow");
+  expect(screen.getByLabelText("记忆与群关系处理")).toHaveValue("auto");
 });

@@ -436,6 +436,8 @@ class VideoAgentToolService(DrawAgentToolService):
             raise RuntimeError("channel registry is not configured")
         outbound = self._channel_registry.require_outbound_for_target(target)
         delivery_contract = self._task_result_delivery(target)
+        delivery_contract["force_send"] = True
+        delivery_contract["send_revalidation_enabled"] = False
         source_message = {
             "agent_tool": "generate_group_video" if source == "agent_tool" else "",
             "command": "/video" if source == "command" else "",

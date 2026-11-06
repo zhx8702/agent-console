@@ -9,6 +9,18 @@ def normalize_scope_session_id(session_id: str | None) -> str:
     return str(session_id or "").strip()
 
 
+def knowledge_scope_session_ids(*candidates: str | None) -> list[str]:
+    seen: set[str] = set()
+    scoped: list[str] = []
+    for raw in candidates:
+        normalized = normalize_scope_session_id(raw)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        scoped.append(normalized)
+    return scoped
+
+
 def is_global_scope(session_id: str | None) -> bool:
     return normalize_scope_session_id(session_id) == GLOBAL_SCOPE_SESSION_ID
 

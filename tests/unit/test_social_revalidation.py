@@ -45,6 +45,21 @@ def test_peer_answer_must_be_tied_to_the_source_question() -> None:
     assert "valid_member_answer_after_source" in result.reason_codes
 
 
+def test_same_topic_chatter_does_not_answer_a_direct_call() -> None:
+    result = evaluate_group_reply_revalidation(
+        source=_source(content="@zzz 特斯拉 音响是什么牌子的"),
+        newer_observations=[
+            _message(11, content="特斯拉内部太毛坯了"),
+            _message(12, content="特斯拉好多女车主"),
+        ],
+        participation_status="must_reply",
+    )
+
+    assert result.valid_member_answer_exists is False
+    assert result.superseded_by_newer_message is False
+    assert result.reason_codes == ("source_still_current",)
+
+
 def test_unrelated_chatter_never_suppresses_a_direct_call() -> None:
     result = evaluate_group_reply_revalidation(
         source=_source(),

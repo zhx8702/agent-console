@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile current memory vectors
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agent-console/memory-vector-reconcile.env
+# Resolve the running service through Compose labels; do not assume a container name.
+ExecStart=/usr/bin/docker compose --project-directory ${APP_DIR} --env-file ${APP_ENV_FILE} -f ${APP_COMPOSE_FILE} -p ${APP_PROJECT} exec -T ${APP_SERVICE} python -m app.ops.memory_vector_reconcile
+TimeoutStartSec=7200
+Nice=10

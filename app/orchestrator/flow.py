@@ -638,6 +638,7 @@ def build_default_flow_registry(
                 name="Route",
                 inputs={"event", "session", "pre"},
                 outputs={"route"},
+                timeout_seconds=20.0,
                 error_policy="degrade",
             ),
             FlowStepDefinition(

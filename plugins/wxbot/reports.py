@@ -21,6 +21,9 @@ from plugins.wxbot.store import WxbotStore
 
 logger = get_logger(__name__)
 _REPORT_MAX_CHARS_PER_CHUNK = 12_000
+_REPORT_SEND_MAX_CHARS = 4_000
+_SDK_TEXT_MAX_CHARS = 8_000
+_REPORT_MONTHLY_MAX_CHARS = 1_500
 _REPORT_TRANSIENT_BACKOFF_SECONDS = 900.0
 _REPORT_TRANSIENT_BACKOFF_MAX_SECONDS = 3600.0
 _DEFAULT_TZ = "Asia/Shanghai"
@@ -278,6 +281,76 @@ def report_chunk_max_chars(settings: Any) -> int:
     except (TypeError, ValueError):
         return _REPORT_MAX_CHARS_PER_CHUNK
     return max(1000, value)
+
+
+def report_send_max_chars(settings: Any) -> int:
+    raw = getattr(settings, "wxbot_report_send_max_chars", _REPORT_SEND_MAX_CHARS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = _REPORT_SEND_MAX_CHARS
+    return min(_SDK_TEXT_MAX_CHARS, max(1, value))
+
+
+def split_report_send_text(text: str, max_chars: int = _REPORT_SEND_MAX_CHARS) -> list[str]:
+    body = str(text or "")
+    max_chars = max(1, int(max_chars or _REPORT_SEND_MAX_CHARS))
+    if len(body) <= max_chars:
+        return [body]
+    # Leave room for "（12/12）" so annotated parts still fit the send limit.
+    packed = _pack_report_paragraphs(body, max(1, max_chars - 12))
+    return _annotate_report_send_parts(packed, max_chars)
+
+
+def _pack_report_paragraphs(body: str, max_chars: int) -> list[str]:
+    paragraphs = body.split("\n\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    separator = "\n\n"
+    for paragraph in paragraphs:
+        pieces = _split_report_line(paragraph, max_chars) or [""]
+        for piece in pieces:
+            extra = len(piece) + (len(separator) if current else 0)
+            if current and current_len + extra > max_chars:
+                chunks.append(separator.join(current))
+                current = [piece]
+                current_len = len(piece)
+                continue
+            current.append(piece)
+            current_len += extra
+    if current:
+        chunks.append(separator.join(current))
+    return chunks
+
+
+def _annotate_report_send_parts(parts: list[str], max_chars: int) -> list[str]:
+    total = len(parts)
+    if total <= 1:
+        return parts
+    annotated: list[str] = []
+    for index, part in enumerate(parts, start=1):
+        marker = f"（{index}/{total}）"
+        if "\n" in part:
+            first, rest = part.split("\n", 1)
+            candidate = f"{first} {marker}\n{rest}"
+        else:
+            candidate = f"{marker}\n{part}"
+        if len(candidate) <= max_chars:
+            annotated.append(candidate)
+            continue
+        suffix = f"\n{marker}"
+        if len(part) + len(suffix) <= max_chars:
+            annotated.append(part + suffix)
+            continue
+        annotated.append(part)
+    return annotated
+
+
+def report_send_command_id(job_id: int, index: int, total: int) -> str:
+    if total <= 1:
+        return f"wxbot-report:{int(job_id)}"
+    return f"wxbot-report:{int(job_id)}:p{int(index)}"
 
 
 def _split_report_line(line: str, max_chars: int) -> list[str]:
@@ -823,6 +896,7 @@ class WxbotReportService:
                 error="",
             ):
                 return False
+            monthly = report_type == "monthly"
             partial = await self._call_llm(
                 trace_id=f"wxbot_report_{job_id}_rollup_{index}",
                 system=f"你是微信群{prompt_title}整理助手。只能基于给定的{source_label}，不要编造缺失日期或周次的内容。",
@@ -831,10 +905,15 @@ class WxbotReportService:
                     "要求：\n"
                     "1. 只使用已完成下级报告里的信息，不要推测缺失内容。\n"
                     "2. 缺失或未完成的周期视为跳过，不要用原始聊天记录补齐。\n"
-                    "3. 输出中文 Markdown 正文，不要重复外层标题。\n\n"
-                    f"{source_label}：\n{chunk}"
+                    "3. 输出中文 Markdown 正文，不要重复外层标题。\n"
+                    + (
+                        f"4. 正文控制在 {_REPORT_MONTHLY_MAX_CHARS} 字以内，只保留月度总览、关键变化和主要话题，不要逐周粘贴原文。\n"
+                        if monthly
+                        else ""
+                    )
+                    + f"\n{source_label}：\n{chunk}"
                 ),
-                max_tokens=1600 if report_type == "weekly" else 1800,
+                max_tokens=700 if monthly else 1600,
             )
             if not await self._scope_allowed_or_defer_report(
                 job_id=job_id,
@@ -847,15 +926,22 @@ class WxbotReportService:
 
         summary_text = "\n\n".join(partials)
         if len(partials) > 1:
+            monthly = report_type == "monthly"
             summary_text = await self._call_llm(
                 trace_id=f"wxbot_report_{job_id}_rollup_final",
                 system=f"你是微信群{prompt_title}整理助手。只能基于给定的分段汇总。",
                 user=(
                     f"请把下面的分段汇总合并成一份完整{prompt_title}正文。\n"
-                    "要求：简洁、中文 Markdown、不要编造缺失周期内容。\n\n"
-                    "分段汇总：\n" + summary_text
+                    "要求：简洁、中文 Markdown、不要编造缺失周期内容。"
+                    + (
+                        f" 正文控制在 {_REPORT_MONTHLY_MAX_CHARS} 字以内，不要逐周粘贴原文。"
+                        if monthly
+                        else ""
+                    )
+                    + "\n\n分段汇总：\n"
+                    + summary_text
                 ),
-                max_tokens=1800,
+                max_tokens=800 if monthly else 1800,
             )
             if not await self._scope_allowed_or_defer_report(
                 job_id=job_id,
@@ -1006,6 +1092,116 @@ class WxbotReportService:
             raise RuntimeError("invalid SDK queue acknowledgement")
         return row_id
 
+    def _normalized_report_text(self, job: dict[str, Any]) -> str:
+        return normalize_report_send_text(
+            str(job.get("report_type") or "daily"),
+            str(job.get("result_text") or ""),
+            footer=str(
+                getattr(
+                    self._store.settings,
+                    "wxbot_daily_report_footer",
+                    "",
+                )
+                or ""
+            ),
+        )
+
+    def _report_send_parts(self, job: dict[str, Any]) -> list[str]:
+        return split_report_send_text(
+            self._normalized_report_text(job),
+            report_send_max_chars(self._store.settings),
+        )
+
+    def _delivery_parts(self, job: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = job.get("report_payload")
+        raw_parts = payload.get("delivery_parts") if isinstance(payload, dict) else None
+        parts: list[dict[str, Any]] = []
+        if isinstance(raw_parts, list):
+            for item in raw_parts:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    outbound_id = int(item.get("sdk_outbound_id"))
+                except (TypeError, ValueError):
+                    continue
+                if outbound_id <= 0:
+                    continue
+                parts.append(
+                    {
+                        "index": int(item.get("index") or len(parts) + 1),
+                        "sdk_outbound_id": outbound_id,
+                        "text": str(item.get("text") or ""),
+                        "command_id": str(item.get("command_id") or ""),
+                    }
+                )
+        if parts:
+            return parts
+        try:
+            outbound_id = int(job.get("sdk_outbound_id"))
+        except (TypeError, ValueError):
+            return []
+        if outbound_id <= 0:
+            return []
+        return [
+            {
+                "index": 1,
+                "sdk_outbound_id": outbound_id,
+                "text": self._normalized_report_text(job),
+                "command_id": f"wxbot-report:{int(job['id'])}",
+            }
+        ]
+
+    async def _persist_delivery_parts(
+        self,
+        job: dict[str, Any],
+        parts: list[dict[str, Any]],
+    ) -> None:
+        payload = dict(job.get("report_payload") or {})
+        payload["delivery_parts"] = parts
+        payload["send_part_count"] = len(parts)
+        await self._store.update_report_job(
+            int(job["id"]),
+            status="completed",
+            current_stage="completed",
+            expected_status="completed",
+            report_payload=payload,
+        )
+        job["report_payload"] = payload
+
+    async def queue_report_sdk_sends(
+        self,
+        *,
+        job_id: int,
+        session_id: str,
+        session_name: str,
+        parts: list[str],
+    ) -> list[dict[str, Any]]:
+        queued: list[dict[str, Any]] = []
+        total = len(parts)
+        for index, part in enumerate(parts, start=1):
+            command_id = report_send_command_id(job_id, index, total)
+            sdk_result = await self.sdk_request(
+                "POST",
+                "/send",
+                json_body={
+                    "session_id": session_id,
+                    "session_name": session_name,
+                    "sender_name": "",
+                    "text": part,
+                    "msg_type": "text",
+                },
+                request_headers={"Idempotency-Key": command_id},
+            )
+            queued.append(
+                {
+                    "index": index,
+                    "text": part,
+                    "command_id": command_id,
+                    "sdk_outbound_id": self.sdk_outbound_id(sdk_result),
+                }
+            )
+        return queued
+
     async def _sdk_outbound_row(
         self,
         sdk_row_id: int,
@@ -1078,14 +1274,8 @@ class WxbotReportService:
         if not await self._scope_execution_allowed(tenant_id, session_id):
             return {"status": "queued", "job_id": int(job_id)}
         delivery_attempt = int(job.get("delivery_attempt") or 0)
-        raw_row_id = job.get("sdk_outbound_id")
-        try:
-            if isinstance(raw_row_id, bool):
-                raise ValueError
-            sdk_row_id = int(raw_row_id)
-            if sdk_row_id <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
+        parts = self._delivery_parts(job)
+        if not parts:
             error = "queued report is missing a valid SDK outbound id"
             updated = await self._store.mark_report_delivery_terminal(
                 int(job_id),
@@ -1099,164 +1289,164 @@ class WxbotReportService:
                 "job_id": int(job_id),
                 "error": error,
             }
+        fence_id = int(parts[-1]["sdk_outbound_id"])
+        pending_status = ""
+        last_sdk_status = ""
+        for part in parts:
+            sdk_row_id = int(part["sdk_outbound_id"])
+            try:
+                sdk_row, sdk_row_source = await self._sdk_outbound_row(sdk_row_id)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    error = f"SDK outbound row {sdk_row_id} was not found"
+                    updated = await self._store.mark_report_delivery_terminal(
+                        int(job_id),
+                        delivery_attempt=delivery_attempt,
+                        sdk_outbound_id=fence_id,
+                        status="indeterminate",
+                        error=error,
+                    )
+                    return {
+                        "status": "indeterminate" if updated else "attempt_lost",
+                        "job_id": int(job_id),
+                        "sdk_outbound_id": fence_id,
+                        "error": error,
+                    }
+                error = f"SDK delivery check deferred: HTTP {exc.status_code}"
+                await self._store.touch_report_delivery_check(
+                    int(job_id),
+                    delivery_attempt=delivery_attempt,
+                    sdk_outbound_id=fence_id,
+                    error=error,
+                )
+                return {
+                    "status": "queued",
+                    "job_id": int(job_id),
+                    "sdk_outbound_id": fence_id,
+                    "error": error,
+                }
+            except Exception as exc:
+                error = f"SDK delivery check deferred: {exc.__class__.__name__}"
+                await self._store.touch_report_delivery_check(
+                    int(job_id),
+                    delivery_attempt=delivery_attempt,
+                    sdk_outbound_id=fence_id,
+                    error=error,
+                )
+                logger.warning(
+                    "wxbot.report_delivery_check_deferred",
+                    job_id=job_id,
+                    sdk_outbound_id=sdk_row_id,
+                    error_class=exc.__class__.__name__,
+                )
+                return {
+                    "status": "queued",
+                    "job_id": int(job_id),
+                    "sdk_outbound_id": fence_id,
+                    "error": error,
+                }
 
-        try:
-            sdk_row, sdk_row_source = await self._sdk_outbound_row(sdk_row_id)
-        except HTTPException as exc:
-            if exc.status_code == 404:
-                error = f"SDK outbound row {sdk_row_id} was not found"
+            expected_command_id = str(
+                part.get("command_id") or f"wxbot-report:{int(job_id)}"
+            )
+            mismatches: list[str] = []
+            if int(sdk_row.get("id") or 0) != sdk_row_id:
+                mismatches.append("id")
+            if str(sdk_row.get("session_id") or "").strip() != session_id:
+                mismatches.append("session_id")
+            command_id = str(
+                sdk_row.get("command_id") or sdk_row.get("idempotency_key") or ""
+            ).strip()
+            if sdk_row_source == "detail":
+                if command_id != expected_command_id:
+                    mismatches.append("command_id")
+            else:
+                # List-only SDK rows do not retain our Idempotency-Key.  Fence
+                # the acknowledgement with the exact queue id, target session
+                # and the queued part body returned by the SDK instead.
+                expected_text = str(part.get("text") or self._normalized_report_text(job))
+                actual_text = str(
+                    sdk_row.get("reply_text") or sdk_row.get("text") or ""
+                )
+                if command_id and command_id != expected_command_id:
+                    mismatches.append("command_id")
+                if actual_text != expected_text:
+                    mismatches.append("text")
+            if mismatches:
+                error = f"SDK outbound identity mismatch: {','.join(mismatches)}"
                 updated = await self._store.mark_report_delivery_terminal(
                     int(job_id),
                     delivery_attempt=delivery_attempt,
-                    sdk_outbound_id=sdk_row_id,
+                    sdk_outbound_id=fence_id,
                     status="indeterminate",
                     error=error,
                 )
                 return {
                     "status": "indeterminate" if updated else "attempt_lost",
                     "job_id": int(job_id),
-                    "sdk_outbound_id": sdk_row_id,
+                    "sdk_outbound_id": fence_id,
                     "error": error,
                 }
-            error = f"SDK delivery check deferred: HTTP {exc.status_code}"
-            await self._store.touch_report_delivery_check(
-                int(job_id),
-                delivery_attempt=delivery_attempt,
-                sdk_outbound_id=sdk_row_id,
-                error=error,
-            )
-            return {
-                "status": "queued",
-                "job_id": int(job_id),
-                "sdk_outbound_id": sdk_row_id,
-                "error": error,
-            }
-        except Exception as exc:
-            error = f"SDK delivery check deferred: {exc.__class__.__name__}"
-            await self._store.touch_report_delivery_check(
-                int(job_id),
-                delivery_attempt=delivery_attempt,
-                sdk_outbound_id=sdk_row_id,
-                error=error,
-            )
-            logger.warning(
-                "wxbot.report_delivery_check_deferred",
-                job_id=job_id,
-                sdk_outbound_id=sdk_row_id,
-                error_class=exc.__class__.__name__,
-            )
-            return {
-                "status": "queued",
-                "job_id": int(job_id),
-                "sdk_outbound_id": sdk_row_id,
-                "error": error,
-            }
 
-        expected_command_id = f"wxbot-report:{int(job_id)}"
-        mismatches: list[str] = []
-        if int(sdk_row.get("id") or 0) != sdk_row_id:
-            mismatches.append("id")
-        if str(sdk_row.get("session_id") or "").strip() != session_id:
-            mismatches.append("session_id")
-        command_id = str(
-            sdk_row.get("command_id") or sdk_row.get("idempotency_key") or ""
-        ).strip()
-        if sdk_row_source == "detail":
-            if command_id != expected_command_id:
-                mismatches.append("command_id")
-        else:
-            # List-only SDK rows do not retain our Idempotency-Key.  Fence the
-            # acknowledgement with the exact queue id, target session and the
-            # normalized report body returned by the SDK instead.
-            expected_text = normalize_report_send_text(
-                str(job.get("report_type") or "daily"),
-                str(job.get("result_text") or ""),
-                footer=str(
-                    getattr(
-                        self._store.settings,
-                        "wxbot_daily_report_footer",
-                        "",
-                    )
-                    or ""
-                ),
-            )
-            actual_text = str(
-                sdk_row.get("reply_text") or sdk_row.get("text") or ""
-            )
-            if command_id and command_id != expected_command_id:
-                mismatches.append("command_id")
-            if actual_text != expected_text:
-                mismatches.append("text")
-        if mismatches:
-            error = f"SDK outbound identity mismatch: {','.join(mismatches)}"
+            sdk_status = str(sdk_row.get("status") or "").strip().lower()
+            last_sdk_status = sdk_status
+            if sdk_status in {"pending", "running", "sending"}:
+                pending_status = sdk_status
+                continue
+            if sdk_status == "sent":
+                continue
+            sdk_error = str(sdk_row.get("error") or "").strip()
+            if sdk_status in {"uncertain", "failed", "cleared"}:
+                error = f"SDK delivery {sdk_status}"
+                if sdk_error:
+                    error = f"{error}: {sdk_error}"
+            else:
+                error = f"unexpected SDK delivery status: {sdk_status or 'missing'}"
             updated = await self._store.mark_report_delivery_terminal(
                 int(job_id),
                 delivery_attempt=delivery_attempt,
-                sdk_outbound_id=sdk_row_id,
+                sdk_outbound_id=fence_id,
                 status="indeterminate",
                 error=error,
             )
+            logger.warning(
+                "wxbot.report_delivery_indeterminate",
+                job_id=job_id,
+                sdk_outbound_id=sdk_row_id,
+                sdk_status=sdk_status,
+                error=sdk_error,
+            )
             return {
                 "status": "indeterminate" if updated else "attempt_lost",
+                "sdk_status": sdk_status,
                 "job_id": int(job_id),
-                "sdk_outbound_id": sdk_row_id,
+                "sdk_outbound_id": fence_id,
                 "error": error,
             }
 
-        sdk_status = str(sdk_row.get("status") or "").strip().lower()
-        if sdk_status in {"pending", "running", "sending"}:
+        if pending_status:
             await self._store.touch_report_delivery_check(
                 int(job_id),
                 delivery_attempt=delivery_attempt,
-                sdk_outbound_id=sdk_row_id,
+                sdk_outbound_id=fence_id,
             )
             return {
                 "status": "queued",
-                "sdk_status": sdk_status,
+                "sdk_status": pending_status,
                 "job_id": int(job_id),
-                "sdk_outbound_id": sdk_row_id,
+                "sdk_outbound_id": fence_id,
             }
-        if sdk_status == "sent":
-            updated = await self._store.mark_report_delivery_terminal(
-                int(job_id),
-                delivery_attempt=delivery_attempt,
-                sdk_outbound_id=sdk_row_id,
-                status="sent",
-            )
-            return {
-                "status": "sent" if updated else "attempt_lost",
-                "sdk_status": sdk_status,
-                "job_id": int(job_id),
-                "sdk_outbound_id": sdk_row_id,
-            }
-
-        sdk_error = str(sdk_row.get("error") or "").strip()
-        if sdk_status in {"uncertain", "failed", "cleared"}:
-            error = f"SDK delivery {sdk_status}"
-            if sdk_error:
-                error = f"{error}: {sdk_error}"
-        else:
-            error = f"unexpected SDK delivery status: {sdk_status or 'missing'}"
         updated = await self._store.mark_report_delivery_terminal(
             int(job_id),
             delivery_attempt=delivery_attempt,
-            sdk_outbound_id=sdk_row_id,
-            status="indeterminate",
-            error=error,
-        )
-        logger.warning(
-            "wxbot.report_delivery_indeterminate",
-            job_id=job_id,
-            sdk_outbound_id=sdk_row_id,
-            sdk_status=sdk_status,
-            error=sdk_error,
+            sdk_outbound_id=fence_id,
+            status="sent",
         )
         return {
-            "status": "indeterminate" if updated else "attempt_lost",
-            "sdk_status": sdk_status,
+            "status": "sent" if updated else "attempt_lost",
+            "sdk_status": last_sdk_status or "sent",
             "job_id": int(job_id),
-            "sdk_outbound_id": sdk_row_id,
-            "error": error,
+            "sdk_outbound_id": fence_id,
         }
 
     async def fetch_report_messages_payload(
@@ -1680,18 +1870,8 @@ class WxbotReportService:
             )
             return False
         report_type = str(job.get("report_type") or "daily")
-        text = normalize_report_send_text(
-            report_type,
-            str(job.get("result_text") or ""),
-            footer=str(
-                getattr(
-                    self._store.settings,
-                    "wxbot_daily_report_footer",
-                    "",
-                )
-                or ""
-            ),
-        )
+        text = self._normalized_report_text(job)
+        parts = self._report_send_parts(job)
         # A report subscription is an explicit, cadence-limited and
         # idempotent delivery obligation. It must not share the conversational
         # speech budget: managed channels persist report delivery under the
@@ -1710,6 +1890,7 @@ class WxbotReportService:
                     "job_id": job_id,
                     "report_type": report_type,
                     "period_key": str(job.get("period_key") or ""),
+                    "send_part_count": len(parts),
                 },
             )
             if not reservation.allowed:
@@ -1739,19 +1920,14 @@ class WxbotReportService:
             )
             return False
         try:
-            sdk_result = await self.sdk_request(
-                "POST",
-                "/send",
-                json_body={
-                    "session_id": str(job["session_id"]),
-                    "session_name": canonical_session_name,
-                    "sender_name": "",
-                    "text": text,
-                    "msg_type": "text",
-                },
-                request_headers={"Idempotency-Key": f"wxbot-report:{job_id}"},
+            queued_parts = await self.queue_report_sdk_sends(
+                job_id=int(job_id),
+                session_id=str(job["session_id"]),
+                session_name=canonical_session_name,
+                parts=parts,
             )
-            sdk_row_id = self.sdk_outbound_id(sdk_result)
+            sdk_row_id = int(queued_parts[-1]["sdk_outbound_id"])
+            await self._persist_delivery_parts(job, queued_parts)
         except Exception as exc:
             if reservation is not None and self._speech_ledger is not None:
                 await self._speech_ledger.release(

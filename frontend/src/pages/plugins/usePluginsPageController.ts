@@ -8,8 +8,10 @@ import {
   apiVersionedResource,
   formatJson,
 } from "../../lib/api";
-import { useStableIdempotencyKeys } from "../../lib/idempotency";
+import type { useStableIdempotencyKeys } from "../../lib/idempotency";
 import { useConsoleConfig } from "../../state/console-config";
+import { useRequestEpoch } from "./useRequestEpoch";
+import { queryPluginRuntime } from "./runtimeQuery";
 import type { DrawRuntimeConfig } from "./DrawConfigSection";
 import type {
   EffectAuditFilters,
@@ -23,7 +25,6 @@ import type {
   MessageFlowRuntimeStatus,
   PluginEvent,
   PluginRuntime,
-  PluginRuntimeEnvelope,
   PluginScopeState,
   PluginSummary,
   ReadyzFlowChecks,
@@ -37,12 +38,16 @@ import {
   summarizeEffectLogRows,
 } from "./models";
 
-export function usePluginsPageController() {
+export function usePluginsPageController(idempotencyKeys: ReturnType<typeof useStableIdempotencyKeys>) {
   const {
     config,
     registerVerifiedGroups,
     selectVerifiedGroup,
   } = useConsoleConfig();
+  const beginRequest = useRequestEpoch();
+  const [runtimeErrors, setRuntimeErrors] = useState<Record<string, string>>({});
+  const [installedStatus, setInstalledStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [scopeReady, setScopeReady] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
   const [data, setData] = useState<PluginSummary | null>(null);
   const [installed, setInstalled] = useState<InstalledPlugin[]>([]);
@@ -55,7 +60,6 @@ export function usePluginsPageController() {
   );
   const [groupPluginState, setGroupPluginState] = useState<GroupPluginState>({});
   const [groupPluginVersions, setGroupPluginVersions] = useState<Record<string, number>>({});
-  const idempotencyKeys = useStableIdempotencyKeys();
   const [pluginEvents, setPluginEvents] = useState<PluginEvent[]>([]);
   const [groupOutput, setGroupOutput] = useState('{\n  "status": "waiting"\n}');
   const [flowStatus, setFlowStatus] = useState<MessageFlowRuntimeStatus | null>(null);
@@ -82,11 +86,11 @@ export function usePluginsPageController() {
   const [drawNotice, setDrawNotice] = useState("");
   const selectedPluginName = searchParams.get("plugin")?.trim() || "";
 
-  const pluginCards: InstalledPlugin[] = installed.length ? installed : (data?.plugins || []).map((plugin) => ({
+  const pluginCards: InstalledPlugin[] = installedStatus === "ready" ? installed : (data?.plugins || []).map((plugin) => ({
     ...plugin,
-    enabled: true,
+    enabled: null,
     system: false,
-    status: "active",
+    status: "unknown",
     restart_required: false,
   }));
   const loadedPluginNames = new Set(pluginCards.map((plugin) => plugin.name));
@@ -95,200 +99,62 @@ export function usePluginsPageController() {
   );
 
   const loadSummary = async () => {
+    const current = beginRequest("summary");
+    beginRequest("runtime");
+    beginRequest("scope");
     setLoading(true);
     setError("");
+    setInstalledStatus("loading");
+    setRuntime({});
+    setRuntimeErrors({});
+    setScopeReady(false);
     try {
-      const result = await apiRequest<PluginSummary>(config, "/v1/admin/plugins/summary", {
-        auth: true,
-      });
-      setData(result);
-      const installedResult = await apiRequest<InstalledPluginsResponse>(config, "/v1/admin/plugins/installed", {
-        auth: true,
-      }).catch(() => ({ plugins: [] }));
-      setInstalled(installedResult.plugins || []);
-      await loadRuntime(installedResult.plugins?.length ? installedResult.plugins : result.plugins);
-      if ((installedResult.plugins?.length ? installedResult.plugins : result.plugins).some((plugin) => plugin.name === "wxbot")) {
-        await loadGroups();
+      const [summaryResult, installedResult] = await Promise.allSettled([
+        apiRequest<PluginSummary>(config, "/v1/admin/plugins/summary", { auth: true }),
+        apiRequest<InstalledPluginsResponse>(config, "/v1/admin/plugins/installed", { auth: true }),
+      ]);
+      if (!current()) return;
+      setData(summaryResult.status === "fulfilled" ? summaryResult.value : null);
+      if (installedResult.status === "rejected" || !Array.isArray(installedResult.value?.plugins)) {
+        setInstalled([]);
+        setInstalledStatus("error");
+        setError("插件状态查询失败，当前启用状态未知，请刷新重试。");
+        return;
       }
-      await loadPluginEvents();
-      await loadRestartInstructions(installedResult.plugins || []);
-      await loadFlowRuntimeStatus();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
+      const plugins = installedResult.value.plugins;
+      setInstalled(plugins);
+      setInstalledStatus("ready");
+      if (summaryResult.status === "rejected") setError("插件摘要查询失败");
+      // Runtime diagnostics settle independently; one slow plugin cannot hold
+      // the installed list, group controls or other diagnostic panels hostage.
+      void loadRuntime(plugins);
+      if (plugins.some((plugin) => plugin.name === "wxbot")) void loadGroups();
+      void loadPluginEvents();
+      void loadRestartInstructions(plugins);
+      void loadFlowRuntimeStatus();
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   };
 
   const loadRuntime = async (plugins: Array<{ name: string }>) => {
-    const loaded = new Set(plugins.map((plugin) => plugin.name));
-    const unifiedRequests = plugins.map((plugin) =>
-      apiRequest<PluginRuntimeEnvelope>(config, `/v1/admin/plugins/${plugin.name}/runtime`, {
-        auth: true,
-      })
-        .then((result) => [plugin.name, result.runtime_status || result.runtime || {}] as [string, Record<string, unknown>])
-        .catch(() => null),
-    );
-    const unifiedEntries = (await Promise.all(unifiedRequests)).filter(Boolean) as Array<[
-      string,
-      Record<string, unknown>,
-    ]>;
-    if (unifiedEntries.length) {
-      setRuntime(Object.fromEntries(unifiedEntries) as PluginRuntime);
-      return;
-    }
-
-    const requests: Array<Promise<[keyof PluginRuntime, PluginRuntime[keyof PluginRuntime]]>> = [];
-
-    if (loaded.has("credits")) {
-      requests.push(
-        apiRequest<Record<string, unknown>>(
-          config,
-          `/plugins/credits/config/${config.tenantId}/${config.sessionId}`,
-        ).then((result) => [
-          "credits",
-          {
-            enabled: Boolean(result.enabled),
-            credit_name: String(result.credit_name || "积分"),
-            cost_per_chat: Number(result.cost_per_chat ?? 0),
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("amap")) {
-      requests.push(
-        apiRequest<Record<string, unknown>>(config, "/plugins/amap/admin/config", {
-          auth: true,
-        }).then((result) => [
-          "amap",
-          {
-            api_key_configured: Boolean(result.api_key_configured),
-            timeout_seconds: Number(result.timeout_seconds ?? 15),
-            storage_dir: String(result.storage_dir || ""),
-            storage_dir_exists: Boolean(result.storage_dir_exists),
-            storage_dir_writable: Boolean(result.storage_dir_writable),
-            agent_scope: String(result.agent_scope || "group_personal_map"),
-            tools: Array.isArray(result.tools) ? result.tools.map(String) : [],
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("commands")) {
-      requests.push(
-        apiRequest<Record<string, unknown>>(
-          config,
-          `/plugins/commands/config/${config.tenantId}`,
-        ).then((result) => [
-          "commands",
-          {
-            admins: Array.isArray(result.admin_user_ids) ? result.admin_user_ids.length : 0,
-            user_commands: Array.isArray(result.user_commands) ? result.user_commands.length : 0,
-            admin_commands: Array.isArray(result.admin_commands) ? result.admin_commands.length : 0,
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("moderation")) {
-      requests.push(
-        apiRequest<Record<string, unknown>>(
-          config,
-          `/plugins/moderation/config/${config.tenantId}/${config.sessionId}`,
-        ).then((result) => [
-          "moderation",
-          {
-            enabled: Boolean(result.enabled),
-            reminder_mode: String(result.reminder_mode || "off"),
-            webhook_enabled: Boolean(result.webhook_enabled),
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("persona_extract")) {
-      requests.push(
-        Promise.all([
-          apiRequest<{ items?: unknown[] }>(config, "/plugins/persona_extract/profiles", {
-            query: { tenant_id: config.tenantId, session_id: config.sessionId },
-          }),
-          apiRequest<{ items?: unknown[] }>(config, "/plugins/persona_extract/jobs", {
-            query: { tenant_id: config.tenantId, session_id: config.sessionId },
-          }),
-        ]).then(([profiles, jobs]) => [
-          "persona_extract",
-          {
-            profiles: profiles.items?.length ?? 0,
-            jobs: jobs.items?.length ?? 0,
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("memory")) {
-      requests.push(
-        Promise.all([
-          apiRequest<{ items?: unknown[] }>(config, "/plugins/memory/profiles", {
-            query: { tenant_id: config.tenantId, limit: 200 },
-          }),
-          apiRequest<{ items?: unknown[] }>(config, "/plugins/memory/events", {
-            query: { tenant_id: config.tenantId, limit: 200 },
-          }),
-        ]).then(([profiles, events]) => [
-          "memory",
-          {
-            profiles: profiles.items?.length ?? 0,
-            events: events.items?.length ?? 0,
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("repeater")) {
-      requests.push(
-        apiRequest<Record<string, unknown>>(
-          config,
-          `/plugins/repeater/config/${config.tenantId}/${config.sessionId}`,
-        ).then((result) => [
-          "repeater",
-          {
-            enabled: Boolean(result.enabled),
-            cooldown_seconds: Number(result.cooldown_seconds ?? 300),
-          },
-        ]),
-      );
-    }
-
-    if (loaded.has("wxbot")) {
-      requests.push(
-        Promise.all([
-          apiRequest<Record<string, unknown>>(config, "/plugins/wxbot/bridge/status"),
-          apiRequest<Record<string, number>>(config, "/plugins/wxbot/admin/reply-queue/stats", {
-            auth: true,
-            query: { tenant_id: config.tenantId },
-          }).catch((): Record<string, number> => ({})),
-          apiRequest<{ sessions?: unknown[] }>(config, "/plugins/wxbot/admin/sessions", {
-            auth: true,
-          }).catch(() => ({ sessions: [] })),
-        ]).then(([bridge, queue, sessionResult]) => [
-          "wxbot",
-          {
-            running: Boolean(bridge.running),
-            sdk_online: Boolean(bridge.sdk_online),
-            ingest_mode: String(bridge.ingest_mode || "-"),
-            pending: Number(queue.pending ?? 0),
-            sessions: sessionResult.sessions?.length ?? 0,
-          },
-        ]),
-      );
-    }
-
-    const entries = await Promise.all(requests);
-    setRuntime(Object.fromEntries(entries) as PluginRuntime);
+    const current = beginRequest("runtime");
+    setRuntime({});
+    setRuntimeErrors({});
+    await Promise.all(plugins.map(async ({ name }) => {
+      try {
+        const facts = await queryPluginRuntime(config, name);
+        if (current()) setRuntime((previous) => ({ ...previous, [name]: facts }));
+      } catch (err) {
+        if (current()) setRuntimeErrors((previous) => ({
+          ...previous, [name]: err instanceof Error ? err.message : "运行状态查询失败",
+        }));
+      }
+    }));
   };
 
   const loadGroups = async () => {
+    const current = beginRequest("groups");
     if (!config.adminToken) {
       return;
     }
@@ -300,15 +166,21 @@ export function usePluginsPageController() {
           auth: true,
         },
       );
+      if (!current()) return;
       const nextGroups = result.sessions || [];
       setGroups(nextGroups);
       registerVerifiedGroups(nextGroups.map((item) => item.session_id));
     } catch (err) {
+      if (!current()) return;
       setGroupOutput(formatJson({ error: err instanceof Error ? err.message : "群列表加载失败" }));
     }
   };
 
   const loadGroupPluginState = async (sessionId: string) => {
+    const current = beginRequest("scope");
+    setScopeReady(false);
+    setGroupPluginState({});
+    setGroupPluginVersions({});
     if (!sessionId) {
       return;
     }
@@ -321,7 +193,9 @@ export function usePluginsPageController() {
           query: { tenant_id: config.tenantId, session_id: sessionId },
         },
       );
-      const entries = (result.items || [])
+      if (!current()) return;
+      if (!Array.isArray(result.items)) throw new Error("群插件状态响应无效");
+      const entries = result.items
         .filter((item) => groupScopedPlugins.some((plugin) => plugin.name === item.plugin_name))
         .map((item) => [item.plugin_name, item.enabled] as [string, boolean]);
       const nextState = {
@@ -333,6 +207,7 @@ export function usePluginsPageController() {
       const versions = (result.items || [])
         .filter((item) => groupScopedPlugins.some((plugin) => plugin.name === item.plugin_name))
         .map((item) => [item.plugin_name, Math.max(0, Number(item.version || 0))]);
+      setScopeReady(true);
       setGroupPluginState(nextState);
       setGroupPluginVersions({
         ...Object.fromEntries(groupScopedPlugins.map((plugin) => [plugin.name, 0])),
@@ -340,11 +215,13 @@ export function usePluginsPageController() {
       });
       setGroupOutput(formatJson({ session_id: sessionId, plugins: nextState }));
     } catch (err) {
+      if (!current()) return;
       setGroupOutput(formatJson({ error: err instanceof Error ? err.message : "群插件状态加载失败" }));
     }
   };
 
   const loadPluginEvents = async () => {
+    const current = beginRequest("events");
     if (!config.adminToken) {
       return;
     }
@@ -353,13 +230,16 @@ export function usePluginsPageController() {
         auth: true,
         query: { limit: 20 },
       });
+      if (!current()) return;
       setPluginEvents(result.events || []);
     } catch {
+      if (!current()) return;
       setPluginEvents([]);
     }
   };
 
   const loadRestartInstructions = async (plugins: Array<{ restart_required?: boolean }>) => {
+    const current = beginRequest("restart");
     if (plugins.some((plugin) => plugin.restart_required)) {
       setRestartRequired(true);
       return;
@@ -374,13 +254,16 @@ export function usePluginsPageController() {
         "/v1/admin/runtime/restart-instructions",
         { auth: true, init: { method: "POST" } },
       );
+      if (!current()) return;
       setRestartRequired(Boolean(result.restart_required));
     } catch {
+      if (!current()) return;
       setRestartRequired(false);
     }
   };
 
   const loadTraceAggregate = async (traceId: string) => {
+    const current = beginRequest("trace");
     const normalizedTraceId = traceId.trim();
     if (!normalizedTraceId) {
       setTraceAggregate(null);
@@ -449,6 +332,7 @@ export function usePluginsPageController() {
             })
           : Promise.resolve<FlowTraceSnapshotResponse>({}),
       ]);
+      if (!current()) return;
       if (traceSnapshotResult.error) {
         errors.push(`Flow trace snapshot 加载失败：${traceSnapshotResult.error}`);
       }
@@ -464,8 +348,10 @@ export function usePluginsPageController() {
       });
       setTraceAggregateError(errors.length ? errors.join("；") : "");
     } catch (err) {
+      if (!current()) return;
       setTraceAggregateError(err instanceof Error ? err.message : "trace 聚合加载失败");
     } finally {
+      if (!current()) return;
       setTraceAggregateLoading(false);
     }
   };
@@ -474,6 +360,11 @@ export function usePluginsPageController() {
     traceFilter = effectTraceFilter,
     auditFilters = effectAuditFilters,
   ) => {
+    const current = beginRequest("flow");
+    beginRequest("trace");
+    setTraceAggregate(null);
+    setTraceAggregateLoading(false);
+    setTraceAggregateError("");
     setFlowLoading(true);
     setFlowError("");
     try {
@@ -487,6 +378,7 @@ export function usePluginsPageController() {
             })
           : Promise.resolve<MessageFlowRuntimeStatus | null>(null),
       ]);
+      if (!current()) return;
       const [effectLogResult, effectSummaryResult] = config.adminToken
         ? await Promise.all([
             apiRequest<FlowEffectLogResponse>(config, "/v1/admin/message-flows/effects", {
@@ -511,6 +403,7 @@ export function usePluginsPageController() {
             })),
           ])
         : [null, null];
+      if (!current()) return;
       const resolvedEffectSummary = effectSummaryResult?.backend === "derived"
         ? {
             ...effectSummaryResult,
@@ -528,14 +421,17 @@ export function usePluginsPageController() {
         setFlowError("请先填写 Admin Token 以查看 admin runtime 详情");
       }
     } catch (err) {
+      if (!current()) return;
       setFlowError(err instanceof Error ? err.message : "message flow runtime 加载失败");
     } finally {
+      if (!current()) return;
       setFlowLoading(false);
     }
   };
 
   const setPluginEnabled = async (pluginName: string, enabled: boolean) => {
-    const intent = `plugin-lifecycle:${pluginName}:${enabled ? "enable" : "disable"}`;
+    const current = beginRequest("lifecycle");
+    const intent = `plugin-lifecycle:${config.apiBaseUrl}:${config.tenantId}:${pluginName}:${enabled ? "enable" : "disable"}`;
     try {
       const result = await apiVersionedResource<{ plugin?: InstalledPlugin }>(
         config,
@@ -546,11 +442,15 @@ export function usePluginsPageController() {
           idempotencyKey: idempotencyKeys.keyFor(intent),
         },
       );
+      if (!current()) return;
       await loadSummary();
+      if (!current()) return;
       await loadPluginEvents();
+      if (!current()) return;
       idempotencyKeys.clear(intent);
       setGroupOutput(formatJson(result.value));
     } catch (err) {
+      if (!current()) return;
       setGroupOutput(formatJson({ error: err instanceof Error ? err.message : "插件开关保存失败" }));
       throw err;
     }
@@ -560,11 +460,12 @@ export function usePluginsPageController() {
     pluginName: string,
     enabled: boolean,
   ) => {
-    if (!managedGroupSessionId) {
+    const current = beginRequest("scopeMutation");
+    if (!managedGroupSessionId || !scopeReady) {
       setGroupOutput(formatJson({ error: "请先选择群" }));
       throw new Error("请先选择群");
     }
-    const intent = `plugin-scope:${managedGroupSessionId}:${pluginName}:${enabled ? "enable" : "disable"}`;
+    const intent = `plugin-scope:${config.apiBaseUrl}:${config.tenantId}:${managedGroupSessionId}:${pluginName}:${enabled ? "enable" : "disable"}`;
     try {
       const selectedGroup = groups.find((item) => item.session_id === managedGroupSessionId);
       const plugin = groupScopedPlugins.find((item) => item.name === pluginName);
@@ -597,6 +498,7 @@ export function usePluginsPageController() {
           },
         },
       );
+      if (!current()) return;
       setGroupPluginState((prev) => ({ ...prev, [pluginName]: enabled }));
       setGroupPluginVersions((prev) => ({
         ...prev,
@@ -606,11 +508,14 @@ export function usePluginsPageController() {
         ),
       }));
       await loadPluginEvents();
+      if (!current()) return;
       idempotencyKeys.clear(intent);
       setGroupOutput(formatJson(result.value));
     } catch (err) {
+      if (!current()) return;
       if (err instanceof VersionConflictError) {
         await loadGroupPluginState(managedGroupSessionId);
+        if (!current()) return;
       }
       setGroupOutput(formatJson({
         error: err instanceof VersionConflictError
@@ -654,6 +559,7 @@ export function usePluginsPageController() {
   };
 
   const loadDrawConfig = async () => {
+    const current = beginRequest("drawRead");
     if (!config.adminToken) {
       return;
     }
@@ -663,6 +569,7 @@ export function usePluginsPageController() {
       const result = await apiVersionedResource<unknown>(config, "/plugins/draw/admin/config", {
         auth: true,
       });
+      if (!current()) return;
       const parsed = parseDrawConfig(result.value);
       if (!parsed) {
         setDrawConfig(null);
@@ -670,14 +577,18 @@ export function usePluginsPageController() {
       }
       applyDrawConfig(parsed, result.etag);
     } catch (err) {
+      if (!current()) return;
       setDrawError(err instanceof Error ? err.message : "画图接口配置读取失败");
       setDrawConfig(null);
     } finally {
+      if (!current()) return;
       setDrawLoading(false);
     }
   };
 
   const saveDrawConfig = async () => {
+    const current = beginRequest("drawMutation");
+    beginRequest("drawRead");
     setDrawSaving(true);
     setDrawError("");
     setDrawNotice("");
@@ -700,24 +611,30 @@ export function usePluginsPageController() {
           body,
         },
       );
+      if (!current()) return;
       const parsed = parseDrawConfig(result.value);
       if (parsed) {
         applyDrawConfig(parsed, result.etag);
       }
       setDrawNotice(body.api_url ? "已保存，当前请求立即使用新地址。" : "已停用画图接口。");
     } catch (err) {
+      if (!current()) return;
       if (err instanceof VersionConflictError) {
         await loadDrawConfig();
+        if (!current()) return;
         setDrawError("配置已被其他管理员修改，已重新读取，请核对后重试。");
       } else {
         setDrawError(err instanceof Error ? err.message : "画图接口配置保存失败");
       }
     } finally {
+      if (!current()) return;
       setDrawSaving(false);
     }
   };
 
   const disableDrawConfig = async () => {
+    const current = beginRequest("drawMutation");
+    beginRequest("drawRead");
     setDrawSaving(true);
     setDrawError("");
     setDrawNotice("");
@@ -732,6 +649,7 @@ export function usePluginsPageController() {
           body: { api_url: "" },
         },
       );
+      if (!current()) return;
       const parsed = parseDrawConfig(result.value);
       if (parsed) {
         applyDrawConfig(parsed, result.etag);
@@ -740,50 +658,33 @@ export function usePluginsPageController() {
       }
       setDrawNotice("已停用画图接口。");
     } catch (err) {
+      if (!current()) return;
       if (err instanceof VersionConflictError) {
         await loadDrawConfig();
+        if (!current()) return;
         setDrawError("配置已被其他管理员修改，已重新读取，请核对后重试。");
       } else {
         setDrawError(err instanceof Error ? err.message : "画图接口停用失败");
       }
     } finally {
+      if (!current()) return;
       setDrawSaving(false);
     }
   };
 
   useEffect(() => {
     if (config.adminToken) {
-      void (async () => {
-        const result = await apiRequest<PluginSummary>(config, "/v1/admin/plugins/summary", {
-          auth: true,
-        });
-        setData(result);
-        const installedResult = await apiRequest<InstalledPluginsResponse>(config, "/v1/admin/plugins/installed", {
-          auth: true,
-        }).catch(() => ({ plugins: [] }));
-        setInstalled(installedResult.plugins || []);
-        const plugins = installedResult.plugins?.length ? installedResult.plugins : result.plugins;
-        await loadRuntime(plugins);
-        if (plugins.some((plugin) => plugin.name === "wxbot")) {
-          await loadGroups();
-        }
-        await loadPluginEvents();
-        await loadRestartInstructions(installedResult.plugins || []);
-        await loadFlowRuntimeStatus();
-        await loadDrawConfig();
-      })().catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : "加载失败");
-      });
-    } else {
-      void loadFlowRuntimeStatus();
+      void loadSummary();
+      void loadDrawConfig();
     }
-  }, [config.adminToken, config.sessionId, config.tenantId]);
+    void loadFlowRuntimeStatus();
+  }, []);
 
   useEffect(() => {
-    if (managedGroupSessionId && data?.plugins?.length) {
+    if (managedGroupSessionId && installedStatus === "ready") {
       void loadGroupPluginState(managedGroupSessionId);
     }
-  }, [managedGroupSessionId, data?.plugins?.length, config.sessionId, config.tenantId]);
+  }, [managedGroupSessionId, installed, installedStatus]);
 
   useEffect(() => {
     const nextGroupSessionId = config.sessionId.endsWith("@chatroom") ? config.sessionId : "";
@@ -890,6 +791,9 @@ export function usePluginsPageController() {
     data,
     pluginCards,
     runtime,
+    runtimeErrors,
+    error,
+    scopeReady,
     loading,
     canManage: Boolean(config.adminToken),
     groups,

@@ -162,13 +162,18 @@ class MemoryItemVectorIndex:
     def is_enabled(self) -> bool:
         return (
             _settings_bool(self.settings, "memory_vector_index_enabled", False)
+            and str(getattr(self.settings, "llm_embed_provider", "")).lower() != "fake"
             and self.vector_store is not None
             and self.llm_service is not None
         )
 
     @property
     def is_available(self) -> bool:
-        return self.vector_store is not None and self.llm_service is not None
+        return (
+            self.vector_store is not None
+            and self.llm_service is not None
+            and str(getattr(self.settings, "llm_embed_provider", "")).lower() != "fake"
+        )
 
     def _is_indexable_item_payload(self, item: dict[str, Any] | None) -> bool:
         if not item:
@@ -287,15 +292,22 @@ class MemoryItemVectorIndex:
         return await asyncio.wait_for(awaitable, timeout=self.timeout_seconds)
 
     async def _embed_raw(self, *, tenant_id: str, text: str, trace_id: str) -> list[float]:
-        resp = await self._with_timeout(
+        background = trace_id.startswith(("memory_item:", "memory_fact:", "memory_episode:"))
+        timeout = (
+            float(getattr(self.settings, "llm_embed_background_timeout_seconds", 30.0))
+            if background else self.timeout_seconds
+        )
+        resp = await asyncio.wait_for(
             self.llm_service.embed(
                 EmbedRequest(
                     tenant_id=tenant_id,
                     trace_id=trace_id,
                     model=self.embed_model,
                     texts=[text],
+                    priority="background" if background else "query",
                 )
-            )
+            ),
+            timeout=timeout,
         )
         vectors = list(getattr(resp, "vectors", []) or [])
         if not vectors:
